@@ -22,6 +22,7 @@
 #include "aie/Dialect/AIEX/Transforms/AIEXPasses.h"
 #include "aie/InitialAllDialect.h"
 #include "aie/version.h"
+#include "onnx/Dialect/ONNX/IR/ONNXDialect.hpp"
 
 using namespace llvm;
 using namespace mlir;
@@ -43,6 +44,7 @@ int main(int argc, char **argv) {
   DialectRegistry registry;
   registerAllDialects(registry);
   xilinx::registerAllDialects(registry);
+  registry.insert<ONNXDialect>();
 
   registerAllExtensions(registry);
 
