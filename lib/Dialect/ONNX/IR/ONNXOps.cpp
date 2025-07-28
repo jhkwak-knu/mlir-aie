@@ -14,7 +14,7 @@
 
 #include "onnx/Dialect/ONNX/IR/ONNXOps.hpp"
 
-using namespace mlir;
+using namespace onnx;
 
 //===----------------------------------------------------------------------===//
 // TableGen'd op method definitions

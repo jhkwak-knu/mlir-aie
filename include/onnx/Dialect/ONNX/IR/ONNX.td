@@ -29,7 +29,7 @@ include "mlir/IR/OpBase.td"
 def ONNX_Dialect : Dialect {
   let name = "onnx";
   let summary = "A high-level dialect for the ONNX specification";
-  let cppNamespace = "::mlir";
+  let cppNamespace = "::onnx";
   let useDefaultTypePrinterParser = 0;
   let useDefaultAttributePrinterParser = 0;
 }

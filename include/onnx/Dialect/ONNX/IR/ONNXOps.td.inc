@@ -4,7 +4,7 @@
 //   Details can be found in docs/ImportONNXDefs.md .
 //********************************************************
 
-def ONNXMatMulOp:ONNX_Op<"MatMul",
+def ONNX_MatMulOp:ONNX_Op<"MatMul",
   [Pure]> {
   let summary = "ONNX MatMul operation";
   let description = [{

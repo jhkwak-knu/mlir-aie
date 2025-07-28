@@ -15,7 +15,7 @@
 #include "onnx/Dialect/ONNX/IR/ONNXDialect.hpp"
 #include "onnx/Dialect/ONNX/IR/ONNXOps.hpp"
 
-using namespace mlir;
+using namespace onnx;
 
 //===----------------------------------------------------------------------===//
 // ONNX Dialect: TableGen generated implementation

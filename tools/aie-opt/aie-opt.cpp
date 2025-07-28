@@ -44,7 +44,7 @@ int main(int argc, char **argv) {
   DialectRegistry registry;
   registerAllDialects(registry);
   xilinx::registerAllDialects(registry);
-  registry.insert<ONNXDialect>();
+  registry.insert<onnx::ONNXDialect>();
 
   registerAllExtensions(registry);
 

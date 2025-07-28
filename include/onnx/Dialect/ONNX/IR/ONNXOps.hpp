@@ -18,12 +18,12 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "onnx/Dialect/ONNX/IR/ONNXDialect.hpp"
 
-namespace mlir {
+namespace onnx {
 // OpSet level supported by onnx-mlir
 // To update all occurrence of the current ONNX opset, please grep
 // "CURRENT_ONNX_OPSET" and update all locations accordingly.
 static constexpr int CURRENT_ONNX_OPSET = 22;
-} // end namespace mlir
+} // end namespace onnx
 
 #define GET_OP_CLASSES
 #include "onnx/Dialect/ONNX/IR/ONNX.h.inc"
