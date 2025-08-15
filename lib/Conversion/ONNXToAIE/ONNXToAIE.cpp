@@ -563,6 +563,22 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
     }
   }
 
+  // Generate AIE FlowOp
+  for (auto &comm : placement.tileComms) {
+    auto &srcTile = placement.aieTiles[comm.fromIdx];
+
+    for(auto &toIdx : comm.toIdxs) {
+      auto &dstTile = placement.aieTiles[toIdx];
+      auto srcCh = builder.getI32IntegerAttr(comm.srcCh);
+      auto dstCh = builder.getI32IntegerAttr(comm.dstCh);
+      auto srcWBAttr = xilinx::AIE::WireBundleAttr::get(builder.getContext(), comm.srcWire);
+      auto dstWBAttr = xilinx::AIE::WireBundleAttr::get(builder.getContext(), comm.dstWire);
+
+      builder.create<xilinx::AIE::FlowOp>(loc, srcTile.value, srcWBAttr, srcCh,
+                                          dstTile.value, dstWBAttr, dstCh);
+    }
+  }
+
   // Save the mlir code composed of AIE dialect
   std::error_code ec;
   llvm::raw_fd_ostream out("./aie.mlir", ec);
