@@ -8,10 +8,6 @@
 //
 //===----------------------------------------------------------------------===//
 
-#define N_ROW 32
-#define N_COL 32
-#define N_DEP 32
-
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,7 +15,8 @@
 
 extern "C" {
 
-void extern_kernel(float *restrict A, float *restrict B, float *restrict C) {
+void extern_kernel(float *restrict A, float *restrict B, float *restrict C,
+                   uint32_t N_ROW, uint32_t N_COL, uint32_t N_DEP) {
 
   for (int row = 0; row < N_ROW; row++) {
     for (int col = 0; col < N_COL; col++) {

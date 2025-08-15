@@ -688,7 +688,8 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
   auto lhsMemrefType = MemRefType::get({coreTileParam.TM * coreTileParam.TK}, coreTileParam.elemType);
   auto rhsMemrefType = MemRefType::get({coreTileParam.TK * coreTileParam.TN}, coreTileParam.elemType);
   auto resMemrefType = MemRefType::get({coreTileParam.TM * coreTileParam.TN}, coreTileParam.elemType);
-  FunctionType funcType = builder.getFunctionType({lhsMemrefType, rhsMemrefType, resMemrefType}, {});
+  auto i32Type = builder.getI32Type();
+  FunctionType funcType = builder.getFunctionType({lhsMemrefType, rhsMemrefType, resMemrefType, i32Type, i32Type, i32Type}, {});
   auto funcOp = builder.create<func::FuncOp>(loc, funcNameAttr, funcType);
   funcOp.setPrivate();
 
@@ -705,6 +706,15 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
       Region &coreRegion = coreOp.getBody();
       Block *coreBlock = builder.createBlock(&coreRegion);
       builder.setInsertionPointToStart(coreBlock);
+
+      // Generate Arith ConstantOp
+      uint32_t n_row = tileParam.coreTile.TM;
+      uint32_t n_col = tileParam.coreTile.TN;
+      uint32_t n_dep = tileParam.coreTile.TK;
+
+      auto constNRowOp = builder.create<mlir::arith::ConstantIntOp>(loc, n_row, /*width=*/32);
+      auto constNColOp = builder.create<mlir::arith::ConstantIntOp>(loc, n_col, /*width=*/32);
+      auto constNDepOp = builder.create<mlir::arith::ConstantIntOp>(loc, n_dep, /*width=*/32);
 
       AieBuf *lhsBuf = nullptr;
       AieBuf *rhsBuf = nullptr;
@@ -730,7 +740,8 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
       // Generate Func CallOp
       auto calleeAttr = SymbolRefAttr::get(builder.getContext(), "extern_kernel");
       builder.create<mlir::func::CallOp>(loc, calleeAttr, TypeRange{}, 
-                                        ValueRange{lhsBuf->bufValue, rhsBuf->bufValue, resBuf->bufValue});
+                                        ValueRange{lhsBuf->bufValue, rhsBuf->bufValue, resBuf->bufValue,
+                                                   constNRowOp, constNColOp, constNDepOp});
 
       // Generate AIE UseLockOp
       builder.create<UseLockOp>(loc, lhsBuf->prodLockValue, LockAction::Release, 1);
