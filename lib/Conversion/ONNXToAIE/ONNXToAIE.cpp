@@ -681,6 +681,17 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
     }
   }
 
+  // Generate Func FuncOp
+  auto funcNameAttr = builder.getStringAttr("extern_kernel");
+  auto coreTileParam = tileParam.coreTile;
+  auto lhsMemrefType = MemRefType::get({coreTileParam.TM * coreTileParam.TK}, coreTileParam.elemType);
+  auto rhsMemrefType = MemRefType::get({coreTileParam.TK * coreTileParam.TN}, coreTileParam.elemType);
+  auto resMemrefType = MemRefType::get({coreTileParam.TM * coreTileParam.TN}, coreTileParam.elemType);
+  FunctionType funcType = builder.getFunctionType({lhsMemrefType, rhsMemrefType, resMemrefType}, {});
+  auto funcOp = builder.create<func::FuncOp>(loc, funcNameAttr, funcType);
+  funcOp.setPrivate();
+
+
   // Save the mlir code composed of AIE dialect
   std::error_code ec;
   llvm::raw_fd_ostream out("./aie.mlir", ec);
