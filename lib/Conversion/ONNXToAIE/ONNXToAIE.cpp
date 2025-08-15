@@ -1,5 +1,6 @@
 #include "../PassDetail.h"
 
+#include "aie/Dialect/AIE/IR/AIEDialect.h"
 #include "onnx/Dialect/ONNX/IR/ONNXOps.hpp"
 #include "onnx/Conversion/ONNXToAIE/ONNXToAIE.h"
 
@@ -479,6 +480,34 @@ optimizeAiePlacement(const TileParam &tileParam) {
 }
 
 void generateAieOps(ConversionPatternRewriter &rewriter,
+                    AiePlacementResult &placement,
+                    const TileParam &tileParam) {
+  // TODO: Implement
+  
+  // Create new module for AIE dialect
+  MLIRContext *ctx = rewriter.getContext();
+  auto loc = mlir::UnknownLoc::get(ctx);
+  auto aieModule = ModuleOp::create(loc);
+  OpBuilder builder(aieModule.getBodyRegion());
+  builder.setInsertionPointToStart(aieModule.getBody());
+
+  // Generate AIE DeviceOp
+  std::vector<AIEDevice> devices{AIEDevice::npu2_1col, AIEDevice::npu2_2col,
+                                 AIEDevice::npu2_3col, AIEDevice::npu2_4col,
+                                 AIEDevice::npu2_5col, AIEDevice::npu2_6col,
+                                 AIEDevice::npu2_7col, AIEDevice::npu2};
+  auto deviceOp = builder.create<DeviceOp>(loc, devices[tileParam.numLastSpm - 1]);
+
+  // Ensure it has a body block, and point insertion into it
+  deviceOp.getRegion().emplaceBlock();
+  DeviceOp::ensureTerminator(deviceOp.getBodyRegion(), builder, loc);
+  builder.setInsertionPointToStart(deviceOp.getBody());
+
+  // Save the mlir code composed of AIE dialect
+  std::error_code ec;
+  llvm::raw_fd_ostream out("./aie.mlir", ec);
+  aieModule->print(out);
+}
 
 //===----------------------------------------------------------------------===//
 // Conversion classes for ONNX ops
@@ -532,6 +561,21 @@ public:
 
     // Perform hardware-aware optimization for AIE
     auto AiePlacement = optimizeAiePlacement(optimalTileParam);
+
+    // Generate AIE Ops
+    generateAieOps(rewriter, AiePlacement, optimalTileParam);
+                  
+    // Dummy to prevent result type errors
+    auto resultType = op.getResult().getType();
+    auto dummy = rewriter.create<mlir::arith::ConstantOp>(
+        loc, resultType, rewriter.getZeroAttr(resultType));
+
+    rewriter.replaceOp(op, dummy);
+
+    return success();
+  }
+};
+
 //===----------------------------------------------------------------------===//
 // Pass main (ConvertONNXToAIE)
 //===----------------------------------------------------------------------===//
@@ -543,6 +587,12 @@ void populateONNXRewritePatterns(RewritePatternSet &patterns,
 
 struct ConvertONNXToAIE
     : public ConvertONNXToAIEBase<ConvertONNXToAIE> {
+
+  void getDependentDialects(mlir::DialectRegistry &registry) const override {
+    registry.insert<mlir::memref::MemRefDialect>();
+    registry.insert<xilinx::AIE::AIEDialect>();
+    registry.insert<xilinx::AIEX::AIEXDialect>();
+  }
 
   void runOnOperation() override {
     RewritePatternSet patterns(&getContext());
