@@ -1,0 +1,19 @@
+{
+    "system": {
+        "name": "xdna2",
+        "num_spm_levels": 2,
+        "spm_levels": [
+            {
+                "level": 1,
+                "num_spms": 4,
+                "spm_size_bytes": 65536
+            },
+            {
+                "level": 2,
+                "num_spms": 8,
+                "spm_size_bytes": 524288
+            }
+        ],
+        "total_cores": 32
+    }
+}
