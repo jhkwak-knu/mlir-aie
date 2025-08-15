@@ -579,6 +579,108 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
     }
   }
 
+  // Generate AIE DMAOp
+  for (auto &tile : placement.aieTiles) {
+
+    Operation *dmaOp = nullptr;
+    if(tile.row == 0) {
+      size_t numBlocks = tile.inCommBufs.size() + tile.outCommBufs.size();
+
+      for(size_t i = 0; i < numBlocks; ++i){
+        bool isInput = (i < tile.inCommBufs.size());
+        auto &commBuf = isInput ? tile.inCommBufs[i] : tile.outCommBufs[i - tile.inCommBufs.size()];
+        auto &comm = placement.tileComms[commBuf.tileCommIdx];
+        auto &buf = tile.allocatedBufs[commBuf.bufIdx];
+
+        auto globalSym = SymbolRefAttr::get(builder.getContext(), buf.symbol);
+        DMAChannelDir dmaDir = isInput ? DMAChannelDir::S2MM : DMAChannelDir::MM2S;
+        DMAChannelDirAttr dmaDirAttr = DMAChannelDirAttr::get(builder.getContext(), dmaDir);
+        auto &channelIdx = isInput ? comm.dstCh : comm.srcCh;
+  
+        builder.create<ShimDMAAllocationOp>(loc, globalSym, dmaDirAttr,
+                                            builder.getI64IntegerAttr(channelIdx),
+                                            builder.getI64IntegerAttr(tile.col));
+      }
+
+      continue;
+    } else if(tile.row == 1) {
+      dmaOp = builder.create<MemTileDMAOp>(loc, tile.value).getOperation();
+    } else {
+      dmaOp = builder.create<MemOp>(loc, tile.value).getOperation();
+    }
+
+    {
+      OpBuilder::InsertionGuard g(builder);
+      Region &DMARegion = dmaOp->getRegion(0);
+
+      std::vector<Block*> dmaBlocks;
+      std::vector<Block*> bdBlocks;
+
+      size_t numBlocks = tile.inCommBufs.size() + tile.outCommBufs.size();
+      for(size_t i = 0; i < numBlocks; ++i){
+        Block *dmaBlock = builder.createBlock(&DMARegion);
+        dmaBlocks.push_back(dmaBlock);
+      }
+      for(size_t i = 0; i < numBlocks; ++i){
+        Block *bdBlock = builder.createBlock(&DMARegion);
+        bdBlocks.push_back(bdBlock);
+      }
+      Block *endBlock = builder.createBlock(&DMARegion);
+      dmaBlocks.push_back(endBlock);
+
+      for(size_t i = 0; i < numBlocks; ++i){
+        bool isInput = (i < tile.inCommBufs.size());
+        auto &commBuf = isInput ? tile.inCommBufs[i] : tile.outCommBufs[i - tile.inCommBufs.size()];
+        auto &comm = placement.tileComms[commBuf.tileCommIdx];
+
+        {
+          OpBuilder::InsertionGuard g(builder);
+          builder.setInsertionPointToStart(dmaBlocks[i]);
+
+          DMAChannelDir dmaDir = isInput ? DMAChannelDir::S2MM : DMAChannelDir::MM2S;
+          DMAChannelDirAttr dmaDirAttr = DMAChannelDirAttr::get(builder.getContext(), dmaDir);
+          auto &channelIdx = isInput ? comm.dstCh : comm.srcCh;
+          auto channelIdxAttr = builder.getI32IntegerAttr(channelIdx);
+          auto repeatCntAttr = builder.getI32IntegerAttr(0);
+
+          builder.create<DMAStartOp>(loc, dmaDirAttr, channelIdxAttr, repeatCntAttr, bdBlocks[i], dmaBlocks[i+1]);
+        }
+
+        {
+          OpBuilder::InsertionGuard g(builder);
+          builder.setInsertionPointToStart(bdBlocks[i]);
+
+          auto &buf = tile.allocatedBufs[commBuf.bufIdx];
+          auto acquireLockValue = isInput ? buf.prodLockValue : buf.consLockValue;
+          auto releaseLockValue = isInput ? buf.consLockValue : buf.prodLockValue;
+          uint32_t numToken = 1;
+          if(tile.row == 1) {
+            uint32_t numCompTile = 4;
+
+            if(isInput && buf.name == "lhs") {
+              numToken = numCompTile; 
+            } else if(!isInput && buf.name == "res") {
+              numToken = numCompTile; 
+            } else {
+              numToken = 1;
+            }
+          } 
+
+          builder.create<UseLockOp>(loc, acquireLockValue, LockAction::AcquireGreaterEqual, numToken);
+          builder.create<DMABDOp>(loc, buf.bufValue, commBuf.bufOffset, commBuf.bufSize);
+          builder.create<UseLockOp>(loc, releaseLockValue, LockAction::Release, numToken);
+          builder.create<NextBDOp>(loc, bdBlocks[i]);
+        }
+      }
+
+      {
+        OpBuilder::InsertionGuard g(builder);
+        builder.setInsertionPointToStart(endBlock);
+        builder.create<EndOp>(loc);
+      }
+    }
+  }
+
   // Save the mlir code composed of AIE dialect
   std::error_code ec;
   llvm::raw_fd_ostream out("./aie.mlir", ec);
