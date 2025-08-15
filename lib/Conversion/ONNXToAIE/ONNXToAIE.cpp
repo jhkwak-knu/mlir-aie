@@ -691,6 +691,54 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
   auto funcOp = builder.create<func::FuncOp>(loc, funcNameAttr, funcType);
   funcOp.setPrivate();
 
+  // Generate AIE CoreOp
+  for (auto &tile : placement.aieTiles) {
+    if(tile.row < 2) {
+      continue;
+    }
+
+    auto coreOp = builder.create<xilinx::AIE::CoreOp>(loc, tile.value);
+    coreOp->setAttr("link_with", builder.getStringAttr("kernel.o"));
+    {
+      OpBuilder::InsertionGuard g(builder);
+      Region &coreRegion = coreOp.getBody();
+      Block *coreBlock = builder.createBlock(&coreRegion);
+      builder.setInsertionPointToStart(coreBlock);
+
+      AieBuf *lhsBuf = nullptr;
+      AieBuf *rhsBuf = nullptr;
+      AieBuf *resBuf = nullptr;
+
+      for (auto &buf : tile.allocatedBufs) {
+        const std::string &name = buf.name;
+
+        if (name == "lhs") {
+          lhsBuf = &buf;
+        } else if (name == "rhs") {
+          rhsBuf = &buf;
+        } else if (name == "res") {
+          resBuf = &buf;
+        }
+      }
+
+      // Generate AIE UseLockOp
+      builder.create<UseLockOp>(loc, lhsBuf->consLockValue, LockAction::AcquireGreaterEqual, 1);
+      builder.create<UseLockOp>(loc, rhsBuf->consLockValue, LockAction::AcquireGreaterEqual, 1);
+      builder.create<UseLockOp>(loc, resBuf->prodLockValue, LockAction::AcquireGreaterEqual, 1);
+
+      // Generate Func CallOp
+      auto calleeAttr = SymbolRefAttr::get(builder.getContext(), "extern_kernel");
+      builder.create<mlir::func::CallOp>(loc, calleeAttr, TypeRange{}, 
+                                        ValueRange{lhsBuf->bufValue, rhsBuf->bufValue, resBuf->bufValue});
+
+      // Generate AIE UseLockOp
+      builder.create<UseLockOp>(loc, lhsBuf->prodLockValue, LockAction::Release, 1);
+      builder.create<UseLockOp>(loc, rhsBuf->prodLockValue, LockAction::Release, 1);
+      builder.create<UseLockOp>(loc, resBuf->consLockValue, LockAction::Release, 1);
+
+      builder.create<EndOp>(loc);
+    }
+  }  
 
   // Save the mlir code composed of AIE dialect
   std::error_code ec;
