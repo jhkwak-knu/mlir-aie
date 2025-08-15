@@ -1,6 +1,7 @@
 #include "../PassDetail.h"
 
 #include "aie/Dialect/AIE/IR/AIEDialect.h"
+#include "aie/Dialect/AIEX/IR/AIEXDialect.h"
 #include "onnx/Dialect/ONNX/IR/ONNXOps.hpp"
 #include "onnx/Conversion/ONNXToAIE/ONNXToAIE.h"
 
@@ -739,6 +740,63 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
       builder.create<EndOp>(loc);
     }
   }  
+
+  // Generate AIEX RuntimeSequenceOp
+  std::string seq_name = "sequence";
+  StringAttr seq_sym_name = builder.getStringAttr(seq_name);
+  auto seqOp = builder.create<xilinx::AIEX::RuntimeSequenceOp>(loc, seq_sym_name);
+  {
+    OpBuilder::InsertionGuard g(builder);
+    Region &seqRegion = seqOp.getBody();
+    Block *seqBlock = builder.createBlock(&seqRegion);
+    builder.setInsertionPointToStart(seqBlock);
+
+    auto &[TM, TK, TN, elemType] = tileParam.levelTiles[0];
+    auto lhsMemrefType = MemRefType::get({TM, TK}, elemType);
+    auto rhsMemrefType = MemRefType::get({TK, TN}, elemType);
+    auto resMemrefType = MemRefType::get({TM, TN}, elemType);
+
+    auto arg_lhs = seqBlock->addArgument(lhsMemrefType, loc);
+    auto arg_rhs = seqBlock->addArgument(rhsMemrefType, loc);
+    auto arg_res = seqBlock->addArgument(resMemrefType, loc);
+
+    const std::vector<std::vector<int64_t>> Offsets = { {0, 0, 0, 0},     // lhs
+                                                        {0, 0, 0, 0},     // rhs
+                                                        {0, 0, 0, 0} };   // res
+    const std::vector<std::vector<int64_t>> Sizes = { {1, 1, TM, TK},     // lhs
+                                                      {1, 1, TK, TN},     // rhs
+                                                      {1, 1, TM, TN} };   // res
+    const std::vector<std::vector<int64_t>> Strides = { {0, 0, TK, 1},    // lhs
+                                                        {0, 0, TN, 1},    // rhs
+                                                        {0, 0, TN, 1} };  // res
+
+    uint32_t id = 0;
+
+    // Generate AIEX NpuDmaMemcpyNdOp
+    for (auto &tile : placement.aieTiles) {
+
+      if(tile.row == 0) {
+        size_t numBlocks = tile.inCommBufs.size() + tile.outCommBufs.size();
+
+        for(size_t i = 0; i < numBlocks; ++i){
+          bool isOutput = (i < tile.outCommBufs.size());
+          auto &commBuf = isOutput ? tile.outCommBufs[i] : tile.inCommBufs[i - tile.outCommBufs.size()];
+          auto &buf = tile.allocatedBufs[commBuf.bufIdx];
+          auto &arg = buf.name == "lhs" ? arg_lhs : (buf.name == "rhs" ? arg_rhs : arg_res);
+          size_t idx = buf.name == "lhs" ? 0 : (buf.name == "rhs" ? 1 : 2);
+
+          StringRef metadata = builder.getStringAttr(buf.symbol);
+          builder.create<xilinx::AIEX::NpuDmaMemcpyNdOp>(loc, arg, SmallVector<Value>{}, SmallVector<Value>{}, SmallVector<Value>{},
+                                                        ArrayRef(Offsets[idx]), ArrayRef(Sizes[idx]), ArrayRef(Strides[idx]), nullptr, 
+                                                        metadata, id++, false, 0, 0, 0, 0, 0, 0);
+                                                        
+          if(!isOutput) {
+            builder.create<xilinx::AIEX::NpuDmaWaitOp>(loc, metadata);
+          }
+        }
+      }
+    }
+  }
 
   // Save the mlir code composed of AIE dialect
   std::error_code ec;
