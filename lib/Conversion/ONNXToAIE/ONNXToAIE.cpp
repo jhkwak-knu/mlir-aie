@@ -1,5 +1,6 @@
 #include "../PassDetail.h"
 
+#include "onnx/Dialect/ONNX/IR/ONNXOps.hpp"
 #include "onnx/Conversion/ONNXToAIE/ONNXToAIE.h"
 
 #include "mlir/IR/Types.h"
@@ -155,6 +156,41 @@ std::optional<SystemInfo> loadSystemInfo(const std::string &filePath) {
 }
 
 //===----------------------------------------------------------------------===//
+// Tiling algorithm
+//===----------------------------------------------------------------------===//
+struct OpInfo {
+  uint32_t M, K, N;
+  Type elemType;
+};
+
+struct LevelTile {
+  uint32_t TM;
+  uint32_t TK;
+  uint32_t TN;
+  Type elemType;
+};
+
+struct TileParam {
+  uint32_t numLastSpm;
+  LevelTile coreTile;
+  std::vector<LevelTile> levelTiles;
+};
+
+TileParam findOptimalTileParam(const SystemInfo &sysInfo, const OpInfo &opInfo) {
+  // TODO: Implement
+
+  TileParam optimalTileParam{
+    .numLastSpm = 1,
+    .coreTile   = {.TM=32, .TK=32, .TN=32, .elemType=opInfo.elemType},
+    .levelTiles = {{.TM=128, .TK=32, .TN=32, .elemType=opInfo.elemType}}
+  };
+
+  return optimalTileParam;
+}
+
+//===----------------------------------------------------------------------===//
+
+//===----------------------------------------------------------------------===//
 // Conversion classes for ONNX ops
 //===----------------------------------------------------------------------===//
 class ConvertONNXMatMulToAIE
@@ -178,6 +214,32 @@ public:
     }
 
     // Find optimal tiling parameters
+    OpInfo opInfo;
+
+    auto ty = op.getResult().getType();
+    if (auto shapedTy = llvm::dyn_cast<ShapedType>(ty)) {
+      opInfo.elemType = shapedTy.getElementType();
+    } else {
+      return rewriter.notifyMatchFailure(op, "expected a shaped type");
+    }
+
+    auto lhsType = llvm::dyn_cast<ShapedType>(op.getA().getType());
+    auto rhsType = llvm::dyn_cast<ShapedType>(op.getB().getType());
+    auto resType = llvm::dyn_cast<ShapedType>(op.getResult().getType());
+
+    if (!lhsType || !rhsType || !resType || 
+        !lhsType.hasStaticShape() || 
+        !rhsType.hasStaticShape() || 
+        !resType.hasStaticShape()) {
+      return rewriter.notifyMatchFailure(op, "MatMul operands/results must have static shapes");
+    }
+
+    opInfo.M = static_cast<uint32_t>(resType.getShape()[0]);
+    opInfo.N = static_cast<uint32_t>(resType.getShape()[1]);
+    opInfo.K = static_cast<uint32_t>(lhsType.getShape()[1]);
+
+    TileParam optimalTileParam = findOptimalTileParam(systemInfo.value(), opInfo);
+
 //===----------------------------------------------------------------------===//
 // Pass main (ConvertONNXToAIE)
 //===----------------------------------------------------------------------===//
