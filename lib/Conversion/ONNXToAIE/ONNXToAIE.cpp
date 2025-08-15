@@ -503,6 +503,13 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
   DeviceOp::ensureTerminator(deviceOp.getBodyRegion(), builder, loc);
   builder.setInsertionPointToStart(deviceOp.getBody());
 
+  // Generate AIE TileOp
+  for (auto &tile : placement.aieTiles) {
+    auto tileOp = builder.create<xilinx::AIE::TileOp>(loc, tile.col, tile.row);
+
+    tile.value = tileOp;
+  }
+
   // Save the mlir code composed of AIE dialect
   std::error_code ec;
   llvm::raw_fd_ostream out("./aie.mlir", ec);
