@@ -510,6 +510,59 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
     tile.value = tileOp;
   }
 
+  // Generate Ops for each tile
+  for (auto &tile : placement.aieTiles) {
+    
+    if(tile.row == 0) { // Shim tile
+      // Generate Memref GlobalOp
+      for (auto &buf : tile.allocatedBufs) {
+        buf.symbol = std::string("global_") + buf.name + "_" + std::to_string(tile.col) + "_" + std::to_string(tile.row);
+        auto globalMemrefNameAttr = builder.getStringAttr(buf.symbol);
+        auto globalMemrefType = MemRefType::get({buf.bufSize}, buf.elemType);
+        builder.create<memref::GlobalOp>(loc, globalMemrefNameAttr, builder.getStringAttr("public"),
+                                                         globalMemrefType, nullptr, false, nullptr);
+      }
+    } else { // Mem/Compute tile
+      // Generate AIE BufferOp
+      for (auto &buf : tile.allocatedBufs) {
+        buf.symbol = std::string("buf_") + buf.name + "_" + std::to_string(tile.col) + "_" + std::to_string(tile.row);
+        auto bufNameAttr = builder.getStringAttr(buf.symbol);
+        auto bufMemType = MemRefType::get({buf.bufSize}, buf.elemType);
+        auto bufOp = builder.create<xilinx::AIE::BufferOp>(loc, 
+                        /*memref*/bufMemType, /*tile*/tile.value, /*sym_name*/bufNameAttr, 
+                        /*address*/nullptr, /*initial_value*/nullptr, /*mem_bank*/nullptr);
+        
+        buf.bufValue = bufOp;
+      }
+
+      // Generate AIE LockOp
+      uint32_t numCompTile = 4;
+      uint32_t id = 0;
+      for (auto &buf : tile.allocatedBufs) {
+        uint32_t numProdToken = (tile.row == 1 && (buf.name == "lhs" || buf.name == "res")) ? numCompTile : 1;
+        uint32_t numConsToken = 0;
+
+        { // Producer lock
+          auto idAttr = builder.getI32IntegerAttr(id++);
+          auto initAttr = builder.getI32IntegerAttr(numProdToken);
+          auto nameAttr = builder.getStringAttr("buf_" + buf.name + "_" + std::to_string(tile.col) + "_" + 
+                                                std::to_string(tile.row) + "_prod_lock");
+          auto lockOp = builder.create<xilinx::AIE::LockOp>(loc, tile.value, idAttr, initAttr, nameAttr);
+          buf.prodLockValue = lockOp;
+        }
+
+        { // Consumer lock
+          auto idAttr = builder.getI32IntegerAttr(id++);
+          auto initAttr = builder.getI32IntegerAttr(numConsToken);
+          auto nameAttr = builder.getStringAttr("buf_" + buf.name + "_" + std::to_string(tile.col) + "_" + 
+                                                std::to_string(tile.row) + "_cons_lock");
+          auto lockOp = builder.create<xilinx::AIE::LockOp>(loc, tile.value, idAttr, initAttr, nameAttr);
+          buf.consLockValue = lockOp;
+        }
+      }
+    }
+  }
+
   // Save the mlir code composed of AIE dialect
   std::error_code ec;
   llvm::raw_fd_ostream out("./aie.mlir", ec);
