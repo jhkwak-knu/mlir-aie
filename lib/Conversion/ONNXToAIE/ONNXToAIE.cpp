@@ -7,6 +7,7 @@
 
 #include "mlir/IR/Types.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -707,46 +708,58 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
       Block *coreBlock = builder.createBlock(&coreRegion);
       builder.setInsertionPointToStart(coreBlock);
 
-      // Generate Arith ConstantOp
-      uint32_t n_row = tileParam.coreTile.TM;
-      uint32_t n_col = tileParam.coreTile.TN;
-      uint32_t n_dep = tileParam.coreTile.TK;
+      // Generate SCF ForOp (infinite loop)
+      auto const0 = builder.create<mlir::arith::ConstantOp>(loc, builder.getIndexAttr(0));
+      auto const1 = builder.create<mlir::arith::ConstantOp>(loc, builder.getIndexAttr(1));
+      auto constMax = builder.create<mlir::arith::ConstantOp>(loc, builder.getIndexAttr(0xFFFFFFFFULL));
+      
+      auto forLoopOp = builder.create<mlir::scf::ForOp>(loc, const0, constMax, const1);
+      {
+        OpBuilder::InsertionGuard g(builder);
+        Region &forRegion = forLoopOp.getRegion();
+        builder.setInsertionPointToStart(&forRegion.back());
 
-      auto constNRowOp = builder.create<mlir::arith::ConstantIntOp>(loc, n_row, /*width=*/32);
-      auto constNColOp = builder.create<mlir::arith::ConstantIntOp>(loc, n_col, /*width=*/32);
-      auto constNDepOp = builder.create<mlir::arith::ConstantIntOp>(loc, n_dep, /*width=*/32);
+        // Generate Arith ConstantOp
+        uint32_t n_row = tileParam.coreTile.TM;
+        uint32_t n_col = tileParam.coreTile.TN;
+        uint32_t n_dep = tileParam.coreTile.TK;
 
-      AieBuf *lhsBuf = nullptr;
-      AieBuf *rhsBuf = nullptr;
-      AieBuf *resBuf = nullptr;
-
-      for (auto &buf : tile.allocatedBufs) {
-        const std::string &name = buf.name;
-
-        if (name == "lhs") {
-          lhsBuf = &buf;
-        } else if (name == "rhs") {
-          rhsBuf = &buf;
-        } else if (name == "res") {
-          resBuf = &buf;
+        auto constNRowOp = builder.create<mlir::arith::ConstantIntOp>(loc, n_row, /*width=*/32);
+        auto constNColOp = builder.create<mlir::arith::ConstantIntOp>(loc, n_col, /*width=*/32);
+        auto constNDepOp = builder.create<mlir::arith::ConstantIntOp>(loc, n_dep, /*width=*/32);
+  
+        AieBuf *lhsBuf = nullptr;
+        AieBuf *rhsBuf = nullptr;
+        AieBuf *resBuf = nullptr;
+  
+        for (auto &buf : tile.allocatedBufs) {
+          const std::string &name = buf.name;
+  
+          if (name == "lhs") {
+            lhsBuf = &buf;
+          } else if (name == "rhs") {
+            rhsBuf = &buf;
+          } else if (name == "res") {
+            resBuf = &buf;
+          }
         }
+  
+        // Generate AIE UseLockOp
+        builder.create<UseLockOp>(loc, lhsBuf->consLockValue, LockAction::AcquireGreaterEqual, 1);
+        builder.create<UseLockOp>(loc, rhsBuf->consLockValue, LockAction::AcquireGreaterEqual, 1);
+        builder.create<UseLockOp>(loc, resBuf->prodLockValue, LockAction::AcquireGreaterEqual, 1);
+  
+        // Generate Func CallOp
+        auto calleeAttr = SymbolRefAttr::get(builder.getContext(), "extern_kernel");
+        builder.create<mlir::func::CallOp>(loc, calleeAttr, TypeRange{}, 
+                                          ValueRange{lhsBuf->bufValue, rhsBuf->bufValue, resBuf->bufValue,
+                                                     constNRowOp, constNColOp, constNDepOp});
+  
+        // Generate AIE UseLockOp
+        builder.create<UseLockOp>(loc, lhsBuf->prodLockValue, LockAction::Release, 1);
+        builder.create<UseLockOp>(loc, rhsBuf->prodLockValue, LockAction::Release, 1);
+        builder.create<UseLockOp>(loc, resBuf->consLockValue, LockAction::Release, 1);
       }
-
-      // Generate AIE UseLockOp
-      builder.create<UseLockOp>(loc, lhsBuf->consLockValue, LockAction::AcquireGreaterEqual, 1);
-      builder.create<UseLockOp>(loc, rhsBuf->consLockValue, LockAction::AcquireGreaterEqual, 1);
-      builder.create<UseLockOp>(loc, resBuf->prodLockValue, LockAction::AcquireGreaterEqual, 1);
-
-      // Generate Func CallOp
-      auto calleeAttr = SymbolRefAttr::get(builder.getContext(), "extern_kernel");
-      builder.create<mlir::func::CallOp>(loc, calleeAttr, TypeRange{}, 
-                                        ValueRange{lhsBuf->bufValue, rhsBuf->bufValue, resBuf->bufValue,
-                                                   constNRowOp, constNColOp, constNDepOp});
-
-      // Generate AIE UseLockOp
-      builder.create<UseLockOp>(loc, lhsBuf->prodLockValue, LockAction::Release, 1);
-      builder.create<UseLockOp>(loc, rhsBuf->prodLockValue, LockAction::Release, 1);
-      builder.create<UseLockOp>(loc, resBuf->consLockValue, LockAction::Release, 1);
 
       builder.create<EndOp>(loc);
     }
@@ -895,6 +908,8 @@ struct ConvertONNXToAIE
     : public ConvertONNXToAIEBase<ConvertONNXToAIE> {
 
   void getDependentDialects(mlir::DialectRegistry &registry) const override {
+    registry.insert<mlir::arith::ArithDialect>();
+    registry.insert<mlir::scf::SCFDialect>();
     registry.insert<mlir::memref::MemRefDialect>();
     registry.insert<xilinx::AIE::AIEDialect>();
     registry.insert<xilinx::AIEX::AIEXDialect>();
