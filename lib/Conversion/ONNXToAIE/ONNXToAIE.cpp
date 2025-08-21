@@ -187,10 +187,63 @@ struct TileParam {
 TileParam findOptimalTileParam(const SystemInfo &sysInfo, const OpInfo &opInfo) {
   // TODO: Implement
 
+  std::string filePath = "/home/ace/ryzen_ai/mlir-aie-dev/mlir-aie/test/onnx-mlir/tc.json";
+
+  auto bufOrErr = llvm::MemoryBuffer::getFile(filePath);
+  if (!bufOrErr) {
+    llvm::errs() << "Error: cannot open JSON '" << filePath
+                 << "' (" << bufOrErr.getError().message() << ")\n";
+    llvm::report_fatal_error("tile param json open failed");
+  }
+  llvm::StringRef jsonText = (*bufOrErr)->getBuffer();
+
+  auto jsonOrErr = llvm::json::parse(jsonText);
+  if (!jsonOrErr) {
+    llvm::errs() << "Error: JSON parse failed in '" << filePath << "'\n";
+    llvm::report_fatal_error("tile param json parse failed");
+  }
+  auto *rootObj = jsonOrErr->getAsObject();
+  if (!rootObj) {
+    llvm::errs() << "Error: root JSON is not an object\n";
+    llvm::report_fatal_error("tile param json root type error");
+  }
+
+  auto getU32 = [&](llvm::StringRef key) -> uint32_t {
+    if (auto v = rootObj->getInteger(key)) {
+      if (*v < 0 || *v > static_cast<int64_t>(UINT32_MAX)) {
+        llvm::errs() << "Error: overflow in '" << key << "' (" << *v << ")\n";
+        llvm::report_fatal_error("tile param overflow");
+      }
+      return static_cast<uint32_t>(*v);
+    }
+    llvm::errs() << "Error: missing integer field '" << key << "'\n";
+    llvm::report_fatal_error("tile param missing field");
+  };
+
+  const uint32_t M      = getU32("M");
+  const uint32_t K      = getU32("K");
+  const uint32_t N      = getU32("N");
+  const uint32_t TM     = getU32("TM");
+  const uint32_t TK     = getU32("TK");
+  const uint32_t TN     = getU32("TN");
+  const uint32_t numLS  = getU32("numLastSpm");
+  const uint32_t MemTM  = getU32("MemTM");
+  const uint32_t MemTK  = getU32("MemTK");
+  const uint32_t MemTN  = getU32("MemTN");
+
+  if ((M % TM) || (K % TK) || (N % TN)) {
+    llvm::errs() << "Error: TM/TK/TN must divide M/K/N: "
+                 << "M=" << M << ",K=" << K << ",N=" << N
+                 << " vs TM=" << TM << ",TK=" << TK << ",TN=" << TN << "\n";
+    llvm::report_fatal_error("tile param divisibility check failed");
+  }
+
   TileParam optimalTileParam{
-    .numLastSpm = 1,
-    .coreTile   = {.TM=32, .TK=32, .TN=32, .elemType=opInfo.elemType},
-    .levelTiles = {{.TM=512, .TK=64, .TN=64, .elemType=opInfo.elemType}}
+      .numLastSpm = numLS,
+      .coreTile   = {.TM = TM, .TK = TK, .TN = TN, .elemType = opInfo.elemType},
+      .levelTiles = {
+          {.TM = MemTM, .TK = MemTK, .TN = MemTN, .elemType = opInfo.elemType}
+      }
   };
 
   return optimalTileParam;
