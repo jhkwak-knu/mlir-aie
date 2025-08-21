@@ -5,12 +5,18 @@ AIE_ARCH ?= aie2p
 CHESSCC_FLAGS ?= --aiearch ${AIE_ARCH} -f -p me -P ${AIE2_INCLUDE_DIR} -I ${AIETOOLS_DIR}/include
 AIECC_FLAGS ?= --aie-generate-xclbin --no-compile-host --aie-generate-npu-insts --npu-insts-name=insts.bin
 
+# Host build macro defs (from run_tc_all.sh): e.g., -DM=256 -DK=32 -DN=32
+CPPDEFS ?=
+CXXFLAGS ?=
+
 # INPUT related variables
 SRC_DIR := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 MLIR_SRCS ?= ${SRC_DIR}/onnx_matmul.mlir
 KERNEL_SRCS ?= ${SRC_DIR}/kernel.cc
 PASSES ?= --convert-onnx-to-aie
 TARGET ?= onnx_matmul
+
+.PHONY: all clean run host
 
 all: build/final.xclbin build/insts.bin
 
@@ -27,10 +33,14 @@ build/final.xclbin: build/aie.mlir build/kernel.o
 	mkdir -p ${@D}
 	cd ${@D} && aiecc.py ${AIECC_FLAGS} --xclbin-name=${@F} $(<:%=../%)
 
+# Build only the host test.cpp with macros from CPPDEFS
+host: ${TARGET}
+
 ${TARGET}: test.cpp
 	rm -rf _build
 	mkdir -p _build
-	cd _build && cmake ${SRC_DIR} -DTARGET_NAME=${TARGET}
+	# Pass macro defines into CMake's CXX flags
+	cd _build && cmake ${SRC_DIR} -DTARGET_NAME=${TARGET} -DCMAKE_CXX_FLAGS:STRING="${CPPDEFS} ${CXXFLAGS}"
 	cd _build && cmake --build . --config Release
 	cp _build/${TARGET} $@
 
