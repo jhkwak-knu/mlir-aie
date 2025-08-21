@@ -190,7 +190,7 @@ TileParam findOptimalTileParam(const SystemInfo &sysInfo, const OpInfo &opInfo) 
   TileParam optimalTileParam{
     .numLastSpm = 1,
     .coreTile   = {.TM=32, .TK=32, .TN=32, .elemType=opInfo.elemType},
-    .levelTiles = {{.TM=512, .TK=64, .TN=32, .elemType=opInfo.elemType}}
+    .levelTiles = {{.TM=512, .TK=64, .TN=64, .elemType=opInfo.elemType}}
   };
 
   return optimalTileParam;
@@ -296,15 +296,16 @@ optimizeAiePlacement(const TileParam &tileParam) {
   for (uint32_t i = 0; i < numCols; ++i) {
     // Shim tile <-> Mem tile
     uint32_t lhsSizeInMemTile = TM * TK * mCountInMemTile * kCountInMemTile;
-    uint32_t rhsSizeInMemTile = TK * TN * kCountInMemTile * nCountInMemTile;
+    uint32_t rhsSizeInMemTile = TK * TN * kCountInMemTile;
     uint32_t resSizeInMemTile = TM * TN * mCountInMemTile * nCountInMemTile;
+    uint32_t rhsCommCount = nCountInMemTile;
 
     size_t shimIdx = findAieTileIdx(i, 0);
     size_t memIdx  = findAieTileIdx(i, 1);
 
     TileComm lhsCommShimToMem{.name="lhs", .fromIdx=shimIdx, .toIdxs={memIdx}, .commCount=1, .commElemSize=lhsSizeInMemTile,
                               .elemType=elemType, .srcCh=0, .dstCh=0, .srcWire=wireBundle, .dstWire=wireBundle};
-    TileComm rhsCommShimToMem{.name="rhs", .fromIdx=shimIdx, .toIdxs={memIdx}, .commCount=1, .commElemSize=rhsSizeInMemTile,
+    TileComm rhsCommShimToMem{.name="rhs", .fromIdx=shimIdx, .toIdxs={memIdx}, .commCount=rhsCommCount, .commElemSize=rhsSizeInMemTile,
                               .elemType=elemType, .srcCh=1, .dstCh=1, .srcWire=wireBundle, .dstWire=wireBundle};
     TileComm resCommMemToShim{.name="res", .fromIdx=memIdx, .toIdxs={shimIdx}, .commCount=1, .commElemSize=resSizeInMemTile,
                               .elemType=elemType, .srcCh=0, .dstCh=0, .srcWire=wireBundle, .dstWire=wireBundle};
@@ -356,9 +357,10 @@ optimizeAiePlacement(const TileParam &tileParam) {
 
   // Allocate physical buffers for each tile
   for (auto &tile : result.aieTiles) {
-    auto allocatePhysicalBuf = [&](AieCommBuf &commBuf) {
+    auto allocatePhysicalBuf = [&](AieCommBuf &commBuf, bool includeCommCount) {
       const auto &comm = result.tileComms[commBuf.tileCommIdx];
-      AieBuf buf{.name=comm.name, .bufSize=comm.commElemSize, .elemType=comm.elemType};
+      uint32_t bufSize = includeCommCount ? comm.commElemSize * comm.commCount : comm.commElemSize;
+      AieBuf buf{.name=comm.name, .bufSize=bufSize, .elemType=comm.elemType};
       tile.allocatedBufs.push_back(buf);
 
       size_t bufIdx = tile.allocatedBufs.size() - 1;
@@ -367,11 +369,12 @@ optimizeAiePlacement(const TileParam &tileParam) {
 
     if (tile.row != 1) { // Shim/Compute tile
       // Allocate physical buffers for all communication buffers
+      bool includeCommCount = tile.row == 0 ? true : false;
       for (auto &commBuf : tile.inCommBufs) {
-        allocatePhysicalBuf(commBuf);
+        allocatePhysicalBuf(commBuf, includeCommCount);
       }
       for (auto &commBuf : tile.outCommBufs) {
-        allocatePhysicalBuf(commBuf);
+        allocatePhysicalBuf(commBuf, includeCommCount);
       }      
     } else { // Mem tile
       // Allocate physical buffers only for communication with Shim tiles
@@ -382,13 +385,13 @@ optimizeAiePlacement(const TileParam &tileParam) {
       for (auto &commBuf : tile.inCommBufs) {
         const auto &comm = result.tileComms[commBuf.tileCommIdx];
         if (isShimTile(comm.fromIdx)) {
-          allocatePhysicalBuf(commBuf);
+          allocatePhysicalBuf(commBuf, false);
         }
       }
       for (auto &commBuf : tile.outCommBufs) {
         const auto &comm = result.tileComms[commBuf.tileCommIdx];
         if (llvm::any_of(comm.toIdxs, isShimTile)) {
-          allocatePhysicalBuf(commBuf);
+          allocatePhysicalBuf(commBuf, false);
         }
       }
 
@@ -820,27 +823,27 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
     Block *seqBlock = builder.createBlock(&seqRegion);
     builder.setInsertionPointToStart(seqBlock);
 
-    auto lhsMemrefType = MemRefType::get({TM * mCountInMemTile, TK * kCountInMemTile}, elemType);
-    auto rhsMemrefType = MemRefType::get({TK * kCountInMemTile, TN * nCountInMemTile}, elemType);
-    auto resMemrefType = MemRefType::get({TM * mCountInMemTile, TN * nCountInMemTile}, elemType);
+    auto lhsMemrefType = MemRefType::get({TM * TK * mCountInMemTile * kCountInMemTile}, elemType);
+    auto rhsMemrefType = MemRefType::get({TK * TN * kCountInMemTile * nCountInMemTile}, elemType);
+    auto resMemrefType = MemRefType::get({TM * TN * mCountInMemTile * nCountInMemTile}, elemType);
 
     auto arg_lhs = seqBlock->addArgument(lhsMemrefType, loc);
     auto arg_rhs = seqBlock->addArgument(rhsMemrefType, loc);
     auto arg_res = seqBlock->addArgument(resMemrefType, loc);
 
-    const std::vector<std::vector<int64_t>> Offsets = { {0, 0, 0, 0},     // lhs
-                                                        {0, 0, 0, 0},     // rhs
-                                                        {0, 0, 0, 0} };   // res
-    const std::vector<std::vector<int64_t>> Sizes = { {mCountInMemTile, kCountInMemTile, TM, TK},     // lhs
-                                                      {nCountInMemTile, kCountInMemTile, TN, TK},     // rhs
-                                                      {mCountInMemTile, nCountInMemTile, TM, TN} };   // res
-    const std::vector<std::vector<int64_t>> Strides = { {TM * TK * kCountInMemTile, TK, TK * kCountInMemTile, 1},    // lhs
-                                                        {TN * TK * kCountInMemTile, TK, TK * kCountInMemTile, 1},    // rhs
-                                                        {TM * TN * nCountInMemTile, TN, TN * nCountInMemTile, 1} };  // res
-
-    uint32_t id = 0;
-
+    uint32_t mCountPerCompTile = mCountInMemTile / numCompTile;
+    const std::vector<std::vector<int64_t>> Offsets = { {0, 0, 0, 0},   // lhs
+                                                        {0, 0, 0, 0},   // rhs
+                                                        {0, 0, 0, 0} }; // res
+    const std::vector<std::vector<int64_t>> Sizes = { {mCountInMemTile, kCountInMemTile, TM, TK},                   // lhs
+                                                      {nCountInMemTile, kCountInMemTile, TN, TK},                   // rhs
+                                                      {numCompTile, nCountInMemTile, TM * mCountPerCompTile, TN} }; // res
+    const std::vector<std::vector<int64_t>> Strides = { {TM * TK * kCountInMemTile, TK, TK * kCountInMemTile, 1},                       // lhs
+                                                        {TN * TK * kCountInMemTile, TK, TK * kCountInMemTile, 1},                       // rhs
+                                                        {TM * TN * mCountPerCompTile * nCountInMemTile, TN, TN * nCountInMemTile, 1} }; // res
+                                       
     // Generate AIEX NpuDmaMemcpyNdOp
+    uint32_t id = 0;
     for (auto &tile : placement.aieTiles) {
       if (tile.row == 0) { // Shim tile
         for (auto &commBuf : tile.outCommBufs) {
