@@ -38,7 +38,7 @@ int main(int argc, const char *argv[]) {
 
   // Declaring design constants
   int M = 512;
-  int K = 32;
+  int K = 64;
   int N = 32;
   int A_SIZE = M * K;
   int B_SIZE = K * N;

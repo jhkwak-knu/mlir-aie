@@ -20,11 +20,9 @@ void extern_kernel(float *restrict A, float *restrict B, float *restrict C,
 
   for (int row = 0; row < N_ROW; row++) {
     for (int col = 0; col < N_COL; col++) {
-      float running_sum = 0.0f;
-      for (int i = 0; i < N_DEP; i++) {
-        running_sum += A[row * N_DEP + i] * B[col * N_DEP + i];
+      for (int dep = 0; dep < N_DEP; dep++) {
+        C[row * N_COL + col] += A[row * N_DEP + dep] * B[col * N_DEP + dep];
       }
-      C[row * N_COL + col] = running_sum;
     }
   }
 }

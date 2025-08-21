@@ -190,7 +190,7 @@ TileParam findOptimalTileParam(const SystemInfo &sysInfo, const OpInfo &opInfo) 
   TileParam optimalTileParam{
     .numLastSpm = 1,
     .coreTile   = {.TM=32, .TK=32, .TN=32, .elemType=opInfo.elemType},
-    .levelTiles = {{.TM=512, .TK=32, .TN=32, .elemType=opInfo.elemType}}
+    .levelTiles = {{.TM=512, .TK=64, .TN=32, .elemType=opInfo.elemType}}
   };
 
   return optimalTileParam;
@@ -495,7 +495,13 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
                     const TileParam &tileParam) {
   // Set variables
   bool doubleBufferingEnabled = false;
-  
+  uint32_t numCompTile = 4;
+  auto numCols = tileParam.numLastSpm;
+  auto [TM, TK, TN, elemType] = tileParam.coreTile;
+  auto mCountInMemTile = tileParam.levelTiles[0].TM / TM;
+  auto kCountInMemTile = tileParam.levelTiles[0].TK / TK;
+  auto nCountInMemTile = tileParam.levelTiles[0].TN / TN;
+
   // Create new module for AIE dialect
   MLIRContext *ctx = rewriter.getContext();
   auto loc = mlir::UnknownLoc::get(ctx);
@@ -508,7 +514,7 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
                                  AIEDevice::npu2_3col, AIEDevice::npu2_4col,
                                  AIEDevice::npu2_5col, AIEDevice::npu2_6col,
                                  AIEDevice::npu2_7col, AIEDevice::npu2};
-  auto deviceOp = builder.create<DeviceOp>(loc, devices[tileParam.numLastSpm - 1]);
+  auto deviceOp = builder.create<DeviceOp>(loc, devices[numCols - 1]);
 
   // Ensure it has a body block, and point insertion into it
   deviceOp.getRegion().emplaceBlock();
@@ -554,10 +560,6 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
         uint32_t numConsToken = 0;
 
         if (tile.row == 1) { // Mem tile
-          uint32_t numCompTile = 4;
-          uint32_t mCountInMemTile = tileParam.levelTiles[0].TM / tileParam.coreTile.TM;
-          uint32_t nCountInMemTile = tileParam.levelTiles[0].TN / tileParam.coreTile.TN;
-
           if (buf.name == "lhs") {
             numProdToken = nCountInMemTile * numCompTile;
           } else if (buf.name == "rhs") {
@@ -680,10 +682,6 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
           auto releaseLockValue = isInput ? buf.consLockValue : buf.prodLockValue;
           uint32_t numToken = 1;
           if (tile.row == 1) {
-            uint32_t numCompTile = 4;
-            uint32_t mCountInMemTile = tileParam.levelTiles[0].TM / tileParam.coreTile.TM;
-            uint32_t nCountInMemTile = tileParam.levelTiles[0].TN / tileParam.coreTile.TN;
-
             if (isInput && buf.name == "lhs") {
               numToken = nCountInMemTile * numCompTile;
             } else if (isInput && buf.name == "rhs") {
@@ -710,10 +708,9 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
 
   // Generate Func FuncOp
   auto funcNameAttr = builder.getStringAttr("extern_kernel");
-  auto coreTileParam = tileParam.coreTile;
-  auto lhsMemrefType = MemRefType::get({coreTileParam.TM * coreTileParam.TK}, coreTileParam.elemType);
-  auto rhsMemrefType = MemRefType::get({coreTileParam.TK * coreTileParam.TN}, coreTileParam.elemType);
-  auto resMemrefType = MemRefType::get({coreTileParam.TM * coreTileParam.TN}, coreTileParam.elemType);
+  auto lhsMemrefType = MemRefType::get({TM * TK}, elemType);
+  auto rhsMemrefType = MemRefType::get({TK * TN}, elemType);
+  auto resMemrefType = MemRefType::get({TM * TN}, elemType);
   auto i32Type = builder.getI32Type();
   FunctionType funcType = builder.getFunctionType({lhsMemrefType, rhsMemrefType, resMemrefType, i32Type, i32Type, i32Type}, {});
   auto funcOp = builder.create<func::FuncOp>(loc, funcNameAttr, funcType);
@@ -725,6 +722,22 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
       continue;
     }
 
+    // Set buffer pointers (lhs/rhs/res)
+    AieBuf *lhsBufPtr = nullptr;
+    AieBuf *rhsBufPtr = nullptr;
+    AieBuf *resBufPtr = nullptr;
+
+    for (auto &buf : tile.allocatedBufs) {
+      const std::string &name = buf.name;
+      if (name == "lhs") {
+        lhsBufPtr = &buf;
+      } else if (name == "rhs") {
+        rhsBufPtr = &buf;
+      } else if (name == "res") {
+        resBufPtr = &buf;
+      }
+    }
+
     auto coreOp = builder.create<xilinx::AIE::CoreOp>(loc, tile.value);
     coreOp->setAttr("link_with", builder.getStringAttr("kernel.o"));
     {
@@ -733,59 +746,66 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
       Block *coreBlock = builder.createBlock(&coreRegion);
       builder.setInsertionPointToStart(coreBlock);
 
-      // Generate SCF ForOp (infinite loop)
-      auto const0 = builder.create<mlir::arith::ConstantOp>(loc, builder.getIndexAttr(0));
-      auto const1 = builder.create<mlir::arith::ConstantOp>(loc, builder.getIndexAttr(1));
-      auto constMax = builder.create<mlir::arith::ConstantOp>(loc, builder.getIndexAttr(0xFFFFFFFFULL));
+      // Generate Arith ConstantOp
+      auto c0 = builder.create<mlir::arith::ConstantOp>(loc, builder.getIndexAttr(0));
+      auto c1 = builder.create<mlir::arith::ConstantOp>(loc, builder.getIndexAttr(1));
+      auto cMax = builder.create<mlir::arith::ConstantOp>(loc, builder.getIndexAttr(0xFFFFFFFFULL));
+      auto cLen = builder.create<mlir::arith::ConstantOp>(loc, builder.getIndexAttr(TM*TN));
+      auto cN = builder.create<mlir::arith::ConstantOp>(loc, builder.getIndexAttr(kCountInMemTile));
+      auto c0f = builder.create<mlir::arith::ConstantOp>(loc, builder.getF32FloatAttr(0.0f));
       
-      auto forLoopOp = builder.create<mlir::scf::ForOp>(loc, const0, constMax, const1);
+      auto cRow = builder.create<mlir::arith::ConstantIntOp>(loc, TM, /*width=*/32);
+      auto cCol = builder.create<mlir::arith::ConstantIntOp>(loc, TN, /*width=*/32);
+      auto cDep = builder.create<mlir::arith::ConstantIntOp>(loc, TK, /*width=*/32);
+
+      // Generate SCF ForOp (infinite loop)
+      auto infiniteLoopOp = builder.create<mlir::scf::ForOp>(loc, c0, cMax, c1);
       {
         OpBuilder::InsertionGuard g(builder);
-        Region &forRegion = forLoopOp.getRegion();
-        builder.setInsertionPointToStart(&forRegion.back());
+        Region &infiniteLoopRegion = infiniteLoopOp.getRegion();
+        builder.setInsertionPointToStart(&infiniteLoopRegion.back());
 
-        // Generate Arith ConstantOp
-        uint32_t n_row = tileParam.coreTile.TM;
-        uint32_t n_col = tileParam.coreTile.TN;
-        uint32_t n_dep = tileParam.coreTile.TK;
+        // Generate AIE UseLockOp (res)
+        builder.create<UseLockOp>(loc, resBufPtr->prodLockValue, LockAction::AcquireGreaterEqual, 1);
 
-        auto constNRowOp = builder.create<mlir::arith::ConstantIntOp>(loc, n_row, /*width=*/32);
-        auto constNColOp = builder.create<mlir::arith::ConstantIntOp>(loc, n_col, /*width=*/32);
-        auto constNDepOp = builder.create<mlir::arith::ConstantIntOp>(loc, n_dep, /*width=*/32);
-  
-        AieBuf *lhsBuf = nullptr;
-        AieBuf *rhsBuf = nullptr;
-        AieBuf *resBuf = nullptr;
-  
-        for (auto &buf : tile.allocatedBufs) {
-          const std::string &name = buf.name;
-  
-          if (name == "lhs") {
-            lhsBuf = &buf;
-          } else if (name == "rhs") {
-            rhsBuf = &buf;
-          } else if (name == "res") {
-            resBuf = &buf;
-          }
+        // Generate SCF ForOp (init loop: res)
+        auto initLoopOp = builder.create<mlir::scf::ForOp>(loc, c0, cLen, c1);
+        {
+          OpBuilder::InsertionGuard g(builder);
+          Region &initLoopRegion = initLoopOp.getRegion();
+          builder.setInsertionPointToStart(&initLoopRegion.back());
+
+          Value index = initLoopOp.getInductionVar();
+          builder.create<mlir::memref::StoreOp>(loc, c0f, resBufPtr->bufValue, ValueRange(index));
         }
   
-        // Generate AIE UseLockOp
-        builder.create<UseLockOp>(loc, lhsBuf->consLockValue, LockAction::AcquireGreaterEqual, 1);
-        builder.create<UseLockOp>(loc, rhsBuf->consLockValue, LockAction::AcquireGreaterEqual, 1);
-        builder.create<UseLockOp>(loc, resBuf->prodLockValue, LockAction::AcquireGreaterEqual, 1);
-  
-        // Generate Func CallOp
-        auto calleeAttr = SymbolRefAttr::get(builder.getContext(), "extern_kernel");
-        builder.create<mlir::func::CallOp>(loc, calleeAttr, TypeRange{}, 
-                                          ValueRange{lhsBuf->bufValue, rhsBuf->bufValue, resBuf->bufValue,
-                                                     constNRowOp, constNColOp, constNDepOp});
-  
-        // Generate AIE UseLockOp
-        builder.create<UseLockOp>(loc, lhsBuf->prodLockValue, LockAction::Release, 1);
-        builder.create<UseLockOp>(loc, rhsBuf->prodLockValue, LockAction::Release, 1);
-        builder.create<UseLockOp>(loc, resBuf->consLockValue, LockAction::Release, 1);
+        // Generate SCF ForOp (calc loop: lhs/rhs)
+        auto calcLoopOp = builder.create<mlir::scf::ForOp>(loc, c0, cN, c1);
+        {
+          OpBuilder::InsertionGuard g(builder);
+          Region &calcLoopRegion = calcLoopOp.getRegion();
+          builder.setInsertionPointToStart(&calcLoopRegion.back());
+
+          // Generate AIE UseLockOp (lhs/rhs)
+          builder.create<UseLockOp>(loc, lhsBufPtr->consLockValue, LockAction::AcquireGreaterEqual, 1);
+          builder.create<UseLockOp>(loc, rhsBufPtr->consLockValue, LockAction::AcquireGreaterEqual, 1);
+
+          // Generate Func CallOp
+          auto calleeAttr = SymbolRefAttr::get(builder.getContext(), "extern_kernel");
+          builder.create<mlir::func::CallOp>(loc, calleeAttr, TypeRange{}, 
+                                            ValueRange{lhsBufPtr->bufValue, rhsBufPtr->bufValue, resBufPtr->bufValue,
+                                                       cRow, cCol, cDep});
+    
+          // Generate AIE UseLockOp (lhs/rhs)
+          builder.create<UseLockOp>(loc, lhsBufPtr->prodLockValue, LockAction::Release, 1);
+          builder.create<UseLockOp>(loc, rhsBufPtr->prodLockValue, LockAction::Release, 1);
+        }
+
+        // Generate AIE UseLockOp (res)
+        builder.create<UseLockOp>(loc, resBufPtr->consLockValue, LockAction::Release, 1);
       }
 
+      // Generate AIE EndOp
       builder.create<EndOp>(loc);
     }
   }  
@@ -800,10 +820,9 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
     Block *seqBlock = builder.createBlock(&seqRegion);
     builder.setInsertionPointToStart(seqBlock);
 
-    auto &[TM, TK, TN, elemType] = tileParam.levelTiles[0];
-    auto lhsMemrefType = MemRefType::get({TM, TK}, elemType);
-    auto rhsMemrefType = MemRefType::get({TK, TN}, elemType);
-    auto resMemrefType = MemRefType::get({TM, TN}, elemType);
+    auto lhsMemrefType = MemRefType::get({TM * mCountInMemTile, TK * kCountInMemTile}, elemType);
+    auto rhsMemrefType = MemRefType::get({TK * kCountInMemTile, TN * nCountInMemTile}, elemType);
+    auto resMemrefType = MemRefType::get({TM * mCountInMemTile, TN * nCountInMemTile}, elemType);
 
     auto arg_lhs = seqBlock->addArgument(lhsMemrefType, loc);
     auto arg_rhs = seqBlock->addArgument(rhsMemrefType, loc);
@@ -812,36 +831,38 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
     const std::vector<std::vector<int64_t>> Offsets = { {0, 0, 0, 0},     // lhs
                                                         {0, 0, 0, 0},     // rhs
                                                         {0, 0, 0, 0} };   // res
-    const std::vector<std::vector<int64_t>> Sizes = { {1, 1, TM, TK},     // lhs
-                                                      {1, 1, TK, TN},     // rhs
-                                                      {1, 1, TM, TN} };   // res
-    const std::vector<std::vector<int64_t>> Strides = { {0, 0, TK, 1},    // lhs
-                                                        {0, 0, TN, 1},    // rhs
-                                                        {0, 0, TN, 1} };  // res
+    const std::vector<std::vector<int64_t>> Sizes = { {mCountInMemTile, kCountInMemTile, TM, TK},     // lhs
+                                                      {nCountInMemTile, kCountInMemTile, TN, TK},     // rhs
+                                                      {mCountInMemTile, nCountInMemTile, TM, TN} };   // res
+    const std::vector<std::vector<int64_t>> Strides = { {TM * TK * kCountInMemTile, TK, TK * kCountInMemTile, 1},    // lhs
+                                                        {TN * TK * kCountInMemTile, TK, TK * kCountInMemTile, 1},    // rhs
+                                                        {TM * TN * nCountInMemTile, TN, TN * nCountInMemTile, 1} };  // res
 
     uint32_t id = 0;
 
     // Generate AIEX NpuDmaMemcpyNdOp
     for (auto &tile : placement.aieTiles) {
-
-      if (tile.row == 0) {
-        size_t numBlocks = tile.inCommBufs.size() + tile.outCommBufs.size();
-
-        for (size_t i = 0; i < numBlocks; ++i){
-          bool isOutput = (i < tile.outCommBufs.size());
-          auto &commBuf = isOutput ? tile.outCommBufs[i] : tile.inCommBufs[i - tile.outCommBufs.size()];
+      if (tile.row == 0) { // Shim tile
+        for (auto &commBuf : tile.outCommBufs) {
           auto &buf = tile.allocatedBufs[commBuf.bufIdx];
-          auto &arg = buf.name == "lhs" ? arg_lhs : (buf.name == "rhs" ? arg_rhs : arg_res);
-          size_t idx = buf.name == "lhs" ? 0 : (buf.name == "rhs" ? 1 : 2);
-
+          auto &arg = buf.name == "lhs" ? arg_lhs : arg_rhs;
+          size_t idx = buf.name == "lhs" ? 0 : 1;
           StringRef metadata = builder.getStringAttr(buf.symbol);
           builder.create<xilinx::AIEX::NpuDmaMemcpyNdOp>(loc, arg, SmallVector<Value>{}, SmallVector<Value>{}, SmallVector<Value>{},
                                                         ArrayRef(Offsets[idx]), ArrayRef(Sizes[idx]), ArrayRef(Strides[idx]), nullptr, 
                                                         metadata, id++, false, 0, 0, 0, 0, 0, 0);
-                                                        
-          if (!isOutput) {
-            builder.create<xilinx::AIEX::NpuDmaWaitOp>(loc, metadata);
-          }
+        }      
+
+        for (auto &commBuf : tile.inCommBufs) {
+          auto &buf = tile.allocatedBufs[commBuf.bufIdx];
+          auto &arg = arg_res;
+          size_t idx = 2;
+          StringRef metadata = builder.getStringAttr(buf.symbol);
+          builder.create<xilinx::AIEX::NpuDmaMemcpyNdOp>(loc, arg, SmallVector<Value>{}, SmallVector<Value>{}, SmallVector<Value>{},
+                                                        ArrayRef(Offsets[idx]), ArrayRef(Sizes[idx]), ArrayRef(Strides[idx]), nullptr, 
+                                                        metadata, id++, false, 0, 0, 0, 0, 0, 0);
+
+          builder.create<xilinx::AIEX::NpuDmaWaitOp>(loc, metadata);
         }
       }
     }
