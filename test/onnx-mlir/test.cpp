@@ -37,7 +37,7 @@ int main(int argc, const char *argv[]) {
   bool verify = vm["verify"].as<bool>();
 
   // Declaring design constants
-  int M = 128;
+  int M = 512;
   int K = 32;
   int N = 32;
   int A_SIZE = M * K;

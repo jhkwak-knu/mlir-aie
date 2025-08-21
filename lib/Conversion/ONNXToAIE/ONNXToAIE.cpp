@@ -190,7 +190,7 @@ TileParam findOptimalTileParam(const SystemInfo &sysInfo, const OpInfo &opInfo) 
   TileParam optimalTileParam{
     .numLastSpm = 1,
     .coreTile   = {.TM=32, .TK=32, .TN=32, .elemType=opInfo.elemType},
-    .levelTiles = {{.TM=128, .TK=32, .TN=32, .elemType=opInfo.elemType}}
+    .levelTiles = {{.TM=512, .TK=32, .TN=32, .elemType=opInfo.elemType}}
   };
 
   return optimalTileParam;
@@ -202,9 +202,9 @@ TileParam findOptimalTileParam(const SystemInfo &sysInfo, const OpInfo &opInfo) 
 struct AieBuf {
   std::string name;
   std::string symbol;
-  Value bufValue;
   uint32_t bufSize;
   Type elemType;
+  Value bufValue;
   Value prodLockValue;
   Value consLockValue;
 };
@@ -244,7 +244,8 @@ struct TileComm {
   std::string name;
   size_t fromIdx;
   std::vector<size_t> toIdxs;
-  uint32_t bufSize;
+  uint32_t commCount;
+  uint32_t commElemSize;
   Type elemType;
   uint32_t srcCh, dstCh;
   WireBundle srcWire, dstWire;
@@ -263,12 +264,20 @@ optimizeAiePlacement(const TileParam &tileParam) {
 
   AiePlacementResult result;
 
+  // Set variables
+  uint32_t numCompTile = 4;
+  uint32_t numTilesPerCol = numCompTile + 2; // Shim: 1, Mem: 1, Compute: 4
+  auto numCols = tileParam.numLastSpm;
+  auto [TM, TK, TN, elemType] = tileParam.coreTile;
+  auto mCountInMemTile = tileParam.levelTiles[0].TM / TM;
+  auto kCountInMemTile = tileParam.levelTiles[0].TK / TK;
+  auto nCountInMemTile = tileParam.levelTiles[0].TN / TN;
+  auto wireBundle = WireBundle::DMA;
+  
   // Place on physical AIE tiles
-  uint32_t numTilesPerCol = 6; // Shim: 1, Mem: 1, Compute: 4
-
-  for (uint32_t i = 0; i < numTilesPerCol; ++i) {
-    for (uint32_t j = 0; j < tileParam.numLastSpm; ++j) {
-      AieTile tile{.col=j, .row=i};
+  for (uint32_t i = 0; i < numCols; ++i) {
+    for (uint32_t j = 0; j < numTilesPerCol; ++j) {
+      AieTile tile{.col=i, .row=j};
       result.aieTiles.push_back(tile);
     }
   }
@@ -284,61 +293,59 @@ optimizeAiePlacement(const TileParam &tileParam) {
     llvm_unreachable("Tile not found");
   };
 
-  for (uint32_t i = 0; i < tileParam.numLastSpm; ++i) {
-
+  for (uint32_t i = 0; i < numCols; ++i) {
     // Shim tile <-> Mem tile
-    auto &[TM, TK, TN, elemType] = tileParam.levelTiles[0];
-    uint32_t lhsSize = TM * TK;
-    uint32_t rhsSize = TK * TN;
-    uint32_t resSize = TM * TN;
+    uint32_t lhsSizeInMemTile = TM * TK * mCountInMemTile * kCountInMemTile;
+    uint32_t rhsSizeInMemTile = TK * TN * kCountInMemTile * nCountInMemTile;
+    uint32_t resSizeInMemTile = TM * TN * mCountInMemTile * nCountInMemTile;
 
     size_t shimIdx = findAieTileIdx(i, 0);
     size_t memIdx  = findAieTileIdx(i, 1);
 
-    TileComm lhsComm{.name="lhs", .fromIdx=shimIdx, .toIdxs={memIdx}, .bufSize=lhsSize, .elemType=elemType,
-                    .srcCh=0, .dstCh=0, .srcWire=WireBundle::DMA, .dstWire=WireBundle::DMA};
-    TileComm rhsComm{.name="rhs", .fromIdx=shimIdx, .toIdxs={memIdx}, .bufSize=rhsSize, .elemType=elemType,
-                    .srcCh=1, .dstCh=1, .srcWire=WireBundle::DMA, .dstWire=WireBundle::DMA};
-    TileComm resComm{.name="res", .fromIdx=memIdx, .toIdxs={shimIdx}, .bufSize=resSize, .elemType=elemType,
-                    .srcCh=0, .dstCh=0, .srcWire=WireBundle::DMA, .dstWire=WireBundle::DMA};
+    TileComm lhsCommShimToMem{.name="lhs", .fromIdx=shimIdx, .toIdxs={memIdx}, .commCount=1, .commElemSize=lhsSizeInMemTile,
+                              .elemType=elemType, .srcCh=0, .dstCh=0, .srcWire=wireBundle, .dstWire=wireBundle};
+    TileComm rhsCommShimToMem{.name="rhs", .fromIdx=shimIdx, .toIdxs={memIdx}, .commCount=1, .commElemSize=rhsSizeInMemTile,
+                              .elemType=elemType, .srcCh=1, .dstCh=1, .srcWire=wireBundle, .dstWire=wireBundle};
+    TileComm resCommMemToShim{.name="res", .fromIdx=memIdx, .toIdxs={shimIdx}, .commCount=1, .commElemSize=resSizeInMemTile,
+                              .elemType=elemType, .srcCh=0, .dstCh=0, .srcWire=wireBundle, .dstWire=wireBundle};
 
-    result.tileComms.push_back(lhsComm);
-    result.tileComms.push_back(rhsComm);
-    result.tileComms.push_back(resComm);
+    result.tileComms.push_back(lhsCommShimToMem);
+    result.tileComms.push_back(rhsCommShimToMem);
+    result.tileComms.push_back(resCommMemToShim);
 
     // Mem tile <-> Compute tile
-    TileComm rhsBroadcastComm = {.name="rhs", .fromIdx=memIdx, .srcCh=5, .dstCh=1, 
-                                .srcWire=WireBundle::DMA, .dstWire=WireBundle::DMA};
+    uint32_t lhsSizeInCompTile = TM * TK;
+    uint32_t rhsSizeInCompTile = TK * TN;
+    uint32_t resSizeInCompTile = TM * TN;
 
-    for (uint32_t j = 0; j < (numTilesPerCol - 2); ++j) {
-      auto &[TM, TK, TN, elemType] = tileParam.coreTile;
-      uint32_t lhsSize = TM * TK;
-      uint32_t rhsSize = TK * TN;
-      uint32_t resSize = TM * TN;
+    uint32_t lhsCommMemToCompCount = (mCountInMemTile * kCountInMemTile) / numCompTile;
+    uint32_t rhsCommMemToCompCount = kCountInMemTile;
+    uint32_t resCommCompToMemCount = (mCountInMemTile * nCountInMemTile) / numCompTile;
 
+    TileComm rhsBcastCommMemToComp = {.name="rhs", .fromIdx=memIdx, .commCount=rhsCommMemToCompCount, .commElemSize=rhsSizeInCompTile,
+                                      .elemType=elemType, .srcCh=5, .dstCh=1, .srcWire=wireBundle, .dstWire=wireBundle};
+
+    for (uint32_t j = 0; j < numCompTile; ++j) {
       size_t computeIdx = findAieTileIdx(i, j + 2);
 
-      TileComm lhsComm{.name="lhs", .fromIdx=memIdx, .toIdxs={computeIdx}, .bufSize=lhsSize, .elemType=elemType,
-                      .srcCh=j+1, .dstCh=0, .srcWire=WireBundle::DMA, .dstWire=WireBundle::DMA};
-      TileComm resComm{.name="res", .fromIdx=computeIdx, .toIdxs={memIdx}, .bufSize=resSize, .elemType=elemType,
-                      .srcCh=0, .dstCh=j+2, .srcWire=WireBundle::DMA, .dstWire=WireBundle::DMA};
+      TileComm lhsCommMemToComp{.name="lhs", .fromIdx=memIdx, .toIdxs={computeIdx}, .commCount=lhsCommMemToCompCount, .commElemSize=lhsSizeInCompTile,
+                                .elemType=elemType, .srcCh=j+1, .dstCh=0, .srcWire=wireBundle, .dstWire=wireBundle};
+      TileComm resCommCompToMem{.name="res", .fromIdx=computeIdx, .toIdxs={memIdx}, .commCount=resCommCompToMemCount, .commElemSize=resSizeInCompTile,
+                                .elemType=elemType, .srcCh=0, .dstCh=j+2, .srcWire=wireBundle, .dstWire=wireBundle};
 
-      result.tileComms.push_back(lhsComm);
-      result.tileComms.push_back(resComm);
+      result.tileComms.push_back(lhsCommMemToComp);
+      result.tileComms.push_back(resCommCompToMem);
 
-      rhsBroadcastComm.bufSize = rhsSize;
-      rhsBroadcastComm.elemType = elemType;
-      rhsBroadcastComm.toIdxs.push_back(computeIdx);
+      rhsBcastCommMemToComp.toIdxs.push_back(computeIdx);
     }
 
-    result.tileComms.push_back(rhsBroadcastComm);
+    result.tileComms.push_back(rhsBcastCommMemToComp);
   }
 
   // Register communication buffers for each tile
   for (size_t commIdx = 0; commIdx < result.tileComms.size(); ++commIdx) {
     const auto &comm = result.tileComms[commIdx];
     auto &prodTile = result.aieTiles[comm.fromIdx];
-
     prodTile.outCommBufs.push_back({.tileCommIdx = commIdx});
 
     for (auto toIdx : comm.toIdxs) {
@@ -348,19 +355,17 @@ optimizeAiePlacement(const TileParam &tileParam) {
   }
 
   // Allocate physical buffers for each tile
-  for (size_t tileIdx = 0; tileIdx < result.aieTiles.size(); ++tileIdx) {
-    auto &tile = result.aieTiles[tileIdx];
-
+  for (auto &tile : result.aieTiles) {
     auto allocatePhysicalBuf = [&](AieCommBuf &commBuf) {
       const auto &comm = result.tileComms[commBuf.tileCommIdx];
-      AieBuf buf{.name=comm.name, .bufSize=comm.bufSize, .elemType=comm.elemType};
+      AieBuf buf{.name=comm.name, .bufSize=comm.commElemSize, .elemType=comm.elemType};
       tile.allocatedBufs.push_back(buf);
 
       size_t bufIdx = tile.allocatedBufs.size() - 1;
-      commBuf.setPhysicalBufInfo(bufIdx, true, 0, buf.bufSize, buf.elemType);
+      commBuf.setPhysicalBufInfo(bufIdx, true, /*offset*/0, buf.bufSize, buf.elemType);
     };
 
-    if(tile.row != 1) { // Shim/Compute tile
+    if (tile.row != 1) { // Shim/Compute tile
       // Allocate physical buffers for all communication buffers
       for (auto &commBuf : tile.inCommBufs) {
         allocatePhysicalBuf(commBuf);
@@ -387,38 +392,42 @@ optimizeAiePlacement(const TileParam &tileParam) {
         }
       }
 
-      // Link communication buffers (with Compute tiles) to physical buffers
+      // Link communication buffers to physical buffers
       for (auto &commBuf : tile.inCommBufs) { // Link 'res' buffer (Compute -> Mem -> Shim)
         const auto &comm = result.tileComms[commBuf.tileCommIdx];
         if (!isShimTile(comm.fromIdx)) {
-          auto linkCommBufIt = llvm::find_if(tile.outCommBufs, [&](AieCommBuf &outBuf) {
+          auto linkCommBufIt = llvm::find_if (tile.outCommBufs, [&](AieCommBuf &outBuf) {
             const auto &outComm = result.tileComms[outBuf.tileCommIdx];
             return outBuf.hasOwnBuf && outComm.name == "res";
           });
-          assert(linkCommBufIt != tile.outCommBufs.end() && "Result buffer not allocated");
+
+          if (linkCommBufIt == tile.outCommBufs.end())
+            llvm::report_fatal_error("'res' buffer not allocated in Mem Tile");
 
           const auto &linkBuf = tile.allocatedBufs[linkCommBufIt->bufIdx];
-          uint32_t offset = (linkBuf.bufSize / 4) * (result.aieTiles[comm.fromIdx].row - 2);
-          commBuf.setPhysicalBufInfo(linkCommBufIt->bufIdx, false, offset, comm.bufSize, comm.elemType);
+          uint32_t offset = (linkBuf.bufSize / numCompTile) * (result.aieTiles[comm.fromIdx].row - 2);
+          uint32_t size = comm.commElemSize * comm.commCount;
+          commBuf.setPhysicalBufInfo(linkCommBufIt->bufIdx, false, offset, size, comm.elemType);
         }
       }
+
       for (auto &commBuf : tile.outCommBufs) { // Link 'lhs/rhs' buffer (Shim -> Mem -> Compute)
         const auto &comm = result.tileComms[commBuf.tileCommIdx];
         if (!llvm::any_of(comm.toIdxs, isShimTile)) {
           std::string commName = comm.name;
 
-          auto linkCommBufIt = llvm::find_if(tile.inCommBufs, [&](AieCommBuf &inBuf) {
+          auto linkCommBufIt = llvm::find_if (tile.inCommBufs, [&](AieCommBuf &inBuf) {
             const auto &inComm = result.tileComms[inBuf.tileCommIdx];
             return inBuf.hasOwnBuf && inComm.name == commName;
           });
-          assert(linkCommBufIt != tile.inCommBufs.end() && "Input buffer not found");
+
+          if (linkCommBufIt == tile.inCommBufs.end())
+            llvm::report_fatal_error("'lhs/rhs' buffer not allocated in Mem Tile");
 
           const auto &linkBuf = tile.allocatedBufs[linkCommBufIt->bufIdx];
-          uint32_t offset = 0;
-          if(commName == "lhs") {
-            offset = (linkBuf.bufSize / 4) * (result.aieTiles[comm.toIdxs.front()].row - 2);
-          }
-          commBuf.setPhysicalBufInfo(linkCommBufIt->bufIdx, false, offset, comm.bufSize, comm.elemType);
+          uint32_t offset = commName == "lhs" ? (linkBuf.bufSize / numCompTile) * (result.aieTiles[comm.toIdxs.front()].row - 2) : 0;
+          uint32_t size = comm.commElemSize * comm.commCount;
+          commBuf.setPhysicalBufInfo(linkCommBufIt->bufIdx, false, offset, size, comm.elemType);
         }
       }
     }
@@ -472,7 +481,7 @@ optimizeAiePlacement(const TileParam &tileParam) {
         const auto &toTile = result.getAieTile(toIdx);
         llvm::dbgs() << "(" << toTile.col << ", " << toTile.row << ") ";
       }
-      llvm::dbgs() << ", bufSize=" << comm.bufSize << ", elemType=";
+      llvm::dbgs() << ", commCount=" << comm.commCount << ", commElemSize=" << comm.commElemSize << ", elemType=";
       comm.elemType.print(llvm::dbgs());
       llvm::dbgs() << "\n";
     }
@@ -484,7 +493,8 @@ optimizeAiePlacement(const TileParam &tileParam) {
 void generateAieOps(ConversionPatternRewriter &rewriter,
                     AiePlacementResult &placement,
                     const TileParam &tileParam) {
-  // TODO: Implement
+  // Set variables
+  bool doubleBufferingEnabled = false;
   
   // Create new module for AIE dialect
   MLIRContext *ctx = rewriter.getContext();
@@ -515,7 +525,7 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
   // Generate Ops for each tile
   for (auto &tile : placement.aieTiles) {
     
-    if(tile.row == 0) { // Shim tile
+    if (tile.row == 0) { // Shim tile
       // Generate Memref GlobalOp
       for (auto &buf : tile.allocatedBufs) {
         buf.symbol = std::string("global_") + buf.name + "_" + std::to_string(tile.col) + "_" + std::to_string(tile.row);
@@ -538,11 +548,24 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
       }
 
       // Generate AIE LockOp
-      uint32_t numCompTile = 4;
       uint32_t id = 0;
       for (auto &buf : tile.allocatedBufs) {
-        uint32_t numProdToken = (tile.row == 1 && (buf.name == "lhs" || buf.name == "res")) ? numCompTile : 1;
+        uint32_t numProdToken = doubleBufferingEnabled ? 2 : 1;
         uint32_t numConsToken = 0;
+
+        if (tile.row == 1) { // Mem tile
+          uint32_t numCompTile = 4;
+          uint32_t mCountInMemTile = tileParam.levelTiles[0].TM / tileParam.coreTile.TM;
+          uint32_t nCountInMemTile = tileParam.levelTiles[0].TN / tileParam.coreTile.TN;
+
+          if (buf.name == "lhs") {
+            numProdToken = nCountInMemTile * numCompTile;
+          } else if (buf.name == "rhs") {
+            numProdToken = mCountInMemTile / numCompTile;
+          } else { // buf.name == "res"
+            numProdToken = numCompTile;
+          }
+        }
 
         { // Producer lock
           auto idAttr = builder.getI32IntegerAttr(id++);
@@ -569,7 +592,7 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
   for (auto &comm : placement.tileComms) {
     auto &srcTile = placement.aieTiles[comm.fromIdx];
 
-    for(auto &toIdx : comm.toIdxs) {
+    for (auto &toIdx : comm.toIdxs) {
       auto &dstTile = placement.aieTiles[toIdx];
       auto srcCh = builder.getI32IntegerAttr(comm.srcCh);
       auto dstCh = builder.getI32IntegerAttr(comm.dstCh);
@@ -585,10 +608,10 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
   for (auto &tile : placement.aieTiles) {
 
     Operation *dmaOp = nullptr;
-    if(tile.row == 0) {
+    if (tile.row == 0) {
       size_t numBlocks = tile.inCommBufs.size() + tile.outCommBufs.size();
 
-      for(size_t i = 0; i < numBlocks; ++i){
+      for (size_t i = 0; i < numBlocks; ++i){
         bool isInput = (i < tile.inCommBufs.size());
         auto &commBuf = isInput ? tile.inCommBufs[i] : tile.outCommBufs[i - tile.inCommBufs.size()];
         auto &comm = placement.tileComms[commBuf.tileCommIdx];
@@ -605,7 +628,7 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
       }
 
       continue;
-    } else if(tile.row == 1) {
+    } else if (tile.row == 1) {
       dmaOp = builder.create<MemTileDMAOp>(loc, tile.value).getOperation();
     } else {
       dmaOp = builder.create<MemOp>(loc, tile.value).getOperation();
@@ -619,18 +642,18 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
       std::vector<Block*> bdBlocks;
 
       size_t numBlocks = tile.inCommBufs.size() + tile.outCommBufs.size();
-      for(size_t i = 0; i < numBlocks; ++i){
+      for (size_t i = 0; i < numBlocks; ++i){
         Block *dmaBlock = builder.createBlock(&DMARegion);
         dmaBlocks.push_back(dmaBlock);
       }
-      for(size_t i = 0; i < numBlocks; ++i){
+      for (size_t i = 0; i < numBlocks; ++i){
         Block *bdBlock = builder.createBlock(&DMARegion);
         bdBlocks.push_back(bdBlock);
       }
       Block *endBlock = builder.createBlock(&DMARegion);
       dmaBlocks.push_back(endBlock);
 
-      for(size_t i = 0; i < numBlocks; ++i){
+      for (size_t i = 0; i < numBlocks; ++i){
         bool isInput = (i < tile.inCommBufs.size());
         auto &commBuf = isInput ? tile.inCommBufs[i] : tile.outCommBufs[i - tile.inCommBufs.size()];
         auto &comm = placement.tileComms[commBuf.tileCommIdx];
@@ -656,15 +679,17 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
           auto acquireLockValue = isInput ? buf.prodLockValue : buf.consLockValue;
           auto releaseLockValue = isInput ? buf.consLockValue : buf.prodLockValue;
           uint32_t numToken = 1;
-          if(tile.row == 1) {
+          if (tile.row == 1) {
             uint32_t numCompTile = 4;
+            uint32_t mCountInMemTile = tileParam.levelTiles[0].TM / tileParam.coreTile.TM;
+            uint32_t nCountInMemTile = tileParam.levelTiles[0].TN / tileParam.coreTile.TN;
 
-            if(isInput && buf.name == "lhs") {
-              numToken = numCompTile; 
-            } else if(!isInput && buf.name == "res") {
-              numToken = numCompTile; 
-            } else {
-              numToken = 1;
+            if (isInput && buf.name == "lhs") {
+              numToken = nCountInMemTile * numCompTile;
+            } else if (isInput && buf.name == "rhs") {
+              numToken = mCountInMemTile / numCompTile;
+            } else if (!isInput && buf.name == "res") {
+              numToken = numCompTile;
             }
           } 
 
@@ -696,7 +721,7 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
 
   // Generate AIE CoreOp
   for (auto &tile : placement.aieTiles) {
-    if(tile.row < 2) {
+    if (tile.row < 2) {
       continue;
     }
 
@@ -799,10 +824,10 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
     // Generate AIEX NpuDmaMemcpyNdOp
     for (auto &tile : placement.aieTiles) {
 
-      if(tile.row == 0) {
+      if (tile.row == 0) {
         size_t numBlocks = tile.inCommBufs.size() + tile.outCommBufs.size();
 
-        for(size_t i = 0; i < numBlocks; ++i){
+        for (size_t i = 0; i < numBlocks; ++i){
           bool isOutput = (i < tile.outCommBufs.size());
           auto &commBuf = isOutput ? tile.outCommBufs[i] : tile.inCommBufs[i - tile.outCommBufs.size()];
           auto &buf = tile.allocatedBufs[commBuf.bufIdx];
@@ -814,7 +839,7 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
                                                         ArrayRef(Offsets[idx]), ArrayRef(Sizes[idx]), ArrayRef(Strides[idx]), nullptr, 
                                                         metadata, id++, false, 0, 0, 0, 0, 0, 0);
                                                         
-          if(!isOutput) {
+          if (!isOutput) {
             builder.create<xilinx::AIEX::NpuDmaWaitOp>(loc, metadata);
           }
         }
