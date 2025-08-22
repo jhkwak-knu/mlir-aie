@@ -60,7 +60,7 @@ echo "Found $TOTAL_CASES cases in $INPUT_JSON"
 
 # CSV header
 if [ ! -f "$RESULT_CSV" ]; then
-  echo "case_index,M,K,N,TM,TK,TN,numLastSpm,MemTM,MemTK,MemTN,status,errors" > "$RESULT_CSV"
+  echo "case_index,numLevel,TM,TK,TN,MemTM,MemTK,MemTN,M,K,N,numLastSpm,status,errors" > "$RESULT_CSV"
 fi
 
 # helper to read numeric (default 0)
@@ -82,29 +82,30 @@ for (( idx=1; idx<=TOTAL_CASES; idx++ )); do
   mv "$tmp_out" "$OUTPUT_JSON"
 
   # 2) read fields
-  M=$(read_num '.M');   K=$(read_num '.K');   N=$(read_num '.N')
+  numLevel=$(read_num '.numLevel')
   TM=$(read_num '.TM'); TK=$(read_num '.TK'); TN=$(read_num '.TN')
-  numLastSpm=$(read_num '.numLastSpm')
   MemTM=$(read_num '.MemTM'); MemTK=$(read_num '.MemTK'); MemTN=$(read_num '.MemTN')
+  M=$(read_num '.M');   K=$(read_num '.K');   N=$(read_num '.N')
+  numLastSpm=$(read_num '.numLastSpm')
 
-  for v in M K N TM TK TN numLastSpm MemTM MemTK MemTN; do
+  for v in numLevel TM TK TN MemTM MemTK MemTN M K N numLastSpm; do
     val="${!v}"
     if ! [[ "$val" =~ ^-?[0-9]+$ ]]; then
       echo "warn: $v not integer (got: $val); marking as PARSE_FAIL"
-      echo "$idx,$M,$K,$N,$TM,$TK,$TN,$numLastSpm,$MemTM,$MemTK,$MemTN,PARSE_FAIL,-1" >> "$RESULT_CSV"
+      echo "$idx,$numLevel,$TM,$TK,$TN,$MemTM,$MemTK,$MemTN,$M,$K,$N,$numLastSpm,PARSE_FAIL,-1" >> "$RESULT_CSV"
       [ -x "$CLEAN_SCRIPT" ] && bash "$CLEAN_SCRIPT" || true
       continue 2
     fi
   done
 
-  echo "Params: M=$M K=$K N=$N | TM=$TM TK=$TK TN=$TN | numLastSpm=$numLastSpm | MemTM=$MemTM MemTK=$MemTK MemTN=$MemTN"
+  echo "Params: numLevel=$numLevel | TM=$TM TK=$TK TN=$TN | MemTM=$MemTM MemTK=$MemTK MemTN=$MemTN | M=$M K=$K N=$N | numLastSpm=$numLastSpm"
 
   # 3) generate MLIR
   if [ -x "$GEN_SCRIPT" ]; then
     echo "running: $GEN_SCRIPT $M $K $N"
     if ! "$GEN_SCRIPT" "$M" "$K" "$N"; then
       echo "warn: generator failed"
-      echo "$idx,$M,$K,$N,$TM,$TK,$TN,$numLastSpm,$MemTM,$MemTK,$MemTN,GEN_FAIL,-1" >> "$RESULT_CSV"
+      echo "$idx,$numLevel,$TM,$TK,$TN,$MemTM,$MemTK,$MemTN,$M,$K,$N,$numLastSpm,GEN_FAIL,-1" >> "$RESULT_CSV"
       [ -x "$CLEAN_SCRIPT" ] && bash "$CLEAN_SCRIPT" || true
       continue
     fi
@@ -112,13 +113,13 @@ for (( idx=1; idx<=TOTAL_CASES; idx++ )); do
     echo "running: bash $GEN_SCRIPT $M $K $N"
     if ! bash "$GEN_SCRIPT" "$M" "$K" "$N"; then
       echo "warn: generator failed"
-      echo "$idx,$M,$K,$N,$TM,$TK,$TN,$numLastSpm,$MemTM,$MemTK,$MemTN,GEN_FAIL,-1" >> "$RESULT_CSV"
+      echo "$idx,$numLevel,$TM,$TK,$TN,$MemTM,$MemTK,$MemTN,$M,$K,$N,$numLastSpm,GEN_FAIL,-1" >> "$RESULT_CSV"
       [ -x "$CLEAN_SCRIPT" ] && bash "$CLEAN_SCRIPT" || true
       continue
     fi
   else
     echo "warn: generator script not found: $GEN_SCRIPT"
-    echo "$idx,$M,$K,$N,$TM,$TK,$TN,$numLastSpm,$MemTM,$MemTK,$MemTN,GEN_MISSING,-1" >> "$RESULT_CSV"
+    echo "$idx,$numLevel,$TM,$TK,$TN,$MemTM,$MemTK,$MemTN,$M,$K,$N,$numLastSpm,GEN_MISSING,-1" >> "$RESULT_CSV"
     [ -x "$CLEAN_SCRIPT" ] && bash "$CLEAN_SCRIPT" || true
     continue
   fi
@@ -128,7 +129,7 @@ for (( idx=1; idx<=TOTAL_CASES; idx++ )); do
   echo "make run CPPDEFS=\"$CPPDEFS\""
   if ! make -C "$MAKE_DIR" run CPPDEFS="$CPPDEFS"; then
     echo "warn: make run failed"
-    echo "$idx,$M,$K,$N,$TM,$TK,$TN,$numLastSpm,$MemTM,$MemTK,$MemTN,RUN_FAIL,-1" >> "$RESULT_CSV"
+    echo "$idx,$numLevel,$TM,$TK,$TN,$MemTM,$MemTK,$MemTN,$M,$K,$N,$numLastSpm,RUN_FAIL,-1" >> "$RESULT_CSV"
     [ -x "$CLEAN_SCRIPT" ] && bash "$CLEAN_SCRIPT" || true
     continue
   fi
@@ -148,7 +149,7 @@ for (( idx=1; idx<=TOTAL_CASES; idx++ )); do
   fi
 
   # 6) append to CSV
-  echo "$idx,$M,$K,$N,$TM,$TK,$TN,$numLastSpm,$MemTM,$MemTK,$MemTN,$STATUS,$ERRORS" >> "$RESULT_CSV"
+  echo "$idx,$numLevel,$TM,$TK,$TN,$MemTM,$MemTK,$MemTN,$M,$K,$N,$numLastSpm,$STATUS,$ERRORS" >> "$RESULT_CSV"
   echo "Result: case #$idx -> $STATUS (errors=$ERRORS) appended to $RESULT_CSV"
 
   # 7) clean before next case

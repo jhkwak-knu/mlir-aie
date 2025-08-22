@@ -1,22 +1,291 @@
 {
     "cases": [
         {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 128, "MemTK": 32, "MemTN": 32,
             "M": 128, "K": 32, "N": 32,
-            "TM": 32, "TK": 32, "TN": 32,
-            "numLastSpm": 1,
-            "MemTM": 128, "MemTK": 32, "MemTN": 32
+            "numLastSpm": 1
         },
         {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 256, "MemTK": 32, "MemTN": 32,
             "M": 256, "K": 32, "N": 32,
-            "TM": 32, "TK": 32, "TN": 32,
-            "numLastSpm": 1,
-            "MemTM": 256, "MemTK": 32, "MemTN": 32
+            "numLastSpm": 1
         },
         {
-            "M": 512, "K": 64, "N": 64,
+            "numLevel": 2,
             "TM": 32, "TK": 32, "TN": 32,
-            "numLastSpm": 1,
-            "MemTM": 512, "MemTK": 64, "MemTN": 64
+            "MemTM": 512, "MemTK": 32, "MemTN": 32,
+            "M": 512, "K": 32, "N": 32,
+            "numLastSpm": 1
+        },
+        {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 1024, "MemTK": 32, "MemTN": 32,
+            "M": 1024, "K": 32, "N": 32,
+            "numLastSpm": 1
+        },
+        {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 128, "MemTK": 64, "MemTN": 32,
+            "M": 128, "K": 64, "N": 32,
+            "numLastSpm": 1
+        },
+        {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 256, "MemTK": 64, "MemTN": 32,
+            "M": 256, "K": 64, "N": 32,
+            "numLastSpm": 1
+        },
+        {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 512, "MemTK": 64, "MemTN": 32,
+            "M": 512, "K": 64, "N": 32,
+            "numLastSpm": 1
+        },
+        {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 128, "MemTK": 96, "MemTN": 32,
+            "M": 128, "K": 96, "N": 32,
+            "numLastSpm": 1
+        },
+        {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 256, "MemTK": 96, "MemTN": 32,
+            "M": 256, "K": 96, "N": 32,
+            "numLastSpm": 1
+        },
+        {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 512, "MemTK": 96, "MemTN": 32,
+            "M": 512, "K": 96, "N": 32,
+            "numLastSpm": 1
+        },
+        {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 128, "MemTK": 128, "MemTN": 32,
+            "M": 128, "K": 128, "N": 32,
+            "numLastSpm": 1
+        },
+        {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 256, "MemTK": 128, "MemTN": 32,
+            "M": 256, "K": 128, "N": 32,
+            "numLastSpm": 1
+        },
+        {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 128, "MemTK": 256, "MemTN": 32,
+            "M": 128, "K": 256, "N": 32,
+            "numLastSpm": 1
+        },
+        {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 128, "MemTK": 32, "MemTN": 64,
+            "M": 128, "K": 32, "N": 64,
+            "numLastSpm": 1
+        },
+        {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 256, "MemTK": 32, "MemTN": 64,
+            "M": 256, "K": 32, "N": 64,
+            "numLastSpm": 1
+        },
+        {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 512, "MemTK": 32, "MemTN": 64,
+            "M": 512, "K": 32, "N": 64,
+            "numLastSpm": 1
+        },
+        {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 128, "MemTK": 64, "MemTN": 64,
+            "M": 128, "K": 64, "N": 64,
+            "numLastSpm": 1
+        },
+        {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 256, "MemTK": 64, "MemTN": 64,
+            "M": 256, "K": 64, "N": 64,
+            "numLastSpm": 1
+        },
+        {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 512, "MemTK": 64, "MemTN": 64,
+            "M": 512, "K": 64, "N": 64,
+            "numLastSpm": 1
+        },
+        {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 128, "MemTK": 96, "MemTN": 64,
+            "M": 128, "K": 96, "N": 64,
+            "numLastSpm": 1
+        },
+        {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 256, "MemTK": 96, "MemTN": 64,
+            "M": 256, "K": 96, "N": 64,
+            "numLastSpm": 1
+        },
+        {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 128, "MemTK": 128, "MemTN": 64,
+            "M": 128, "K": 128, "N": 64,
+            "numLastSpm": 1
+        },
+        {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 256, "MemTK": 128, "MemTN": 64,
+            "M": 256, "K": 128, "N": 64,
+            "numLastSpm": 1
+        },
+        {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 128, "MemTK": 256, "MemTN": 64,
+            "M": 128, "K": 256, "N": 64,
+            "numLastSpm": 1
+        },
+        {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 128, "MemTK": 32, "MemTN": 96,
+            "M": 128, "K": 32, "N": 96,
+            "numLastSpm": 1
+        },
+        {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 256, "MemTK": 32, "MemTN": 96,
+            "M": 256, "K": 32, "N": 96,
+            "numLastSpm": 1
+        },
+        {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 512, "MemTK": 32, "MemTN": 96,
+            "M": 512, "K": 32, "N": 96,
+            "numLastSpm": 1
+        },
+        {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 128, "MemTK": 64, "MemTN": 96,
+            "M": 128, "K": 64, "N": 96,
+            "numLastSpm": 1
+        },
+        {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 256, "MemTK": 64, "MemTN": 96,
+            "M": 256, "K": 64, "N": 96,
+            "numLastSpm": 1
+        },
+        {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 128, "MemTK": 96, "MemTN": 96,
+            "M": 128, "K": 96, "N": 96,
+            "numLastSpm": 1
+        },
+        {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 256, "MemTK": 96, "MemTN": 96,
+            "M": 256, "K": 96, "N": 96,
+            "numLastSpm": 1
+        },
+        {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 128, "MemTK": 128, "MemTN": 96,
+            "M": 128, "K": 128, "N": 96,
+            "numLastSpm": 1
+        },
+        {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 256, "MemTK": 128, "MemTN": 96,
+            "M": 256, "K": 128, "N": 96,
+            "numLastSpm": 1
+        },
+        {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 128, "MemTK": 256, "MemTN": 96,
+            "M": 128, "K": 256, "N": 96,
+            "numLastSpm": 1
+        },
+        {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 128, "MemTK": 32, "MemTN": 128,
+            "M": 128, "K": 32, "N": 128,
+            "numLastSpm": 1
+        },
+        {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 256, "MemTK": 32, "MemTN": 128,
+            "M": 256, "K": 32, "N": 128,
+            "numLastSpm": 1
+        },
+        {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 128, "MemTK": 64, "MemTN": 128,
+            "M": 128, "K": 64, "N": 128,
+            "numLastSpm": 1
+        },
+        {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 256, "MemTK": 64, "MemTN": 128,
+            "M": 256, "K": 64, "N": 128,
+            "numLastSpm": 1
+        },
+        {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 128, "MemTK": 96, "MemTN": 128,
+            "M": 128, "K": 96, "N": 128,
+            "numLastSpm": 1
+        },
+        {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 256, "MemTK": 96, "MemTN": 128,
+            "M": 256, "K": 96, "N": 128,
+            "numLastSpm": 1
+        },
+        {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 128, "MemTK": 128, "MemTN": 128,
+            "M": 128, "K": 128, "N": 128,
+            "numLastSpm": 1
         }
     ]
 }

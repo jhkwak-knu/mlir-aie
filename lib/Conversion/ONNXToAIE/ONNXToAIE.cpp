@@ -166,25 +166,23 @@ std::optional<SystemInfo> loadSystemInfo(const std::string &filePath) {
 //===----------------------------------------------------------------------===//
 // Tiling algorithm
 //===----------------------------------------------------------------------===//
-struct OpInfo {
+struct MatmulOpInfo {
   uint32_t M, K, N;
   Type elemType;
 };
 
-struct LevelTile {
-  uint32_t TM;
-  uint32_t TK;
-  uint32_t TN;
-  Type elemType;
+struct TileSize {
+  uint32_t TM, TK, TN;
 };
 
 struct TileParam {
+  uint32_t numLevel;
+  std::vector<TileSize> levelTileSizes;
+  Type elemType;
   uint32_t numLastSpm;
-  LevelTile coreTile;
-  std::vector<LevelTile> levelTiles;
 };
 
-TileParam findOptimalTileParam(const SystemInfo &sysInfo, const OpInfo &opInfo) {
+TileParam findOptimalTileParam(const SystemInfo &sysInfo, const MatmulOpInfo &opInfo) {
   // TODO: Implement
 
   std::string filePath = "/home/ace/ryzen_ai/mlir-aie-dev/mlir-aie/test/onnx-mlir/tc.json";
@@ -220,16 +218,17 @@ TileParam findOptimalTileParam(const SystemInfo &sysInfo, const OpInfo &opInfo) 
     llvm::report_fatal_error("tile param missing field");
   };
 
-  const uint32_t M      = getU32("M");
-  const uint32_t K      = getU32("K");
-  const uint32_t N      = getU32("N");
+  const uint32_t numL   = getU32("numLevel");
   const uint32_t TM     = getU32("TM");
   const uint32_t TK     = getU32("TK");
   const uint32_t TN     = getU32("TN");
-  const uint32_t numLS  = getU32("numLastSpm");
   const uint32_t MemTM  = getU32("MemTM");
   const uint32_t MemTK  = getU32("MemTK");
   const uint32_t MemTN  = getU32("MemTN");
+  const uint32_t M      = getU32("M");
+  const uint32_t K      = getU32("K");
+  const uint32_t N      = getU32("N");
+  const uint32_t numLS  = getU32("numLastSpm");
 
   if ((M % TM) || (K % TK) || (N % TN)) {
     llvm::errs() << "Error: TM/TK/TN must divide M/K/N: "
@@ -239,11 +238,14 @@ TileParam findOptimalTileParam(const SystemInfo &sysInfo, const OpInfo &opInfo) 
   }
 
   TileParam optimalTileParam{
-      .numLastSpm = numLS,
-      .coreTile   = {.TM = TM, .TK = TK, .TN = TN, .elemType = opInfo.elemType},
-      .levelTiles = {
-          {.TM = MemTM, .TK = MemTK, .TN = MemTN, .elemType = opInfo.elemType}
-      }
+      .numLevel = numL,
+      .levelTileSizes = {
+          {.TM = TM, .TK = TK, .TN = TN},
+          {.TM = MemTM, .TK = MemTK, .TN = MemTN},
+          {.TM = M, .TK = K, .TN = N}
+      },
+      .elemType = opInfo.elemType,
+      .numLastSpm = numLS
   };
 
   return optimalTileParam;
@@ -320,11 +322,16 @@ optimizeAiePlacement(const TileParam &tileParam) {
   // Set variables
   uint32_t numCompTile = 4;
   uint32_t numTilesPerCol = numCompTile + 2; // Shim: 1, Mem: 1, Compute: 4
-  auto numCols = tileParam.numLastSpm;
-  auto [TM, TK, TN, elemType] = tileParam.coreTile;
-  auto mCountInMemTile = tileParam.levelTiles[0].TM / TM;
-  auto kCountInMemTile = tileParam.levelTiles[0].TK / TK;
-  auto nCountInMemTile = tileParam.levelTiles[0].TN / TN;
+  uint32_t numCols = tileParam.numLastSpm;
+
+  auto [TM, TK, TN] = tileParam.levelTileSizes[0];
+  auto elemType = tileParam.elemType;
+
+  auto [memTM, memTK, memTN] = tileParam.levelTileSizes[1];
+  uint32_t mCountInMemTile = memTM / TM;
+  uint32_t kCountInMemTile = memTK / TK;
+  uint32_t nCountInMemTile = memTN / TN;
+
   auto wireBundle = WireBundle::DMA;
   
   // Place on physical AIE tiles
@@ -552,11 +559,20 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
   // Set variables
   bool doubleBufferingEnabled = false;
   uint32_t numCompTile = 4;
-  auto numCols = tileParam.numLastSpm;
-  auto [TM, TK, TN, elemType] = tileParam.coreTile;
-  auto mCountInMemTile = tileParam.levelTiles[0].TM / TM;
-  auto kCountInMemTile = tileParam.levelTiles[0].TK / TK;
-  auto nCountInMemTile = tileParam.levelTiles[0].TN / TN;
+  uint32_t numCols = tileParam.numLastSpm;
+
+  auto [TM, TK, TN] = tileParam.levelTileSizes[0];
+  auto elemType = tileParam.elemType;
+
+  auto [memTM, memTK, memTN] = tileParam.levelTileSizes[1];
+  uint32_t mCountInMemTile = memTM / TM;
+  uint32_t kCountInMemTile = memTK / TK;
+  uint32_t nCountInMemTile = memTN / TN;
+
+  auto [totalMSize, totalKSize, totalNSize] = tileParam.levelTileSizes[2];
+  uint32_t mCountInShimTile = totalMSize / memTM;
+  uint32_t kCountInShimTile = totalKSize / memTK;
+  uint32_t nCountInShimTile = totalNSize / memTN;
 
   // Create new module for AIE dialect
   MLIRContext *ctx = rewriter.getContext();
@@ -954,7 +970,7 @@ public:
     }
 
     // Find optimal tiling parameters
-    OpInfo opInfo;
+    MatmulOpInfo opInfo;
 
     auto ty = op.getResult().getType();
     if (auto shapedTy = llvm::dyn_cast<ShapedType>(ty)) {
