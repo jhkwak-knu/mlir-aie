@@ -286,6 +286,34 @@
             "MemTM": 128, "MemTK": 128, "MemTN": 128,
             "M": 128, "K": 128, "N": 128,
             "numLastSpm": 1
+        },
+        {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 128, "MemTK": 32, "MemTN": 32,
+            "M": 256, "K": 32, "N": 32,
+            "numLastSpm": 1
+        },
+        {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 128, "MemTK": 32, "MemTN": 32,
+            "M": 256, "K": 32, "N": 64,
+            "numLastSpm": 1
+        },
+        {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 128, "MemTK": 128, "MemTN": 128,
+            "M": 256, "K": 128, "N": 512,
+            "numLastSpm": 1
+        },
+        {
+            "numLevel": 2,
+            "TM": 32, "TK": 32, "TN": 32,
+            "MemTM": 128, "MemTK": 64, "MemTN": 32,
+            "M": 256, "K": 128, "N": 512,
+            "numLastSpm": 1
         }
     ]
 }
