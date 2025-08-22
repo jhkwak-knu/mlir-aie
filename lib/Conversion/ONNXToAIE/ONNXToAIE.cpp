@@ -824,6 +824,7 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
       auto cMax = builder.create<mlir::arith::ConstantOp>(loc, builder.getIndexAttr(0xFFFFFFFFULL));
       auto cLen = builder.create<mlir::arith::ConstantOp>(loc, builder.getIndexAttr(TM*TN));
       auto cN = builder.create<mlir::arith::ConstantOp>(loc, builder.getIndexAttr(kCountInMemTile));
+      auto cInit = builder.create<mlir::arith::ConstantOp>(loc, builder.getIndexAttr(kCountInShimTile));
       auto c0f = builder.create<mlir::arith::ConstantOp>(loc, builder.getF32FloatAttr(0.0f));
       
       auto cRow = builder.create<mlir::arith::ConstantIntOp>(loc, TM, /*width=*/32);
@@ -840,17 +841,25 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
         // Generate AIE UseLockOp (res)
         builder.create<UseLockOp>(loc, resBufPtr->prodLockValue, LockAction::AcquireGreaterEqual, 1);
 
-        // Generate SCF ForOp (init loop: res)
-        auto initLoopOp = builder.create<mlir::scf::ForOp>(loc, c0, cLen, c1);
+        // Generate SCF IfOp
+        auto remOp = builder.create<mlir::arith::RemSIOp>(loc, infiniteLoopOp.getInductionVar(), cInit);
+        auto cond = builder.create<mlir::arith::CmpIOp>(loc, arith::CmpIPredicate::eq, remOp, c0);
+        auto ifOp = builder.create<mlir::scf::IfOp>(loc, cond, /*withElseRegion=*/false);
         {
-          OpBuilder::InsertionGuard g(builder);
-          Region &initLoopRegion = initLoopOp.getRegion();
-          builder.setInsertionPointToStart(&initLoopRegion.back());
+          OpBuilder tb = ifOp.getThenBodyBuilder();
 
-          Value index = initLoopOp.getInductionVar();
-          builder.create<mlir::memref::StoreOp>(loc, c0f, resBufPtr->bufValue, ValueRange(index));
-        }
+          // Generate SCF ForOp (init loop: res)
+          auto initLoopOp = tb.create<mlir::scf::ForOp>(loc, c0, cLen, c1);
+          {
+            OpBuilder::InsertionGuard g(builder);
+            Region &initLoopRegion = initLoopOp.getRegion();
+            builder.setInsertionPointToStart(&initLoopRegion.back());
   
+            Value index = initLoopOp.getInductionVar();
+            builder.create<mlir::memref::StoreOp>(loc, c0f, resBufPtr->bufValue, ValueRange(index));
+          }
+        }
+
         // Generate SCF ForOp (calc loop: lhs/rhs)
         auto calcLoopOp = builder.create<mlir::scf::ForOp>(loc, c0, cN, c1);
         {
