@@ -4,24 +4,30 @@
 #
 # Usage:
 #   ./run_tc_all.sh [-i INPUT_JSON] [-o OUTPUT_JSON] [-r RESULT_CSV]
-#     -i: input file  (default: tc_list.json)
-#     -o: tc.json path (default: tc.json)
-#     -r: result csv  (default: result.csv)
+#     -i: input file   (default: data/tc_list.json)
+#     -o: tc.json path (default: out/tc.json)
+#     -r: result csv   (default: out/reports/result.csv)
 
 set -uo pipefail  # intentionally NOT using -e to continue on errors
 
-INPUT_JSON="tc_list.json"
-OUTPUT_JSON="tc.json"
-RESULT_CSV="result.csv"
+# resolve dirs and common paths
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/common.sh"
+
+# defaults under new tree
+INPUT_JSON="$TC_LIST"                  # data/tc_list.json
+OUTPUT_JSON="$OUT_DIR/tc.json"         # out/tc.json
+RESULT_CSV="$REPORTS_DIR/result.csv"   # out/reports/result.csv
 
 usage() {
-  cat <<'EOF'
-run_tc_all.sh - Run ALL testcases from tc_list.json and append results to CSV.
+  cat <<EOF
+run_tc_all.sh - Run ALL testcases from JSON and append results to CSV.
 
 Options:
-  -i FILE   Input JSON list (default: tc_list.json)
-  -o FILE   Per-case extracted JSON (default: tc.json)
-  -r FILE   Result CSV path (default: result.csv)
+  -i FILE   Input JSON list (default: $INPUT_JSON)
+  -o FILE   Per-case extracted JSON (default: $OUTPUT_JSON)
+  -r FILE   Result CSV path (default: $RESULT_CSV)
   -h        Help
 EOF
   exit 1
@@ -38,11 +44,10 @@ while getopts ":i:o:r:h" opt; do
   esac
 done
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-GEN_SCRIPT="$SCRIPT_DIR/gen_onnx_matmul_mlir.sh"
-CLEAN_SCRIPT="$SCRIPT_DIR/clean_tc_all.sh"
-MAKE_DIR="$SCRIPT_DIR"
-LOG_FILE="$MAKE_DIR/log.txt"
+GEN_SCRIPT="$SCRIPTS_DIR/gen_onnx_matmul_mlir.sh"
+CLEAN_SCRIPT="$SCRIPTS_DIR/clean_tc_all.sh"
+MAKE_DIR="$ROOT_DIR"                   # Makefile at repo root
+LOG_FILE="$LOGS_DIR/log.txt"
 
 # deps
 command -v jq   >/dev/null 2>&1 || { echo "error: 'jq' required"; exit 127; }
@@ -60,6 +65,7 @@ echo "Found $TOTAL_CASES cases in $INPUT_JSON"
 
 # CSV header
 if [ ! -f "$RESULT_CSV" ]; then
+  mkdir -p "$(dirname "$RESULT_CSV")"
   echo "case_index,numLevel,TM,TK,TN,MemTM,MemTK,MemTN,M,K,N,numLastSpm,doubleBuffer,status,errors" > "$RESULT_CSV"
 fi
 
@@ -116,7 +122,7 @@ for (( idx=1; idx<=TOTAL_CASES; idx++ )); do
     echo "running: bash $GEN_SCRIPT $M $K $N"
     if ! bash "$GEN_SCRIPT" "$M" "$K" "$N"; then
       echo "warn: generator failed"
-      echo "$idx,$numLevel,$TM,$TK,$TN,$MemTM,$MemTK,$MemTN,$M,$K,$N,$numLastSpm,GEN_FAIL,-1" >> "$RESULT_CSV"
+      echo "$idx,$numLevel,$TM,$TK,$TN,$MemTM,$MemTK,$MemTN,$M,$K,$N,$numLastSpm,$DB_STR,GEN_FAIL,-1" >> "$RESULT_CSV"
       [ -x "$CLEAN_SCRIPT" ] && bash "$CLEAN_SCRIPT" || true
       continue
     fi
@@ -127,9 +133,9 @@ for (( idx=1; idx<=TOTAL_CASES; idx++ )); do
     continue
   fi
 
-  # 4) build & run (Makefile 'run' target). Pass macros for test.cpp.
+  # 4) build & run (Makefile 'run' target). Pass macros for host.cpp.
   CPPDEFS="-DM_SIZE=$M -DK_SIZE=$K -DN_SIZE=$N"
-  echo "make run CPPDEFS=\"$CPPDEFS\""
+  echo "make -C \"$MAKE_DIR\" run CPPDEFS=\"$CPPDEFS\""
   if ! make -C "$MAKE_DIR" run CPPDEFS="$CPPDEFS"; then
     echo "warn: make run failed"
     echo "$idx,$numLevel,$TM,$TK,$TN,$MemTM,$MemTK,$MemTN,$M,$K,$N,$numLastSpm,$DB_STR,RUN_FAIL,-1" >> "$RESULT_CSV"
@@ -143,7 +149,6 @@ for (( idx=1; idx<=TOTAL_CASES; idx++ )); do
     if grep -q 'PASS!' "$LOG_FILE"; then
       STATUS="PASS"; ERRORS=0
     else
-      # last "<num> mismatches."
       last_mis="$(grep -Eo '[0-9]+ mismatches\.' "$LOG_FILE" | tail -n1 | grep -Eo '^[0-9]+')"
       if [ -n "${last_mis:-}" ]; then ERRORS="$last_mis"; fi
     fi

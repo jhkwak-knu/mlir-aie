@@ -186,7 +186,7 @@ struct TileParam {
 TileParam findOptimalTileParam(const SystemInfo &sysInfo, const MatmulOpInfo &opInfo) {
   // TODO: Implement
 
-  std::string filePath = "/home/ace/ryzen_ai/mlir-aie-dev/mlir-aie/test/onnx-mlir/tc.json";
+  std::string filePath = "/home/ace/ryzen_ai/mlir-aie-dev/mlir-aie/test/onnx-mlir/out/tc.json";
 
   auto bufOrErr = llvm::MemoryBuffer::getFile(filePath);
   if (!bufOrErr) {
