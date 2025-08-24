@@ -180,6 +180,7 @@ struct TileParam {
   std::vector<TileSize> levelTileSizes;
   Type elemType;
   uint32_t numLastSpm;
+  bool doubleBufferEnabled;
 };
 
 TileParam findOptimalTileParam(const SystemInfo &sysInfo, const MatmulOpInfo &opInfo) {
@@ -218,6 +219,19 @@ TileParam findOptimalTileParam(const SystemInfo &sysInfo, const MatmulOpInfo &op
     llvm::report_fatal_error("tile param missing field");
   };
 
+  auto getBool = [&](llvm::StringRef key) -> bool {
+    if (auto v = rootObj->getBoolean(key))
+      return *v;
+
+    if (rootObj->get(key) != nullptr) {
+      llvm::errs() << "Error: boolean expected in '" << key << "'\n";
+      llvm::report_fatal_error("tile param type mismatch");
+    }
+
+    llvm::errs() << "Error: missing boolean field '" << key << "'\n";
+    llvm::report_fatal_error("tile param missing field");
+  };
+
   const uint32_t numL   = getU32("numLevel");
   const uint32_t TM     = getU32("TM");
   const uint32_t TK     = getU32("TK");
@@ -229,6 +243,7 @@ TileParam findOptimalTileParam(const SystemInfo &sysInfo, const MatmulOpInfo &op
   const uint32_t K      = getU32("K");
   const uint32_t N      = getU32("N");
   const uint32_t numLS  = getU32("numLastSpm");
+  const bool db         = getBool("doubleBuffer");
 
   if ((M % TM) || (K % TK) || (N % TN)) {
     llvm::errs() << "Error: TM/TK/TN must divide M/K/N: "
@@ -245,7 +260,8 @@ TileParam findOptimalTileParam(const SystemInfo &sysInfo, const MatmulOpInfo &op
           {.TM = M, .TK = K, .TN = N}
       },
       .elemType = opInfo.elemType,
-      .numLastSpm = numLS
+      .numLastSpm = numLS,
+      .doubleBufferEnabled = db
   };
 
   return optimalTileParam;

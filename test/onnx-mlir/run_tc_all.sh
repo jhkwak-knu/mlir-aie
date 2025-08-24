@@ -60,11 +60,13 @@ echo "Found $TOTAL_CASES cases in $INPUT_JSON"
 
 # CSV header
 if [ ! -f "$RESULT_CSV" ]; then
-  echo "case_index,numLevel,TM,TK,TN,MemTM,MemTK,MemTN,M,K,N,numLastSpm,status,errors" > "$RESULT_CSV"
+  echo "case_index,numLevel,TM,TK,TN,MemTM,MemTK,MemTN,M,K,N,numLastSpm,doubleBuffer,status,errors" > "$RESULT_CSV"
 fi
 
 # helper to read numeric (default 0)
 read_num() { jq -r "$1 // 0" "$OUTPUT_JSON"; }
+# helper to read bool -> true/false 문자열
+read_bool_str() { jq -r "if $1 == true then \"true\" else \"false\" end" "$OUTPUT_JSON"; }
 
 for (( idx=1; idx<=TOTAL_CASES; idx++ )); do
   echo "=== Case #$idx / $TOTAL_CASES ==="
@@ -73,7 +75,7 @@ for (( idx=1; idx<=TOTAL_CASES; idx++ )); do
   tmp_out="$(mktemp)"
   if ! jq --indent 4 ".cases[$((idx-1))]" "$INPUT_JSON" > "$tmp_out"; then
     echo "warn: failed to extract case #$idx"
-    echo "$idx,0,0,0,0,0,0,0,0,0,0,EXTRACT_FAIL,-1" >> "$RESULT_CSV"
+    echo "$idx,0,0,0,0,0,0,0,0,0,0,0,false,EXTRACT_FAIL,-1" >> "$RESULT_CSV"
     rm -f "$tmp_out"
     # cleanup then continue
     if [ -x "$CLEAN_SCRIPT" ]; then bash "$CLEAN_SCRIPT" || true; fi
@@ -87,25 +89,26 @@ for (( idx=1; idx<=TOTAL_CASES; idx++ )); do
   MemTM=$(read_num '.MemTM'); MemTK=$(read_num '.MemTK'); MemTN=$(read_num '.MemTN')
   M=$(read_num '.M');   K=$(read_num '.K');   N=$(read_num '.N')
   numLastSpm=$(read_num '.numLastSpm')
+  DB_STR=$(read_bool_str '.doubleBuffer')
 
   for v in numLevel TM TK TN MemTM MemTK MemTN M K N numLastSpm; do
     val="${!v}"
     if ! [[ "$val" =~ ^-?[0-9]+$ ]]; then
       echo "warn: $v not integer (got: $val); marking as PARSE_FAIL"
-      echo "$idx,$numLevel,$TM,$TK,$TN,$MemTM,$MemTK,$MemTN,$M,$K,$N,$numLastSpm,PARSE_FAIL,-1" >> "$RESULT_CSV"
+      echo "$idx,$numLevel,$TM,$TK,$TN,$MemTM,$MemTK,$MemTN,$M,$K,$N,$numLastSpm,$DB_STR,PARSE_FAIL,-1" >> "$RESULT_CSV"
       [ -x "$CLEAN_SCRIPT" ] && bash "$CLEAN_SCRIPT" || true
       continue 2
     fi
   done
 
-  echo "Params: numLevel=$numLevel | TM=$TM TK=$TK TN=$TN | MemTM=$MemTM MemTK=$MemTK MemTN=$MemTN | M=$M K=$K N=$N | numLastSpm=$numLastSpm"
+  echo "Params: numLevel=$numLevel | TM=$TM TK=$TK TN=$TN | MemTM=$MemTM MemTK=$MemTK MemTN=$MemTN | M=$M K=$K N=$N | numLastSpm=$numLastSpm | doubleBuffer=$DB_STR"
 
   # 3) generate MLIR
   if [ -x "$GEN_SCRIPT" ]; then
     echo "running: $GEN_SCRIPT $M $K $N"
     if ! "$GEN_SCRIPT" "$M" "$K" "$N"; then
       echo "warn: generator failed"
-      echo "$idx,$numLevel,$TM,$TK,$TN,$MemTM,$MemTK,$MemTN,$M,$K,$N,$numLastSpm,GEN_FAIL,-1" >> "$RESULT_CSV"
+      echo "$idx,$numLevel,$TM,$TK,$TN,$MemTM,$MemTK,$MemTN,$M,$K,$N,$numLastSpm,$DB_STR,GEN_FAIL,-1" >> "$RESULT_CSV"
       [ -x "$CLEAN_SCRIPT" ] && bash "$CLEAN_SCRIPT" || true
       continue
     fi
@@ -119,7 +122,7 @@ for (( idx=1; idx<=TOTAL_CASES; idx++ )); do
     fi
   else
     echo "warn: generator script not found: $GEN_SCRIPT"
-    echo "$idx,$numLevel,$TM,$TK,$TN,$MemTM,$MemTK,$MemTN,$M,$K,$N,$numLastSpm,GEN_MISSING,-1" >> "$RESULT_CSV"
+    echo "$idx,$numLevel,$TM,$TK,$TN,$MemTM,$MemTK,$MemTN,$M,$K,$N,$numLastSpm,$DB_STR,GEN_MISSING,-1" >> "$RESULT_CSV"
     [ -x "$CLEAN_SCRIPT" ] && bash "$CLEAN_SCRIPT" || true
     continue
   fi
@@ -129,7 +132,7 @@ for (( idx=1; idx<=TOTAL_CASES; idx++ )); do
   echo "make run CPPDEFS=\"$CPPDEFS\""
   if ! make -C "$MAKE_DIR" run CPPDEFS="$CPPDEFS"; then
     echo "warn: make run failed"
-    echo "$idx,$numLevel,$TM,$TK,$TN,$MemTM,$MemTK,$MemTN,$M,$K,$N,$numLastSpm,RUN_FAIL,-1" >> "$RESULT_CSV"
+    echo "$idx,$numLevel,$TM,$TK,$TN,$MemTM,$MemTK,$MemTN,$M,$K,$N,$numLastSpm,$DB_STR,RUN_FAIL,-1" >> "$RESULT_CSV"
     [ -x "$CLEAN_SCRIPT" ] && bash "$CLEAN_SCRIPT" || true
     continue
   fi
@@ -149,7 +152,7 @@ for (( idx=1; idx<=TOTAL_CASES; idx++ )); do
   fi
 
   # 6) append to CSV
-  echo "$idx,$numLevel,$TM,$TK,$TN,$MemTM,$MemTK,$MemTN,$M,$K,$N,$numLastSpm,$STATUS,$ERRORS" >> "$RESULT_CSV"
+  echo "$idx,$numLevel,$TM,$TK,$TN,$MemTM,$MemTK,$MemTN,$M,$K,$N,$numLastSpm,$DB_STR,$STATUS,$ERRORS" >> "$RESULT_CSV"
   echo "Result: case #$idx -> $STATUS (errors=$ERRORS) appended to $RESULT_CSV"
 
   # 7) clean before next case
