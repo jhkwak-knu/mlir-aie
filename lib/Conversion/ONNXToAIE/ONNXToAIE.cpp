@@ -329,6 +329,14 @@ struct AiePlacementResult {
 
   AieTile& getAieTile(size_t idx) { return aieTiles[idx]; }
   TileComm& getTileComm(size_t idx) { return tileComms[idx]; }
+  size_t findAieTileIdx(uint32_t col, uint32_t row) const {
+    for (size_t idx = 0; idx < aieTiles.size(); ++idx) {
+      const auto &tile = aieTiles[idx];
+      if (tile.col == col && tile.row == row)
+        return idx;
+    }
+    llvm_unreachable("Tile not found");
+  };
 };
 
 AiePlacementResult
@@ -361,15 +369,6 @@ optimizeAiePlacement(const TileParam &tileParam) {
   }
 
   // Configure tile communication paths (TODO: Optimize the tile communication paths)
-  auto findAieTileIdx = [&](uint32_t col, uint32_t row) -> size_t {
-    for (size_t idx = 0; idx < result.aieTiles.size(); ++idx) {
-      const auto &tile = result.aieTiles[idx];
-      if (tile.col == col && tile.row == row)
-        return idx;
-    }
-    llvm_unreachable("Tile not found");
-  };
-
   for (uint32_t i = 0; i < numCols; ++i) {
     // Shim tile <-> Mem tile
     uint32_t lhsSizeInMemTile = TM * TK * mCountInMemTile * kCountInMemTile;
@@ -377,8 +376,8 @@ optimizeAiePlacement(const TileParam &tileParam) {
     uint32_t resSizeInMemTile = TM * TN * mCountInMemTile * nCountInMemTile;
     uint32_t rhsCommCount = nCountInMemTile;
 
-    size_t shimIdx = findAieTileIdx(i, 0);
-    size_t memIdx  = findAieTileIdx(i, 1);
+    size_t shimIdx = result.findAieTileIdx(i, 0);
+    size_t memIdx  = result.findAieTileIdx(i, 1);
 
     TileComm lhsCommShimToMem{.name="lhs", .fromIdx=shimIdx, .toIdxs={memIdx}, .commCount=1, .commElemSize=lhsSizeInMemTile,
                               .elemType=elemType, .srcCh=0, .dstCh=0, .srcWire=wireBundle, .dstWire=wireBundle};
@@ -404,7 +403,7 @@ optimizeAiePlacement(const TileParam &tileParam) {
                                       .elemType=elemType, .srcCh=5, .dstCh=1, .srcWire=wireBundle, .dstWire=wireBundle};
 
     for (uint32_t j = 0; j < numCompTile; ++j) {
-      size_t computeIdx = findAieTileIdx(i, j + 2);
+      size_t computeIdx = result.findAieTileIdx(i, j + 2);
 
       TileComm lhsCommMemToComp{.name="lhs", .fromIdx=memIdx, .toIdxs={computeIdx}, .commCount=lhsCommMemToCompCount, .commElemSize=lhsSizeInCompTile,
                                 .elemType=elemType, .srcCh=j+1, .dstCh=0, .srcWire=wireBundle, .dstWire=wireBundle};
@@ -1160,19 +1159,10 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
           uint32_t id = 0;
 
           for (size_t i = 0; i < numCols; ++i) {
-            auto findAieTileIdx = [&](uint32_t col, uint32_t row) -> size_t {
-              for (size_t idx = 0; idx < placement.aieTiles.size(); ++idx) {
-                const auto &tile = placement.aieTiles[idx];
-                if (tile.col == col && tile.row == row)
-                  return idx;
-              }
-              llvm_unreachable("Tile not found");
-            };
-
             int64_t lhsOffset = lhsBases[i] + (mIdx * mStep) + (kIdx * kStep);
             int64_t resOffset = resBases[i] + (mIdx * resMStep) + (nIdx * resNStep);
 
-            size_t shimIdx = findAieTileIdx(i, 0);
+            size_t shimIdx = placement.findAieTileIdx(i, 0);
             AieTile &tile = placement.aieTiles[shimIdx];
 
             for (auto &commBuf : tile.outCommBufs) {
