@@ -287,6 +287,7 @@ struct AieCommBuf {
   uint32_t bufOffset;
   uint32_t bufSize;
   Type elemType;
+  std::vector<AieCommBuf> chain;
 
   void setPhysicalBufInfo(size_t idx, bool own, uint32_t offset, uint32_t size, Type type) {
     hasOwnBuf = own;
@@ -348,6 +349,7 @@ optimizeAiePlacement(const TileParam &tileParam) {
   uint32_t kCountInMemTile = memTK / TK;
   uint32_t nCountInMemTile = memTN / TN;
 
+  bool doubleBufferEnabled = tileParam.doubleBufferEnabled;
   auto wireBundle = WireBundle::DMA;
   
   // Place on physical AIE tiles
@@ -358,8 +360,7 @@ optimizeAiePlacement(const TileParam &tileParam) {
     }
   }
 
-  // Configure tile communication paths
-  // TODO: Optimize the tile communication paths
+  // Configure tile communication paths (TODO: Optimize the tile communication paths)
   auto findAieTileIdx = [&](uint32_t col, uint32_t row) -> size_t {
     for (size_t idx = 0; idx < result.aieTiles.size(); ++idx) {
       const auto &tile = result.aieTiles[idx];
@@ -443,31 +444,32 @@ optimizeAiePlacement(const TileParam &tileParam) {
       commBuf.setPhysicalBufInfo(bufIdx, true, /*offset*/0, buf.bufSize, buf.elemType);
     };
 
-    if (tile.row != 1) { // Shim/Compute tile
+    if (tile.row == 0) { // Shim tile
       // Allocate physical buffers for all communication buffers
-      bool includeCommCount = tile.row == 0 ? true : false;
+      bool includeCommCount = true;
       for (auto &commBuf : tile.inCommBufs) {
         allocatePhysicalBuf(commBuf, includeCommCount);
       }
       for (auto &commBuf : tile.outCommBufs) {
         allocatePhysicalBuf(commBuf, includeCommCount);
       }      
-    } else { // Mem tile
+    } else if (tile.row == 1) { // Mem tile
       // Allocate physical buffers only for communication with Shim tiles
       auto isShimTile = [&](size_t idx) {
         return result.aieTiles[idx].row == 0;
       };
 
+      bool includeCommCount = false;
       for (auto &commBuf : tile.inCommBufs) {
         const auto &comm = result.tileComms[commBuf.tileCommIdx];
         if (isShimTile(comm.fromIdx)) {
-          allocatePhysicalBuf(commBuf, false);
+          allocatePhysicalBuf(commBuf, includeCommCount);
         }
       }
       for (auto &commBuf : tile.outCommBufs) {
         const auto &comm = result.tileComms[commBuf.tileCommIdx];
         if (llvm::any_of(comm.toIdxs, isShimTile)) {
-          allocatePhysicalBuf(commBuf, false);
+          allocatePhysicalBuf(commBuf, includeCommCount);
         }
       }
 
@@ -509,6 +511,30 @@ optimizeAiePlacement(const TileParam &tileParam) {
           commBuf.setPhysicalBufInfo(linkCommBufIt->bufIdx, false, offset, size, comm.elemType);
         }
       }
+    } else { // Compute tile
+      // Allocate physical buffers for all communication buffers
+      // if double buffering is enabled, allocate communication/physical buffers (support compute tile only)
+      bool includeCommCount = false;
+      for (auto &commBuf : tile.inCommBufs) {
+        allocatePhysicalBuf(commBuf, includeCommCount);
+
+        if(doubleBufferEnabled) {
+          AieCommBuf doubleCommBuf{.tileCommIdx = commBuf.tileCommIdx};
+          allocatePhysicalBuf(doubleCommBuf, includeCommCount);
+          tile.allocatedBufs[doubleCommBuf.bufIdx].name.append("db");
+          commBuf.chain.push_back(doubleCommBuf);
+        }
+      }
+      for (auto &commBuf : tile.outCommBufs) {
+        allocatePhysicalBuf(commBuf, includeCommCount);
+
+        if(doubleBufferEnabled) {
+          AieCommBuf doubleCommBuf{.tileCommIdx = commBuf.tileCommIdx};
+          allocatePhysicalBuf(doubleCommBuf, includeCommCount);
+          tile.allocatedBufs[doubleCommBuf.bufIdx].name.append("db");
+          commBuf.chain.push_back(doubleCommBuf);
+        }
+      }      
     }
   }
 
@@ -573,7 +599,6 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
                     AiePlacementResult &placement,
                     const TileParam &tileParam) {
   // Set variables
-  bool doubleBufferingEnabled = false;
   uint32_t numCompTile = 4;
   uint32_t numCols = tileParam.numLastSpm;
 
@@ -644,7 +669,7 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
       // Generate AIE LockOp
       uint32_t id = 0;
       for (auto &buf : tile.allocatedBufs) {
-        uint32_t numProdToken = doubleBufferingEnabled ? 2 : 1;
+        uint32_t numProdToken = 1;
         uint32_t numConsToken = 0;
 
         if (tile.row == 1) { // Mem tile
@@ -699,9 +724,9 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
 
     Operation *dmaOp = nullptr;
     if (tile.row == 0) {
-      size_t numBlocks = tile.inCommBufs.size() + tile.outCommBufs.size();
+      size_t numDmaBlocks = tile.inCommBufs.size() + tile.outCommBufs.size();
 
-      for (size_t i = 0; i < numBlocks; ++i){
+      for (size_t i = 0; i < numDmaBlocks; ++i){
         bool isInput = (i < tile.inCommBufs.size());
         auto &commBuf = isInput ? tile.inCommBufs[i] : tile.outCommBufs[i - tile.inCommBufs.size()];
         auto &comm = placement.tileComms[commBuf.tileCommIdx];
@@ -731,19 +756,28 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
       std::vector<Block*> dmaBlocks;
       std::vector<Block*> bdBlocks;
 
-      size_t numBlocks = tile.inCommBufs.size() + tile.outCommBufs.size();
-      for (size_t i = 0; i < numBlocks; ++i){
+      size_t numDmaBlocks = tile.inCommBufs.size() + tile.outCommBufs.size();
+      size_t numBdBlocks = tile.inCommBufs.size() + tile.outCommBufs.size();
+      for (auto &commBuf : tile.inCommBufs) {
+        numBdBlocks += commBuf.chain.size();
+      }
+      for (auto &commBuf : tile.outCommBufs) {
+        numBdBlocks += commBuf.chain.size();
+      }
+
+      for (size_t i = 0; i < numDmaBlocks; ++i){
         Block *dmaBlock = builder.createBlock(&DMARegion);
         dmaBlocks.push_back(dmaBlock);
       }
-      for (size_t i = 0; i < numBlocks; ++i){
+      for (size_t i = 0; i < numBdBlocks; ++i){
         Block *bdBlock = builder.createBlock(&DMARegion);
         bdBlocks.push_back(bdBlock);
       }
       Block *endBlock = builder.createBlock(&DMARegion);
       dmaBlocks.push_back(endBlock);
 
-      for (size_t i = 0; i < numBlocks; ++i){
+      size_t bdBlockIdx = 0;
+      for (size_t i = 0; i < numDmaBlocks; ++i){
         bool isInput = (i < tile.inCommBufs.size());
         auto &commBuf = isInput ? tile.inCommBufs[i] : tile.outCommBufs[i - tile.inCommBufs.size()];
         auto &comm = placement.tileComms[commBuf.tileCommIdx];
@@ -758,32 +792,40 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
           auto channelIdxAttr = builder.getI32IntegerAttr(channelIdx);
           auto repeatCntAttr = builder.getI32IntegerAttr(0);
 
-          builder.create<DMAStartOp>(loc, dmaDirAttr, channelIdxAttr, repeatCntAttr, bdBlocks[i], dmaBlocks[i+1]);
+          builder.create<DMAStartOp>(loc, dmaDirAttr, channelIdxAttr, repeatCntAttr, bdBlocks[bdBlockIdx], dmaBlocks[i+1]);
         }
 
-        {
-          OpBuilder::InsertionGuard g(builder);
-          builder.setInsertionPointToStart(bdBlocks[i]);
+        uint32_t bdBlockCount = commBuf.chain.size() + 1;
+        for (size_t j = 0; j < bdBlockCount; ++j) {
+          auto &curCommBuf = j == 0 ? commBuf : commBuf.chain[j - 1];
+          size_t curBdBlockIdx = bdBlockIdx + j;
+          size_t nextBdBlockIdx = bdBlockIdx + ((j + 1) % bdBlockCount);
 
-          auto &buf = tile.allocatedBufs[commBuf.bufIdx];
-          auto acquireLockValue = isInput ? buf.prodLockValue : buf.consLockValue;
-          auto releaseLockValue = isInput ? buf.consLockValue : buf.prodLockValue;
-          uint32_t numToken = 1;
-          if (tile.row == 1) {
-            if (isInput && buf.name == "lhs") {
-              numToken = nCountInMemTile * numCompTile;
-            } else if (isInput && buf.name == "rhs") {
-              numToken = mCountInMemTile / numCompTile;
-            } else if (!isInput && buf.name == "res") {
-              numToken = numCompTile;
-            }
-          } 
-
-          builder.create<UseLockOp>(loc, acquireLockValue, LockAction::AcquireGreaterEqual, numToken);
-          builder.create<DMABDOp>(loc, buf.bufValue, commBuf.bufOffset, commBuf.bufSize);
-          builder.create<UseLockOp>(loc, releaseLockValue, LockAction::Release, numToken);
-          builder.create<NextBDOp>(loc, bdBlocks[i]);
+          {
+            OpBuilder::InsertionGuard g(builder);
+            builder.setInsertionPointToStart(bdBlocks[curBdBlockIdx]);
+  
+            auto &buf = tile.allocatedBufs[curCommBuf.bufIdx];
+            auto acquireLockValue = isInput ? buf.prodLockValue : buf.consLockValue;
+            auto releaseLockValue = isInput ? buf.consLockValue : buf.prodLockValue;
+            uint32_t numToken = 1;
+            if (tile.row == 1) {
+              if (isInput && buf.name == "lhs") {
+                numToken = nCountInMemTile * numCompTile;
+              } else if (isInput && buf.name == "rhs") {
+                numToken = mCountInMemTile / numCompTile;
+              } else if (!isInput && buf.name == "res") {
+                numToken = numCompTile;
+              }
+            } 
+  
+            builder.create<UseLockOp>(loc, acquireLockValue, LockAction::AcquireGreaterEqual, numToken);
+            builder.create<DMABDOp>(loc, buf.bufValue, curCommBuf.bufOffset, curCommBuf.bufSize);
+            builder.create<UseLockOp>(loc, releaseLockValue, LockAction::Release, numToken);
+            builder.create<NextBDOp>(loc, bdBlocks[nextBdBlockIdx]);
+          }
         }
+        bdBlockIdx += bdBlockCount;
       }
 
       {
@@ -810,19 +852,19 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
       continue;
     }
 
-    // Set buffer pointers (lhs/rhs/res)
-    AieBuf *lhsBufPtr = nullptr;
-    AieBuf *rhsBufPtr = nullptr;
-    AieBuf *resBufPtr = nullptr;
+    // Set vector for each buffer (lhs/rhs/res)
+    std::vector<AieBuf> lhsBufs;
+    std::vector<AieBuf> rhsBufs;
+    std::vector<AieBuf> resBufs;
 
     for (auto &buf : tile.allocatedBufs) {
       const std::string &name = buf.name;
-      if (name == "lhs") {
-        lhsBufPtr = &buf;
-      } else if (name == "rhs") {
-        rhsBufPtr = &buf;
-      } else if (name == "res") {
-        resBufPtr = &buf;
+      if (name == "lhs" || name == "lhsdb") {
+        lhsBufs.push_back(buf);
+      } else if (name == "rhs" || name == "rhsdb") {
+        rhsBufs.push_back(buf);
+      } else if (name == "res" || name == "resdb") {
+        resBufs.push_back(buf);
       }
     }
 
@@ -837,69 +879,229 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
       // Generate Arith ConstantOp
       auto c0 = builder.create<mlir::arith::ConstantOp>(loc, builder.getIndexAttr(0));
       auto c1 = builder.create<mlir::arith::ConstantOp>(loc, builder.getIndexAttr(1));
-      auto cMax = builder.create<mlir::arith::ConstantOp>(loc, builder.getIndexAttr(0xFFFFFFFFULL));
-      auto cLen = builder.create<mlir::arith::ConstantOp>(loc, builder.getIndexAttr(TM*TN));
-      auto cN = builder.create<mlir::arith::ConstantOp>(loc, builder.getIndexAttr(kCountInMemTile));
-      auto cInit = builder.create<mlir::arith::ConstantOp>(loc, builder.getIndexAttr(kCountInShimTile));
+      auto cMax = builder.create<mlir::arith::ConstantOp>(loc, builder.getIndexAttr(0x7FFFFFFFFFFFFFFFULL));
+      auto cResLen = builder.create<mlir::arith::ConstantOp>(loc, builder.getIndexAttr(TM*TN));
+      auto cKCnt = builder.create<mlir::arith::ConstantOp>(loc, builder.getIndexAttr(kCountInMemTile));
+      auto cInitCnt = builder.create<mlir::arith::ConstantOp>(loc, builder.getIndexAttr(kCountInShimTile));
+
       auto c0f = builder.create<mlir::arith::ConstantOp>(loc, builder.getF32FloatAttr(0.0f));
-      
       auto cRow = builder.create<mlir::arith::ConstantIntOp>(loc, TM, /*width=*/32);
       auto cCol = builder.create<mlir::arith::ConstantIntOp>(loc, TN, /*width=*/32);
       auto cDep = builder.create<mlir::arith::ConstantIntOp>(loc, TK, /*width=*/32);
 
-      // Generate SCF ForOp (infinite loop)
-      auto infiniteLoopOp = builder.create<mlir::scf::ForOp>(loc, c0, cMax, c1);
+      Value trueI1 = builder.create<arith::ConstantIntOp>(loc, /*value=*/1, /*bitWidth=*/1);
+      SmallVector<Value, 11> outerInitArgs{
+        /*lhs*/ lhsBufs[0].bufValue, lhsBufs[0].consLockValue, lhsBufs[0].prodLockValue,
+        /*rhs*/ rhsBufs[0].bufValue, rhsBufs[0].consLockValue, rhsBufs[0].prodLockValue,
+        /*res*/ resBufs[0].bufValue, resBufs[0].consLockValue, resBufs[0].prodLockValue,
+        /*t  */ trueI1, trueI1
+      };
+
+      // Generate SCF ForOp (outer loop: infinite)
+      auto outerLoopOp = builder.create<mlir::scf::ForOp>(loc, c0, cMax, c1, outerInitArgs);
       {
         OpBuilder::InsertionGuard g(builder);
-        Region &infiniteLoopRegion = infiniteLoopOp.getRegion();
-        builder.setInsertionPointToStart(&infiniteLoopRegion.back());
+        Region &outerLoopRegion = outerLoopOp.getRegion();
+        builder.setInsertionPointToStart(&outerLoopRegion.back());
+
+        // Set arguments
+        auto outerArgs  = outerLoopOp.getRegionIterArgs();
+        Value lhsBuf  = outerArgs[0];
+        Value lhsCons = outerArgs[1];
+        Value lhsProd = outerArgs[2];
+        Value rhsBuf  = outerArgs[3];
+        Value rhsCons = outerArgs[4];
+        Value rhsProd = outerArgs[5];
+        Value resBuf  = outerArgs[6];
+        Value resCons = outerArgs[7];
+        Value resProd = outerArgs[8];
+        Value innerT  = outerArgs[9];
+        Value outerT  = outerArgs[10];
+
+        SmallVector<Value, 7> innerInitArgs{
+          /*lhs*/ lhsBuf, lhsCons, lhsProd,
+          /*rhs*/ rhsBuf, rhsCons, rhsProd,
+          /*t  */ innerT
+        };
 
         // Generate AIE UseLockOp (res)
-        builder.create<UseLockOp>(loc, resBufPtr->prodLockValue, LockAction::AcquireGreaterEqual, 1);
+        builder.create<UseLockOp>(loc, resProd, LockAction::AcquireGreaterEqual, 1);
 
         // Generate SCF IfOp
-        auto remOp = builder.create<mlir::arith::RemSIOp>(loc, infiniteLoopOp.getInductionVar(), cInit);
+        auto remOp = builder.create<mlir::arith::RemSIOp>(loc, outerLoopOp.getInductionVar(), cInitCnt);
         auto cond = builder.create<mlir::arith::CmpIOp>(loc, arith::CmpIPredicate::eq, remOp, c0);
         auto ifOp = builder.create<mlir::scf::IfOp>(loc, cond, /*withElseRegion=*/false);
         {
           OpBuilder tb = ifOp.getThenBodyBuilder();
 
           // Generate SCF ForOp (init loop: res)
-          auto initLoopOp = tb.create<mlir::scf::ForOp>(loc, c0, cLen, c1);
+          auto initLoopOp = tb.create<mlir::scf::ForOp>(loc, c0, cResLen, c1);
           {
             OpBuilder::InsertionGuard g(builder);
             Region &initLoopRegion = initLoopOp.getRegion();
             builder.setInsertionPointToStart(&initLoopRegion.back());
   
-            Value index = initLoopOp.getInductionVar();
-            builder.create<mlir::memref::StoreOp>(loc, c0f, resBufPtr->bufValue, ValueRange(index));
+            auto index = initLoopOp.getInductionVar();
+            builder.create<mlir::memref::StoreOp>(loc, c0f, resBuf, ValueRange(index));
           }
         }
 
-        // Generate SCF ForOp (calc loop: lhs/rhs)
-        auto calcLoopOp = builder.create<mlir::scf::ForOp>(loc, c0, cN, c1);
+        // Generate SCF ForOp (inner loop: calc lhs/rhs)
+        auto innerLoopOp = builder.create<mlir::scf::ForOp>(loc, c0, cKCnt, c1, innerInitArgs);
         {
           OpBuilder::InsertionGuard g(builder);
-          Region &calcLoopRegion = calcLoopOp.getRegion();
-          builder.setInsertionPointToStart(&calcLoopRegion.back());
+          Region &innerLoopRegion = innerLoopOp.getRegion();
+          builder.setInsertionPointToStart(&innerLoopRegion.back());
+
+          // Set arguments
+          auto innerArgs  = innerLoopOp.getRegionIterArgs();
+          Value lhsBuf  = innerArgs[0];
+          Value lhsCons = innerArgs[1];
+          Value lhsProd = innerArgs[2];
+          Value rhsBuf  = innerArgs[3];
+          Value rhsCons = innerArgs[4];
+          Value rhsProd = innerArgs[5];
+          Value innerT  = innerArgs[6];
 
           // Generate AIE UseLockOp (lhs/rhs)
-          builder.create<UseLockOp>(loc, lhsBufPtr->consLockValue, LockAction::AcquireGreaterEqual, 1);
-          builder.create<UseLockOp>(loc, rhsBufPtr->consLockValue, LockAction::AcquireGreaterEqual, 1);
+          builder.create<UseLockOp>(loc, lhsCons, LockAction::AcquireGreaterEqual, 1);
+          builder.create<UseLockOp>(loc, rhsCons, LockAction::AcquireGreaterEqual, 1);
 
           // Generate Func CallOp
           auto calleeAttr = SymbolRefAttr::get(builder.getContext(), "extern_kernel");
           builder.create<mlir::func::CallOp>(loc, calleeAttr, TypeRange{}, 
-                                            ValueRange{lhsBufPtr->bufValue, rhsBufPtr->bufValue, resBufPtr->bufValue,
-                                                       cRow, cCol, cDep});
+                                            ValueRange{lhsBuf, rhsBuf, resBuf, cRow, cCol, cDep});
     
           // Generate AIE UseLockOp (lhs/rhs)
-          builder.create<UseLockOp>(loc, lhsBufPtr->prodLockValue, LockAction::Release, 1);
-          builder.create<UseLockOp>(loc, rhsBufPtr->prodLockValue, LockAction::Release, 1);
+          builder.create<UseLockOp>(loc, lhsProd, LockAction::Release, 1);
+          builder.create<UseLockOp>(loc, rhsProd, LockAction::Release, 1);
+
+          // Generate SCF YieldOp
+          if (lhsBufs.size() < 2) {
+            builder.create<mlir::scf::YieldOp>(loc, ValueRange{lhsBuf, lhsCons, lhsProd,
+                                                         rhsBuf, rhsCons, rhsProd, innerT});
+          } else {
+            Value innerT2 = builder.create<arith::XOrIOp>(loc, /*lhs=*/innerT, /*rhs=*/trueI1);
+
+            llvm::SmallVector<Type, 7> packTys{
+              lhsBuf.getType(), lhsCons.getType(), lhsProd.getType(),
+              rhsBuf.getType(), rhsCons.getType(), rhsProd.getType(),
+              innerT.getType()
+            };
+
+            auto ifPack = builder.create<mlir::scf::IfOp>(loc, TypeRange(packTys),
+                                                    /*cond=*/innerT2, /*withElseRegion=*/true);
+            // then (db0)
+            {
+              OpBuilder::InsertionGuard g(builder);
+              Block &tb = ifPack.getThenRegion().front();
+              builder.setInsertionPointToStart(&tb);
+              builder.create<mlir::scf::YieldOp>(loc, ValueRange{
+                lhsBufs[0].bufValue, lhsBufs[0].consLockValue, lhsBufs[0].prodLockValue,
+                rhsBufs[0].bufValue, rhsBufs[0].consLockValue, rhsBufs[0].prodLockValue,
+                innerT2
+              });
+            }
+            // else (db1)
+            {
+              OpBuilder::InsertionGuard g(builder);
+              Block &eb = ifPack.getElseRegion().front();
+              builder.setInsertionPointToStart(&eb);
+              builder.create<mlir::scf::YieldOp>(loc, ValueRange{
+                lhsBufs[1].bufValue, lhsBufs[1].consLockValue, lhsBufs[1].prodLockValue,
+                rhsBufs[1].bufValue, rhsBufs[1].consLockValue, rhsBufs[1].prodLockValue,
+                innerT2
+              });
+            }
+
+            builder.create<mlir::scf::YieldOp>(loc, ValueRange{
+              ifPack.getResult(0), ifPack.getResult(1), ifPack.getResult(2),
+              ifPack.getResult(3), ifPack.getResult(4), ifPack.getResult(5),
+              ifPack.getResult(6)
+            });
+          }
         }
 
         // Generate AIE UseLockOp (res)
-        builder.create<UseLockOp>(loc, resBufPtr->consLockValue, LockAction::Release, 1);
+        builder.create<UseLockOp>(loc, resCons, LockAction::Release, 1);
+
+        // Generate SCF YieldOp
+        if (resBufs.size() < 2) {
+          builder.create<mlir::scf::YieldOp>(loc, ValueRange{
+            innerLoopOp.getResult(0), innerLoopOp.getResult(1), innerLoopOp.getResult(2),
+            innerLoopOp.getResult(3), innerLoopOp.getResult(4), innerLoopOp.getResult(5),
+            resBuf, resCons, resProd, 
+            innerLoopOp.getResult(6), outerT});
+        } else {
+          Value outerT2 = builder.create<arith::XOrIOp>(loc, /*lhs=*/outerT, /*rhs=*/trueI1);
+
+          llvm::SmallVector<Type, 4> packTys{
+            resBuf.getType(), resCons.getType(), resProd.getType(),
+            outerT.getType()
+          };
+
+          auto ifPack = builder.create<mlir::scf::IfOp>(loc, TypeRange(packTys),
+                                                  /*cond=*/outerT2, /*withElseRegion=*/true);
+          // then (db0)
+          {
+            OpBuilder::InsertionGuard g(builder);
+            Block &tb = ifPack.getThenRegion().front();
+            builder.setInsertionPointToStart(&tb);
+            builder.create<mlir::scf::YieldOp>(loc, ValueRange{
+              resBufs[0].bufValue, resBufs[0].consLockValue, resBufs[0].prodLockValue,
+              outerT2
+            });
+          }
+          // else (db1)
+          {
+            OpBuilder::InsertionGuard g(builder);
+            Block &eb = ifPack.getElseRegion().front();
+            builder.setInsertionPointToStart(&eb);
+            builder.create<mlir::scf::YieldOp>(loc, ValueRange{
+              resBufs[1].bufValue, resBufs[1].consLockValue, resBufs[1].prodLockValue,
+              outerT2
+            });
+          }
+
+          auto kCountInShim = builder.create<arith::AddIOp>(loc, remOp, c1);
+          auto resCopyCond = builder.create<mlir::arith::CmpIOp>(loc, arith::CmpIPredicate::ne, kCountInShim, cInitCnt);
+          auto resCopyIfOp = builder.create<mlir::scf::IfOp>(loc, resCopyCond, /*withElseRegion=*/false);
+          // then (copy res buffer)
+          {
+            OpBuilder::InsertionGuard g(builder);
+            Block &tb = resCopyIfOp.getThenRegion().front();
+            builder.setInsertionPointToStart(&tb);
+
+            builder.create<UseLockOp>(loc, resBufs[0].prodLockValue, LockAction::AcquireGreaterEqual, 1);
+            builder.create<UseLockOp>(loc, resBufs[1].prodLockValue, LockAction::AcquireGreaterEqual, 1);
+
+            auto copyDirIfOp = builder.create<mlir::scf::IfOp>(loc, /*cond=*/outerT2, /*withElseRegion=*/true);
+            // then (copy from db1 to db0)
+            {
+              OpBuilder::InsertionGuard g(builder);
+              Block &tb = copyDirIfOp.getThenRegion().front();
+              builder.setInsertionPointToStart(&tb);
+              builder.create<memref::CopyOp>(loc, resBufs[1].bufValue, resBufs[0].bufValue);
+            }
+            // else (copy from db0 to db1)
+            {
+              OpBuilder::InsertionGuard g(builder);
+              Block &eb = copyDirIfOp.getElseRegion().front();
+              builder.setInsertionPointToStart(&eb);
+              builder.create<memref::CopyOp>(loc, resBufs[0].bufValue, resBufs[1].bufValue);
+            }
+
+            builder.create<UseLockOp>(loc, resBufs[0].prodLockValue, LockAction::Release, 1);
+            builder.create<UseLockOp>(loc, resBufs[1].prodLockValue, LockAction::Release, 1);
+          }
+
+          builder.create<mlir::scf::YieldOp>(loc, ValueRange{
+            innerLoopOp.getResult(0), innerLoopOp.getResult(1), innerLoopOp.getResult(2),
+            innerLoopOp.getResult(3), innerLoopOp.getResult(4), innerLoopOp.getResult(5),
+            ifPack.getResult(0), ifPack.getResult(1), ifPack.getResult(2),
+            innerLoopOp.getResult(6), ifPack.getResult(3)
+          });
+        }
       }
 
       // Generate AIE EndOp
