@@ -310,6 +310,21 @@ struct AieTile {
   bool operator==(const AieTile &o) const {
     return col == o.col && row == o.row;
   }
+
+  const AieCommBuf& findCommBufFromName(bool isInput, const std::string &name) const {
+    if(isInput) {
+      for (auto &commBuf : inCommBufs) {
+        if(allocatedBufs[commBuf.bufIdx].name == name)
+          return commBuf;
+      }
+    } else {
+      for (auto &commBuf : outCommBufs) {
+        if(allocatedBufs[commBuf.bufIdx].name == name)
+          return commBuf;
+      }
+    }
+    llvm_unreachable("Tile not found");
+  };
 };
 
 struct TileComm {
@@ -373,8 +388,9 @@ optimizeAiePlacement(const TileParam &tileParam) {
     // Shim tile <-> Mem tile
     uint32_t lhsSizeInMemTile = TM * TK * mCountInMemTile * kCountInMemTile;
     uint32_t rhsSizeInMemTile = TK * TN * kCountInMemTile;
-    uint32_t resSizeInMemTile = TM * TN * mCountInMemTile * nCountInMemTile;
+    uint32_t resSizeInMemTile = TM * TN * mCountInMemTile;
     uint32_t rhsCommCount = nCountInMemTile;
+    uint32_t resCommCount = nCountInMemTile;
 
     size_t shimIdx = result.findAieTileIdx(i, 0);
     size_t memIdx  = result.findAieTileIdx(i, 1);
@@ -383,7 +399,7 @@ optimizeAiePlacement(const TileParam &tileParam) {
                               .elemType=elemType, .srcCh=0, .dstCh=0, .srcWire=wireBundle, .dstWire=wireBundle};
     TileComm rhsCommShimToMem{.name="rhs", .fromIdx=shimIdx, .toIdxs={memIdx}, .commCount=rhsCommCount, .commElemSize=rhsSizeInMemTile,
                               .elemType=elemType, .srcCh=1, .dstCh=1, .srcWire=wireBundle, .dstWire=wireBundle};
-    TileComm resCommMemToShim{.name="res", .fromIdx=memIdx, .toIdxs={shimIdx}, .commCount=1, .commElemSize=resSizeInMemTile,
+    TileComm resCommMemToShim{.name="res", .fromIdx=memIdx, .toIdxs={shimIdx}, .commCount=resCommCount, .commElemSize=resSizeInMemTile,
                               .elemType=elemType, .srcCh=0, .dstCh=0, .srcWire=wireBundle, .dstWire=wireBundle};
 
     result.tileComms.push_back(lhsCommShimToMem);
@@ -397,7 +413,7 @@ optimizeAiePlacement(const TileParam &tileParam) {
 
     uint32_t lhsCommMemToCompCount = (mCountInMemTile * kCountInMemTile) / numCompTile;
     uint32_t rhsCommMemToCompCount = kCountInMemTile;
-    uint32_t resCommCompToMemCount = (mCountInMemTile * nCountInMemTile) / numCompTile;
+    uint32_t resCommCompToMemCount = mCountInMemTile / numCompTile;
 
     TileComm rhsBcastCommMemToComp = {.name="rhs", .fromIdx=memIdx, .commCount=rhsCommMemToCompCount, .commElemSize=rhsSizeInCompTile,
                                       .elemType=elemType, .srcCh=5, .dstCh=1, .srcWire=wireBundle, .dstWire=wireBundle};
@@ -1128,11 +1144,16 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
 
     uint32_t mCountPerCompTile = mCountInMemTile / numCompTile;
     const std::vector<int64_t> staticLhsSize = {mCountInMemTile, kCountInMemTile, TM, TK};
-    const std::vector<int64_t> staticRhsSize = {nCountInMemTile, kCountInMemTile, TN, TK};
-    const std::vector<int64_t> staticResSize = {numCompTile, nCountInMemTile, TM * mCountPerCompTile, TN};
-    const std::vector<int64_t> staticLhsStride = {TM * totalKSize, TK, totalKSize, 1};
-    const std::vector<int64_t> staticRhsStride = {TN * totalKSize, TK, totalKSize, 1};
-    const std::vector<int64_t> staticResStride = {TM * mCountPerCompTile * totalNSize, TN, totalNSize, 1};
+    const std::vector<int64_t> staticRhsSize = {1, kCountInMemTile, TN, TK};
+    const std::vector<int64_t> staticResSize = {1, numCompTile, TM * mCountPerCompTile, TN};
+    std::vector<int64_t> staticLhsStride = {TM * totalKSize, TK, totalKSize, 1};
+    std::vector<int64_t> staticRhsStride = {0, TK, totalKSize, 1};
+    std::vector<int64_t> staticResStride = {0, TM * mCountPerCompTile * totalNSize, totalNSize, 1};
+    for (size_t i = 0; i < 3; ++i) {
+      if (staticLhsSize[i] == 1) staticLhsStride[i] = 0;
+      if (staticRhsSize[i] == 1) staticRhsStride[i] = 0;
+      if (staticResSize[i] == 1) staticResStride[i] = 0;
+    }
                                        
     uint32_t mCountPerMemTile = mCountInShimTile / numCols;
 
@@ -1154,46 +1175,54 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
     for (size_t mIdx = 0; mIdx < mCountPerMemTile; ++mIdx) {
       for (size_t nIdx = 0; nIdx < nCountInShimTile; ++nIdx) {
         for (size_t kIdx = 0; kIdx < kCountInShimTile; ++kIdx) {
-          std::vector<StringRef> metadatas;
-          int64_t rhsOffset = rhsBase + (nIdx * nStep) + (kIdx * kStep);
-          uint32_t id = 0;
-
+          // LHS
           for (size_t i = 0; i < numCols; ++i) {
             int64_t lhsOffset = lhsBases[i] + (mIdx * mStep) + (kIdx * kStep);
-            int64_t resOffset = resBases[i] + (mIdx * resMStep) + (nIdx * resNStep);
 
             size_t shimIdx = placement.findAieTileIdx(i, 0);
             AieTile &tile = placement.aieTiles[shimIdx];
 
-            for (auto &commBuf : tile.outCommBufs) {
-              auto &buf = tile.allocatedBufs[commBuf.bufIdx];
-              auto &arg = buf.name == "lhs" ? arg_lhs : arg_rhs;
-              auto &size = buf.name == "lhs" ? staticLhsSize : staticRhsSize;
-              auto &stride = buf.name == "lhs" ? staticLhsStride : staticRhsStride;
-              auto offset = buf.name == "lhs" ? lhsOffset : rhsOffset;
-              std::vector<int64_t> staticOffset = {0, 0, 0, offset};
-              StringRef metadata = builder.getStringAttr(buf.symbol);
-              builder.create<xilinx::AIEX::NpuDmaMemcpyNdOp>(loc, arg, SmallVector<Value>{}, SmallVector<Value>{}, SmallVector<Value>{},
-                                                            ArrayRef(staticOffset), ArrayRef(size), ArrayRef(stride), nullptr,
-                                                            metadata, id++, false, 0, 0, 0, 0, 0, 0);
-            }      
-
-            for (auto &commBuf : tile.inCommBufs) {
-              auto &buf = tile.allocatedBufs[commBuf.bufIdx];
-              auto &arg = arg_res;
-              auto &size = staticResSize;
-              auto &stride = staticResStride;
-              std::vector<int64_t> staticOffset = {0, 0, 0, resOffset};
-              StringRef metadata = builder.getStringAttr(buf.symbol);
-              builder.create<xilinx::AIEX::NpuDmaMemcpyNdOp>(loc, arg, SmallVector<Value>{}, SmallVector<Value>{}, SmallVector<Value>{},
-                                                            ArrayRef(staticOffset), ArrayRef(size), ArrayRef(stride), nullptr,
-                                                            metadata, id++, true, 0, 0, 0, 0, 0, 0);
-              metadatas.push_back(metadata);
-            }
+            auto lhsCommBuf = tile.findCommBufFromName(/*isInput*/false, "lhs");
+            auto lhsBuf = tile.allocatedBufs[lhsCommBuf.bufIdx];
+            std::vector<int64_t> lhsStaticOffset = {0, 0, 0, lhsOffset};
+            StringRef lhsMetadata = builder.getStringAttr(lhsBuf.symbol);
+            builder.create<xilinx::AIEX::NpuDmaMemcpyNdOp>(loc, arg_lhs, SmallVector<Value>{}, SmallVector<Value>{}, SmallVector<Value>{},
+                                                            ArrayRef(lhsStaticOffset), ArrayRef(staticLhsSize), ArrayRef(staticLhsStride), nullptr,
+                                                            lhsMetadata, 0, false, 0, 0, 0, 0, 0, 0);
           }
 
-          for (auto &metadata : metadatas) {
-            builder.create<xilinx::AIEX::NpuDmaWaitOp>(loc, metadata);
+          // RHS, RES
+          int64_t rhsOffset = rhsBase + (nIdx * nStep) + (kIdx * kStep);
+          for (size_t i = 0; i < nCountInMemTile; ++i) {
+            std::vector<StringRef> resMetadatas;
+            for (size_t j = 0; j < numCols; ++j) {
+              size_t shimIdx = placement.findAieTileIdx(j, 0);
+              AieTile &tile = placement.aieTiles[shimIdx];
+
+              auto rhsCommBuf = tile.findCommBufFromName(/*isInput*/false, "rhs");
+              auto rhsBuf = tile.allocatedBufs[rhsCommBuf.bufIdx];
+              int64_t rhsNOffset = rhsOffset + (TN * totalKSize) * i;
+              std::vector<int64_t> rhsStaticOffset = {0, 0, 0, rhsNOffset};
+              StringRef rhsMetadata = builder.getStringAttr(rhsBuf.symbol);
+              builder.create<xilinx::AIEX::NpuDmaMemcpyNdOp>(loc, arg_rhs, SmallVector<Value>{}, SmallVector<Value>{}, SmallVector<Value>{},
+                                                            ArrayRef(rhsStaticOffset), ArrayRef(staticRhsSize), ArrayRef(staticRhsStride), nullptr,
+                                                            rhsMetadata, 1, false, 0, 0, 0, 0, 0, 0);
+
+              int64_t resOffset = resBases[j] + (mIdx * resMStep) + (nIdx * resNStep);
+              auto resCommBuf = tile.findCommBufFromName(/*isInput*/true, "res");
+              auto resBuf = tile.allocatedBufs[resCommBuf.bufIdx];
+              int64_t resNOffset = resOffset + TN * i;
+              std::vector<int64_t> resStaticOffset = {0, 0, 0, resNOffset};
+              StringRef resMetadata = builder.getStringAttr(resBuf.symbol);
+              builder.create<xilinx::AIEX::NpuDmaMemcpyNdOp>(loc, arg_res, SmallVector<Value>{}, SmallVector<Value>{}, SmallVector<Value>{},
+                                                            ArrayRef(resStaticOffset), ArrayRef(staticResSize), ArrayRef(staticResStride), nullptr,
+                                                            resMetadata, 2, true, 0, 0, 0, 0, 0, 0);
+              resMetadatas.push_back(resMetadata);
+            }
+ 
+            for (auto &metadata : resMetadatas) {
+              builder.create<xilinx::AIEX::NpuDmaWaitOp>(loc, metadata);
+            }
           }
         }
       }
