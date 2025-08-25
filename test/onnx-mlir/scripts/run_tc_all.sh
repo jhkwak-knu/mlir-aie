@@ -3,10 +3,11 @@
 #                 append results to result.csv, then clean before next case.
 #
 # Usage:
-#   ./run_tc_all.sh [-i INPUT_JSON] [-o OUTPUT_JSON] [-r RESULT_CSV]
-#     -i: input file   (default: data/tc_list.json)
+#   ./run_tc_all.sh [-i INPUT_JSON] [-o OUTPUT_JSON] [-r RESULT_CSV] [-n INDEX]
+#     -i: input file   (default: out/tc_list.json)
 #     -o: tc.json path (default: out/tc.json)
 #     -r: result csv   (default: out/reports/result.csv)
+#     -n: 1-based case index to run only that single case
 
 set -uo pipefail  # intentionally NOT using -e to continue on errors
 
@@ -16,28 +17,31 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 source "$SCRIPT_DIR/common.sh"
 
 # defaults under new tree
-INPUT_JSON="$TC_LIST"                  # data/tc_list.json
+INPUT_JSON="$TC_LIST"                  # out/tc_list.json
 OUTPUT_JSON="$OUT_DIR/tc.json"         # out/tc.json
 RESULT_CSV="$REPORTS_DIR/result.csv"   # out/reports/result.csv
+SINGLE_IDX=""                          # optional: run only this 1-based index
 
 usage() {
   cat <<EOF
-run_tc_all.sh - Run ALL testcases from JSON and append results to CSV.
+run_tc_all.sh - Run testcases from JSON and append results to CSV.
 
 Options:
   -i FILE   Input JSON list (default: $INPUT_JSON)
   -o FILE   Per-case extracted JSON (default: $OUTPUT_JSON)
   -r FILE   Result CSV path (default: $RESULT_CSV)
+  -n INDEX  Run only the INDEX-th case (1-based)
   -h        Help
 EOF
   exit 1
 }
 
-while getopts ":i:o:r:h" opt; do
+while getopts ":i:o:r:n:h" opt; do
   case "$opt" in
     i) INPUT_JSON="$OPTARG" ;;
     o) OUTPUT_JSON="$OPTARG" ;;
     r) RESULT_CSV="$OPTARG" ;;
+    n) SINGLE_IDX="$OPTARG" ;;
     h) usage ;;
     \?) echo "Unknown option: -$OPTARG" >&2; usage ;;
     :)  echo "Option -$OPTARG requires an argument." >&2; usage ;;
@@ -61,7 +65,21 @@ if [ "$TOTAL_CASES" -le 0 ]; then
   echo "error: 'cases' array is empty." >&2
   exit 3
 fi
-echo "Found $TOTAL_CASES cases in $INPUT_JSON"
+
+# range decide (single-case support)
+if [ -n "${SINGLE_IDX:-}" ]; then
+  if ! [[ "$SINGLE_IDX" =~ ^[0-9]+$ ]] || [ "$SINGLE_IDX" -lt 1 ] || [ "$SINGLE_IDX" -gt "$TOTAL_CASES" ]; then
+    echo "error: invalid -n index: $SINGLE_IDX (valid range: 1..$TOTAL_CASES)" >&2
+    exit 4
+  fi
+  START_IDX="$SINGLE_IDX"
+  END_IDX="$SINGLE_IDX"
+  echo "Found $TOTAL_CASES cases in $INPUT_JSON (running only case #$SINGLE_IDX)"
+else
+  START_IDX=1
+  END_IDX="$TOTAL_CASES"
+  echo "Found $TOTAL_CASES cases in $INPUT_JSON"
+fi
 
 # CSV header
 if [ ! -f "$RESULT_CSV" ]; then
@@ -74,7 +92,7 @@ read_num() { jq -r "$1 // 0" "$OUTPUT_JSON"; }
 # helper to read bool -> true/false 문자열
 read_bool_str() { jq -r "if $1 == true then \"true\" else \"false\" end" "$OUTPUT_JSON"; }
 
-for (( idx=1; idx<=TOTAL_CASES; idx++ )); do
+for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
   echo "=== Case #$idx / $TOTAL_CASES ==="
 
   # 1) extract case -> tc.json

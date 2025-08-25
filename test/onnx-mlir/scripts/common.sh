@@ -15,7 +15,7 @@ MLIR_DIR="$OUT_DIR/mlir"
 LOGS_DIR="$OUT_DIR/logs"
 REPORTS_DIR="$OUT_DIR/reports"
 
-TC_LIST="$DATA_DIR/tc_list.json"
-REF_DIR="$DATA_DIR/ref"
+OP_LIST="$DATA_DIR/op_list.json"
+TC_LIST="$OUT_DIR/tc_list.json"
 
 mkdir -p "$BUILD_DIR" "$ONNX_DIR" "$MLIR_DIR" "$LOGS_DIR" "$REPORTS_DIR"
