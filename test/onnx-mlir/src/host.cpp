@@ -133,6 +133,8 @@ int main(int argc, const char *argv[]) {
       }
     }
 
+    run = {}; bo_outC = {}; bo_inB = {}; bo_inA = {}; bo_instr = {}; kernel = {}; device = {};
+
     // Print Pass/Fail result of our test
     if (!errors) {
       std::cout << std::endl << "PASS!" << std::endl << std::endl;
