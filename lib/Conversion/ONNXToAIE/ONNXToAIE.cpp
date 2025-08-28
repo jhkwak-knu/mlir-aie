@@ -1156,15 +1156,14 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
         for (size_t kIdx = 0; kIdx < kCountInShimTile; ++kIdx) {
           std::vector<StringRef> metadatas;
           int64_t rhsOffset = rhsBase + (nIdx * nStep) + (kIdx * kStep);
-          uint32_t id = 0;
-
+          
           for (size_t i = 0; i < numCols; ++i) {
             int64_t lhsOffset = lhsBases[i] + (mIdx * mStep) + (kIdx * kStep);
             int64_t resOffset = resBases[i] + (mIdx * resMStep) + (nIdx * resNStep);
-
+            
             size_t shimIdx = placement.findAieTileIdx(i, 0);
             AieTile &tile = placement.aieTiles[shimIdx];
-
+            
             for (auto &commBuf : tile.outCommBufs) {
               auto &buf = tile.allocatedBufs[commBuf.bufIdx];
               auto &arg = buf.name == "lhs" ? arg_lhs : arg_rhs;
@@ -1172,10 +1171,11 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
               auto &stride = buf.name == "lhs" ? staticLhsStride : staticRhsStride;
               auto offset = buf.name == "lhs" ? lhsOffset : rhsOffset;
               std::vector<int64_t> staticOffset = {0, 0, 0, offset};
+              uint32_t id = buf.name == "lhs" ? 0 : 1;
               StringRef metadata = builder.getStringAttr(buf.symbol);
               builder.create<xilinx::AIEX::NpuDmaMemcpyNdOp>(loc, arg, SmallVector<Value>{}, SmallVector<Value>{}, SmallVector<Value>{},
                                                             ArrayRef(staticOffset), ArrayRef(size), ArrayRef(stride), nullptr,
-                                                            metadata, id++, false, 0, 0, 0, 0, 0, 0);
+                                                            metadata, id, false, 0, 0, 0, 0, 0, 0);
             }      
 
             for (auto &commBuf : tile.inCommBufs) {
@@ -1184,6 +1184,7 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
               auto &size = staticResSize;
               auto &stride = staticResStride;
               std::vector<int64_t> staticOffset = {0, 0, 0, resOffset};
+              uint32_t id = 2;
               StringRef metadata = builder.getStringAttr(buf.symbol);
               builder.create<xilinx::AIEX::NpuDmaMemcpyNdOp>(loc, arg, SmallVector<Value>{}, SmallVector<Value>{}, SmallVector<Value>{},
                                                             ArrayRef(staticOffset), ArrayRef(size), ArrayRef(stride), nullptr,
