@@ -172,7 +172,7 @@ def make_tc_cases(op_cases: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     tc_cases: List[Dict[str, Any]] = []
 
     # unit sizes for tiles
-    TM_UNIT, TK_UNIT, TN_UNIT = 16, 16, 4
+    TM_UNIT, TK_UNIT, TN_UNIT = 8, 8, 2
 
     for idx, base in enumerate(op_cases, start=1):
         try:

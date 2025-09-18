@@ -81,10 +81,21 @@ else
   echo "Found $TOTAL_CASES cases in $INPUT_JSON"
 fi
 
-# CSV header
+# CSV header (+upgrade if old header exists)
+NEW_HEADER="case_index,numLevel,TM,TK,TN,MemTM,MemTK,MemTN,M,K,N,numLastSpm,doubleBuffer,status,errors,iters,warmup,avg_us,min_us,max_us"
 if [ ! -f "$RESULT_CSV" ]; then
   mkdir -p "$(dirname "$RESULT_CSV")"
-  echo "case_index,numLevel,TM,TK,TN,MemTM,MemTK,MemTN,M,K,N,numLastSpm,doubleBuffer,status,errors" > "$RESULT_CSV"
+  echo "$NEW_HEADER" > "$RESULT_CSV"
+else
+  CUR_HEADER="$(head -n1 "$RESULT_CSV" || true)"
+  if ! echo "$CUR_HEADER" | grep -q 'avg_us'; then
+    echo "info: upgrading result CSV header (adding timing columns) ..."
+    tmp_csv="$(mktemp)"
+    echo "$NEW_HEADER" > "$tmp_csv"
+    # Append old rows with five additional timing fields defaulted to -1
+    tail -n +2 "$RESULT_CSV" 2>/dev/null | awk -F',' '{print $0",-1,-1,-1,-1,-1"}' >> "$tmp_csv"
+    mv "$tmp_csv" "$RESULT_CSV"
+  fi
 fi
 
 # helper to read numeric (default 0)
@@ -99,7 +110,7 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
   tmp_out="$(mktemp)"
   if ! jq --indent 4 ".cases[$((idx-1))]" "$INPUT_JSON" > "$tmp_out"; then
     echo "warn: failed to extract case #$idx"
-    echo "$idx,0,0,0,0,0,0,0,0,0,0,0,false,EXTRACT_FAIL,-1" >> "$RESULT_CSV"
+    echo "$idx,0,0,0,0,0,0,0,0,0,0,0,false,EXTRACT_FAIL,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
     rm -f "$tmp_out"
     # cleanup then continue
     if [ -x "$CLEAN_SCRIPT" ]; then bash "$CLEAN_SCRIPT" || true; fi
@@ -119,7 +130,7 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
     val="${!v}"
     if ! [[ "$val" =~ ^-?[0-9]+$ ]]; then
       echo "warn: $v not integer (got: $val); marking as PARSE_FAIL"
-      echo "$idx,$numLevel,$TM,$TK,$TN,$MemTM,$MemTK,$MemTN,$M,$K,$N,$numLastSpm,$DB_STR,PARSE_FAIL,-1" >> "$RESULT_CSV"
+      echo "$idx,$numLevel,$TM,$TK,$TN,$MemTM,$MemTK,$MemTN,$M,$K,$N,$numLastSpm,$DB_STR,PARSE_FAIL,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
       [ -x "$CLEAN_SCRIPT" ] && bash "$CLEAN_SCRIPT" || true
       continue 2
     fi
@@ -132,7 +143,7 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
     echo "running: $GEN_SCRIPT $M $K $N"
     if ! "$GEN_SCRIPT" "$M" "$K" "$N"; then
       echo "warn: generator failed"
-      echo "$idx,$numLevel,$TM,$TK,$TN,$MemTM,$MemTK,$MemTN,$M,$K,$N,$numLastSpm,$DB_STR,GEN_FAIL,-1" >> "$RESULT_CSV"
+      echo "$idx,$numLevel,$TM,$TK,$TN,$MemTM,$MemTK,$MemTN,$M,$K,$N,$numLastSpm,$DB_STR,GEN_FAIL,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
       [ -x "$CLEAN_SCRIPT" ] && bash "$CLEAN_SCRIPT" || true
       continue
     fi
@@ -140,13 +151,13 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
     echo "running: bash $GEN_SCRIPT $M $K $N"
     if ! bash "$GEN_SCRIPT" "$M" "$K" "$N"; then
       echo "warn: generator failed"
-      echo "$idx,$numLevel,$TM,$TK,$TN,$MemTM,$MemTK,$MemTN,$M,$K,$N,$numLastSpm,$DB_STR,GEN_FAIL,-1" >> "$RESULT_CSV"
+      echo "$idx,$numLevel,$TM,$TK,$TN,$MemTM,$MemTK,$MemTN,$M,$K,$N,$numLastSpm,$DB_STR,GEN_FAIL,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
       [ -x "$CLEAN_SCRIPT" ] && bash "$CLEAN_SCRIPT" || true
       continue
     fi
   else
     echo "warn: generator script not found: $GEN_SCRIPT"
-    echo "$idx,$numLevel,$TM,$TK,$TN,$MemTM,$MemTK,$MemTN,$M,$K,$N,$numLastSpm,$DB_STR,GEN_MISSING,-1" >> "$RESULT_CSV"
+    echo "$idx,$numLevel,$TM,$TK,$TN,$MemTM,$MemTK,$MemTN,$M,$K,$N,$numLastSpm,$DB_STR,GEN_MISSING,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
     [ -x "$CLEAN_SCRIPT" ] && bash "$CLEAN_SCRIPT" || true
     continue
   fi
@@ -156,27 +167,61 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
   echo "make -C \"$MAKE_DIR\" run CPPDEFS=\"$CPPDEFS\""
   if ! make -C "$MAKE_DIR" run CPPDEFS="$CPPDEFS"; then
     echo "warn: make run failed"
-    echo "$idx,$numLevel,$TM,$TK,$TN,$MemTM,$MemTK,$MemTN,$M,$K,$N,$numLastSpm,$DB_STR,RUN_FAIL,-1" >> "$RESULT_CSV"
+    echo "$idx,$numLevel,$TM,$TK,$TN,$MemTM,$MemTK,$MemTN,$M,$K,$N,$numLastSpm,$DB_STR,RUN_FAIL,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
     [ -x "$CLEAN_SCRIPT" ] && bash "$CLEAN_SCRIPT" || true
     continue
   fi
 
   # 5) parse log.txt
   STATUS="FAIL"; ERRORS=-1
+  ITERS=-1; WARMUP=-1; AVG_US=-1; MIN_US=-1; MAX_US=-1
+
   if [ -f "$LOG_FILE" ]; then
+    # PASS/FAIL & mismatches
     if grep -q 'PASS!' "$LOG_FILE"; then
       STATUS="PASS"; ERRORS=0
     else
       last_mis="$(grep -Eo '[0-9]+ mismatches\.' "$LOG_FILE" | tail -n1 | grep -Eo '^[0-9]+')"
       if [ -n "${last_mis:-}" ]; then ERRORS="$last_mis"; fi
     fi
+
+    # Iterations/Warmup: "Number of iterations: 5 (warmup iterations: 3)"
+    it_line="$(grep -m1 -E '^Number of iterations:' "$LOG_FILE" || true)"
+    if [ -n "$it_line" ]; then
+      ITERS="$(echo "$it_line"  | grep -Eo 'Number of iterations:\s*[0-9]+' | awk '{print $NF}')"
+      # 괄호 내 warmup 추출
+      WARMUP="$(echo "$it_line" | grep -Eo '\(warmup iterations:\s*[0-9]+' | grep -Eo '[0-9]+' || true)"
+      : "${ITERS:=-1}"; : "${WARMUP:=-1}"
+    fi
+
+    # Avg/Min/Max NPU time: "Avg NPU time: 1279.2us."
+    avg_line="$(grep -m1 -E '^Avg NPU time:' "$LOG_FILE" || true)"
+    if [ -n "$avg_line" ]; then
+      AVG_US="$(echo "$avg_line" | sed -E 's/.*Avg NPU time:\s*([0-9]+(\.[0-9]+)?)us.*/\1/')"
+    fi
+    min_line="$(grep -m1 -E '^Min NPU time:' "$LOG_FILE" || true)"
+    if [ -n "$min_line" ]; then
+      MIN_US="$(echo "$min_line" | sed -E 's/.*Min NPU time:\s*([0-9]+(\.[0-9]+)?)us.*/\1/')"
+    fi
+    max_line="$(grep -m1 -E '^Max NPU time:' "$LOG_FILE" || true)"
+    if [ -n "$max_line" ]; then
+      MAX_US="$(echo "$max_line" | sed -E 's/.*Max NPU time:\s*([0-9]+(\.[0-9]+)?)us.*/\1/')"
+    fi
+
+    # 숫자 형태 검증 (미발견 시 -1)
+    for v in AVG_US MIN_US MAX_US; do
+      val="$(eval echo \$$v)"
+      if ! [[ "$val" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        eval $v=-1
+      fi
+    done
   else
     STATUS="NO_LOG"; ERRORS=-1
   fi
 
   # 6) append to CSV
-  echo "$idx,$numLevel,$TM,$TK,$TN,$MemTM,$MemTK,$MemTN,$M,$K,$N,$numLastSpm,$DB_STR,$STATUS,$ERRORS" >> "$RESULT_CSV"
-  echo "Result: case #$idx -> $STATUS (errors=$ERRORS) appended to $RESULT_CSV"
+  echo "$idx,$numLevel,$TM,$TK,$TN,$MemTM,$MemTK,$MemTN,$M,$K,$N,$numLastSpm,$DB_STR,$STATUS,$ERRORS,$ITERS,$WARMUP,$AVG_US,$MIN_US,$MAX_US" >> "$RESULT_CSV"
+  echo "Result: case #$idx -> $STATUS (errors=$ERRORS, avg=${AVG_US}us, min=${MIN_US}us, max=${MAX_US}us) appended to $RESULT_CSV"
 
   # 7) clean before next case
   if [ -x "$CLEAN_SCRIPT" ]; then

@@ -8,6 +8,8 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include <chrono>
+#include <iomanip>
 #include <cstdint>
 #include <fstream>
 #include <iostream>
@@ -96,56 +98,109 @@ int main(int argc, const char *argv[]) {
   bo_inB.sync(XCL_BO_SYNC_BO_TO_DEVICE);
   bo_outC.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
-  // Execute the kernel and wait to finish
-  if (verbosity >= 1)
-    std::cout << "Running Kernel.\n";
-  unsigned int opcode = 3;
-  auto run =
-      kernel(opcode, bo_instr, instr_v.size(), bo_inA, bo_inB, bo_outC);
-  run.wait();
+  // ------------------------------------------------------
+  // Initialize run configs
+  // ------------------------------------------------------
+  int n_iterations = 10;
+  int n_warmup_iterations = 3;
+  unsigned num_iter = n_iterations + n_warmup_iterations;
+  float npu_time_total = 0;
+  float npu_time_min = 99999999;
+  float npu_time_max = 0;
 
-  // Sync device to host memories
-  bo_outC.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+  int errors = 0;
 
-  // Compare out to golden
-  if(verify) {
-    int errors = 0;
-    if (verbosity >= 1) {
-      std::cout << "Verifying results ..." << std::endl;
+  // ------------------------------------------------------
+  // Main run loop
+  // ------------------------------------------------------
+  for (unsigned iter = 0; iter < num_iter; iter++) {
+
+    // Run kernel
+    if (verbosity >= 1)
+      std::cout << "Running Kernel.\n";
+    auto start = std::chrono::high_resolution_clock::now();
+    unsigned int opcode = 3;
+    auto run =
+        kernel(opcode, bo_instr, instr_v.size(), bo_inA, bo_inB, bo_outC);
+    run.wait();
+    auto stop = std::chrono::high_resolution_clock::now();
+
+    // Sync device to host memories
+    bo_outC.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+
+    if (iter < n_warmup_iterations) {
+      /* Warmup iterations do not count towards average runtime. */
+      continue;
     }
-    for (uint32_t i = 0; i < M; i++) {
-      for (uint32_t j = 0; j < N; j++) {
-        int32_t ref = 0;
-        int32_t test = bufOut[(i * N) + j];
 
-        for (uint32_t k = 0; k < K; k++) {
-          ref += bufInA[(i * K) + k] * bufInB[(j * K) + k];
-        }
+    // Compare out to golden
+    if(verify) {
+      if (verbosity >= 1) {
+        std::cout << "Verifying results ..." << std::endl;
+      }
+      for (uint32_t i = 0; i < M; i++) {
+        for (uint32_t j = 0; j < N; j++) {
+          int32_t ref = 0;
+          int32_t test = bufOut[(i * N) + j];
 
-        if (test != ref) {
-          if (verbosity >= 1)
-            std::cout << "Error in output " << test << " != " << ref << std::endl;
-          errors++;
-        } else {
-          if (verbosity >= 1)
-            std::cout << "Correct output " << test << " == " << ref << std::endl;
+          for (uint32_t k = 0; k < K; k++) {
+            ref += bufInA[(i * K) + k] * bufInB[(j * K) + k];
+          }
+
+          if (test != ref) {
+            if (verbosity >= 1)
+              std::cout << "Error in output " << test << " != " << ref << std::endl;
+            errors++;
+          } else {
+            if (verbosity >= 1)
+              std::cout << "Correct output " << test << " == " << ref << std::endl;
+          }
         }
       }
     }
+    // Accumulate run times
+    float npu_time =
+        std::chrono::duration_cast<std::chrono::microseconds>(stop - start)
+            .count();
 
-    run = {}; bo_outC = {}; bo_inB = {}; bo_inA = {}; bo_instr = {}; kernel = {}; device = {};
+    npu_time_total += npu_time;
+    npu_time_min = (npu_time < npu_time_min) ? npu_time : npu_time_min;
+    npu_time_max = (npu_time > npu_time_max) ? npu_time : npu_time_max;
+  }
 
-    // Print Pass/Fail result of our test
-    if (!errors) {
-      std::cout << std::endl << "PASS!" << std::endl << std::endl;
-      return 0;
-    } else {
-      std::cout << std::endl
-                << errors << " mismatches." << std::endl
-                << std::endl;
-      std::cout << std::endl << "fail." << std::endl << std::endl;
-      return 1;
-    }
+  // ------------------------------------------------------
+  // Print verification and timing results
+  // ------------------------------------------------------
+  std::cout << std::endl
+            << "Number of iterations: " << n_iterations
+            << " (warmup iterations: " << n_warmup_iterations << ")"
+            << std::endl;
+
+  std::ios oldState(nullptr);
+  oldState.copyfmt(std::cout);
+
+  std::cout << std::endl
+            << "Avg NPU time: " << std::fixed << std::setprecision(1) << npu_time_total / n_iterations << "us."
+            << std::endl;
+
+  std::cout << std::endl
+            << "Min NPU time: " << std::fixed << std::setprecision(0) << npu_time_min << "us." << std::endl;
+
+  std::cout << std::endl
+            << "Max NPU time: " << std::fixed << std::setprecision(0) << npu_time_max << "us." << std::endl;
+
+  std::cout.copyfmt(oldState);
+
+  // Print Pass/Fail result of our test
+  if (!errors) {
+    std::cout << std::endl << "PASS!" << std::endl << std::endl;
+    return 0;
+  } else {
+    std::cout << std::endl
+              << errors << " mismatches." << std::endl
+              << std::endl;
+    std::cout << std::endl << "fail." << std::endl << std::endl;
+    return 1;
   }
 
   return 0;
