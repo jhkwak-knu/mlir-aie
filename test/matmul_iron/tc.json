@@ -1,0 +1,28 @@
+    {
+      "M": 32,
+      "K": 32,
+      "N": 32,
+      "elemType": "f32",
+      "numLevel": 1,
+      "numLastSpm": 4,
+      "doubleBuffer": false,
+      "levels": [
+        {
+          "label": "DRAM<->CT",
+          "numSpm": 4,
+          "SPm": 4,
+          "SPn": 1,
+          "TPm": 1,
+          "TPk": 1,
+          "TPn": 1,
+          "TM": 8,
+          "TK": 32,
+          "TN": 32,
+          "tpOrder": [
+            0,
+            1,
+            2
+          ]
+        }
+      ]
+    }

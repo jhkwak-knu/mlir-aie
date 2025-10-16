@@ -12,7 +12,7 @@ srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 
 include ${srcdir}/makefile-common
 
-devicename ?= $(if $(filter 1,$(NPU2)),npu2,npu)
+filepath = ${srcdir}/tc.json
 targetname = aie2
 
 in1_size = 16384 # in bytes
@@ -30,29 +30,29 @@ endif
 
 all: build/final.xclbin build/insts.bin
 
-build/scale.o: ${srcdir}/vector_scalar_mul.cc
+build/kernel.o: ${srcdir}/kernel.cc
 	mkdir -p ${@D}
 	xchesscc ${CHESSCC_FLAGS} -c $< -o $@
 
 build/aie.mlir: ${srcdir}/${aie_py_src}
 	mkdir -p ${@D}
-	python3 $< -d ${devicename} -i1s ${in1_size} -i2s ${in2_size} -os ${out_size} > $@
+	python3 $< -p ${filepath} > $@
 
 build/aie_trace.mlir: ${srcdir}/${aie_py_src}
 	mkdir -p ${@D}
-	python3 $< -d ${devicename} -i1s ${in1_size} -i2s ${in2_size} -os ${out_size} -t ${trace_size} > $@
+	python3 $< -p ${filepath} -t ${trace_size} > $@
 
-build/final.xclbin: build/aie.mlir build/scale.o
+build/final.xclbin: build/aie.mlir build/kernel.o
 	mkdir -p ${@D}
 	cd ${@D} && aiecc.py ${AIECC_FLAGS} --xclbin-name=$(@F) $(<:%=../%)
 
-build/final_trace.xclbin: build/aie_trace.mlir build/scale.o
+build/final_trace.xclbin: build/aie_trace.mlir build/kernel.o
 	mkdir -p ${@D}
 	cd ${@D} && aiecc.py ${AIECC_FLAGS} --xclbin-name=$(@F) $(<:%=../%)
 
 host: ${targetname}
 
-${targetname}: ${srcdir}/test.cpp
+${targetname}: ${srcdir}/host.cpp
 	rm -rf _build
 	mkdir -p _build
 	cd _build && cmake ${srcdir} -DTARGET_NAME=${targetname} -DIN1_SIZE=${in1_size} -DIN2_SIZE=${in2_size} -DOUT_SIZE=${out_size}

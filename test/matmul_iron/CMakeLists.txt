@@ -31,7 +31,7 @@ project(${ProjectName})
 
 add_executable(${currentTarget}
     ${CMAKE_CURRENT_SOURCE_DIR}/../../runtime_lib/test_lib/test_utils.cpp
-    test.cpp
+    host.cpp
 )
 
 target_compile_definitions(${currentTarget} PUBLIC
