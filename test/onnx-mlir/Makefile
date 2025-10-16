@@ -79,7 +79,7 @@ run: host all | $(LOGS_DIR)
 	$(BUILD_DIR)/$(TARGET) \
 		-x $(BUILD_DIR)/final.xclbin \
 		-i $(BUILD_DIR)/insts.bin \
-		-k MLIR_AIE -v 1 \
+		-k MLIR_AIE -v 2 \
 		> $(LOGS_DIR)/log.txt
 
 # Convenience: print paths
