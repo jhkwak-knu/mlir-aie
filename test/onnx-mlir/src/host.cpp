@@ -164,9 +164,9 @@ int main(int argc, const char *argv[]) {
   int chunkTPk = (tp.tpOrder[0] == 2) ? tp.TPk : 1;
 
   int chunkASize = ((tp.TM * tp.TK) * tp.SPm) * chunkTPm * chunkTPk;
-  int chunkBSize = ((tp.TN * tp.TK) * tp.SPn) * chunkTPk * chunkTPn;
+  int chunkBSize = ((tp.TN * tp.TK) * tp.SPn) * chunkTPn * chunkTPk;
   int chunkCSize = ((tp.TM * tp.TN) * tp.SPm * tp.SPn) * chunkTPm * chunkTPn;
-  int chunkOutCSize = ((tp.TM * tp.TN) * tp.SPm * tp.SPn) * chunkTPm * chunkTPn;
+  int chunkOutCSize = ((tp.TM * tp.TN + 1) * tp.SPm * tp.SPn) * chunkTPm * chunkTPn;
 
   bool useInC= (tp.TPk > 1) && (tp.tpOrder[0] != 2);
 
@@ -500,63 +500,73 @@ int main(int argc, const char *argv[]) {
         // Sync device to host memories
         bo_outC.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
 
-        for (int i = 0; i < (tp.SPm * tp.SPn); ++i) {
-          std::cout << "OutC[" << i << "]: ";
-          for (int j = 0; j < (tp.TM * tp.TN); ++j) {
-            std::cout << bufOut[(tp.TM * tp.TN) * i + j] << " ";
+        if (verbosity >= 2) {
+          for (int i = 0; i < (tp.SPm * tp.SPn); ++i) {
+            uint32_t pkt_header, pkt_id;
+            std::memcpy(&pkt_header, &bufOut[(tp.TM * tp.TN + 1) * i + 0], sizeof(pkt_header));
+            pkt_id = pkt_header & 0x1F;
+
+            std::cout << "OutC[" << i << "] (packet id = " << pkt_id << "): ";
+            for (int j = 0; j < (tp.TM * tp.TN); ++j) {
+              std::cout << bufOut[(tp.TM * tp.TN + 1) * i + j + 1] << " ";
+            }
+            std::cout << "\n";
           }
-          std::cout << "\n";
         }
 
-        // // store partial sums to matC
-        // for (int i = 0; i < ((tp.SPm * tp.SPn) / 4); ++i) {
-        //   int repeatCount = (reuseTPAxis != 2) ? reuseTP : 1;
-        //   int outerOffset = (repeatCount * 4) * i;
+        // store partial sums to matC
+        for (int i = 0; i < ((tp.SPm * tp.SPn) / 4); ++i) {
+          int repeatCount = (reuseTPAxis != 2) ? reuseTP : 1;
+          int outerOffset = (repeatCount * 4) * i;
 
-        //   for (int j = 0; j < repeatCount; ++j) {
-        //     int innerFactor = (reuseTPAxis != 1) ? 1 : tp.SPm;
-        //     int innerOffset = innerFactor * j;
+          for (int j = 0; j < repeatCount; ++j) {
+            int innerFactor = (reuseTPAxis != 1) ? 1 : tp.SPm;
+            int innerOffset = innerFactor * j;
 
-        //     for (int k = 0; k < 4; ++k) {
-        //       int baseOffset = (reuseTPAxis != 1) ? (repeatCount * k) : ((k / tp.SPm) * tp.SPm * tp.TPn + (k % tp.SPm));
-        //       int idx = baseOffset + innerOffset + outerOffset;
+            for (int k = 0; k < 4; ++k) {
+              int baseOffset = (reuseTPAxis != 1) ? (repeatCount * k) : ((k / tp.SPm) * tp.SPm * tp.TPn + (k % tp.SPm));
+              int idx = baseOffset + innerOffset + outerOffset;
 
-        //       int packetId;
-        //       std::memcpy(&packetId, &bufOut[(tp.TM * tp.TN + 1) * idx], sizeof(packetId));
-        //       int matCOffset = (reuseTPAxis != 1) ? (repeatCount * packetId) : ((packetId / tp.SPm) * tp.SPm * tp.TPn + (packetId % tp.SPm));
-        //       int matCIdx = matCOffset + innerOffset + outerOffset;
+              int packetHeader, packetId;
+              std::memcpy(&packetHeader, &bufOut[(tp.TM * tp.TN + 1) * idx], sizeof(packetHeader));
+              packetId = packetHeader & 0x1F;
+              if (packetId == 0) packetId = 0;
+              else if (packetId == 2) packetId = 1;
+              else if (packetId == 6) packetId = 2;
+              else if (packetId == 14) packetId = 3;
+              int matCOffset = (reuseTPAxis != 1) ? (repeatCount * packetId) : ((packetId / tp.SPm) * tp.SPm * tp.TPn + (packetId % tp.SPm));
+              int matCIdx = matCOffset + innerOffset + outerOffset;
 
-        //       // std::pair<int,int> tilePos = chunkCTileOrder[matCIdx];
+              std::pair<int,int> tilePos = chunkCTileOrder[matCIdx];
 
-        //       const size_t tileElems  = static_cast<size_t>(tp.TM) * tp.TN;
-        //       const size_t blockElems = tileElems + 1;
-        //       const size_t start      = blockElems * static_cast<size_t>(idx) + 1;
-        //       const size_t end        = start + tileElems;
+              const size_t tileElems  = static_cast<size_t>(tp.TM) * tp.TN;
+              const size_t blockElems = tileElems + 1;
+              const size_t start      = blockElems * static_cast<size_t>(idx) + 1;
+              const size_t end        = start + tileElems;
 
-        //       if (verbosity >= 2) {
-        //         std::cout
-        //           << "[k=" << k << "] "
-        //           << "baseOffset=" << baseOffset
-        //           << " idx=" << idx
-        //           << " packetId=" << packetId
-        //           << " matCOffset=" << matCOffset
-        //           << " matCIdx=" << matCIdx
-        //           // << " tilePos=(" << tilePos.first << "," << tilePos.second << ") "
-        //           << "tileElems=" << static_cast<unsigned long long>(tileElems)
-        //           << " blockElems=" << static_cast<unsigned long long>(blockElems)
-        //           << " start=" << static_cast<unsigned long long>(start)
-        //           << " end=" << static_cast<unsigned long long>(end)
-        //           << " innerOffset=" << innerOffset
-        //           << " outerOffset=" << outerOffset
-        //           << "\n";
-        //       }
+              if (verbosity >= 2) {
+                std::cout
+                  << "[k=" << k << "] "
+                  << "baseOffset=" << baseOffset
+                  << " idx=" << idx
+                  << " packetId=" << packetId
+                  << " matCOffset=" << matCOffset
+                  << " matCIdx=" << matCIdx
+                  << " tilePos=(" << tilePos.first << "," << tilePos.second << ") "
+                  << "tileElems=" << static_cast<unsigned long long>(tileElems)
+                  << " blockElems=" << static_cast<unsigned long long>(blockElems)
+                  << " start=" << static_cast<unsigned long long>(start)
+                  << " end=" << static_cast<unsigned long long>(end)
+                  << " innerOffset=" << innerOffset
+                  << " outerOffset=" << outerOffset
+                  << "\n";
+              }
               
-        //       // std::vector<DATATYPE> tileValue(bufOut + start, bufOut + end);
-        //       // std::vector<DATATYPE> tileValue(&bufOut[(tp.TM * tp.TN + 1) * idx + 1], &bufOut[(tp.TM * tp.TN + 1) * (idx + 1)]);
-        //       // write_tile_1d_strict<DATATYPE>(matC, tp.M, tp.N, tp.TM, tp.TN, tilePos.first, tilePos.second, tileValue);
-        //     }
-        //   }
-        // }
+              std::vector<DATATYPE> tileValue(&bufOut[(tp.TM * tp.TN + 1) * idx + 1], &bufOut[(tp.TM * tp.TN + 1) * (idx + 1)]);
+              write_tile_1d_strict<DATATYPE>(matC, tp.M, tp.N, tp.TM, tp.TN, tilePos.first, tilePos.second, tileValue);
+            }
+          }
+        }
       }
     }
 

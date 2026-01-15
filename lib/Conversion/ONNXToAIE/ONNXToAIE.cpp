@@ -574,6 +574,8 @@ optimizeAiePlacement(const TileParam &tileParam) {
   auto elemType = tileParam.elemType;
   // bool doubleBufferEnabled = tileParam.doubleBufferEnabled;
   auto dmaWireBundle = WireBundle::DMA;
+
+  std::array<uint32_t,8> packetIdList = {0, 2, 6, 14, 1, 3, 7, 15};
   
   // Place on physical AIE tiles
   for (uint32_t i = 0; i < numCols; ++i) {
@@ -591,7 +593,7 @@ optimizeAiePlacement(const TileParam &tileParam) {
     if (tile.row == 0) { // Shim tile
       uint32_t lhsBufSize = compTM * compTK;
       uint32_t rhsBufSize = compTK * compTN;
-      uint32_t resBufSize = compTM * compTN;
+      uint32_t resBufSize = compTM * compTN + 1;  // packet header (4B)
 
       AieBuf lhsBuf{.name="lhs", .bufSize=lhsBufSize, .elemType=elemType};
       AieBuf rhsBuf{.name="rhs", .bufSize=rhsBufSize, .elemType=elemType};
@@ -627,8 +629,8 @@ optimizeAiePlacement(const TileParam &tileParam) {
     uint32_t shimIdx = placement.findAieTileIdx(col, 0);
     AieComm inputComm0{.name="input0", .srcIdx=shimIdx, .srcBundle=dmaWireBundle, .srcCh=0, .isPacket=true};
     AieComm inputComm1{.name="input1", .srcIdx=shimIdx, .srcBundle=dmaWireBundle, .srcCh=1, .isPacket=true};
-    uint32_t inputPacketId0 = 0;
-    uint32_t inputPacketId1 = 0;
+    uint32_t inputPacketIdIdx0 = 0;
+    uint32_t inputPacketIdIdx1 = 0;
 
     // LHS packets (input0)
     uint32_t numLhsPacket = std::max<uint32_t>(compTileSPm / numCols, 1u);
@@ -636,7 +638,7 @@ optimizeAiePlacement(const TileParam &tileParam) {
     for (uint32_t i = 0; i < numLhsPacket; ++i) {
       AiePacket packet;
       packet.name = std::string("lhs") + std::to_string(i*numCols + col);
-      packet.packetId = inputPacketId0++;
+      packet.packetId = packetIdList[inputPacketIdIdx0++];
       packet.size = compTM * compTK;
       packet.elemType = elemType;
 
@@ -660,7 +662,7 @@ optimizeAiePlacement(const TileParam &tileParam) {
 
       AiePacket packet;
       packet.name = std::string("rhs") + std::to_string((numCompTilesPerCol*((a*col+b)%numCols))/compTileSPm + i);
-      packet.packetId = inputPacketId1++;
+      packet.packetId = packetIdList[inputPacketIdIdx1++];
       packet.size = compTK * compTN;
       packet.elemType = elemType;
 
@@ -688,11 +690,11 @@ optimizeAiePlacement(const TileParam &tileParam) {
 
       if (tpOrder[0] == 0) { // M-axis
         inputCommPtr = &inputComm0;
-        inputPacketIdPtr = &inputPacketId0;
+        inputPacketIdPtr = &inputPacketIdIdx0;
         dstCh = 0;
       } else if (tpOrder[0] == 1) { // N-axis
         inputCommPtr = &inputComm1;
-        inputPacketIdPtr = &inputPacketId1;
+        inputPacketIdPtr = &inputPacketIdIdx1;
         dstCh = 1;
       } else { // K-axis
         // No need to transfer the partial sum
@@ -710,7 +712,7 @@ optimizeAiePlacement(const TileParam &tileParam) {
 
             AiePacket newPacket;
             newPacket.name = std::string("pres") + std::to_string(count);
-            newPacket.packetId = inputPacketId++;
+            newPacket.packetId = packetIdList[inputPacketId++];
             newPacket.size = compTM * compTN;
             newPacket.elemType = elemType;
             newPacket.dstIdxs.push_back(dstIdx);
@@ -732,7 +734,7 @@ optimizeAiePlacement(const TileParam &tileParam) {
   // 2. Shim tile <- Comp tile (output)
   for (uint32_t col = 0; col < numCols; ++col) {
     uint32_t shimIdx = placement.findAieTileIdx(col, 0);
-    uint32_t outputPacketId = 0;
+    uint32_t outputPacketIdIdx = 0;
 
     std::vector<AieComm> outputComms;
     for (auto &comm : placement.aieComms) {
@@ -746,7 +748,7 @@ optimizeAiePlacement(const TileParam &tileParam) {
               // RES packets (output0)
               AiePacket newPacket;
               newPacket.name = std::string("res") + std::to_string(count);
-              newPacket.packetId = outputPacketId++;
+              newPacket.packetId = packetIdList[outputPacketIdIdx++];
               newPacket.size = compTM * compTN;
               newPacket.elemType = elemType;
               newPacket.dstIdxs.push_back(shimIdx);
@@ -868,7 +870,7 @@ optimizeAiePlacement(const TileParam &tileParam) {
           auto &dstDma = dstTile.dmas[dstDmaIdx];
           AieBufferDescriptor bd{.name=packet.name, .isPacket=true, .packetId=packet.packetId};
           bd.bufIdx = dstTile.findBufIdx(packet.name);
-          bd.bufSize = packet.size;
+          bd.bufSize = (dstTile.row == 0) ? (packet.size + 1) : packet.size;
           bd.bufOffset = 0;
           bd.nextBdIdx = dstDma.bdIdx;
           dstTile.bds.push_back(bd);
@@ -1335,40 +1337,37 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
   // Generate communication paths
   for (auto &comm : placement.aieComms) {
     if (comm.isPacket) {  // packet-switched communication
-      // Generate AIEX BroadcastPacketOp
       auto &srcTile = placement.aieTiles[comm.srcIdx];
+      BoolAttr keep_pkt_header = nullptr;
 
-      auto bpOp = builder.create<xilinx::AIEX::BroadcastPacketOp>(loc, srcTile.value, comm.srcBundle, static_cast<int32_t>(comm.srcCh));
-      {
-        OpBuilder::InsertionGuard g(builder);
-        Region &bpRegion = bpOp.getBodyRegion();
-        Block *bpBlock = builder.createBlock(&bpRegion);
-        builder.setInsertionPointToStart(bpBlock);
+      // Generate AIEX PacketFlowOp
+      if (srcTile.row != 0) {
+        keep_pkt_header = builder.getBoolAttr(true);
+      }
         
-        for (auto &packet : comm.packets) {
-          int8_t bpId = packet.packetId;
+      for (auto &packet : comm.packets) {
+        int8_t pkt_Id = packet.packetId;
 
-          auto bpIdOp = builder.create<xilinx::AIEX::BPIDOp>(loc, bpId);
-          {
-            OpBuilder::InsertionGuard g(builder);
-            Region &bpIdRegion = bpIdOp.getBodyRegion();
-            Block *bpIdBlock = builder.createBlock(&bpIdRegion);
-            builder.setInsertionPointToStart(bpIdBlock);
-  
-            for (uint32_t i = 0; i < packet.dstIdxs.size(); ++i) {
-              auto dstIdx = packet.dstIdxs[i];
-              auto dstBundle = packet.dstBundles[i];
-              auto dstCh = packet.dstChs[i];
-              auto &dstTile = placement.aieTiles[dstIdx];
+        auto flowOp = builder.create<xilinx::AIE::PacketFlowOp>(loc, pkt_Id, keep_pkt_header, nullptr);
+        {
+          OpBuilder::InsertionGuard g(builder);
+          Region &flowRegion = flowOp.getBodyRegion();
+          Block *flowBlock = builder.createBlock(&flowRegion);
+          builder.setInsertionPointToStart(flowBlock);
 
-              builder.create<xilinx::AIEX::BPDestOp>(loc, dstTile.value, dstBundle, static_cast<int32_t>(dstCh));
-            }
+          builder.create<xilinx::AIE::PacketSourceOp>(loc, srcTile.value, comm.srcBundle, static_cast<int32_t>(comm.srcCh));
 
-            builder.create<EndOp>(loc);
+          for (uint32_t i = 0; i < packet.dstIdxs.size(); ++i) {
+            auto dstIdx = packet.dstIdxs[i];
+            auto dstBundle = packet.dstBundles[i];
+            auto dstCh = packet.dstChs[i];
+            auto &dstTile = placement.aieTiles[dstIdx];
+
+            builder.create<xilinx::AIE::PacketDestOp>(loc, dstTile.value, dstBundle, static_cast<int32_t>(dstCh));
           }
-        }
 
-        builder.create<EndOp>(loc);
+          builder.create<EndOp>(loc);
+        }
       }
     } else { // circuit-switched communication
       // TODO: implement (FlowOp)
