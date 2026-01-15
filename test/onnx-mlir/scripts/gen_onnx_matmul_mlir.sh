@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-set -euo pipefail
-
 # Usage: ./gen_onnx_matmul_mlir.sh M K N [OUT=out/mlir/onnx_matmul.mlir]
+
+set -euo pipefail
 
 # resolve dirs and load common paths
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
