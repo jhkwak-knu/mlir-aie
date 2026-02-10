@@ -28,6 +28,8 @@ REPORTS_DIR:= $(OUT_DIR)/reports
 MLIR_SRCS   ?= $(MLIR_DIR)/onnx_matmul.mlir
 KERNEL_SRCS ?= $(SRC_DIR)/kernel.cc
 PASSES      ?= --convert-onnx-to-aie
+# DEBUGS		?= --debug-system-info --debug-tile-param --debug-aie-placement
+DEBUGS		?= 
 
 # Host executable name (CMakeLists.txt uses TARGET_NAME)
 TARGET      ?= onnx_matmul
@@ -53,7 +55,7 @@ $(BUILD_DIR) $(LOGS_DIR) $(MLIR_DIR) $(ONNX_DIR) $(REPORTS_DIR):
 #    Assuming $(MLIR_SRCS) is created by gen_onnx_matmul_mlir.sh beforehand,
 #    run aie-opt and place aie.mlir/host.mlir into $(BUILD_DIR).
 $(BUILD_DIR)/aie.mlir: $(MLIR_SRCS) | $(BUILD_DIR)
-	aie-opt $< ${PASSES} > host.mlir
+	aie-opt $< ${PASSES} ${DEBUGS} > host.mlir
 	# Assume some passes may produce aie.mlir separately
 	mv aie.mlir host.mlir $(BUILD_DIR)
 

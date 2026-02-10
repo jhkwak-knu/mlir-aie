@@ -91,8 +91,7 @@ def write_tc_list(tc_cases: List[Dict[str, Any]], out_json_path: Path) -> None:
 CTILE_MEM_LIMIT = 64 * 1024 - 4 * 1024  # 64KB - 1KB (stack) - 1KB (heap) - 2KB (reserved)
 MEMTILE_MEM_LIMIT = 512 * 1024          # 512KB (unused)
 TM_UNIT, TK_UNIT, TN_UNIT = 1, 1, 1     # unit sizes for tiles
-ELEM_SIZE_MAP = {"f16": 2, "bf16": 2, "f32": 4, "f64": 8, "i8": 1, "i16": 2, "i32": 4, "i64": 8,
-                 "ui8": 1, "ui16": 2, "ui32": 4, "ui64": 8}
+ELEM_SIZE_MAP = {"f16": 2, "bf16": 2, "f32": 4, "i8": 1, "i16": 2, "i32": 4, "ui8": 1, "ui16": 2, "ui32": 4}
 
 def _est_ws_bytes(TM: int, TK: int, TN: int, elem_bytes: int) -> int:
     """
@@ -205,7 +204,7 @@ def make_tc_cases(op_cases: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]],
                     log_lines.append(
                         f"[CASE#{idx}] MKN=({M},{K},{N}) elemType={elem_type} numLastSpm={numLastSpm} SP=(m={SPm},n={SPn}) "
                         f"CTblock(M0,K0,N0)=({M0},{K0},{N0}) ct_limit={ct_limit}B ws_block={ws_bytes}B "
-                        f"TPtotal_init={TPtotal_init}"
+                        f"TPtotal_init={TPtotal_init} TPtotal_max={TPtotal_max}"
                     )
 
                     for TPtotal in range(TPtotal_init, TPtotal_max + 1):
@@ -245,11 +244,13 @@ def make_tc_cases(op_cases: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]],
 
                             # Selection key: minimize extra_cost; tie → larger winner_score;
                             # then winner priority M>N>K; then smaller TP sum for compactness.
-                            active_cnt = (1 if TPm > 1 else 0) + (1 if TPk > 1 else 0) + (1 if TPn > 1 else 0)
-                            if active_cnt == 1:
-                                key = (extra_cost, -tie_rank[winner], (TPm + TPk + TPn))
-                            else:
-                                key = (extra_cost, -winner_score, -tie_rank[winner], (TPm + TPk + TPn))
+                            key = (extra_cost, -winner_score, -tie_rank[winner], (TPm + TPk + TPn))
+                            
+                            # active_cnt = (1 if TPm > 1 else 0) + (1 if TPk > 1 else 0) + (1 if TPn > 1 else 0)
+                            # if active_cnt == 1:
+                            #     key = (extra_cost, -tie_rank[winner], (TPm + TPk + TPn))
+                            # else:
+                            #     key = (extra_cost, -winner_score, -tie_rank[winner], (TPm + TPk + TPn))
 
                             # ---- LOG per valid candidate ----
                             log_lines.append(

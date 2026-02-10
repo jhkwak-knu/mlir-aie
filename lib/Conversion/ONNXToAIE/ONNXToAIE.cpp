@@ -14,6 +14,7 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/ADT/Twine.h"
+#include "llvm/ADT/MapVector.h"
 
 #include <string>
 #include <vector>
@@ -466,6 +467,14 @@ struct AieTile {
     return col == o.col && row == o.row;
   }
 
+  AieBuf& getAieBuf(uint32_t idx) { return bufs[idx]; }
+  AieBufferDescriptor& getAieBd(uint32_t idx) { return bds[idx]; }
+  AieDma& getAieDma(uint32_t idx) { return dmas[idx]; }
+
+  const AieBuf& getAieBuf(uint32_t idx) const { return bufs[idx]; }
+  const AieBufferDescriptor& getAieBd(uint32_t idx) const { return bds[idx]; }
+  const AieDma& getAieDma(uint32_t idx) const { return dmas[idx]; }
+
   uint32_t findBufIdx(std::string name) const {
     const size_t pos = name.find_first_of("0123456789");
     const std::string base = name.substr(0, pos);
@@ -522,6 +531,12 @@ struct AieComm {
   std::vector<AieCircuit> circuits;
 };
 
+struct AieNpuWait {
+  uint32_t col;
+  uint32_t row;
+  uint32_t bufIdx;
+};
+
 struct AieNpuMemcpyNd {
   std::string name;
   uint32_t id;
@@ -530,7 +545,7 @@ struct AieNpuMemcpyNd {
   uint32_t packetType;
   uint32_t packetId;
   bool issueToken;
-  bool doWait;
+  std::vector<AieNpuWait> waitBufs;
   std::array<int64_t,4> staticOffset;
   std::array<int64_t,4> staticSize;
   std::array<int64_t,4> staticStride;
@@ -543,7 +558,11 @@ struct AiePlacement {
 
   AieTile& getAieTile(uint32_t idx) { return aieTiles[idx]; }
   AieComm& getAieComm(uint32_t idx) { return aieComms[idx]; }
-  uint32_t findAieTileIdx(uint32_t col, uint32_t row) const {
+
+  const AieTile& getAieTile(uint32_t idx) const { return aieTiles[idx]; }
+  const AieComm& getAieComm(uint32_t idx) const { return aieComms[idx]; }
+
+uint32_t findAieTileIdx(uint32_t col, uint32_t row) const {
     for (uint32_t idx = 0; idx < aieTiles.size(); ++idx) {
       const auto &tile = aieTiles[idx];
       if (tile.col == col && tile.row == row)
@@ -552,6 +571,14 @@ struct AiePlacement {
     llvm_unreachable("Tile not found");
   };
 };
+
+static inline uint32_t getElemBytes(mlir::Type t) {
+  if (auto shaped = llvm::dyn_cast<mlir::ShapedType>(t))
+    t = shaped.getElementType(); 
+
+  unsigned bits = t.getIntOrFloatBitWidth(); 
+  return bits / 8;
+}
 
 AiePlacement
 optimizeAiePlacement(const TileParam &tileParam) {
@@ -565,7 +592,7 @@ optimizeAiePlacement(const TileParam &tileParam) {
   auto &compTileLevel = tileParam.levels[0];
   auto [compTM, compTK, compTN] = compTileLevel.tileSize;
   uint32_t compTileSPm = compTileLevel.SPm;
-  uint32_t compTileSPn = compTileLevel.SPn;
+  // uint32_t compTileSPn = compTileLevel.SPn;
   uint32_t compTileTPm = compTileLevel.TPm;
   uint32_t compTileTPk = compTileLevel.TPk;
   uint32_t compTileTPn = compTileLevel.TPn;
@@ -574,8 +601,6 @@ optimizeAiePlacement(const TileParam &tileParam) {
   auto elemType = tileParam.elemType;
   // bool doubleBufferEnabled = tileParam.doubleBufferEnabled;
   auto dmaWireBundle = WireBundle::DMA;
-
-  std::array<uint32_t,8> packetIdList = {0, 2, 6, 14, 1, 3, 7, 15};
   
   // Place on physical AIE tiles
   for (uint32_t i = 0; i < numCols; ++i) {
@@ -593,7 +618,7 @@ optimizeAiePlacement(const TileParam &tileParam) {
     if (tile.row == 0) { // Shim tile
       uint32_t lhsBufSize = compTM * compTK;
       uint32_t rhsBufSize = compTK * compTN;
-      uint32_t resBufSize = compTM * compTN + 1;  // packet header (4B)
+      uint32_t resBufSize = compTM * compTN + (4 / getElemBytes(elemType));  // packet header (4B)
 
       AieBuf lhsBuf{.name="lhs", .bufSize=lhsBufSize, .elemType=elemType};
       AieBuf rhsBuf{.name="rhs", .bufSize=rhsBufSize, .elemType=elemType};
@@ -626,167 +651,167 @@ optimizeAiePlacement(const TileParam &tileParam) {
   // Configure AIE communication paths
   // 1. Shim tile -> Comp tile (input)
   for (uint32_t col = 0; col < numCols; ++col) {
+    // Generate input (LHS/RHS) communications for each Shim tile
     uint32_t shimIdx = placement.findAieTileIdx(col, 0);
-    AieComm inputComm0{.name="input0", .srcIdx=shimIdx, .srcBundle=dmaWireBundle, .srcCh=0, .isPacket=true};
-    AieComm inputComm1{.name="input1", .srcIdx=shimIdx, .srcBundle=dmaWireBundle, .srcCh=1, .isPacket=true};
-    uint32_t inputPacketIdIdx0 = 0;
-    uint32_t inputPacketIdIdx1 = 0;
+    AieComm lhsComm{.name="lhs", .srcIdx=shimIdx, .srcBundle=dmaWireBundle, .srcCh=0, .isPacket=true};
+    AieComm rhsComm{.name="rhs", .srcIdx=shimIdx, .srcBundle=dmaWireBundle, .srcCh=1, .isPacket=true};
+    uint32_t lhsPacketCnt = 0;
+    uint32_t rhsPacketCnt = 0;
 
-    // LHS packets (input0)
-    uint32_t numLhsPacket = std::max<uint32_t>(compTileSPm / numCols, 1u);
-    uint32_t numLhsTarget = numCompTilesPerCol / numLhsPacket;
-    for (uint32_t i = 0; i < numLhsPacket; ++i) {
-      AiePacket packet;
-      packet.name = std::string("lhs") + std::to_string(i*numCols + col);
-      packet.packetId = packetIdList[inputPacketIdIdx0++];
-      packet.size = compTM * compTK;
-      packet.elemType = elemType;
+    // Find the input (LHS/RHS) packets required by the compute tiles in this column
+    llvm::MapVector<uint32_t, AiePacket> lhsPackets; 
+    llvm::MapVector<uint32_t, AiePacket> rhsPackets;
+    
+    for (uint32_t i = 0; i < numCompTilesPerCol; ++i) {
+      uint32_t l_idx = numCompTilesPerCol * col + i;
+      uint32_t m_idx = l_idx % compTileSPm;
+      uint32_t n_idx = l_idx / compTileSPm;
 
-      for (uint32_t j = 0; j < numLhsTarget; ++j) {
-        uint32_t row = 5 - ((j * numLhsPacket) + i);
-        uint32_t compIdx = placement.findAieTileIdx(col, row);
-        packet.dstIdxs.push_back(compIdx);
-        packet.dstBundles.push_back(dmaWireBundle);
-        packet.dstChs.push_back(0);
+      uint32_t compIdx = placement.findAieTileIdx(col, 5 - i);
+
+      { // LHS packets
+        auto it = lhsPackets.find(m_idx);
+        if (it == lhsPackets.end()) {
+          AiePacket pkt;
+          pkt.name     = std::string("lhs") + std::to_string(m_idx);
+          pkt.packetId = (1u << lhsPacketCnt++);
+          pkt.size     = compTM * compTK;
+          pkt.elemType = elemType;
+
+          pkt.dstIdxs.push_back(compIdx);
+          pkt.dstBundles.push_back(dmaWireBundle);
+          pkt.dstChs.push_back(0);
+
+          lhsPackets.insert({m_idx, std::move(pkt)});
+        } else {
+          it->second.dstIdxs.push_back(compIdx);
+          it->second.dstBundles.push_back(dmaWireBundle);
+          it->second.dstChs.push_back(0);
+        }
       }
 
-      inputComm0.packets.push_back(packet);
-    }
+      { // RHS packets
+        auto it = rhsPackets.find(n_idx);
+        if (it == rhsPackets.end()) {
+          AiePacket pkt;
+          pkt.name     = std::string("rhs") + std::to_string(n_idx);
+          pkt.packetId = (1u << rhsPacketCnt++);
+          pkt.size     = compTK * compTN;
+          pkt.elemType = elemType;
 
-    // RHS packets (input1)
-    uint32_t numRhsPacket = std::max<uint32_t>(compTileSPn / numCols, 1u);
-    uint32_t numRhsTarget = numCompTilesPerCol / numRhsPacket;
-    for (uint32_t i = 0; i < numRhsPacket; ++i) {
-      uint32_t a = std::max<uint32_t>(numCols / numCompTilesPerCol, 1u);
-      uint32_t b = col / numCompTilesPerCol;
+          pkt.dstIdxs.push_back(compIdx);
+          pkt.dstBundles.push_back(dmaWireBundle);
+          pkt.dstChs.push_back(1);
 
-      AiePacket packet;
-      packet.name = std::string("rhs") + std::to_string((numCompTilesPerCol*((a*col+b)%numCols))/compTileSPm + i);
-      packet.packetId = packetIdList[inputPacketIdIdx1++];
-      packet.size = compTK * compTN;
-      packet.elemType = elemType;
-
-      for (uint32_t j = 0; j < numRhsTarget; ++j) {
-        uint32_t colOffset = numCompTilesPerCol * (col / numCompTilesPerCol);
-        uint32_t localCol = col % numCompTilesPerCol;
-        uint32_t localIdx = (numCompTilesPerCol * localCol) + (i * numRhsTarget) + j;
-        uint32_t localnumCols = ((numCols - 1) % numCompTilesPerCol) + 1;
-        uint32_t compCol = colOffset + (localIdx % localnumCols);
-        uint32_t compRow = 5 - (localIdx / localnumCols);
-        uint32_t compIdx = placement.findAieTileIdx(compCol, compRow);
-        packet.dstIdxs.push_back(compIdx);
-        packet.dstBundles.push_back(dmaWireBundle);
-        packet.dstChs.push_back(1);
+          rhsPackets.insert({n_idx, std::move(pkt)});
+        } else {
+          it->second.dstIdxs.push_back(compIdx);
+          it->second.dstBundles.push_back(dmaWireBundle);
+          it->second.dstChs.push_back(1);
+        }
       }
-
-      inputComm1.packets.push_back(packet);
     }
 
-    // RES packets (input0 or input1 only when a partial sum needs to be transferred)
+    // Register LHS packets to the LHS communication
+    for (auto &kv : lhsPackets) {
+      lhsComm.packets.push_back(std::move(kv.second));
+    }
+
+    // Register RHS packets to the RHS communication
+    for (auto &kv : rhsPackets) {
+      rhsComm.packets.push_back(std::move(kv.second));
+    }
+
+    // Check the need for PRES packet transmission (only when a partial sum needs to be transferred)
     if (compTileTPk > 1) {
-      AieComm *inputCommPtr = nullptr;
-      uint32_t *inputPacketIdPtr = nullptr;
+      AieComm *presCommPtr = nullptr;
       uint32_t dstCh = 0;
 
       if (tpOrder[0] == 0) { // M-axis
-        inputCommPtr = &inputComm0;
-        inputPacketIdPtr = &inputPacketIdIdx0;
+        presCommPtr = &lhsComm;
         dstCh = 0;
       } else if (tpOrder[0] == 1) { // N-axis
-        inputCommPtr = &inputComm1;
-        inputPacketIdPtr = &inputPacketIdIdx1;
+        presCommPtr = &rhsComm;
         dstCh = 1;
       } else { // K-axis
         // No need to transfer the partial sum
       }
       
-      if (inputCommPtr) {
-        auto &inputComm = *inputCommPtr;
-        auto &inputPacketId = *inputPacketIdPtr;
-        
-        std::vector<AiePacket> newPackets;
-        for (auto &packet : inputComm.packets) {
-          for (auto dstIdx : packet.dstIdxs) {
-            auto &dstTile = placement.aieTiles[dstIdx];
-            uint32_t count = (5 - dstTile.row)*numCols + dstTile.col;
+      // Register PRES packets to the PRES (LHS or RHS) communication
+      if (presCommPtr) {
+        auto &presComm = *presCommPtr;
+        uint32_t presPacketCnt = 0;
 
-            AiePacket newPacket;
-            newPacket.name = std::string("pres") + std::to_string(count);
-            newPacket.packetId = packetIdList[inputPacketId++];
-            newPacket.size = compTM * compTN;
-            newPacket.elemType = elemType;
-            newPacket.dstIdxs.push_back(dstIdx);
-            newPacket.dstBundles.push_back(dmaWireBundle);
-            newPacket.dstChs.push_back(dstCh);
+        for (uint32_t i = 0; i < numCompTilesPerCol; ++i) {
+          uint32_t l_idx = numCompTilesPerCol * col + i;
+          uint32_t compIdx = placement.findAieTileIdx(col, 5 - i);
 
-            newPackets.push_back(newPacket);
-          }
+          AiePacket pkt;
+          pkt.name = std::string("pres") + std::to_string(l_idx);
+          pkt.packetId = (1u << presPacketCnt++) + 16;
+          pkt.size = compTM * compTN;
+          pkt.elemType = elemType;
+
+          pkt.dstIdxs.push_back(compIdx);
+          pkt.dstBundles.push_back(dmaWireBundle);
+          pkt.dstChs.push_back(dstCh);
+
+          presComm.packets.push_back(pkt);
         }
-
-        inputComm.packets.insert(inputComm.packets.begin(), newPackets.begin(), newPackets.end());
       }
     }
 
-    placement.aieComms.push_back(inputComm0);
-    placement.aieComms.push_back(inputComm1);
+    placement.aieComms.push_back(lhsComm);
+    placement.aieComms.push_back(rhsComm);
   }
 
   // 2. Shim tile <- Comp tile (output)
   for (uint32_t col = 0; col < numCols; ++col) {
     uint32_t shimIdx = placement.findAieTileIdx(col, 0);
-    uint32_t outputPacketIdIdx = 0;
+    uint32_t resPacketCnt = 0;
 
-    std::vector<AieComm> outputComms;
-    for (auto &comm : placement.aieComms) {
-      if (shimIdx == comm.srcIdx) {
-        for (auto &packet : comm.packets) {
-          if (packet.name.compare(0, 3, "rhs") == 0) {
-            for (auto &dstIdx : packet.dstIdxs) {
-              auto &dstTile = placement.aieTiles[dstIdx];
-              uint32_t count = (5 - dstTile.row)*numCols + dstTile.col;
+    // Generate and register RES communications for each Shim tile
+    for (uint32_t i = 0; i < numCompTilesPerCol; ++i) {
+      uint32_t l_idx = numCompTilesPerCol * col + i;
+      uint32_t compIdx = placement.findAieTileIdx(col, 5 - i);
 
-              // RES packets (output0)
-              AiePacket newPacket;
-              newPacket.name = std::string("res") + std::to_string(count);
-              newPacket.packetId = packetIdList[outputPacketIdIdx++];
-              newPacket.size = compTM * compTN;
-              newPacket.elemType = elemType;
-              newPacket.dstIdxs.push_back(shimIdx);
-              newPacket.dstBundles.push_back(dmaWireBundle);
-              newPacket.dstChs.push_back(0);
+      AiePacket pkt;
+      pkt.name = std::string("res") + std::to_string(l_idx);
+      pkt.packetId = (1u << resPacketCnt++);
+      pkt.size = compTM * compTN;
+      pkt.elemType = elemType;
 
-              AieComm outputComm{.name="output", .srcIdx=dstIdx, .srcBundle=dmaWireBundle, .srcCh=0, .isPacket=true};
-              outputComm.packets.push_back(newPacket);
+      pkt.dstIdxs.push_back(shimIdx);
+      pkt.dstBundles.push_back(dmaWireBundle);
+      pkt.dstChs.push_back(0);
 
-              outputComms.push_back(outputComm);
-            }
-          }
-        }
-      }
+      AieComm resComm{.name="res", .srcIdx=compIdx, .srcBundle=dmaWireBundle, .srcCh=0, .isPacket=true};
+      resComm.packets.push_back(pkt);
+
+      placement.aieComms.push_back(resComm);
     }
-
-    placement.aieComms.insert(placement.aieComms.end(), outputComms.begin(), outputComms.end());
   }
 
   // Configure AIE DMAs, BDs for each tile
-  // 1. MM2S
+  // 1. MM2S (Send)
   for (auto &comm : placement.aieComms) {
-    auto &srcTile = placement.aieTiles[comm.srcIdx];
+    auto &srcTile = placement.getAieTile(comm.srcIdx);
     auto [hasSrcDma, srcDmaIdx] = srcTile.findDmaIdx(DMAChannelDir::MM2S, comm.srcCh);
     bool hasLastBd;
     uint32_t lastBdIdx;
     
+    // Configure DMAs
     if (hasSrcDma) { // DMA configuration already exists
-      auto &srcDma = srcTile.dmas[srcDmaIdx];
+      auto &srcDma = srcTile.getAieDma(srcDmaIdx);
       uint32_t firstBdIdx, curBdIdx, nextBdIdx;
 
       firstBdIdx = srcDma.bdIdx;
       curBdIdx = firstBdIdx;
-      nextBdIdx = srcTile.bds[curBdIdx].nextBdIdx;
+      nextBdIdx = srcTile.getAieBd(curBdIdx).nextBdIdx;
 
       while (nextBdIdx != firstBdIdx) {
         curBdIdx = nextBdIdx;
-        nextBdIdx = srcTile.bds[curBdIdx].nextBdIdx;
+        nextBdIdx = srcTile.getAieBd(curBdIdx).nextBdIdx;
       }
 
       hasLastBd = true;
@@ -799,9 +824,10 @@ optimizeAiePlacement(const TileParam &tileParam) {
       hasLastBd = false;
     }
 
+    // Configure BDs
     if (comm.isPacket) { // packet-switched communication
       for (auto &packet : comm.packets) {
-        auto &srcDma = srcTile.dmas[srcDmaIdx];
+        auto &srcDma = srcTile.getAieDma(srcDmaIdx);
 
         AieBufferDescriptor bd{.name=packet.name, .isPacket=true, .packetId=packet.packetId};
         bd.bufIdx = srcTile.findBufIdx(packet.name);
@@ -811,16 +837,17 @@ optimizeAiePlacement(const TileParam &tileParam) {
         srcTile.bds.push_back(bd);
 
         if (hasLastBd) {
-          auto &lastBd = srcTile.bds[lastBdIdx];
+          auto &lastBd = srcTile.getAieBd(lastBdIdx);
           uint32_t next = srcTile.bds.size() - 1;
 
           lastBd.nextBdIdx = next;
           lastBdIdx = next;
         } else {
           uint32_t next = srcTile.bds.size() - 1;
+          auto &newBd = srcTile.getAieBd(next);
           
           srcDma.bdIdx = next;
-          srcTile.bds[next].nextBdIdx = next;
+          newBd.nextBdIdx = next;
 
           hasLastBd = true;
           lastBdIdx = next;
@@ -831,7 +858,7 @@ optimizeAiePlacement(const TileParam &tileParam) {
     }
   }
 
-  // 2. S2MM
+  // 2. S2MM (Receive)
   for (auto &comm : placement.aieComms) {
     if (comm.isPacket) { // packet-switched communication
       for (auto &packet : comm.packets) {
@@ -839,22 +866,22 @@ optimizeAiePlacement(const TileParam &tileParam) {
           uint32_t dstIdx = packet.dstIdxs[i];
           uint32_t dstCh = packet.dstChs[i];
 
-          auto &dstTile = placement.aieTiles[dstIdx];
+          auto &dstTile = placement.getAieTile(dstIdx);
           auto [hasDstDma, dstDmaIdx] = dstTile.findDmaIdx(DMAChannelDir::S2MM, dstCh);
           bool hasLastBd;
           uint32_t lastBdIdx;
           
           if (hasDstDma) { // DMA configuration already exists
-            auto &dstDma = dstTile.dmas[dstDmaIdx];
+            auto &dstDma = dstTile.getAieDma(dstDmaIdx);
             uint32_t firstBdIdx, curBdIdx, nextBdIdx;
 
             firstBdIdx = dstDma.bdIdx;
             curBdIdx = firstBdIdx;
-            nextBdIdx = dstTile.bds[curBdIdx].nextBdIdx;
+            nextBdIdx = dstTile.getAieBd(curBdIdx).nextBdIdx;
 
             while (nextBdIdx != firstBdIdx) {
               curBdIdx = nextBdIdx;
-              nextBdIdx = dstTile.bds[curBdIdx].nextBdIdx;
+              nextBdIdx = dstTile.getAieBd(curBdIdx).nextBdIdx;
             }
 
             hasLastBd = true;
@@ -867,25 +894,26 @@ optimizeAiePlacement(const TileParam &tileParam) {
             hasLastBd = false;
           }
 
-          auto &dstDma = dstTile.dmas[dstDmaIdx];
+          auto &dstDma = dstTile.getAieDma(dstDmaIdx);
           AieBufferDescriptor bd{.name=packet.name, .isPacket=true, .packetId=packet.packetId};
           bd.bufIdx = dstTile.findBufIdx(packet.name);
-          bd.bufSize = (dstTile.row == 0) ? (packet.size + 1) : packet.size;
+          bd.bufSize = (dstTile.row == 0) ? (packet.size + (4 / getElemBytes(elemType))) : packet.size;
           bd.bufOffset = 0;
           bd.nextBdIdx = dstDma.bdIdx;
           dstTile.bds.push_back(bd);
 
           if (hasLastBd) {
-            auto &lastBd = dstTile.bds[lastBdIdx];
+            auto &lastBd = dstTile.getAieBd(lastBdIdx);
             uint32_t next = dstTile.bds.size() - 1;
 
             lastBd.nextBdIdx = next;
             lastBdIdx = next;
           } else {
             uint32_t next = dstTile.bds.size() - 1;
-            
+            auto &newBd = dstTile.getAieBd(next);
+
             dstDma.bdIdx = next;
-            dstTile.bds[next].nextBdIdx = next;
+            newBd.nextBdIdx = next;
 
             hasLastBd = true;
             lastBdIdx = next;
@@ -914,41 +942,41 @@ optimizeAiePlacement(const TileParam &tileParam) {
           uint32_t curBdIdx = firstBdIdx;
           
           do {
-            auto &bd = tile.bds[curBdIdx];
+            auto &bd = tile.getAieBd(curBdIdx);
             std::array<int64_t,4> defaultSize = {1, 1, 1, static_cast<int64_t>(bd.bufSize)};
             std::array<int64_t,4> defaultStride = {0, 0, 0, 1};
             
             if (bd.name.compare(0, 3, "lhs") == 0) {
               uint32_t idx = static_cast<uint32_t>(std::strtoul(bd.name.c_str() + 3, nullptr, 10));
-              uint32_t off = (tpOrder[0] == 0) ? (compTM * compTK * compTileTPm) :
-                              ((tpOrder[0] == 2) ? (compTM * compTK * compTileTPk) : (compTM * compTK));
+              uint32_t off = compTM * compTK;
 
               std::string name = std::string("lhs") + std::to_string(tile.col) + std::to_string(tile.row);
               std::array<int64_t,4> offset = {0, 0, 0, static_cast<int64_t>(off * idx)};
               AieNpuMemcpyNd lhsTx{.name=name, .id=0, .bufIdx=bd.bufIdx, .isPacket=bd.isPacket, .packetType=0, .packetId=bd.packetId,
-                                    .issueToken=true, .doWait=true, .staticOffset=offset, .staticSize=defaultSize, .staticStride=defaultStride};
+                                    .issueToken=true, .waitBufs={AieNpuWait{tile.col, tile.row, bd.bufIdx}},
+                                    .staticOffset=offset, .staticSize=defaultSize, .staticStride=defaultStride};
 
               lhsTxSchedule.push_back(lhsTx);
             } else if (bd.name.compare(0, 3, "rhs") == 0) {
               uint32_t idx = static_cast<uint32_t>(std::strtoul(bd.name.c_str() + 3, nullptr, 10));
-              uint32_t off = (tpOrder[0] == 1) ? (compTK * compTN * compTileTPn) :
-                              ((tpOrder[0] == 2) ? (compTK * compTN * compTileTPk) : (compTK * compTN));
+              uint32_t off = compTK * compTN;
 
               std::string name = std::string("rhs") + std::to_string(tile.col) + std::to_string(tile.row);
               std::array<int64_t,4> offset = {0, 0, 0, static_cast<int64_t>(off * idx)};
               AieNpuMemcpyNd rhsTx{.name=name, .id=1, .bufIdx=bd.bufIdx, .isPacket=bd.isPacket, .packetType=0, .packetId=bd.packetId,
-                                    .issueToken=true, .doWait=true, .staticOffset=offset, .staticSize=defaultSize, .staticStride=defaultStride};
+                                    .issueToken=true, .waitBufs={AieNpuWait{tile.col, tile.row, bd.bufIdx}},
+                                    .staticOffset=offset, .staticSize=defaultSize, .staticStride=defaultStride};
 
               rhsTxSchedule.push_back(rhsTx);
             } else { // tile.bufs[bd.bufIdx].name == "pres"
               uint32_t idx = static_cast<uint32_t>(std::strtoul(bd.name.c_str() + 4, nullptr, 10));
-              uint32_t off = (tpOrder[0] == 0) ? (compTM * compTN * compTileTPm) :
-                              ((tpOrder[0] == 1) ? (compTM * compTN * compTileTPn) : (compTM * compTN));
+              uint32_t off = compTM * compTN;
 
               std::string name = std::string("pres") + std::to_string(tile.col) + std::to_string(tile.row);
               std::array<int64_t,4> offset = {0, 0, 0, static_cast<int64_t>(off * idx)};
               AieNpuMemcpyNd presTx{.name=name, .id=2, .bufIdx=bd.bufIdx, .isPacket=bd.isPacket, .packetType=0, .packetId=bd.packetId,
-                                    .issueToken=true, .doWait=true, .staticOffset=offset, .staticSize=defaultSize, .staticStride=defaultStride};
+                                    .issueToken=true, .waitBufs={AieNpuWait{tile.col, tile.row, bd.bufIdx}},
+                                    .staticOffset=offset, .staticSize=defaultSize, .staticStride=defaultStride};
 
               presTxSchedule.push_back(presTx);
             }
@@ -960,19 +988,20 @@ optimizeAiePlacement(const TileParam &tileParam) {
           uint32_t curBdIdx = firstBdIdx;
           
           do {
-            auto &bd = tile.bds[curBdIdx];
+            auto &bd = tile.getAieBd(curBdIdx);
             uint32_t idx = static_cast<uint32_t>(std::strtoul(bd.name.c_str() + 3, nullptr, 10));
-            uint32_t off = (tpOrder[0] == 0) ? ((compTM * compTN) * compTileTPm) :
-                            ((tpOrder[0] == 1) ? ((compTM * compTN) * compTileTPn) : (compTM * compTN));
+            uint32_t off = compTM * compTN + (4 / getElemBytes(elemType));
             
             std::string name = std::string("res") + std::to_string(tile.col) + std::to_string(tile.row);
             std::array<int64_t,4> offset = {0, 0, 0, static_cast<int64_t>(off * idx)};
             std::array<int64_t,4> size = {1, 1, 1, static_cast<int64_t>(bd.bufSize)};
             std::array<int64_t,4> stride = {0, 0, 0, 1};
             AieNpuMemcpyNd resRx{.name=name, .id=3, .bufIdx=bd.bufIdx, .isPacket=bd.isPacket, .packetType=0, .packetId=bd.packetId,
-                                    .issueToken=true, .doWait=true, .staticOffset=offset, .staticSize=size, .staticStride=stride};
+                                    .issueToken=true, .waitBufs={AieNpuWait{tile.col, tile.row, bd.bufIdx}},
+                                    .staticOffset=offset, .staticSize=size, .staticStride=stride};
 
-            resRxSchedule.insert(resRxSchedule.begin(), resRx);
+            // resRxSchedule.insert(resRxSchedule.begin(), resRx);
+            resRxSchedule.push_back(resRx);
 
             curBdIdx = bd.nextBdIdx;
           } while (curBdIdx != firstBdIdx);
@@ -993,17 +1022,26 @@ optimizeAiePlacement(const TileParam &tileParam) {
 
     for (size_t i = 0; i < n; ++i) {
       if (moved[i]) continue;
+
       std::vector<size_t> group{ i };
       moved[i] = 1;
       for (size_t j = i + 1; j < n; ++j)
         if (!moved[j] && sameData(v[i], v[j])) { group.push_back(j); moved[j] = 1; }
 
+      std::vector<AieNpuWait> mergedWait;
       for (size_t k = 0; k < group.size(); ++k) {
         auto item = v[group[k]];
-        if (k + 1 < group.size()) item.doWait = false;
+        mergedWait.insert(mergedWait.end(), item.waitBufs.begin(), item.waitBufs.end());
+        item.waitBufs.clear();
+
+        if (k == (group.size() - 1)) {
+          item.waitBufs = mergedWait;
+        }
+
         out.push_back(std::move(item));
       }
     }
+
     v.swap(out);
   };
 
@@ -1012,64 +1050,78 @@ optimizeAiePlacement(const TileParam &tileParam) {
   syncChannelParallelSameData(presTxSchedule);
   syncChannelParallelSameData(resRxSchedule);
 
-  placement.aieSchedule.insert(placement.aieSchedule.end(), presTxSchedule.begin(), presTxSchedule.end());
-  placement.aieSchedule.insert(placement.aieSchedule.end(), lhsTxSchedule.begin(), lhsTxSchedule.end());
-  placement.aieSchedule.insert(placement.aieSchedule.end(), rhsTxSchedule.begin(), rhsTxSchedule.end());
+  const uint32_t lhsTxWaitCnt  = static_cast<uint32_t>(std::count_if(
+      lhsTxSchedule.begin(), lhsTxSchedule.end(),
+      [](const AieNpuMemcpyNd &s) { return !s.waitBufs.empty(); }));
+
+  const uint32_t rhsTxWaitCnt  = static_cast<uint32_t>(std::count_if(
+      rhsTxSchedule.begin(), rhsTxSchedule.end(),
+      [](const AieNpuMemcpyNd &s) { return !s.waitBufs.empty(); }));
+
+  const uint32_t presTxWaitCnt = static_cast<uint32_t>(std::count_if(  
+      presTxSchedule.begin(), presTxSchedule.end(),
+      [](const AieNpuMemcpyNd &s) { return !s.waitBufs.empty(); }));
+        
+  const uint32_t resRxWaitCnt  = static_cast<uint32_t>(std::count_if(
+      resRxSchedule.begin(), resRxSchedule.end(),
+      [](const AieNpuMemcpyNd &s) { return !s.waitBufs.empty(); }));
 
   if (tpOrder[0] == 0) {
-    for (uint32_t i = 0; i < (compTileTPm-1); ++i) {
+    placement.aieSchedule.insert(placement.aieSchedule.end(), rhsTxSchedule.begin(), rhsTxSchedule.end());
+
+    for (uint32_t i = 0; i < compTileTPm; ++i) {
+      placement.aieSchedule.insert(placement.aieSchedule.end(), lhsTxSchedule.begin(), lhsTxSchedule.end());
+      placement.aieSchedule.insert(placement.aieSchedule.end(), presTxSchedule.begin(), presTxSchedule.end());
       placement.aieSchedule.insert(placement.aieSchedule.end(), resRxSchedule.begin(), resRxSchedule.end());
 
-      for (auto &sch : resRxSchedule) {
-        sch.staticOffset[3] += (compTM * compTN);
+      for (auto &sch : lhsTxSchedule) {
+        sch.staticOffset[3] += (compTM * compTK) * lhsTxWaitCnt;
       }
 
       for (auto &sch : presTxSchedule) {
-        sch.staticOffset[3] += (compTM * compTN);
-      }
+        sch.staticOffset[3] += (compTM * compTN) * presTxWaitCnt;
+      }  
       
-      for (auto &sch : lhsTxSchedule) {
-        sch.staticOffset[3] += (compTM * compTK);
+      for (auto &sch : resRxSchedule) {
+        sch.staticOffset[3] += (compTM * compTN + (4 / getElemBytes(elemType))) * resRxWaitCnt;
       }
-      
-      placement.aieSchedule.insert(placement.aieSchedule.end(), presTxSchedule.begin(), presTxSchedule.end());
-      placement.aieSchedule.insert(placement.aieSchedule.end(), lhsTxSchedule.begin(), lhsTxSchedule.end());
     }
   } else if (tpOrder[0] == 1) {    
-    for (uint32_t i = 0; i < (compTileTPn-1); ++i) {
-      placement.aieSchedule.insert(placement.aieSchedule.end(), resRxSchedule.begin(), resRxSchedule.end());
-      
-      for (auto &sch : resRxSchedule) {
-        sch.staticOffset[3] += (compTM * compTN);
-      }
+    placement.aieSchedule.insert(placement.aieSchedule.end(), lhsTxSchedule.begin(), lhsTxSchedule.end());
 
-      for (auto &sch : presTxSchedule) {
-        sch.staticOffset[3] += (compTM * compTN);
-      }
+    for (uint32_t i = 0; i < compTileTPn; ++i) {
+      placement.aieSchedule.insert(placement.aieSchedule.end(), rhsTxSchedule.begin(), rhsTxSchedule.end());
+      placement.aieSchedule.insert(placement.aieSchedule.end(), presTxSchedule.begin(), presTxSchedule.end());
+      placement.aieSchedule.insert(placement.aieSchedule.end(), resRxSchedule.begin(), resRxSchedule.end());
 
       for (auto &sch : rhsTxSchedule) {
-        sch.staticOffset[3] += (compTK * compTN);
+        sch.staticOffset[3] += (compTK * compTN) * rhsTxWaitCnt;
+      }
+      
+      for (auto &sch : presTxSchedule) {
+        sch.staticOffset[3] += (compTM * compTN) * presTxWaitCnt;
       }
 
-      placement.aieSchedule.insert(placement.aieSchedule.end(), presTxSchedule.begin(), presTxSchedule.end());
-      placement.aieSchedule.insert(placement.aieSchedule.end(), rhsTxSchedule.begin(), rhsTxSchedule.end());
+      for (auto &sch : resRxSchedule) {
+        sch.staticOffset[3] += (compTM * compTN + (4 / getElemBytes(elemType))) * resRxWaitCnt;
+      }  
     }
   } else { // tpOrder[0] == 2
-    for (uint32_t i = 0; i < (compTileTPk-1); ++i) {
+    for (uint32_t i = 0; i < compTileTPk; ++i) {
+      placement.aieSchedule.insert(placement.aieSchedule.end(), lhsTxSchedule.begin(), lhsTxSchedule.end());
+      placement.aieSchedule.insert(placement.aieSchedule.end(), rhsTxSchedule.begin(), rhsTxSchedule.end());
+
       for (auto &sch : lhsTxSchedule) {
-        sch.staticOffset[3] += (compTM * compTK);
+        sch.staticOffset[3] += (compTM * compTK) * lhsTxWaitCnt;
       }
       
       for (auto &sch : rhsTxSchedule) {
-        sch.staticOffset[3] += (compTK * compTN);
+        sch.staticOffset[3] += (compTK * compTN) * rhsTxWaitCnt;
       }
-
-      placement.aieSchedule.insert(placement.aieSchedule.end(), lhsTxSchedule.begin(), lhsTxSchedule.end());
-      placement.aieSchedule.insert(placement.aieSchedule.end(), rhsTxSchedule.begin(), rhsTxSchedule.end());
     }
-  }
 
-  placement.aieSchedule.insert(placement.aieSchedule.end(), resRxSchedule.begin(), resRxSchedule.end());
+    placement.aieSchedule.insert(placement.aieSchedule.end(), resRxSchedule.begin(), resRxSchedule.end());
+  }
 
   if (DebugAiePlacement) {
     llvm::dbgs() << "[AiePlacement] Computed AIE Placement:\n";
@@ -1077,13 +1129,13 @@ optimizeAiePlacement(const TileParam &tileParam) {
     // ---- Tiles ----
     llvm::dbgs() << "  aieTiles (" << placement.aieTiles.size() << "):\n";
     for (size_t tileIdx = 0; tileIdx < placement.aieTiles.size(); ++tileIdx) {
-      const auto &tile = placement.aieTiles[tileIdx];
+      const auto &tile = placement.getAieTile(tileIdx);
       llvm::dbgs() << "    Tile[" << tileIdx << "] (" << tile.col << ", " << tile.row << ")\n";
 
       // Buffers (no Value prints)
       llvm::dbgs() << "      bufs (" << tile.bufs.size() << "):\n";
       for (size_t i = 0; i < tile.bufs.size(); ++i) {
-        const auto &b = tile.bufs[i];
+        const auto &b = tile.getAieBuf(i);
         llvm::dbgs() << "        - [" << i << "] name=" << b.name
                     << " symbol=" << b.symbol
                     << " size=" << b.bufSize
@@ -1096,7 +1148,7 @@ optimizeAiePlacement(const TileParam &tileParam) {
       // Buffer Descriptors
       llvm::dbgs() << "      bds (" << tile.bds.size() << "):\n";
       for (size_t i = 0; i < tile.bds.size(); ++i) {
-        const auto &bd = tile.bds[i];
+        const auto &bd = tile.getAieBd(i);
         llvm::dbgs() << "        - [" << i << "]" 
                     << " name=" << bd.name
                     << " isPacket=" << (bd.isPacket ? "true" : "false");
@@ -1111,7 +1163,7 @@ optimizeAiePlacement(const TileParam &tileParam) {
       // DMAs
       llvm::dbgs() << "      dmas (" << tile.dmas.size() << "):\n";
       for (size_t i = 0; i < tile.dmas.size(); ++i) {
-        const auto &d = tile.dmas[i];
+        const auto &d = tile.getAieDma(i);
         llvm::dbgs() << "        - [" << i << "] dir=" << static_cast<int>(d.dir)
                     << " channel=" << d.channel
                     << " bdIdx=" << d.bdIdx << "\n";
@@ -1121,7 +1173,7 @@ optimizeAiePlacement(const TileParam &tileParam) {
     // ---- Comms (packet or circuit) ----
     llvm::dbgs() << "  aieComms (" << placement.aieComms.size() << "):\n";
     for (size_t commIdx = 0; commIdx < placement.aieComms.size(); ++commIdx) {
-      const auto &comm = placement.aieComms[commIdx];
+      const auto &comm = placement.getAieComm(commIdx);
       const auto &srcTile = placement.getAieTile(comm.srcIdx);
 
       llvm::dbgs() << "    Comm[" << commIdx << "] name=" << comm.name
@@ -1203,6 +1255,17 @@ optimizeAiePlacement(const TileParam &tileParam) {
                      << v[0] << ", " << v[1] << ", " << v[2] << ", " << v[3] << "]";
       };
 
+      auto printU32VecWait = [&](const char *label, const std::vector<AieNpuWait> &vec) {
+        llvm::dbgs() << " " << label << "=[";
+        for (size_t i = 0; i < vec.size(); ++i) {
+          if (i) llvm::dbgs() << ", ";
+          llvm::dbgs() << "{c=" << vec[i].col
+                      << ", r=" << vec[i].row
+                      << ", b=" << vec[i].bufIdx << "}";
+        }
+        llvm::dbgs() << "]";
+      };
+
       llvm::dbgs() << "    Sched[" << sIdx << "]"
                    << " name=" << sch.name
                    << " id=" << sch.id
@@ -1215,7 +1278,8 @@ optimizeAiePlacement(const TileParam &tileParam) {
       }
 
       llvm::dbgs() << " issueToken=" << (sch.issueToken ? "true" : "false")
-                   << " doWait="     << (sch.doWait ? "true" : "false");
+                  << " hasWait="    << (!sch.waitBufs.empty() ? "true" : "false");
+      printU32VecWait("waitBufs", sch.waitBufs);
 
       printI64x4("offset", sch.staticOffset.data());
       printI64x4("size",   sch.staticSize.data());
@@ -1337,7 +1401,7 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
   // Generate communication paths
   for (auto &comm : placement.aieComms) {
     if (comm.isPacket) {  // packet-switched communication
-      auto &srcTile = placement.aieTiles[comm.srcIdx];
+      auto &srcTile = placement.getAieTile(comm.srcIdx);
       BoolAttr keep_pkt_header = nullptr;
 
       // Generate AIEX PacketFlowOp
@@ -1361,7 +1425,7 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
             auto dstIdx = packet.dstIdxs[i];
             auto dstBundle = packet.dstBundles[i];
             auto dstCh = packet.dstChs[i];
-            auto &dstTile = placement.aieTiles[dstIdx];
+            auto &dstTile = placement.getAieTile(dstIdx);
 
             builder.create<xilinx::AIE::PacketDestOp>(loc, dstTile.value, dstBundle, static_cast<int32_t>(dstCh));
           }
@@ -1376,17 +1440,16 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
 
   // Generate AIE DMAOp
   for (auto &tile : placement.aieTiles) {
-    Operation *dmaOp = nullptr;
-
-    if (tile.row == 0) { // Shim tile
+    // Shim tile
+    if (tile.row == 0) { 
       for (auto &dma : tile.dmas) {
         std::vector<bool> allocatedBuf(tile.bufs.size(), false);
         uint32_t firstBdIdx = dma.bdIdx;
         uint32_t curBdIdx = firstBdIdx;
 
         do {
-          auto &bd = tile.bds[curBdIdx];
-          auto &buf = tile.bufs[bd.bufIdx];
+          auto &bd = tile.getAieBd(curBdIdx);
+          auto &buf = tile.getAieBuf(bd.bufIdx);
 
           if (!allocatedBuf[bd.bufIdx]) {
             auto globalSym = SymbolRefAttr::get(builder.getContext(), buf.symbol);
@@ -1405,10 +1468,10 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
       }
 
       continue;
-    } else { // Comp tile
-      dmaOp = builder.create<MemOp>(loc, tile.value).getOperation();
-    }
-
+    } 
+    
+    // Comp tile
+    auto dmaOp = builder.create<MemOp>(loc, tile.value).getOperation();
     {
       OpBuilder::InsertionGuard g(builder);
       Region &DMARegion = dmaOp->getRegion(0);
@@ -1431,7 +1494,7 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
       dmaBlocks.push_back(endBlock);
 
       for (uint32_t i = 0; i < numDmaBlocks; ++i){
-        auto &dma = tile.dmas[i];
+        auto &dma = tile.getAieDma(i);
         uint32_t firstBdIdx = dma.bdIdx;
 
         {
@@ -1447,8 +1510,8 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
 
         uint32_t curBdIdx = firstBdIdx;
         do {
-          auto &bd = tile.bds[curBdIdx];
-          auto &buf = tile.bufs[bd.bufIdx];
+          auto &bd = tile.getAieBd(curBdIdx);
+          auto &buf = tile.getAieBuf(bd.bufIdx);
 
           {
             OpBuilder::InsertionGuard g(builder);
@@ -1500,7 +1563,8 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
 
   // Configure operations of Compute tile
   for (auto &tile : placement.aieTiles) {
-    if (tile.row < 2) { // Shim/Mem tile
+    // Shim/Mem tile
+    if (tile.row < 2) { 
       continue;
     }
 
@@ -1535,12 +1599,12 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
 
     if (tpOrder[0] == 0) {
       reuseInitArgsPtr = &rhsInitArgs;
-      inner1InitArgsPtr = &resInitArgs;
-      inner2InitArgsPtr = &lhsInitArgs;
+      inner1InitArgsPtr = &lhsInitArgs;
+      inner2InitArgsPtr = &resInitArgs;
     } else if (tpOrder[0] == 1) {
       reuseInitArgsPtr = &lhsInitArgs;
-      inner1InitArgsPtr = &resInitArgs;
-      inner2InitArgsPtr = &rhsInitArgs;
+      inner1InitArgsPtr = &rhsInitArgs;
+      inner2InitArgsPtr = &resInitArgs;
     } else { // tpOrder[0] == 2
       reuseInitArgsPtr = &resInitArgs;
       inner1InitArgsPtr = &lhsInitArgs;
@@ -1553,6 +1617,14 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
 
     uint32_t repeatCount = (tpOrder[0] == 0) ? compTileTPm :
                             ((tpOrder[0] == 1) ? compTileTPn : compTileTPk);
+
+    // Generate Memref GlobalOp
+    std::string flagName = std::string("flag_") + std::to_string(tile.col) + "_" + std::to_string(tile.row);
+    auto flagMemrefNameAttr = builder.getStringAttr(flagName);
+    auto i1Ty = builder.getI1Type();
+    auto flagMemrefType = MemRefType::get({}, i1Ty);
+    builder.create<memref::GlobalOp>(loc, flagMemrefNameAttr, builder.getStringAttr("private"),
+                                                      flagMemrefType, nullptr, false, nullptr);
 
     // Generate AIE CoreOp
     auto coreOp = builder.create<xilinx::AIE::CoreOp>(loc, tile.value);
@@ -1569,13 +1641,14 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
       auto cMax = builder.create<mlir::arith::ConstantOp>(loc, builder.getIndexAttr(0x7FFFFFFFFFFFFFFFULL));
       auto cCnt = builder.create<mlir::arith::ConstantOp>(loc, builder.getIndexAttr(repeatCount));
 
-      auto cRow = builder.create<mlir::arith::ConstantIntOp>(loc, compTM, /*width=*/32);
-      auto cCol = builder.create<mlir::arith::ConstantIntOp>(loc, compTN, /*width=*/32);
-      auto cDep = builder.create<mlir::arith::ConstantIntOp>(loc, compTK, /*width=*/32);
+      auto cRow = builder.create<mlir::arith::ConstantIntOp>(loc, compTM, /*width=*/getElemBytes(elemType)*8);
+      auto cCol = builder.create<mlir::arith::ConstantIntOp>(loc, compTN, /*width=*/getElemBytes(elemType)*8);
+      auto cDep = builder.create<mlir::arith::ConstantIntOp>(loc, compTK, /*width=*/getElemBytes(elemType)*8);
 
       auto trueI1 = builder.create<arith::ConstantIntOp>(loc, /*value=*/1, /*bitWidth=*/1);
       auto falseI1 = builder.create<arith::ConstantIntOp>(loc, /*value=*/0, /*bitWidth=*/1);
-      auto accVar = builder.create<memref::AllocOp>(loc, MemRefType::get({}, builder.getI1Type()));
+
+      auto accVar = builder.create<memref::GetGlobalOp>(loc, flagMemrefType, flagName);
 
       SmallVector<Value, 11> outerInitArgs;
       outerInitArgs.append(reuseInitArgs[0].begin(), reuseInitArgs[0].end());
@@ -1636,14 +1709,14 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
 
           SmallVector<Value, 4> commonArgs{cRow, cCol, cDep, acc};
           SmallVector<Value, 7> callArgs;
-          if (tpOrder[0] == 0) { // arg1: res, arg2: lhs
-            callArgs.push_back(arg2[0]);
-            callArgs.push_back(reuseArgs[0]);
+          if (tpOrder[0] == 0) { // arg1: lhs, arg2: res
             callArgs.push_back(arg1[0]);
-          } else if (tpOrder[0] == 1) { // arg1: res, arg2: rhs
             callArgs.push_back(reuseArgs[0]);
             callArgs.push_back(arg2[0]);
+          } else if (tpOrder[0] == 1) { // arg1: rhs, arg2: res
+            callArgs.push_back(reuseArgs[0]);
             callArgs.push_back(arg1[0]);
+            callArgs.push_back(arg2[0]);
           } else { // tpOrder[0] == 2, arg1: lhs, arg2: rhs
             callArgs.push_back(arg1[0]);
             callArgs.push_back(arg2[0]);
@@ -1780,7 +1853,7 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
 
     uint32_t lhsSize = ((compTM * compTileSPm) * compTK) * localTPm * localTPk;
     uint32_t rhsSize = (compTK * (compTN * compTileSPn)) * localTPk * localTPn;
-    uint32_t resSize = ((compTM * compTN) * compTileSPm * compTileSPn) * localTPm * localTPn;
+    uint32_t resSize = ((compTM * compTN + (4 / getElemBytes(elemType))) * compTileSPm * compTileSPn) * localTPm * localTPn;
 
     auto lhsMemrefType = MemRefType::get({lhsSize}, elemType);
     auto rhsMemrefType = MemRefType::get({rhsSize}, elemType);
@@ -1821,9 +1894,9 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
       }
       
       uint32_t shimIdx = placement.findAieTileIdx(col, row);
-      AieTile &shimTile = placement.aieTiles[shimIdx];
+      AieTile &shimTile = placement.getAieTile(shimIdx);
       
-      auto &buf = shimTile.bufs[sch.bufIdx];
+      auto &buf = shimTile.getAieBuf(sch.bufIdx);
       StringRef metadata = builder.getStringAttr(buf.symbol);
       PacketInfoAttr packetAttr = nullptr;
       if (sch.isPacket) {
@@ -1834,7 +1907,11 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
                                                     ArrayRef(sch.staticOffset), ArrayRef(sch.staticSize), ArrayRef(sch.staticStride), 
                                                     packetAttr, metadata, sch.id, sch.issueToken, 0, 0, 0, 0, 0, 0);
 
-      if (sch.doWait) {
+      for (auto &waitBuf : sch.waitBufs) {
+        uint32_t tileIdx = placement.findAieTileIdx(waitBuf.col, waitBuf.row);
+        AieTile &tile = placement.getAieTile(tileIdx);
+        auto &buf = tile.getAieBuf(waitBuf.bufIdx);
+        StringRef metadata = builder.getStringAttr(buf.symbol);
         builder.create<xilinx::AIEX::NpuDmaWaitOp>(loc, metadata);
       }
     }

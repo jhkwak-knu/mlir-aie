@@ -138,8 +138,12 @@ void write_tile_1d_strict(std::vector<T>& mat,
 
   const T* src = tile.data();
   for (size_t r = 0; r < TM; ++r) {
+    const T* srcRow = src + (r * TN);
     T* dstRow = mat.data() + (r0 + r) * N + c0;
-    std::copy(src + r * TN, src + (r + 1) * TN, dstRow);
+
+    for (size_t i = 0; i < TN; ++i) {
+      dstRow[i] = srcRow[i];
+    }
   }
 }
 
@@ -166,9 +170,9 @@ int main(int argc, const char *argv[]) {
   int chunkASize = ((tp.TM * tp.TK) * tp.SPm) * chunkTPm * chunkTPk;
   int chunkBSize = ((tp.TN * tp.TK) * tp.SPn) * chunkTPn * chunkTPk;
   int chunkCSize = ((tp.TM * tp.TN) * tp.SPm * tp.SPn) * chunkTPm * chunkTPn;
-  int chunkOutCSize = ((tp.TM * tp.TN + 1) * tp.SPm * tp.SPn) * chunkTPm * chunkTPn;
+  int chunkOutCSize = ((tp.TM * tp.TN + (4 / sizeof(DATATYPE))) * tp.SPm * tp.SPn) * chunkTPm * chunkTPn;
 
-  bool useInC= (tp.TPk > 1) && (tp.tpOrder[0] != 2);
+  bool useInC = (tp.TPk > 1) && (tp.tpOrder[0] != 2);
 
   // Initialize matrix A
   std::vector<DATATYPE> matA(matASize);
@@ -185,7 +189,10 @@ int main(int argc, const char *argv[]) {
   if (verbosity >= 2) printMatrix("B", matB, tp.N, tp.K);
 
   // Initialize matrix C
-  std::vector<DATATYPE> matC(matCSize, 0);
+  std::vector<DATATYPE> matC(matCSize);
+  for (int i = 0; i < matCSize; ++i) {
+    matC[i] = 0;
+  }
   if (verbosity >= 2) printMatrix("C", matC, tp.M, tp.N);
   
   // Initialize matrix C (ref)
@@ -265,9 +272,9 @@ int main(int argc, const char *argv[]) {
   int n_iterations = 1;
   int n_warmup_iterations = 0;
   unsigned num_iter = n_iterations + n_warmup_iterations;
-  float npu_time_total = 0;
-  float npu_time_min = 99999999;
-  float npu_time_max = 0;
+  double npu_time_total = 0;
+  double npu_time_min = 99999999;
+  double npu_time_max = 0;
 
   int errors = 0;
 
@@ -275,26 +282,26 @@ int main(int argc, const char *argv[]) {
   // Main run loop
   // ------------------------------------------------------
   std::array<int,3> tpValues{static_cast<int>(tp.TPm), static_cast<int>(tp.TPn), static_cast<int>(tp.TPk)};
-  int baseStepforSPm = static_cast<int>((tp.M / tp.TM) / tp.SPm);
-  int baseStepforSPn = static_cast<int>((tp.N / tp.TN) / tp.SPn);
+  int baseStepforSPm = static_cast<int>((tp.M / tp.TM) / tp.TPm);
+  int baseStepforSPn = static_cast<int>((tp.N / tp.TN) / tp.TPn);
   int defaultSize = 1;
   std::pair<int,int> defaultStep{0,0};
 
   std::array<int,3> matASizeBase{static_cast<int>(tp.SPm), static_cast<int>(tp.TPm), static_cast<int>(tp.TPk)};
-  std::array<std::pair<int,int>,3> matAStepBase{std::pair<int,int>{baseStepforSPm,0},
-                                                std::pair<int,int>{1,0},
+  std::array<std::pair<int,int>,3> matAStepBase{std::pair<int,int>{1,0},
+                                                std::pair<int,int>{baseStepforSPm,0},
                                                 std::pair<int,int>{0,1}};
   
   std::array<int,3> matBSizeBase{static_cast<int>(tp.SPn), static_cast<int>(tp.TPn), static_cast<int>(tp.TPk)};
-  std::array<std::pair<int,int>,3> matBStepBase{std::pair<int,int>{baseStepforSPn,0},
-                                                std::pair<int,int>{1,0},
+  std::array<std::pair<int,int>,3> matBStepBase{std::pair<int,int>{1,0},
+                                                std::pair<int,int>{baseStepforSPn,0},
                                                 std::pair<int,int>{0,1}};
   
   std::array<int,4> matCSizeBase{static_cast<int>(tp.SPm), static_cast<int>(tp.SPn), static_cast<int>(tp.TPm), static_cast<int>(tp.TPn)};
-  std::array<std::pair<int,int>,4> matCStepBase{std::pair<int,int>{baseStepforSPm,0},
-                                                std::pair<int,int>{0,baseStepforSPn},
-                                                std::pair<int,int>{1,0},
-                                                std::pair<int,int>{0,1}};
+  std::array<std::pair<int,int>,4> matCStepBase{std::pair<int,int>{1,0},
+                                                std::pair<int,int>{0,1},
+                                                std::pair<int,int>{baseStepforSPm,0},
+                                                std::pair<int,int>{0,baseStepforSPn}};
   
   int reuseTPAxis = tp.tpOrder[0];
   int innerTPAxis = tp.tpOrder[1];
@@ -314,10 +321,10 @@ int main(int argc, const char *argv[]) {
   std::array<std::pair<int,int>,3> matCSteps;
 
   if (reuseTPAxis == 0) {
-    matAOuterOffset = matAStepBase[2];
+    matAOuterOffset = {matAStepBase[2]};
     matAInnerOffset = defaultStep;
-    matASizes = std::array<int,3>{matASizeBase[1], matASizeBase[0], defaultSize};
-    matASteps = std::array<std::pair<int,int>,3>{matAStepBase[1], matAStepBase[0], defaultStep};
+    matASizes = std::array<int,3>{matASizeBase[0], matASizeBase[1], defaultSize};
+    matASteps = std::array<std::pair<int,int>,3>{matAStepBase[0], matAStepBase[1], defaultStep};
 
     matBOuterOffset = matBStepBase[2];
     matBInnerOffset = matBStepBase[1];
@@ -326,8 +333,8 @@ int main(int argc, const char *argv[]) {
 
     matCOuterOffset = defaultStep;
     matCInnerOffset = matCStepBase[3];
-    matCSizes = std::array<int,3>{matCSizeBase[2], matCSizeBase[0], matCSizeBase[1]};
-    matCSteps = std::array<std::pair<int,int>,3>{matCStepBase[2], matCStepBase[0], matCStepBase[1]};
+    matCSizes = std::array<int,3>{matCSizeBase[0], matCSizeBase[1], matCSizeBase[2]};
+    matCSteps = std::array<std::pair<int,int>,3>{matCStepBase[0], matCStepBase[1], matCStepBase[2]};
   } else if (reuseTPAxis == 1) {
     matAOuterOffset = matAStepBase[2];
     matAInnerOffset = matAStepBase[1];
@@ -336,23 +343,23 @@ int main(int argc, const char *argv[]) {
 
     matBOuterOffset = matBStepBase[2];
     matBInnerOffset = defaultStep;
-    matBSizes = std::array<int,3>{matBSizeBase[1], matBSizeBase[0], defaultSize};
-    matBSteps = std::array<std::pair<int,int>,3>{matBStepBase[1], matBStepBase[0], defaultStep};
+    matBSizes = std::array<int,3>{matBSizeBase[0], matBSizeBase[1], defaultSize};
+    matBSteps = std::array<std::pair<int,int>,3>{matBStepBase[0], matBStepBase[1], defaultStep};
 
     matCOuterOffset = defaultStep;
     matCInnerOffset = matCStepBase[2];
-    matCSizes = std::array<int,3>{matCSizeBase[0], matCSizeBase[3], matCSizeBase[1]};
-    matCSteps = std::array<std::pair<int,int>,3>{matCStepBase[0], matCStepBase[3], matCStepBase[1]};
+    matCSizes = std::array<int,3>{matCSizeBase[0], matCSizeBase[1], matCSizeBase[3]};
+    matCSteps = std::array<std::pair<int,int>,3>{matCStepBase[0], matCStepBase[1], matCStepBase[3]};
   } else { // reuseTPAxis == 2
     matAOuterOffset = defaultStep;
     matAInnerOffset = matAStepBase[1];
-    matASizes = std::array<int,3>{matASizeBase[2], matASizeBase[0], defaultSize};
-    matASteps = std::array<std::pair<int,int>,3>{matAStepBase[2], matAStepBase[0], defaultStep};
+    matASizes = std::array<int,3>{matASizeBase[0], matASizeBase[2], defaultSize};
+    matASteps = std::array<std::pair<int,int>,3>{matAStepBase[0], matAStepBase[2], defaultStep};
 
     matBOuterOffset = matBStepBase[1];
     matBInnerOffset = defaultStep;
-    matBSizes = std::array<int,3>{matBSizeBase[2], matBSizeBase[0], defaultSize};
-    matBSteps = std::array<std::pair<int,int>,3>{matBStepBase[2], matBStepBase[0], defaultStep};
+    matBSizes = std::array<int,3>{matBSizeBase[0], matBSizeBase[2], defaultSize};
+    matBSteps = std::array<std::pair<int,int>,3>{matBStepBase[0], matBStepBase[2], defaultStep};
 
     matCOuterOffset = matCStepBase[3];
     matCInnerOffset = matCStepBase[2];
@@ -365,7 +372,7 @@ int main(int argc, const char *argv[]) {
   auto chunkCTileOrderBase = makeTileOrder(matCSizes, matCSteps);
 
   for (unsigned iter = 0; iter < num_iter; iter++) {
-    float npu_time = 0;
+    double npu_time = 0;
 
     for (int i = 0; i < outerTP; ++i) {
       for (int j = 0; j < innerTP; ++j) {
@@ -495,47 +502,47 @@ int main(int argc, const char *argv[]) {
         run.wait();
         auto stop = std::chrono::high_resolution_clock::now();
 
-        npu_time += std::chrono::duration_cast<std::chrono::microseconds>(stop - start).count();
+        npu_time = std::chrono::duration<double, std::micro>(stop - start).count();
 
         // Sync device to host memories
         bo_outC.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
 
         if (verbosity >= 2) {
-          for (int i = 0; i < (tp.SPm * tp.SPn); ++i) {
-            uint32_t pkt_header, pkt_id;
-            std::memcpy(&pkt_header, &bufOut[(tp.TM * tp.TN + 1) * i + 0], sizeof(pkt_header));
-            pkt_id = pkt_header & 0x1F;
+          int repeatCount = (reuseTPAxis != 2) ? reuseTP : 1;
+          for (int i = 0; i < repeatCount; ++i) {
+            for (int j = 0; j < (tp.SPm * tp.SPn); ++j) {
+              uint32_t pkt_header, pkt_id;
+              std::memcpy(&pkt_header, &bufOut[(tp.TM * tp.TN + (4 / sizeof(DATATYPE))) * ((tp.SPm * tp.SPn) * i + j) + 0], sizeof(pkt_header));
+              pkt_id = pkt_header & 0x1F;
 
-            std::cout << "OutC[" << i << "] (packet id = " << pkt_id << "): ";
-            for (int j = 0; j < (tp.TM * tp.TN); ++j) {
-              std::cout << bufOut[(tp.TM * tp.TN + 1) * i + j + 1] << " ";
+              std::cout << "OutC[" << ((tp.SPm * tp.SPn) * i + j) << "] (packet id = " << pkt_id << "): ";
+              for (int k = 0; k < (tp.TM * tp.TN); ++k) {
+                std::cout << bufOut[(tp.TM * tp.TN + (4 / sizeof(DATATYPE))) * ((tp.SPm * tp.SPn) * i + j) + k + (4 / sizeof(DATATYPE))] << " ";
+              }
+              std::cout << "\n";
             }
-            std::cout << "\n";
           }
         }
 
         // store partial sums to matC
-        for (int i = 0; i < ((tp.SPm * tp.SPn) / 4); ++i) {
-          int repeatCount = (reuseTPAxis != 2) ? reuseTP : 1;
-          int outerOffset = (repeatCount * 4) * i;
+        int repeatCount = (reuseTPAxis != 2) ? reuseTP : 1;
+        for (int i = 0; i < repeatCount; ++i) {
+          int outerOffset = tp.SPm * tp.SPn * i;
 
-          for (int j = 0; j < repeatCount; ++j) {
-            int innerFactor = (reuseTPAxis != 1) ? 1 : tp.SPm;
-            int innerOffset = innerFactor * j;
+          for (int j = 0; j < ((tp.SPm * tp.SPn) / 4); ++j) {
+            int innerOffset =  4 * j;
 
             for (int k = 0; k < 4; ++k) {
-              int baseOffset = (reuseTPAxis != 1) ? (repeatCount * k) : ((k / tp.SPm) * tp.SPm * tp.TPn + (k % tp.SPm));
-              int idx = baseOffset + innerOffset + outerOffset;
+              int idx = outerOffset + innerOffset + k;
 
-              int packetHeader, packetId;
-              std::memcpy(&packetHeader, &bufOut[(tp.TM * tp.TN + 1) * idx], sizeof(packetHeader));
+              uint32_t packetHeader, packetId;
+              std::memcpy(&packetHeader, &bufOut[(tp.TM * tp.TN + (4 / sizeof(DATATYPE))) * idx], sizeof(packetHeader));
               packetId = packetHeader & 0x1F;
-              if (packetId == 0) packetId = 0;
+              if (packetId == 1) packetId = 0;
               else if (packetId == 2) packetId = 1;
-              else if (packetId == 6) packetId = 2;
-              else if (packetId == 14) packetId = 3;
-              int matCOffset = (reuseTPAxis != 1) ? (repeatCount * packetId) : ((packetId / tp.SPm) * tp.SPm * tp.TPn + (packetId % tp.SPm));
-              int matCIdx = matCOffset + innerOffset + outerOffset;
+              else if (packetId == 4) packetId = 2;
+              else if (packetId == 8) packetId = 3;
+              int matCIdx = outerOffset + innerOffset + packetId;
 
               std::pair<int,int> tilePos = chunkCTileOrder[matCIdx];
 
@@ -547,18 +554,16 @@ int main(int argc, const char *argv[]) {
               if (verbosity >= 2) {
                 std::cout
                   << "[k=" << k << "] "
-                  << "baseOffset=" << baseOffset
                   << " idx=" << idx
                   << " packetId=" << packetId
-                  << " matCOffset=" << matCOffset
                   << " matCIdx=" << matCIdx
                   << " tilePos=(" << tilePos.first << "," << tilePos.second << ") "
                   << "tileElems=" << static_cast<unsigned long long>(tileElems)
                   << " blockElems=" << static_cast<unsigned long long>(blockElems)
                   << " start=" << static_cast<unsigned long long>(start)
                   << " end=" << static_cast<unsigned long long>(end)
-                  << " innerOffset=" << innerOffset
                   << " outerOffset=" << outerOffset
+                  << " innerOffset=" << innerOffset
                   << "\n";
               }
               
@@ -614,14 +619,14 @@ int main(int argc, const char *argv[]) {
   oldState.copyfmt(std::cout);
 
   std::cout << std::endl
-            << "Avg NPU time: " << std::fixed << std::setprecision(1) << npu_time_total / n_iterations << "us."
+            << "Avg NPU time: " << std::fixed << std::setprecision(2) << npu_time_total / n_iterations << "us."
             << std::endl;
 
   std::cout << std::endl
-            << "Min NPU time: " << std::fixed << std::setprecision(0) << npu_time_min << "us." << std::endl;
+            << "Min NPU time: " << std::fixed << std::setprecision(2) << npu_time_min << "us." << std::endl;
 
   std::cout << std::endl
-            << "Max NPU time: " << std::fixed << std::setprecision(0) << npu_time_max << "us." << std::endl;
+            << "Max NPU time: " << std::fixed << std::setprecision(2) << npu_time_max << "us." << std::endl;
 
   std::cout.copyfmt(oldState);
 

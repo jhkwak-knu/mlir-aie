@@ -82,7 +82,7 @@ else
 fi
 
 # CSV header (+upgrade if old header exists)
-NEW_HEADER="case_index,numLevel,TM,TK,TN,MemTM,MemTK,MemTN,M,K,N,numLastSpm,doubleBuffer,status,errors,iters,warmup,avg_us,min_us,max_us"
+NEW_HEADER="case_index,numSpm,SPm,SPn,TPm,TPk,TPn,TM,TK,TN,M,K,N,doubleBuffer,status,errors,iters,warmup,avg_us,min_us,max_us"
 if [[ ! -f "$RESULT_CSV" ]]; then
   mkdir -p "$(dirname "$RESULT_CSV")"
   echo "$NEW_HEADER" > "$RESULT_CSV"
@@ -110,7 +110,7 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
   tmp_out="$(mktemp)"
   if ! jq --indent 4 ".cases[$((idx-1))]" "$INPUT_JSON" > "$tmp_out"; then
     echo "warn: failed to extract case #$idx"
-    echo "$idx,0,0,0,0,0,0,0,0,0,0,0,false,EXTRACT_FAIL,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
+    echo "$idx,0,0,0,0,0,0,0,0,0,0,0,0,false,EXTRACT_FAIL,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
     rm -f "$tmp_out"
     # cleanup then continue
     if [[ -f "$CLEAN_SCRIPT" ]]; then bash "$CLEAN_SCRIPT" || true; fi
@@ -120,37 +120,37 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
   mv "$tmp_out" "$OUTPUT_JSON"
 
   # 2) read fields
-  numLevel=$(read_num '.numLevel')
+  numSpm=$(read_num '.levels[0].numSpm')
+  SPm=$(read_num '.levels[0].SPm'); SPn=$(read_num '.levels[0].SPn')
+  TPm=$(read_num '.levels[0].TPm'); TPk=$(read_num '.levels[0].TPk'); TPn=$(read_num '.levels[0].TPn')
   TM=$(read_num '.levels[0].TM'); TK=$(read_num '.levels[0].TK'); TN=$(read_num '.levels[0].TN')
-  MemTM=$(read_num '.MemTM'); MemTK=$(read_num '.MemTK'); MemTN=$(read_num '.MemTN')
   M=$(read_num '.M');   K=$(read_num '.K');   N=$(read_num '.N')
-  numLastSpm=$(read_num '.numLastSpm')
   DB_STR=$(read_bool_str '.doubleBuffer')
 
-  for v in numLevel TM TK TN MemTM MemTK MemTN M K N numLastSpm; do
+  for v in numSpm SPm SPn TPm TPk TPn TM TK TN M K N; do
     val="${!v}"
     if ! [[ "$val" =~ ^-?[0-9]+$ ]]; then
       echo "warn: $v not integer (got: $val); marking as PARSE_FAIL"
-      echo "$idx,$numLevel,$TM,$TK,$TN,$MemTM,$MemTK,$MemTN,$M,$K,$N,$numLastSpm,$DB_STR,PARSE_FAIL,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
+      echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,PARSE_FAIL,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
       if [[ -f "$CLEAN_SCRIPT" ]]; then bash "$CLEAN_SCRIPT" || true; fi
       continue 2
     fi
   done
 
-  echo "Params: numLevel=$numLevel | TM=$TM TK=$TK TN=$TN | MemTM=$MemTM MemTK=$MemTK MemTN=$MemTN | M=$M K=$K N=$N | numLastSpm=$numLastSpm | doubleBuffer=$DB_STR"
+  echo "Params: numSpm=$numSpm | SPm=$SPm SPn=$SPn | TPm=$TPm TPk=$TPk TPn=$TPn | TM=$TM TK=$TK TN=$TN | M=$M K=$K N=$N | doubleBuffer=$DB_STR"
 
   # 3) generate MLIR
   if [[ -f "$GEN_SCRIPT" ]]; then
     echo "running: bash $GEN_SCRIPT $M $K $N"
     if ! bash "$GEN_SCRIPT" "$M" "$K" "$N"; then
       echo "warn: generator failed"
-      echo "$idx,$numLevel,$TM,$TK,$TN,$MemTM,$MemTK,$MemTN,$M,$K,$N,$numLastSpm,$DB_STR,GEN_FAIL,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
+      echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,GEN_FAIL,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
       if [[ -f "$CLEAN_SCRIPT" ]]; then bash "$CLEAN_SCRIPT" || true; fi
       continue
     fi
   else
     echo "warn: generator script not found: $GEN_SCRIPT"
-    echo "$idx,$numLevel,$TM,$TK,$TN,$MemTM,$MemTK,$MemTN,$M,$K,$N,$numLastSpm,$DB_STR,GEN_MISSING,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
+    echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,GEN_MISSING,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
     if [[ -f "$CLEAN_SCRIPT" ]]; then bash "$CLEAN_SCRIPT" || true; fi
     continue
   fi
@@ -160,8 +160,8 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
   echo "make -C \"$MAKE_DIR\" run CPPDEFS=\"$CPPDEFS\""
   if ! make -C "$MAKE_DIR" run CPPDEFS="$CPPDEFS"; then
     echo "warn: make run failed"
-    echo "$idx,$numLevel,$TM,$TK,$TN,$MemTM,$MemTK,$MemTN,$M,$K,$N,$numLastSpm,$DB_STR,RUN_FAIL,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
-    if [[ -f "$CLEAN_SCRIPT" ]]; then bash "$CLEAN_SCRIPT" || true; fi
+    echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,RUN_FAIL,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
+    # if [[ -f "$CLEAN_SCRIPT" ]]; then bash "$CLEAN_SCRIPT" || true; fi
     continue
   fi
 
@@ -213,7 +213,7 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
   fi
 
   # 6) append to CSV
-  echo "$idx,$numLevel,$TM,$TK,$TN,$MemTM,$MemTK,$MemTN,$M,$K,$N,$numLastSpm,$DB_STR,$STATUS,$ERRORS,$ITERS,$WARMUP,$AVG_US,$MIN_US,$MAX_US" >> "$RESULT_CSV"
+  echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,$STATUS,$ERRORS,$ITERS,$WARMUP,$AVG_US,$MIN_US,$MAX_US" >> "$RESULT_CSV"
   echo "Result: case #$idx -> $STATUS (errors=$ERRORS, avg=${AVG_US}us, min=${MIN_US}us, max=${MAX_US}us) appended to $RESULT_CSV"
 
   # 7) clean before next case
