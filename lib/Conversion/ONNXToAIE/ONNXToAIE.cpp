@@ -16,6 +16,7 @@
 #include "llvm/ADT/Twine.h"
 #include "llvm/ADT/MapVector.h"
 
+#include <map>
 #include <string>
 #include <vector>
 #include <optional>
@@ -601,6 +602,9 @@ struct AiePlacement {
   std::vector<AieTile> aieTiles;
   std::vector<AieComm> aieComms;
   std::vector<AieNpuMemcpyNd> aieSchedule;
+  // Maps (col, row) -> index into aieTiles for O(1) lookup.
+  // Populated by placeTiles() alongside aieTiles.
+  std::map<std::pair<uint32_t,uint32_t>, uint32_t> tileIdxMap;
 
   AieTile& getAieTile(uint32_t idx) { return aieTiles[idx]; }
   AieComm& getAieComm(uint32_t idx) { return aieComms[idx]; }
@@ -608,14 +612,11 @@ struct AiePlacement {
   const AieTile& getAieTile(uint32_t idx) const { return aieTiles[idx]; }
   const AieComm& getAieComm(uint32_t idx) const { return aieComms[idx]; }
 
-uint32_t findAieTileIdx(uint32_t col, uint32_t row) const {
-    for (uint32_t idx = 0; idx < aieTiles.size(); ++idx) {
-      const auto &tile = aieTiles[idx];
-      if (tile.col == col && tile.row == row)
-        return idx;
-    }
-    llvm_unreachable("Tile not found");
-  };
+  uint32_t findAieTileIdx(uint32_t col, uint32_t row) const {
+    auto it = tileIdxMap.find({col, row});
+    assert(it != tileIdxMap.end() && "Tile not found");
+    return it->second;
+  }
 };
 
 static inline uint32_t getElemBytes(mlir::Type t) {
@@ -635,10 +636,12 @@ static void placeTiles(AiePlacement &placement, const TilingContext &tilingCtx) 
   for (uint32_t i = 0; i < numCols; ++i) {
     AieTile shimTile{.col=i, .row=0};
     placement.aieTiles.push_back(shimTile);
+    placement.tileIdxMap[{shimTile.col, shimTile.row}] = placement.aieTiles.size() - 1;
 
     for (uint32_t j = 0; j < numCompTilesPerCol; ++j) {
       AieTile compTile{.col=i, .row=(5-j)};
       placement.aieTiles.push_back(compTile);
+      placement.tileIdxMap[{compTile.col, compTile.row}] = placement.aieTiles.size() - 1;
     }
   }
 }
