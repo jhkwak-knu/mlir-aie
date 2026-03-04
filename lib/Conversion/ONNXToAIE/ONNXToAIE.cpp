@@ -564,6 +564,39 @@ struct AieNpuMemcpyNd {
   std::array<int64_t,4> staticStride;
 };
 
+/// Derived tiling variables shared by optimizeAiePlacement and generateAieOps.
+/// Built once from TileParam to eliminate repeated extraction.
+struct TilingContext {
+  uint32_t numCols;
+  uint32_t numCompTilesPerCol; // always NUM_COMP_TILES_PER_COL
+  uint32_t compTM, compTK, compTN;
+  uint32_t compTileSPm, compTileSPn;
+  uint32_t compTileTPm, compTileTPk, compTileTPn;
+  std::vector<uint32_t> tpOrder;
+  Type     elemType;
+  bool     doubleBufferEnabled;
+};
+
+static TilingContext buildTilingContext(const TileParam &tp) {
+  TilingContext tc;
+  const auto &lv = tp.levels[0];
+  tc.numCompTilesPerCol  = NUM_COMP_TILES_PER_COL;
+  tc.numCols             = tp.numLastSpm / tc.numCompTilesPerCol;
+  tc.compTM              = lv.tileSize.TM;
+  tc.compTK              = lv.tileSize.TK;
+  tc.compTN              = lv.tileSize.TN;
+  tc.compTileSPm         = lv.SPm;
+  tc.compTileSPn         = lv.SPn;
+  tc.compTileTPm         = lv.TPm;
+  tc.compTileTPk         = lv.TPk;
+  tc.compTileTPn         = lv.TPn;
+  tc.tpOrder             = lv.tpOrder;
+  tc.elemType            = tp.elemType;
+  tc.doubleBufferEnabled = tp.doubleBufferEnabled;
+  assert(tc.tpOrder.size() == 3 && "tpOrder must have exactly 3 elements");
+  return tc;
+}
+
 struct AiePlacement {
   std::vector<AieTile> aieTiles;
   std::vector<AieComm> aieComms;
@@ -594,25 +627,21 @@ static inline uint32_t getElemBytes(mlir::Type t) {
 }
 
 AiePlacement
-optimizeAiePlacement(const TileParam &tileParam) {
+optimizeAiePlacement(const TilingContext &tilingCtx) {
 
   AiePlacement placement;
 
-  // Set variables
-  uint32_t numCompTilesPerCol = NUM_COMP_TILES_PER_COL;
-  uint32_t numCols = tileParam.numLastSpm / numCompTilesPerCol;
-
-  auto &compTileLevel = tileParam.levels[0];
-  auto [compTM, compTK, compTN] = compTileLevel.tileSize;
-  uint32_t compTileSPm = compTileLevel.SPm;
-  // uint32_t compTileSPn = compTileLevel.SPn;
-  uint32_t compTileTPm = compTileLevel.TPm;
-  uint32_t compTileTPk = compTileLevel.TPk;
-  uint32_t compTileTPn = compTileLevel.TPn;
-  auto tpOrder = compTileLevel.tpOrder;
-
-  auto elemType = tileParam.elemType;
-  // bool doubleBufferEnabled = tileParam.doubleBufferEnabled;
+  const auto &numCols            = tilingCtx.numCols;
+  const auto &numCompTilesPerCol = tilingCtx.numCompTilesPerCol;
+  const auto &compTM             = tilingCtx.compTM;
+  const auto &compTK             = tilingCtx.compTK;
+  const auto &compTN             = tilingCtx.compTN;
+  const auto &compTileSPm        = tilingCtx.compTileSPm;
+  const auto &compTileTPm        = tilingCtx.compTileTPm;
+  const auto &compTileTPk        = tilingCtx.compTileTPk;
+  const auto &compTileTPn        = tilingCtx.compTileTPn;
+  const auto &tpOrder            = tilingCtx.tpOrder;
+  const auto &elemType           = tilingCtx.elemType;
   auto dmaWireBundle = WireBundle::DMA;
   
   // Place on physical AIE tiles
@@ -1309,22 +1338,20 @@ optimizeAiePlacement(const TileParam &tileParam) {
 
 void generateAieOps(ConversionPatternRewriter &rewriter,
                     AiePlacement &placement,
+                    const TilingContext &tilingCtx,
                     const TileParam &tileParam) {
-  // Set variables
-  uint32_t numCompTilesPerCol = NUM_COMP_TILES_PER_COL;
-  uint32_t numCols = tileParam.numLastSpm / numCompTilesPerCol;
-
-  auto &compTileLevel = tileParam.levels[0];
-  auto [compTM, compTK, compTN] = compTileLevel.tileSize;
-  uint32_t compTileSPm = compTileLevel.SPm;
-  uint32_t compTileSPn = compTileLevel.SPn;
-  uint32_t compTileTPm = compTileLevel.TPm;
-  uint32_t compTileTPk = compTileLevel.TPk;
-  uint32_t compTileTPn = compTileLevel.TPn;
-  auto tpOrder = compTileLevel.tpOrder;
-
-  auto elemType = tileParam.elemType;
-  bool doubleBufferEnabled = tileParam.doubleBufferEnabled;
+  const auto &numCols             = tilingCtx.numCols;
+  const auto &compTM              = tilingCtx.compTM;
+  const auto &compTK              = tilingCtx.compTK;
+  const auto &compTN              = tilingCtx.compTN;
+  const auto &compTileSPm         = tilingCtx.compTileSPm;
+  const auto &compTileSPn         = tilingCtx.compTileSPn;
+  const auto &compTileTPm         = tilingCtx.compTileTPm;
+  const auto &compTileTPk         = tilingCtx.compTileTPk;
+  const auto &compTileTPn         = tilingCtx.compTileTPn;
+  const auto &tpOrder             = tilingCtx.tpOrder;
+  const auto &elemType            = tilingCtx.elemType;
+  const auto &doubleBufferEnabled = tilingCtx.doubleBufferEnabled;
 
   // Create new module for AIE dialect
   MLIRContext *ctx = rewriter.getContext();
@@ -1987,10 +2014,11 @@ public:
     TileParam optimalTileParam = findOptimalTileParam(systemInfo.value(), opInfo);
 
     // Perform hardware-aware optimization for AIE
-    auto AiePlacement = optimizeAiePlacement(optimalTileParam);
+    TilingContext tilingCtx = buildTilingContext(optimalTileParam);
+    auto placement = optimizeAiePlacement(tilingCtx);
 
     // Generate AIE Ops
-    generateAieOps(rewriter, AiePlacement, optimalTileParam);
+    generateAieOps(rewriter, placement, tilingCtx, optimalTileParam);
                   
     // Dummy to prevent result type errors
     auto resultType = op.getResult().getType();
