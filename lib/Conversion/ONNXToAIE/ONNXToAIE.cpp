@@ -69,8 +69,7 @@ static constexpr uint32_t NUM_COMP_TILES_PER_COL = 4;
 // Maximum number of AIE columns supported by the npu2 device family.
 // Corresponds to the size of the devices[] array in emitDeviceOp.
 static constexpr uint32_t NUM_MAX_COLS           = 8;
-// Packet header prepended by the switch: 4 bytes, divided by elem size
-// to express as element count for buffer size/offset arithmetic
+// 4-byte header inserted by the DMA switch before each outgoing packet payload.
 static constexpr uint32_t PKT_HDR_BYTES          = 4;
 // pres packet IDs start above lhs/rhs range to avoid packet-filter collisions
 static constexpr uint32_t PRES_PKT_ID_OFFSET     = 16;
@@ -722,7 +721,7 @@ static void allocateBuffers(AiePlacement &placement, const TilingContext &tiling
     if (tile.row == 0) { // Shim tile
       uint32_t lhsBufSize = compTM * compTK;
       uint32_t rhsBufSize = compTK * compTN;
-      uint32_t resBufSize = compTM * compTN + (PKT_HDR_BYTES / getElemBytes(elemType));
+      uint32_t resBufSize = compTM * compTN + (PKT_HDR_BYTES / getElemBytes(elemType)); // header overhead in elements
 
       AieBuf lhsBuf{.name="lhs", .bufSize=lhsBufSize, .elemType=elemType};
       AieBuf rhsBuf{.name="rhs", .bufSize=rhsBufSize, .elemType=elemType};
@@ -1025,6 +1024,7 @@ static void configureDmas(AiePlacement &placement, const TilingContext &tilingCt
           auto &dstDma = dstTile.getAieDma(dstDmaIdx);
           AieBufferDescriptor bd{.name=packet.name, .isPacket=true, .packetId=packet.packetId};
           bd.bufIdx = dstTile.findBufIdx(packet.name);
+          // shim tile receives the DMA switch header alongside the payload; add header overhead in elements
           bd.bufSize = (dstTile.row == 0) ? (packet.size + (PKT_HDR_BYTES / getElemBytes(elemType))) : packet.size;
           bd.bufOffset = 0;
           bd.nextBdIdx = dstDma.bdIdx;
@@ -1135,7 +1135,7 @@ static void buildSchedule(AiePlacement &placement, const TilingContext &tilingCt
           do {
             auto &bd = tile.getAieBd(curBdIdx);
             uint32_t idx = static_cast<uint32_t>(std::strtoul(bd.name.c_str() + 3, nullptr, 10));
-            uint32_t off = compTM * compTN + (PKT_HDR_BYTES / getElemBytes(elemType));
+            uint32_t off = compTM * compTN + (PKT_HDR_BYTES / getElemBytes(elemType)); // header overhead in elements
 
             std::string name = "res";
             std::array<int64_t,4> offset = {0, 0, 0, static_cast<int64_t>(off * idx)};
@@ -1228,7 +1228,7 @@ static void buildSchedule(AiePlacement &placement, const TilingContext &tilingCt
       }  
       
       for (auto &sch : resRxSchedule) {
-        sch.staticOffset[3] += (compTM * compTN + (PKT_HDR_BYTES / getElemBytes(elemType))) * resRxWaitCnt;
+        sch.staticOffset[3] += (compTM * compTN + (PKT_HDR_BYTES / getElemBytes(elemType))) * resRxWaitCnt; // header overhead in elements
       }
     }
   } else if (tpOrder[0] == 1) {    
@@ -1248,7 +1248,7 @@ static void buildSchedule(AiePlacement &placement, const TilingContext &tilingCt
       }
 
       for (auto &sch : resRxSchedule) {
-        sch.staticOffset[3] += (compTM * compTN + (PKT_HDR_BYTES / getElemBytes(elemType))) * resRxWaitCnt;
+        sch.staticOffset[3] += (compTM * compTN + (PKT_HDR_BYTES / getElemBytes(elemType))) * resRxWaitCnt; // header overhead in elements
       }  
     }
   } else { // tpOrder[0] == 2
@@ -2044,7 +2044,7 @@ static void emitRuntimeSequenceOp(OpBuilder &builder, Location loc,
 
     uint32_t lhsSize = ((compTM * compTileSPm) * compTK) * localTPm * localTPk;
     uint32_t rhsSize = (compTK * (compTN * compTileSPn)) * localTPk * localTPn;
-    uint32_t resSize = ((compTM * compTN + (PKT_HDR_BYTES / getElemBytes(elemType))) * compTileSPm * compTileSPn) * localTPm * localTPn;
+    uint32_t resSize = ((compTM * compTN + (PKT_HDR_BYTES / getElemBytes(elemType))) * compTileSPm * compTileSPn) * localTPm * localTPn; // header overhead in elements
 
     auto lhsMemrefType = MemRefType::get({lhsSize}, elemType);
     auto rhsMemrefType = MemRefType::get({rhsSize}, elemType);
