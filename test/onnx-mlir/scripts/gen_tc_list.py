@@ -228,10 +228,6 @@ def make_tc_cases(op_cases: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]],
                                 continue
 
                             # Reuse scores (same formula), at this level using (M0,K0,N0)
-                            MKTotal = (TM * TK) * TPm * TPn * TPk * SPm * SPn
-                            KNTotal = (TK * TN) * TPm * TPn * TPk * SPm * SPn
-                            MNTotal = (2 * TM * TN) * TPm * TPn * TPk * SPm * SPn
-
                             spatial_reuse_rate = {
                                 "M": {"MK": SPn, "KN": SPm, "MN": 1},
                                 "N": {"MK": SPn, "KN": SPm, "MN": 1},
