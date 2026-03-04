@@ -1400,47 +1400,39 @@ optimizeAiePlacement(const TilingContext &tilingCtx) {
   return placement;
 }
 
-void generateAieOps(ConversionPatternRewriter &rewriter,
-                    AiePlacement &placement,
-                    const TilingContext &tilingCtx,
-                    const TileParam &tileParam) {
-  const auto &numCols             = tilingCtx.numCols;
-  const auto &compTM              = tilingCtx.compTM;
-  const auto &compTK              = tilingCtx.compTK;
-  const auto &compTN              = tilingCtx.compTN;
-  const auto &compTileSPm         = tilingCtx.compTileSPm;
-  const auto &compTileSPn         = tilingCtx.compTileSPn;
-  const auto &compTileTPm         = tilingCtx.compTileTPm;
-  const auto &compTileTPk         = tilingCtx.compTileTPk;
-  const auto &compTileTPn         = tilingCtx.compTileTPn;
-  const auto &tpOrder             = tilingCtx.tpOrder;
-  const auto &elemType            = tilingCtx.elemType;
-  const auto &doubleBufferEnabled = tilingCtx.doubleBufferEnabled;
-
-  // Create new module for AIE dialect
-  MLIRContext *ctx = rewriter.getContext();
-  auto loc = mlir::UnknownLoc::get(ctx);
-  auto aieModule = ModuleOp::create(loc);
-  OpBuilder builder(aieModule.getBodyRegion());
-  builder.setInsertionPointToStart(aieModule.getBody());
-
-  // Generate AIE DeviceOp
+// Creates DeviceOp sized to numCols columns.
+// Sets builder insertion point to DeviceOp body for subsequent emit calls.
+static DeviceOp emitDeviceOp(OpBuilder &builder, Location loc,
+                              const TilingContext &tilingCtx) {
+  const auto &numCols = tilingCtx.numCols;
   std::vector<AIEDevice> devices{AIEDevice::npu2_1col, AIEDevice::npu2_2col,
                                  AIEDevice::npu2_3col, AIEDevice::npu2_4col,
                                  AIEDevice::npu2_5col, AIEDevice::npu2_6col,
                                  AIEDevice::npu2_7col, AIEDevice::npu2};
   auto deviceOp = builder.create<DeviceOp>(loc, devices[numCols - 1]);
-
-  // Ensure it has a body block, and point insertion into it
   deviceOp.getRegion().emplaceBlock();
   DeviceOp::ensureTerminator(deviceOp.getBodyRegion(), builder, loc);
   builder.setInsertionPointToStart(deviceOp.getBody());
+  return deviceOp;
+}
 
-  // Generate AIE TileOp
+// Creates TileOp for every tile in placement and stores the result in tile.value.
+static void emitTileOps(OpBuilder &builder, Location loc,
+                        AiePlacement &placement) {
   for (auto &tile : placement.aieTiles) {
     auto tileOp = builder.create<xilinx::AIE::TileOp>(loc, tile.col, tile.row);
     tile.value = tileOp;
   }
+}
+
+// Creates GlobalOp (shim tiles) and BufferOp+LockOp (comp tiles).
+// Comp tile res buffer gets an extra calc lock when partial sums must be forwarded
+// (TPk>1 and K is not the innermost reuse axis).
+static void emitBufferAndLockOps(OpBuilder &builder, Location loc,
+                                 AiePlacement &placement,
+                                 const TilingContext &tilingCtx) {
+  const auto &compTileTPk = tilingCtx.compTileTPk;
+  const auto &tpOrder     = tilingCtx.tpOrder;
 
   // Generate Ops for each tile
   for (auto &tile : placement.aieTiles) {
@@ -1501,39 +1493,32 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
       }
     }
   }
+}
 
-  // Generate communication paths
+// Creates PacketFlowOp/PacketSourceOp/PacketDestOp for each packet comm.
+// comp->shim flows set keep_pkt_header=true to preserve the packet header.
+static void emitPacketFlowOps(OpBuilder &builder, Location loc,
+                               const AiePlacement &placement) {
   for (auto &comm : placement.aieComms) {
-    if (comm.isPacket) {  // packet-switched communication
-      auto &srcTile = placement.getAieTile(comm.srcIdx);
+    if (comm.isPacket) {
+      const auto &srcTile = placement.getAieTile(comm.srcIdx);
       BoolAttr keep_pkt_header = nullptr;
-
-      // Generate AIEX PacketFlowOp
-      if (srcTile.row != 0) {
+      if (srcTile.row != 0)
         keep_pkt_header = builder.getBoolAttr(true);
-      }
-        
+
       for (auto &packet : comm.packets) {
         int8_t pkt_Id = packet.packetId;
-
         auto flowOp = builder.create<xilinx::AIE::PacketFlowOp>(loc, pkt_Id, keep_pkt_header, nullptr);
         {
           OpBuilder::InsertionGuard g(builder);
           Region &flowRegion = flowOp.getBodyRegion();
           Block *flowBlock = builder.createBlock(&flowRegion);
           builder.setInsertionPointToStart(flowBlock);
-
           builder.create<xilinx::AIE::PacketSourceOp>(loc, srcTile.value, comm.srcBundle, static_cast<int32_t>(comm.srcCh));
-
           for (uint32_t i = 0; i < packet.dstIdxs.size(); ++i) {
-            auto dstIdx = packet.dstIdxs[i];
-            auto dstBundle = packet.dstBundles[i];
-            auto dstCh = packet.dstChs[i];
-            auto &dstTile = placement.getAieTile(dstIdx);
-
-            builder.create<xilinx::AIE::PacketDestOp>(loc, dstTile.value, dstBundle, static_cast<int32_t>(dstCh));
+            auto &dstTile = placement.getAieTile(packet.dstIdxs[i]);
+            builder.create<xilinx::AIE::PacketDestOp>(loc, dstTile.value, packet.dstBundles[i], static_cast<int32_t>(packet.dstChs[i]));
           }
-
           builder.create<EndOp>(loc);
         }
       }
@@ -1541,6 +1526,16 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
       // TODO: implement (FlowOp)
     }
   }
+}
+
+// Creates ShimDMAAllocationOp (shim tiles) and MemOp/DMAStartOp/DMABDOp (comp tiles).
+// Comp tile res S2MM BDs release calc lock instead of cons lock when pres is needed
+// (TPk>1 and K is not the innermost reuse axis).
+static void emitMemDmaOps(OpBuilder &builder, Location loc,
+                          AiePlacement &placement,
+                          const TilingContext &tilingCtx) {
+  const auto &compTileTPk = tilingCtx.compTileTPk;
+  const auto &tpOrder     = tilingCtx.tpOrder;
 
   // Generate AIE DMAOp
   for (auto &tile : placement.aieTiles) {
@@ -1653,6 +1648,24 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
       }
     }
   }
+
+}
+
+// Declares the extern_kernel FuncOp and creates CoreOp+SCF ForOp for each compute tile.
+// Inner loop iterates over the innermost axis (tpOrder[0]); outer loop runs infinitely.
+// Uses pres partial-sum accumulation when K is not the innermost reuse axis (TPk>1, tpOrder[0]!=2).
+static void emitCoreOps(OpBuilder &builder, Location loc,
+                        AiePlacement &placement,
+                        const TilingContext &tilingCtx) {
+  const auto &compTM              = tilingCtx.compTM;
+  const auto &compTK              = tilingCtx.compTK;
+  const auto &compTN              = tilingCtx.compTN;
+  const auto &compTileTPm         = tilingCtx.compTileTPm;
+  const auto &compTileTPk         = tilingCtx.compTileTPk;
+  const auto &compTileTPn         = tilingCtx.compTileTPn;
+  const auto &tpOrder             = tilingCtx.tpOrder;
+  const auto &elemType            = tilingCtx.elemType;
+  const auto &doubleBufferEnabled = tilingCtx.doubleBufferEnabled;
 
   // Generate Func FuncOp
   auto funcNameAttr = builder.getStringAttr("extern_kernel");
@@ -1939,7 +1952,25 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
       // Generate AIE EndOp
       builder.create<EndOp>(loc);
     }
-  }  
+  }
+}
+
+// Creates RuntimeSequenceOp and NpuDmaMemcpyNdOp/NpuDmaWaitOp for the NPU DMA schedule.
+// Buffer sizes are derived from tilingCtx; pres argument is added only when needed
+// (TPk>1 and K is not the innermost reuse axis).
+static void emitRuntimeSequenceOp(OpBuilder &builder, Location loc,
+                                   AiePlacement &placement,
+                                   const TilingContext &tilingCtx) {
+  const auto &compTM      = tilingCtx.compTM;
+  const auto &compTK      = tilingCtx.compTK;
+  const auto &compTN      = tilingCtx.compTN;
+  const auto &compTileSPm = tilingCtx.compTileSPm;
+  const auto &compTileSPn = tilingCtx.compTileSPn;
+  const auto &compTileTPm = tilingCtx.compTileTPm;
+  const auto &compTileTPk = tilingCtx.compTileTPk;
+  const auto &compTileTPn = tilingCtx.compTileTPn;
+  const auto &tpOrder     = tilingCtx.tpOrder;
+  const auto &elemType    = tilingCtx.elemType;
 
   // Generate AIEX RuntimeSequenceOp
   std::string seq_name = "sequence";
@@ -2020,6 +2051,25 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
       }
     }
   }
+}
+
+void generateAieOps(ConversionPatternRewriter &rewriter,
+                    AiePlacement &placement,
+                    const TilingContext &tilingCtx,
+                    const TileParam &tileParam) {
+  MLIRContext *ctx = rewriter.getContext();
+  auto loc = mlir::UnknownLoc::get(ctx);
+  auto aieModule = ModuleOp::create(loc);
+  OpBuilder builder(aieModule.getBodyRegion());
+  builder.setInsertionPointToStart(aieModule.getBody());
+
+  emitDeviceOp(builder, loc, tilingCtx);
+  emitTileOps(builder, loc, placement);
+  emitBufferAndLockOps(builder, loc, placement, tilingCtx);
+  emitPacketFlowOps(builder, loc, placement);
+  emitMemDmaOps(builder, loc, placement, tilingCtx);
+  emitCoreOps(builder, loc, placement, tilingCtx);
+  emitRuntimeSequenceOp(builder, loc, placement, tilingCtx);
 
   // Save the mlir code composed of AIE dialect
   std::error_code ec;
