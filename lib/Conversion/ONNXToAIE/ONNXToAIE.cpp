@@ -652,17 +652,23 @@ static void placeTiles(AiePlacement &placement, const TilingContext &tilingCtx) 
   }
 }
 
+// Returns true when a partial-sum buffer (pres) is needed.
+// pres is required when TPk > 1 and K is not the innermost loop axis,
+// because partial sums must be forwarded between K-axis iterations.
+// tpOrder[0] == 2 means K is innermost (local accumulation, no forwarding needed).
+static bool needsPres(const TilingContext &ctx) {
+  return ctx.compTileTPk > 1 && ctx.tpOrder[0] != 2;
+}
+
 // Allocate lhs/rhs/res (and optionally pres) buffers for each tile.
 // Shim tiles include a packet-header overhead in the res buffer.
 // pres buffer is needed when partial sums must be forwarded between tiles:
 //   TPk>1 and K is not the innermost (reuse) axis (tpOrder[0] != 2).
 static void allocateBuffers(AiePlacement &placement, const TilingContext &tilingCtx) {
-  const auto &compTM      = tilingCtx.compTM;
-  const auto &compTK      = tilingCtx.compTK;
-  const auto &compTN      = tilingCtx.compTN;
-  const auto &compTileTPk = tilingCtx.compTileTPk;
-  const auto &tpOrder     = tilingCtx.tpOrder;
-  const auto &elemType    = tilingCtx.elemType;
+  const auto &compTM   = tilingCtx.compTM;
+  const auto &compTK   = tilingCtx.compTK;
+  const auto &compTN   = tilingCtx.compTN;
+  const auto &elemType = tilingCtx.elemType;
 
   for (auto &tile : placement.aieTiles) {
     if (tile.row == 0) { // Shim tile
@@ -678,7 +684,7 @@ static void allocateBuffers(AiePlacement &placement, const TilingContext &tiling
       tile.bufs.push_back(rhsBuf);
       tile.bufs.push_back(resBuf);
 
-      if ((compTileTPk > 1) && (tpOrder[0] != 2)) {
+      if (needsPres(tilingCtx)) {
         uint32_t presBufSize = compTM * compTN;
         AieBuf presBuf{.name="pres", .bufSize=presBufSize, .elemType=elemType};
         tile.bufs.push_back(presBuf);
@@ -709,7 +715,6 @@ static void configureInputComms(AiePlacement &placement, const TilingContext &ti
   const auto &compTK             = tilingCtx.compTK;
   const auto &compTN             = tilingCtx.compTN;
   const auto &compTileSPm        = tilingCtx.compTileSPm;
-  const auto &compTileTPk        = tilingCtx.compTileTPk;
   const auto &tpOrder            = tilingCtx.tpOrder;
   const auto &elemType           = tilingCtx.elemType;
   auto dmaWireBundle = WireBundle::DMA;
@@ -787,42 +792,36 @@ static void configureInputComms(AiePlacement &placement, const TilingContext &ti
       rhsComm.packets.push_back(std::move(kv.second));
     }
 
-    // Check the need for PRES packet transmission (only when a partial sum needs to be transferred)
-    if (compTileTPk > 1) {
-      AieComm *presCommPtr = nullptr;
-      uint32_t dstCh = 0;
+    // Register PRES packets when partial sums must be forwarded between K iterations.
+    // needsPres() guarantees tpOrder[0] is 0 (M) or 1 (N), never 2 (K).
+    if (needsPres(tilingCtx)) {
+      AieComm *presComm;
+      uint32_t dstCh;
 
-      if (tpOrder[0] == 0) { // M-axis
-        presCommPtr = &lhsComm;
+      if (tpOrder[0] == 0) { // M-axis innermost: share LHS DMA channel
+        presComm = &lhsComm;
         dstCh = 0;
-      } else if (tpOrder[0] == 1) { // N-axis
-        presCommPtr = &rhsComm;
+      } else { // N-axis innermost (tpOrder[0] == 1): share RHS DMA channel
+        presComm = &rhsComm;
         dstCh = 1;
-      } else { // K-axis
-        // No need to transfer the partial sum
       }
-      
-      // Register PRES packets to the PRES (LHS or RHS) communication
-      if (presCommPtr) {
-        auto &presComm = *presCommPtr;
-        uint32_t presPacketCnt = 0;
 
-        for (uint32_t i = 0; i < numCompTilesPerCol; ++i) {
-          uint32_t l_idx = numCompTilesPerCol * col + i;
-          uint32_t compIdx = placement.findAieTileIdx(col, 5 - i);
+      uint32_t presPacketCnt = 0;
+      for (uint32_t i = 0; i < numCompTilesPerCol; ++i) {
+        uint32_t l_idx = numCompTilesPerCol * col + i;
+        uint32_t compIdx = placement.findAieTileIdx(col, 5 - i);
 
-          AiePacket pkt;
-          pkt.name = std::string("pres") + std::to_string(l_idx);
-          pkt.packetId = (1u << presPacketCnt++) + PRES_PKT_ID_OFFSET;
-          pkt.size = compTM * compTN;
-          pkt.elemType = elemType;
+        AiePacket pkt;
+        pkt.name = std::string("pres") + std::to_string(l_idx);
+        pkt.packetId = (1u << presPacketCnt++) + PRES_PKT_ID_OFFSET;
+        pkt.size = compTM * compTN;
+        pkt.elemType = elemType;
 
-          pkt.dstIdxs.push_back(compIdx);
-          pkt.dstBundles.push_back(dmaWireBundle);
-          pkt.dstChs.push_back(dstCh);
+        pkt.dstIdxs.push_back(compIdx);
+        pkt.dstBundles.push_back(dmaWireBundle);
+        pkt.dstChs.push_back(dstCh);
 
-          presComm.packets.push_back(pkt);
-        }
+        presComm->packets.push_back(pkt);
       }
     }
 
