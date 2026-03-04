@@ -554,6 +554,8 @@ struct AieNpuWait {
 struct AieNpuMemcpyNd {
   std::string name;
   uint32_t id;
+  uint32_t shimCol; // shim tile column (source of this DMA transfer)
+  uint32_t shimRow; // shim tile row (always 0 for current architecture)
   uint32_t bufIdx;
   bool isPacket;
   uint32_t packetType;
@@ -1042,9 +1044,9 @@ static void buildSchedule(AiePlacement &placement, const TilingContext &tilingCt
               uint32_t idx = static_cast<uint32_t>(std::strtoul(bd.name.c_str() + 3, nullptr, 10));
               uint32_t off = compTM * compTK;
 
-              std::string name = std::string("lhs") + std::to_string(tile.col) + std::to_string(tile.row);
+              std::string name = "lhs";
               std::array<int64_t,4> offset = {0, 0, 0, static_cast<int64_t>(off * idx)};
-              AieNpuMemcpyNd lhsTx{.name=name, .id=0, .bufIdx=bd.bufIdx, .isPacket=bd.isPacket, .packetType=0, .packetId=bd.packetId,
+              AieNpuMemcpyNd lhsTx{.name=name, .id=0, .shimCol=tile.col, .shimRow=tile.row, .bufIdx=bd.bufIdx, .isPacket=bd.isPacket, .packetType=0, .packetId=bd.packetId,
                                     .issueToken=true, .waitBufs={AieNpuWait{tile.col, tile.row, bd.bufIdx}},
                                     .staticOffset=offset, .staticSize=defaultSize, .staticStride=defaultStride};
 
@@ -1053,9 +1055,9 @@ static void buildSchedule(AiePlacement &placement, const TilingContext &tilingCt
               uint32_t idx = static_cast<uint32_t>(std::strtoul(bd.name.c_str() + 3, nullptr, 10));
               uint32_t off = compTK * compTN;
 
-              std::string name = std::string("rhs") + std::to_string(tile.col) + std::to_string(tile.row);
+              std::string name = "rhs";
               std::array<int64_t,4> offset = {0, 0, 0, static_cast<int64_t>(off * idx)};
-              AieNpuMemcpyNd rhsTx{.name=name, .id=1, .bufIdx=bd.bufIdx, .isPacket=bd.isPacket, .packetType=0, .packetId=bd.packetId,
+              AieNpuMemcpyNd rhsTx{.name=name, .id=1, .shimCol=tile.col, .shimRow=tile.row, .bufIdx=bd.bufIdx, .isPacket=bd.isPacket, .packetType=0, .packetId=bd.packetId,
                                     .issueToken=true, .waitBufs={AieNpuWait{tile.col, tile.row, bd.bufIdx}},
                                     .staticOffset=offset, .staticSize=defaultSize, .staticStride=defaultStride};
 
@@ -1064,9 +1066,9 @@ static void buildSchedule(AiePlacement &placement, const TilingContext &tilingCt
               uint32_t idx = static_cast<uint32_t>(std::strtoul(bd.name.c_str() + 4, nullptr, 10));
               uint32_t off = compTM * compTN;
 
-              std::string name = std::string("pres") + std::to_string(tile.col) + std::to_string(tile.row);
+              std::string name = "pres";
               std::array<int64_t,4> offset = {0, 0, 0, static_cast<int64_t>(off * idx)};
-              AieNpuMemcpyNd presTx{.name=name, .id=2, .bufIdx=bd.bufIdx, .isPacket=bd.isPacket, .packetType=0, .packetId=bd.packetId,
+              AieNpuMemcpyNd presTx{.name=name, .id=2, .shimCol=tile.col, .shimRow=tile.row, .bufIdx=bd.bufIdx, .isPacket=bd.isPacket, .packetType=0, .packetId=bd.packetId,
                                     .issueToken=true, .waitBufs={AieNpuWait{tile.col, tile.row, bd.bufIdx}},
                                     .staticOffset=offset, .staticSize=defaultSize, .staticStride=defaultStride};
 
@@ -1084,11 +1086,11 @@ static void buildSchedule(AiePlacement &placement, const TilingContext &tilingCt
             uint32_t idx = static_cast<uint32_t>(std::strtoul(bd.name.c_str() + 3, nullptr, 10));
             uint32_t off = compTM * compTN + (PKT_HDR_BYTES / getElemBytes(elemType));
 
-            std::string name = std::string("res") + std::to_string(tile.col) + std::to_string(tile.row);
+            std::string name = "res";
             std::array<int64_t,4> offset = {0, 0, 0, static_cast<int64_t>(off * idx)};
             std::array<int64_t,4> size = {1, 1, 1, static_cast<int64_t>(bd.bufSize)};
             std::array<int64_t,4> stride = {0, 0, 0, 1};
-            AieNpuMemcpyNd resRx{.name=name, .id=3, .bufIdx=bd.bufIdx, .isPacket=bd.isPacket, .packetType=0, .packetId=bd.packetId,
+            AieNpuMemcpyNd resRx{.name=name, .id=3, .shimCol=tile.col, .shimRow=tile.row, .bufIdx=bd.bufIdx, .isPacket=bd.isPacket, .packetType=0, .packetId=bd.packetId,
                                     .issueToken=true, .waitBufs={AieNpuWait{tile.col, tile.row, bd.bufIdx}},
                                     .staticOffset=offset, .staticSize=size, .staticStride=stride};
 
@@ -1366,6 +1368,8 @@ static void debugDumpPlacement(const AiePlacement &placement) {
 
       llvm::dbgs() << "    Sched[" << sIdx << "]"
                    << " name=" << sch.name
+                   << " shimCol=" << sch.shimCol
+                   << " shimRow=" << sch.shimRow
                    << " id=" << sch.id
                    << " bufIdx=" << sch.bufIdx
                    << " isPacket=" << (sch.isPacket ? "true" : "false");
@@ -2011,20 +2015,13 @@ static void emitRuntimeSequenceOp(OpBuilder &builder, Location loc,
     // Generate AIEX NpuDmaMemcpyNdOp
     for (auto &sch : placement.aieSchedule) {
       Value arg;
-      uint32_t col, row;
 
       if (sch.name.compare(0, 3, "lhs") == 0) {
         arg = arg_lhs;
-        col = static_cast<uint32_t>(sch.name[3] - '0');
-        row = static_cast<uint32_t>(sch.name[4] - '0');
       } else if (sch.name.compare(0, 3, "rhs") == 0) {
         arg = arg_rhs;
-        col = static_cast<uint32_t>(sch.name[3] - '0');
-        row = static_cast<uint32_t>(sch.name[4] - '0');
       } else if (sch.name.compare(0, 3, "res") == 0) {
         arg = arg_res;
-        col = static_cast<uint32_t>(sch.name[3] - '0');
-        row = static_cast<uint32_t>(sch.name[4] - '0');
       } else { // name starts with "pres"
         // Invariant: a "pres" schedule entry is only generated when pres buffers
         // are allocated, which requires (compTileTPk > 1) && (tpOrder[0] != 2) --
@@ -2032,9 +2029,9 @@ static void emitRuntimeSequenceOp(OpBuilder &builder, Location loc,
         assert(arg_pres && "pres schedule entry present but arg_pres not initialized; "
                            "check (compTileTPk > 1) && (tpOrder[0] != 2) invariant");
         arg = arg_pres;
-        col = static_cast<uint32_t>(sch.name[4] - '0');
-        row = static_cast<uint32_t>(sch.name[5] - '0');
       }
+      uint32_t col = sch.shimCol;
+      uint32_t row = sch.shimRow;
       
       uint32_t shimIdx = placement.findAieTileIdx(col, row);
       AieTile &shimTile = placement.getAieTile(shimIdx);
