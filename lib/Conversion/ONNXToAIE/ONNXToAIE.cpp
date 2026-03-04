@@ -66,6 +66,9 @@ static llvm::cl::opt<std::string>
 //===----------------------------------------------------------------------===//
 // Number of compute tiles stacked per column (rows 2-5 on XDNA2)
 static constexpr uint32_t NUM_COMP_TILES_PER_COL = 4;
+// Maximum number of AIE columns supported by the npu2 device family.
+// Corresponds to the size of the devices[] array in emitDeviceOp.
+static constexpr uint32_t NUM_MAX_COLS           = 8;
 // Packet header prepended by the switch: 4 bytes, divided by elem size
 // to express as element count for buffer size/offset arithmetic
 static constexpr uint32_t PKT_HDR_BYTES          = 4;
@@ -611,8 +614,23 @@ struct TilingContext {
 static TilingContext buildTilingContext(const TileParam &tp) {
   TilingContext tc;
   const auto &lv = tp.levels[0];
-  tc.numCompTilesPerCol  = NUM_COMP_TILES_PER_COL;
-  tc.numCols             = tp.numLastSpm / tc.numCompTilesPerCol;
+  tc.numCompTilesPerCol = NUM_COMP_TILES_PER_COL;
+
+  // numLastSpm must be a positive multiple of NUM_COMP_TILES_PER_COL so that
+  // the tile grid fills complete columns without remainder.
+  if (tp.numLastSpm == 0 || tp.numLastSpm % NUM_COMP_TILES_PER_COL != 0)
+    llvm::report_fatal_error(
+        llvm::Twine("numLastSpm=") + llvm::Twine(tp.numLastSpm) +
+        " must be a positive multiple of " +
+        llvm::Twine(NUM_COMP_TILES_PER_COL));
+
+  tc.numCols = tp.numLastSpm / tc.numCompTilesPerCol;
+
+  if (tc.numCols > NUM_MAX_COLS)
+    llvm::report_fatal_error(
+        llvm::Twine("numCols=") + llvm::Twine(tc.numCols) +
+        " exceeds maximum supported columns (" +
+        llvm::Twine(NUM_MAX_COLS) + ")");
   tc.compTM              = lv.tileSize.TM;
   tc.compTK              = lv.tileSize.TK;
   tc.compTN              = lv.tileSize.TN;
