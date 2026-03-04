@@ -2,9 +2,9 @@
 # Toolchain (Vitis-AI/AIEngine)
 # =========================
 AIETOOLS_DIR       ?= $(shell realpath $(dir $(shell which xchesscc))/../)
-AIE2_INCLUDE_DIR   ?= ${AIETOOLS_DIR}/data/aie2p/lib
+AIE2_INCLUDE_DIR   ?= $(AIETOOLS_DIR)/data/aie2p/lib
 AIE_ARCH           ?= aie2p
-CHESSCC_FLAGS      ?= --aiearch ${AIE_ARCH} -f -p me -P ${AIE2_INCLUDE_DIR} -I ${AIETOOLS_DIR}/include
+CHESSCC_FLAGS      ?= --aiearch $(AIE_ARCH) -f -p me -P $(AIE2_INCLUDE_DIR) -I $(AIETOOLS_DIR)/include
 AIECC_FLAGS        ?= --aie-generate-xclbin --no-compile-host --aie-generate-npu-insts --npu-insts-name=insts.bin
 
 # =========================
@@ -56,17 +56,17 @@ $(BUILD_DIR) $(LOGS_DIR) $(MLIR_DIR) $(ONNX_DIR) $(REPORTS_DIR):
 #    Assuming $(MLIR_SRCS) is created by gen_onnx_matmul_mlir.sh beforehand,
 #    run aie-opt and place aie.mlir/host.mlir into $(BUILD_DIR).
 $(BUILD_DIR)/aie.mlir: $(MLIR_SRCS) | $(BUILD_DIR)
-	aie-opt $< ${PASSES} --tile-param-json=$(TC_JSON) ${DEBUGS} > host.mlir
+	aie-opt $< $(PASSES) --tile-param-json=$(TC_JSON) $(DEBUGS) > host.mlir
 	# Assume some passes may produce aie.mlir separately
 	mv aie.mlir host.mlir $(BUILD_DIR)
 
 # 2) Compile kernel (xchesscc)
 $(BUILD_DIR)/kernel.o: $(KERNEL_SRCS) | $(BUILD_DIR)
-	xchesscc ${CHESSCC_FLAGS} -c $< -o $@
+	xchesscc $(CHESSCC_FLAGS) -c $< -o $@
 
 # 3) Generate xclbin/insts.bin with aiecc.py
 $(BUILD_DIR)/final.xclbin: $(BUILD_DIR)/aie.mlir $(BUILD_DIR)/kernel.o
-	cd $(BUILD_DIR) && aiecc.py ${AIECC_FLAGS} --xclbin-name=$(@F) aie.mlir
+	cd $(BUILD_DIR) && aiecc.py $(AIECC_FLAGS) --xclbin-name=$(@F) aie.mlir
 
 # 4) Build host (assumes CMakeLists.txt lives at repo root)
 host: $(BUILD_DIR)/$(TARGET)
