@@ -46,6 +46,11 @@ static llvm::cl::opt<bool>
                     llvm::cl::desc("Print computed AIE placement"),
                     llvm::cl::init(false));
 
+static llvm::cl::opt<std::string>
+    TileParamJson("tile-param-json",
+                  llvm::cl::desc("Path to tc.json tiling config file"),
+                  llvm::cl::init(""));
+
 //===----------------------------------------------------------------------===//
 // Layout constants
 //===----------------------------------------------------------------------===//
@@ -323,7 +328,11 @@ static TileSize getLevelTileSize(const llvm::json::Object &obj) {
 // TODO: Implement the tiling algorithm
 TileParam findOptimalTileParam(const SystemInfo &sysInfo, const MatmulOpInfo &opInfo) {
 
-  std::string filePath = "/home/ace/ryzen_ai/mlir-aie-dev/mlir-aie/test/onnx-mlir/out/tc.json";
+  if (TileParamJson.empty()) {
+    llvm::errs() << "Error: --tile-param-json is required\n";
+    llvm::report_fatal_error("tile param json path not specified");
+  }
+  std::string filePath = TileParamJson;
 
   auto bufOrErr = llvm::MemoryBuffer::getFile(filePath);
   if (!bufOrErr) {
