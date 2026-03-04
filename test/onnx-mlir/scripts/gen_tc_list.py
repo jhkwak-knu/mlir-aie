@@ -12,7 +12,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 import tempfile
 import shutil
 import math
@@ -58,12 +58,18 @@ def atomic_write_json(obj: Any, out_path: Path) -> None:
     Write JSON atomically to out_path (prevent partial writes).
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", suffix=".tmp", delete=False, dir=str(out_path.parent), encoding="utf-8") as tmp:
-        json.dump(obj, tmp, ensure_ascii=False, indent=2)
-        tmp.flush()
-        tmp_path = Path(tmp.name)
-    # POSIX atomic replace
-    shutil.move(str(tmp_path), str(out_path))
+    tmp_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".tmp", delete=False, dir=str(out_path.parent), encoding="utf-8") as tmp:
+            json.dump(obj, tmp, ensure_ascii=False, indent=2)
+            tmp.flush()
+            tmp_path = Path(tmp.name)
+        # POSIX atomic replace
+        shutil.move(str(tmp_path), str(out_path))
+    except Exception:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+        raise
 
 
 def atomic_write_text(text: str, out_path: Path) -> None:
@@ -71,11 +77,17 @@ def atomic_write_text(text: str, out_path: Path) -> None:
     Write TEXT atomically to out_path (prevent partial writes).
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", suffix=".logtmp", delete=False, dir=str(out_path.parent), encoding="utf-8") as tmp:
-        tmp.write(text)
-        tmp.flush()
-        tmp_path = Path(tmp.name)
-    shutil.move(str(tmp_path), str(out_path))
+    tmp_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".logtmp", delete=False, dir=str(out_path.parent), encoding="utf-8") as tmp:
+            tmp.write(text)
+            tmp.flush()
+            tmp_path = Path(tmp.name)
+        shutil.move(str(tmp_path), str(out_path))
+    except Exception:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+        raise
 
 
 def write_tc_list(tc_cases: List[Dict[str, Any]], out_json_path: Path) -> None:
