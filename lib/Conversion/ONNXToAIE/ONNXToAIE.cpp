@@ -493,6 +493,10 @@ struct AieTile {
     const size_t pos = name.find_first_of("0123456789");
     const std::string base = name.substr(0, pos);
     
+    // "pres" packets are received into the "res" buffer on compute tiles,
+    // which have no dedicated "pres" buffer. Shim tiles do have a "pres"
+    // buffer and are matched by the first target. Compute tiles fall through
+    // to "res", where partial sums are accumulated.
     const char* targets[2];
     size_t tcount = 0;
     if (base == "pres") { targets[0] = "pres"; targets[1] = "res"; tcount = 2; }
