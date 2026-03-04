@@ -2032,7 +2032,7 @@ static void emitRuntimeSequenceOp(OpBuilder &builder, Location loc,
     auto arg_res = seqBlock->addArgument(resMemrefType, loc);
 
     Value arg_pres;
-    if ((compTileTPk > 1) && (tpOrder[0] != 2)) {
+    if (needsPres(tilingCtx)) {
       uint32_t presSize = ((compTM * compTN) * compTileSPm * compTileSPn) * localTPm * localTPn;
       auto presMemrefType = MemRefType::get({presSize}, elemType);
       arg_pres = seqBlock->addArgument(presMemrefType, loc);
@@ -2050,10 +2050,9 @@ static void emitRuntimeSequenceOp(OpBuilder &builder, Location loc,
         arg = arg_res;
       } else { // name starts with "pres"
         // Invariant: a "pres" schedule entry is only generated when pres buffers
-        // are allocated, which requires (compTileTPk > 1) && (tpOrder[0] != 2) --
-        // the same condition that initializes arg_pres above.
-        assert(arg_pres && "pres schedule entry present but arg_pres not initialized; "
-                           "check (compTileTPk > 1) && (tpOrder[0] != 2) invariant");
+        // are allocated, which requires needsPres(tilingCtx) -- the same
+        // condition that initializes arg_pres above.
+        assert(arg_pres && "pres schedule entry present but needsPres() returned false");
         arg = arg_pres;
       }
       uint32_t col = sch.shimCol;
