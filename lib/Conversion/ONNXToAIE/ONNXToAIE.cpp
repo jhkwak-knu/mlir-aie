@@ -295,7 +295,12 @@ static mlir::Type getElemTypeReq(const llvm::json::Object &obj,
 static std::vector<uint32_t>
 getAxisArrayOpt(const llvm::json::Object &obj, llvm::StringRef key) {
   std::vector<uint32_t> out;
-  if (auto *arr = obj.getArray(key)) {
+  auto *arr = obj.getArray(key);
+  if (!arr) {
+    llvm::errs() << "Error: missing required array '" << key << "'\n";
+    llvm::report_fatal_error("tpOrder missing");
+  }
+  {
     std::bitset<3> seen;
     for (const auto &it : *arr) {
       if (auto iv = it.getAsInteger()) {
