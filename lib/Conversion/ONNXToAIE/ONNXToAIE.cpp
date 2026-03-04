@@ -2103,6 +2103,9 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
   // Save the mlir code composed of AIE dialect
   std::error_code ec;
   llvm::raw_fd_ostream out(AieMlirOutput, ec);
+  if (ec)
+    llvm::report_fatal_error(llvm::Twine("cannot open aie.mlir output '") +
+                             AieMlirOutput + "': " + ec.message());
   aieModule->print(out);
 }
 
