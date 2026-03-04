@@ -534,7 +534,7 @@ struct AieTile {
         if (bufs[idx].name == targets[t])
           return idx;
 
-    llvm_unreachable("Buffer not found");
+    llvm::report_fatal_error(llvm::Twine("Buffer not found: '") + name + "'");
   };
 
   std::pair<bool, uint32_t> findDmaIdx(DMAChannelDir dir, uint32_t channel) {
