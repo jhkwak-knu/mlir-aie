@@ -2025,7 +2025,12 @@ static void emitRuntimeSequenceOp(OpBuilder &builder, Location loc,
         arg = arg_res;
         col = static_cast<uint32_t>(sch.name[3] - '0');
         row = static_cast<uint32_t>(sch.name[4] - '0');
-      } else { // sch.name.compare(0, 4, "pres") == 0
+      } else { // name starts with "pres"
+        // Invariant: a "pres" schedule entry is only generated when pres buffers
+        // are allocated, which requires (compTileTPk > 1) && (tpOrder[0] != 2) --
+        // the same condition that initializes arg_pres above.
+        assert(arg_pres && "pres schedule entry present but arg_pres not initialized; "
+                           "check (compTileTPk > 1) && (tpOrder[0] != 2) invariant");
         arg = arg_pres;
         col = static_cast<uint32_t>(sch.name[4] - '0');
         row = static_cast<uint32_t>(sch.name[5] - '0');
