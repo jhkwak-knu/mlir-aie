@@ -54,11 +54,10 @@ $(BUILD_DIR) $(LOGS_DIR) $(MLIR_DIR) $(ONNX_DIR) $(REPORTS_DIR):
 
 # 1) Prepare conversion outputs: ONNX-MLIR -> AIE MLIR
 #    Assuming $(MLIR_SRCS) is created by gen_onnx_matmul_mlir.sh beforehand,
-#    run aie-opt and place aie.mlir/host.mlir into $(BUILD_DIR).
+#    run aie-opt and write aie.mlir/host.mlir directly into $(BUILD_DIR).
 $(BUILD_DIR)/aie.mlir: $(MLIR_SRCS) | $(BUILD_DIR)
-	aie-opt $< $(PASSES) --tile-param-json=$(TC_JSON) $(DEBUGS) > host.mlir
-	# Assume some passes may produce aie.mlir separately
-	mv aie.mlir host.mlir $(BUILD_DIR)
+	aie-opt $< $(PASSES) --tile-param-json=$(TC_JSON) --aie-mlir-output=$@ $(DEBUGS) \
+		-o $(BUILD_DIR)/host.mlir
 
 # 2) Compile kernel (xchesscc)
 $(BUILD_DIR)/kernel.o: $(KERNEL_SRCS) | $(BUILD_DIR)

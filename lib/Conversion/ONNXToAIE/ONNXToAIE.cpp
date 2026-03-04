@@ -51,6 +51,11 @@ static llvm::cl::opt<std::string>
                   llvm::cl::desc("Path to tc.json tiling config file"),
                   llvm::cl::init(""));
 
+static llvm::cl::opt<std::string>
+    AieMlirOutput("aie-mlir-output",
+                  llvm::cl::desc("Output path for generated aie.mlir"),
+                  llvm::cl::init("./aie.mlir"));
+
 //===----------------------------------------------------------------------===//
 // Layout constants
 //===----------------------------------------------------------------------===//
@@ -2092,7 +2097,7 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
 
   // Save the mlir code composed of AIE dialect
   std::error_code ec;
-  llvm::raw_fd_ostream out("./aie.mlir", ec);
+  llvm::raw_fd_ostream out(AieMlirOutput, ec);
   aieModule->print(out);
 }
 
