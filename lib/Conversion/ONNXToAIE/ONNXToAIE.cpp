@@ -2139,8 +2139,12 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
 class ConvertONNXMatMulToAIE
     : public OpConversionPattern<onnx::MatMulOp> {
 
+  SystemInfo sysInfo_;
+
 public:
-  using OpConversionPattern<onnx::MatMulOp>::OpConversionPattern;
+  ConvertONNXMatMulToAIE(MLIRContext *ctx, SystemInfo sysInfo)
+      : OpConversionPattern<onnx::MatMulOp>(ctx),
+        sysInfo_(std::move(sysInfo)) {}
 
   LogicalResult
   matchAndRewrite(onnx::MatMulOp op,
@@ -2148,17 +2152,6 @@ public:
                   ConversionPatternRewriter &rewriter) const override {
     
     Location loc = op.getLoc();
-
-    // Read the system information
-    if (SystemInfoJson.empty()) {
-      llvm::errs() << "Error: --system-info-json is required\n";
-      llvm::report_fatal_error("system info json path not specified");
-    }
-    std::string filePath = SystemInfoJson;
-    auto systemInfo = loadSystemInfo(filePath);
-    if (!systemInfo) {
-      return rewriter.notifyMatchFailure(op, llvm::Twine("Unable to open JSON file: '") + filePath + "'");
-    }
 
     // Find optimal tiling parameters
     MatmulOpInfo opInfo;
@@ -2185,7 +2178,7 @@ public:
     opInfo.N = static_cast<uint32_t>(resType.getShape()[1]);
     opInfo.K = static_cast<uint32_t>(lhsType.getShape()[1]);
 
-    TileParam optimalTileParam = findOptimalTileParam(systemInfo.value(), opInfo);
+    TileParam optimalTileParam = findOptimalTileParam(sysInfo_, opInfo);
 
     // Perform hardware-aware optimization for AIE
     TilingContext tilingCtx = buildTilingContext(optimalTileParam);
@@ -2209,9 +2202,9 @@ public:
 // Pass main (ConvertONNXToAIE)
 //===----------------------------------------------------------------------===//
 void populateONNXRewritePatterns(RewritePatternSet &patterns,
-                                 MLIRContext *ctx) {
+                                 MLIRContext *ctx, SystemInfo sysInfo) {
   // Matmul
-  patterns.insert<ConvertONNXMatMulToAIE>(ctx);
+  patterns.insert<ConvertONNXMatMulToAIE>(ctx, std::move(sysInfo));
 }
 
 struct ConvertONNXToAIE
@@ -2226,8 +2219,20 @@ struct ConvertONNXToAIE
   }
 
   void runOnOperation() override {
+    // Load system info once at pass level, not per-op in matchAndRewrite.
+    if (SystemInfoJson.empty()) {
+      llvm::errs() << "Error: --system-info-json is required\n";
+      signalPassFailure();
+      return;
+    }
+    auto systemInfo = loadSystemInfo(SystemInfoJson);
+    if (!systemInfo) {
+      signalPassFailure();
+      return;
+    }
+
     RewritePatternSet patterns(&getContext());
-    populateONNXRewritePatterns(patterns, &getContext());
+    populateONNXRewritePatterns(patterns, &getContext(), std::move(*systemInfo));
     ConversionTarget target(getContext());
 
     target.markUnknownOpDynamicallyLegal([](...) { return true; });
