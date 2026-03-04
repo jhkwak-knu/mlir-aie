@@ -1223,175 +1223,173 @@ static void debugDumpPlacement(const AiePlacement &placement) {
   if (!DebugAiePlacement)
     return;
 
-  if (true) {
-    llvm::dbgs() << "[AiePlacement] Computed AIE Placement:\n";
+  llvm::dbgs() << "[AiePlacement] Computed AIE Placement:\n";
 
-    // ---- Tiles ----
-    llvm::dbgs() << "  aieTiles (" << placement.aieTiles.size() << "):\n";
-    for (size_t tileIdx = 0; tileIdx < placement.aieTiles.size(); ++tileIdx) {
-      const auto &tile = placement.getAieTile(tileIdx);
-      llvm::dbgs() << "    Tile[" << tileIdx << "] (" << tile.col << ", " << tile.row << ")\n";
+  // ---- Tiles ----
+  llvm::dbgs() << "  aieTiles (" << placement.aieTiles.size() << "):\n";
+  for (size_t tileIdx = 0; tileIdx < placement.aieTiles.size(); ++tileIdx) {
+    const auto &tile = placement.getAieTile(tileIdx);
+    llvm::dbgs() << "    Tile[" << tileIdx << "] (" << tile.col << ", " << tile.row << ")\n";
 
-      // Buffers (no Value prints)
-      llvm::dbgs() << "      bufs (" << tile.bufs.size() << "):\n";
-      for (size_t i = 0; i < tile.bufs.size(); ++i) {
-        const auto &b = tile.getAieBuf(i);
-        llvm::dbgs() << "        - [" << i << "] name=" << b.name
-                    << " symbol=" << b.symbol
-                    << " size=" << b.bufSize
-                    << " elemType=";
-        if (b.elemType) b.elemType.print(llvm::dbgs());
-        else            llvm::dbgs() << "<null>";
-        llvm::dbgs() << "\n";
-      }
-
-      // Buffer Descriptors
-      llvm::dbgs() << "      bds (" << tile.bds.size() << "):\n";
-      for (size_t i = 0; i < tile.bds.size(); ++i) {
-        const auto &bd = tile.getAieBd(i);
-        llvm::dbgs() << "        - [" << i << "]" 
-                    << " name=" << bd.name
-                    << " isPacket=" << (bd.isPacket ? "true" : "false");
-        if (bd.isPacket)
-          llvm::dbgs() << " packetId=" << bd.packetId;
-        llvm::dbgs() << " bufIdx=" << bd.bufIdx
-                    << " bufOffset=" << bd.bufOffset
-                    << " bufSize=" << bd.bufSize
-                    << " nextBdIdx=" << bd.nextBdIdx << "\n";
-      }
-
-      // DMAs
-      llvm::dbgs() << "      dmas (" << tile.dmas.size() << "):\n";
-      for (size_t i = 0; i < tile.dmas.size(); ++i) {
-        const auto &d = tile.getAieDma(i);
-        llvm::dbgs() << "        - [" << i << "] dir=" << static_cast<int>(d.dir)
-                    << " channel=" << d.channel
-                    << " bdIdx=" << d.bdIdx << "\n";
-      }
-    }
-
-    // ---- Comms (packet or circuit) ----
-    llvm::dbgs() << "  aieComms (" << placement.aieComms.size() << "):\n";
-    for (size_t commIdx = 0; commIdx < placement.aieComms.size(); ++commIdx) {
-      const auto &comm = placement.getAieComm(commIdx);
-      const auto &srcTile = placement.getAieTile(comm.srcIdx);
-
-      llvm::dbgs() << "    Comm[" << commIdx << "] name=" << comm.name
-                  << " src=(" << srcTile.col << ", " << srcTile.row << ")"
-                  << " srcBundle=" << static_cast<int>(comm.srcBundle)
-                  << " srcCh=" << comm.srcCh
-                  << " isPacket=" << (comm.isPacket ? "true" : "false") << "\n";
-
-      auto printDsts = [&](size_t nd,
-                          const std::vector<uint32_t> &dstIdxs,
-                          const std::vector<WireBundle> &dstBundles,
-                          const std::vector<uint32_t> &dstChs) {
-        if (nd != dstIdxs.size() || nd != dstBundles.size() || nd != dstChs.size()) {
-          llvm::dbgs() << "            (warn) dst arrays length mismatch: "
-                      << "dstIdxs=" << dstIdxs.size()
-                      << " dstBundles=" << dstBundles.size()
-                      << " dstChs="  << dstChs.size()  << "\n";
-        }
-        llvm::dbgs() << "            dsts (" << nd << "):\n";
-        for (size_t j = 0; j < nd; ++j) {
-          uint32_t dstIdx = dstIdxs[j];
-          const auto &dstTile = placement.getAieTile(dstIdx);
-          llvm::dbgs() << "              • [" << j << "] -> tile("
-                      << dstTile.col << ", " << dstTile.row << ")"
-                      << " Bundle=" << static_cast<int>(dstBundles[j])
-                      << " ch="   << dstChs[j] << "\n";
-        }
-      };
-
-      if (comm.isPacket) {
-        // Packets
-        llvm::dbgs() << "      packets (" << comm.packets.size() << "):\n";
-        for (size_t pIdx = 0; pIdx < comm.packets.size(); ++pIdx) {
-          const auto &p = comm.packets[pIdx];
-          llvm::dbgs() << "        - Packet[" << pIdx << "] name=" << p.name
-                      << " packetId=" << p.packetId
-                      << " size=" << p.size
-                      << " elemType=";
-          if (p.elemType) p.elemType.print(llvm::dbgs());
-          else            llvm::dbgs() << "<null>";
-          llvm::dbgs() << "\n";
-
-          size_t nd = std::min({p.dstIdxs.size(), p.dstBundles.size(), p.dstChs.size()});
-          printDsts(nd, p.dstIdxs, p.dstBundles, p.dstChs);
-        }
-        if (!comm.circuits.empty()) {
-          llvm::dbgs() << "      (warn) isPacket=true but circuits not empty: "
-                      << comm.circuits.size() << "\n";
-        }
-      } else {
-        // Circuits
-        llvm::dbgs() << "      circuits (" << comm.circuits.size() << "):\n";
-        for (size_t cIdx = 0; cIdx < comm.circuits.size(); ++cIdx) {
-          const auto &c = comm.circuits[cIdx];
-          llvm::dbgs() << "        - Circuit[" << cIdx << "] name=" << c.name
-                      << " size=" << c.size
-                      << " elemType=";
-          if (c.elemType) c.elemType.print(llvm::dbgs());
-          else            llvm::dbgs() << "<null>";
-          llvm::dbgs() << "\n";
-
-          size_t nd = std::min({c.dstIdxs.size(), c.dstBundles.size(), c.dstChs.size()});
-          printDsts(nd, c.dstIdxs, c.dstBundles, c.dstChs);
-        }
-        if (!comm.packets.empty()) {
-          llvm::dbgs() << "      (warn) isPacket=false but packets not empty: "
-                      << comm.packets.size() << "\n";
-        }
-      }
-    }
-
-    // ---- Schedule (NPU DMA memcpy ND) ----
-    llvm::dbgs() << "  aieSchedule (" << placement.aieSchedule.size() << "):\n";
-    for (size_t sIdx = 0; sIdx < placement.aieSchedule.size(); ++sIdx) {
-      const auto &sch = placement.aieSchedule[sIdx];
-
-      auto printI64x4 = [&](const char *label, const int64_t v[4]) {
-        llvm::dbgs() << " " << label << "=["
-                     << v[0] << ", " << v[1] << ", " << v[2] << ", " << v[3] << "]";
-      };
-
-      auto printU32VecWait = [&](const char *label, const std::vector<AieNpuWait> &vec) {
-        llvm::dbgs() << " " << label << "=[";
-        for (size_t i = 0; i < vec.size(); ++i) {
-          if (i) llvm::dbgs() << ", ";
-          llvm::dbgs() << "{c=" << vec[i].col
-                      << ", r=" << vec[i].row
-                      << ", b=" << vec[i].bufIdx << "}";
-        }
-        llvm::dbgs() << "]";
-      };
-
-      llvm::dbgs() << "    Sched[" << sIdx << "]"
-                   << " name=" << sch.name
-                   << " shimCol=" << sch.shimCol
-                   << " shimRow=" << sch.shimRow
-                   << " id=" << sch.id
-                   << " bufIdx=" << sch.bufIdx
-                   << " isPacket=" << (sch.isPacket ? "true" : "false");
-
-      if (sch.isPacket) {
-        llvm::dbgs() << " packetType=" << sch.packetType
-                     << " packetId="   << sch.packetId;
-      }
-
-      llvm::dbgs() << " issueToken=" << (sch.issueToken ? "true" : "false")
-                  << " hasWait="    << (!sch.waitBufs.empty() ? "true" : "false");
-      printU32VecWait("waitBufs", sch.waitBufs);
-
-      printI64x4("offset", sch.staticOffset.data());
-      printI64x4("size",   sch.staticSize.data());
-      printI64x4("stride", sch.staticStride.data());
-
+    // Buffers (no Value prints)
+    llvm::dbgs() << "      bufs (" << tile.bufs.size() << "):\n";
+    for (size_t i = 0; i < tile.bufs.size(); ++i) {
+      const auto &b = tile.getAieBuf(i);
+      llvm::dbgs() << "        - [" << i << "] name=" << b.name
+                  << " symbol=" << b.symbol
+                  << " size=" << b.bufSize
+                  << " elemType=";
+      if (b.elemType) b.elemType.print(llvm::dbgs());
+      else            llvm::dbgs() << "<null>";
       llvm::dbgs() << "\n";
     }
 
+    // Buffer Descriptors
+    llvm::dbgs() << "      bds (" << tile.bds.size() << "):\n";
+    for (size_t i = 0; i < tile.bds.size(); ++i) {
+      const auto &bd = tile.getAieBd(i);
+      llvm::dbgs() << "        - [" << i << "]" 
+                  << " name=" << bd.name
+                  << " isPacket=" << (bd.isPacket ? "true" : "false");
+      if (bd.isPacket)
+        llvm::dbgs() << " packetId=" << bd.packetId;
+      llvm::dbgs() << " bufIdx=" << bd.bufIdx
+                  << " bufOffset=" << bd.bufOffset
+                  << " bufSize=" << bd.bufSize
+                  << " nextBdIdx=" << bd.nextBdIdx << "\n";
+    }
+
+    // DMAs
+    llvm::dbgs() << "      dmas (" << tile.dmas.size() << "):\n";
+    for (size_t i = 0; i < tile.dmas.size(); ++i) {
+      const auto &d = tile.getAieDma(i);
+      llvm::dbgs() << "        - [" << i << "] dir=" << static_cast<int>(d.dir)
+                  << " channel=" << d.channel
+                  << " bdIdx=" << d.bdIdx << "\n";
+    }
+  }
+
+  // ---- Comms (packet or circuit) ----
+  llvm::dbgs() << "  aieComms (" << placement.aieComms.size() << "):\n";
+  for (size_t commIdx = 0; commIdx < placement.aieComms.size(); ++commIdx) {
+    const auto &comm = placement.getAieComm(commIdx);
+    const auto &srcTile = placement.getAieTile(comm.srcIdx);
+
+    llvm::dbgs() << "    Comm[" << commIdx << "] name=" << comm.name
+                << " src=(" << srcTile.col << ", " << srcTile.row << ")"
+                << " srcBundle=" << static_cast<int>(comm.srcBundle)
+                << " srcCh=" << comm.srcCh
+                << " isPacket=" << (comm.isPacket ? "true" : "false") << "\n";
+
+    auto printDsts = [&](size_t nd,
+                        const std::vector<uint32_t> &dstIdxs,
+                        const std::vector<WireBundle> &dstBundles,
+                        const std::vector<uint32_t> &dstChs) {
+      if (nd != dstIdxs.size() || nd != dstBundles.size() || nd != dstChs.size()) {
+        llvm::dbgs() << "            (warn) dst arrays length mismatch: "
+                    << "dstIdxs=" << dstIdxs.size()
+                    << " dstBundles=" << dstBundles.size()
+                    << " dstChs="  << dstChs.size()  << "\n";
+      }
+      llvm::dbgs() << "            dsts (" << nd << "):\n";
+      for (size_t j = 0; j < nd; ++j) {
+        uint32_t dstIdx = dstIdxs[j];
+        const auto &dstTile = placement.getAieTile(dstIdx);
+        llvm::dbgs() << "              • [" << j << "] -> tile("
+                    << dstTile.col << ", " << dstTile.row << ")"
+                    << " Bundle=" << static_cast<int>(dstBundles[j])
+                    << " ch="   << dstChs[j] << "\n";
+      }
+    };
+
+    if (comm.isPacket) {
+      // Packets
+      llvm::dbgs() << "      packets (" << comm.packets.size() << "):\n";
+      for (size_t pIdx = 0; pIdx < comm.packets.size(); ++pIdx) {
+        const auto &p = comm.packets[pIdx];
+        llvm::dbgs() << "        - Packet[" << pIdx << "] name=" << p.name
+                    << " packetId=" << p.packetId
+                    << " size=" << p.size
+                    << " elemType=";
+        if (p.elemType) p.elemType.print(llvm::dbgs());
+        else            llvm::dbgs() << "<null>";
+        llvm::dbgs() << "\n";
+
+        size_t nd = std::min({p.dstIdxs.size(), p.dstBundles.size(), p.dstChs.size()});
+        printDsts(nd, p.dstIdxs, p.dstBundles, p.dstChs);
+      }
+      if (!comm.circuits.empty()) {
+        llvm::dbgs() << "      (warn) isPacket=true but circuits not empty: "
+                    << comm.circuits.size() << "\n";
+      }
+    } else {
+      // Circuits
+      llvm::dbgs() << "      circuits (" << comm.circuits.size() << "):\n";
+      for (size_t cIdx = 0; cIdx < comm.circuits.size(); ++cIdx) {
+        const auto &c = comm.circuits[cIdx];
+        llvm::dbgs() << "        - Circuit[" << cIdx << "] name=" << c.name
+                    << " size=" << c.size
+                    << " elemType=";
+        if (c.elemType) c.elemType.print(llvm::dbgs());
+        else            llvm::dbgs() << "<null>";
+        llvm::dbgs() << "\n";
+
+        size_t nd = std::min({c.dstIdxs.size(), c.dstBundles.size(), c.dstChs.size()});
+        printDsts(nd, c.dstIdxs, c.dstBundles, c.dstChs);
+      }
+      if (!comm.packets.empty()) {
+        llvm::dbgs() << "      (warn) isPacket=false but packets not empty: "
+                    << comm.packets.size() << "\n";
+      }
+    }
+  }
+
+  // ---- Schedule (NPU DMA memcpy ND) ----
+  llvm::dbgs() << "  aieSchedule (" << placement.aieSchedule.size() << "):\n";
+  for (size_t sIdx = 0; sIdx < placement.aieSchedule.size(); ++sIdx) {
+    const auto &sch = placement.aieSchedule[sIdx];
+
+    auto printI64x4 = [&](const char *label, const int64_t v[4]) {
+      llvm::dbgs() << " " << label << "=["
+                   << v[0] << ", " << v[1] << ", " << v[2] << ", " << v[3] << "]";
+    };
+
+    auto printU32VecWait = [&](const char *label, const std::vector<AieNpuWait> &vec) {
+      llvm::dbgs() << " " << label << "=[";
+      for (size_t i = 0; i < vec.size(); ++i) {
+        if (i) llvm::dbgs() << ", ";
+        llvm::dbgs() << "{c=" << vec[i].col
+                    << ", r=" << vec[i].row
+                    << ", b=" << vec[i].bufIdx << "}";
+      }
+      llvm::dbgs() << "]";
+    };
+
+    llvm::dbgs() << "    Sched[" << sIdx << "]"
+                 << " name=" << sch.name
+                 << " shimCol=" << sch.shimCol
+                 << " shimRow=" << sch.shimRow
+                 << " id=" << sch.id
+                 << " bufIdx=" << sch.bufIdx
+                 << " isPacket=" << (sch.isPacket ? "true" : "false");
+
+    if (sch.isPacket) {
+      llvm::dbgs() << " packetType=" << sch.packetType
+                   << " packetId="   << sch.packetId;
+    }
+
+    llvm::dbgs() << " issueToken=" << (sch.issueToken ? "true" : "false")
+                << " hasWait="    << (!sch.waitBufs.empty() ? "true" : "false");
+    printU32VecWait("waitBufs", sch.waitBufs);
+
+    printI64x4("offset", sch.staticOffset.data());
+    printI64x4("size",   sch.staticSize.data());
+    printI64x4("stride", sch.staticStride.data());
+
     llvm::dbgs() << "\n";
   }
+
+  llvm::dbgs() << "\n";
 }
 
 AiePlacement
