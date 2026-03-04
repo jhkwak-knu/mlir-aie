@@ -626,25 +626,12 @@ static inline uint32_t getElemBytes(mlir::Type t) {
   return bits / 8;
 }
 
-AiePlacement
-optimizeAiePlacement(const TilingContext &tilingCtx) {
-
-  AiePlacement placement;
-
+// Place shim and compute tiles in a column-major grid.
+// Each column has 1 shim tile (row=0) and NUM_COMP_TILES_PER_COL compute tiles (rows 5..2).
+static void placeTiles(AiePlacement &placement, const TilingContext &tilingCtx) {
   const auto &numCols            = tilingCtx.numCols;
   const auto &numCompTilesPerCol = tilingCtx.numCompTilesPerCol;
-  const auto &compTM             = tilingCtx.compTM;
-  const auto &compTK             = tilingCtx.compTK;
-  const auto &compTN             = tilingCtx.compTN;
-  const auto &compTileSPm        = tilingCtx.compTileSPm;
-  const auto &compTileTPm        = tilingCtx.compTileTPm;
-  const auto &compTileTPk        = tilingCtx.compTileTPk;
-  const auto &compTileTPn        = tilingCtx.compTileTPn;
-  const auto &tpOrder            = tilingCtx.tpOrder;
-  const auto &elemType           = tilingCtx.elemType;
-  auto dmaWireBundle = WireBundle::DMA;
-  
-  // Place on physical AIE tiles
+
   for (uint32_t i = 0; i < numCols; ++i) {
     AieTile shimTile{.col=i, .row=0};
     placement.aieTiles.push_back(shimTile);
@@ -654,8 +641,20 @@ optimizeAiePlacement(const TilingContext &tilingCtx) {
       placement.aieTiles.push_back(compTile);
     }
   }
+}
 
-  // Allocate physical buffers for each tile
+// Allocate lhs/rhs/res (and optionally pres) buffers for each tile.
+// Shim tiles include a packet-header overhead in the res buffer.
+// pres buffer is needed when partial sums must be forwarded between tiles:
+//   TPk>1 and K is not the innermost (reuse) axis (tpOrder[0] != 2).
+static void allocateBuffers(AiePlacement &placement, const TilingContext &tilingCtx) {
+  const auto &compTM      = tilingCtx.compTM;
+  const auto &compTK      = tilingCtx.compTK;
+  const auto &compTN      = tilingCtx.compTN;
+  const auto &compTileTPk = tilingCtx.compTileTPk;
+  const auto &tpOrder     = tilingCtx.tpOrder;
+  const auto &elemType    = tilingCtx.elemType;
+
   for (auto &tile : placement.aieTiles) {
     if (tile.row == 0) { // Shim tile
       uint32_t lhsBufSize = compTM * compTK;
@@ -689,8 +688,23 @@ optimizeAiePlacement(const TilingContext &tilingCtx) {
       tile.bufs.push_back(resBuf);
     }
   }
+}
 
-  // Configure AIE communication paths
+// Configure shim->comp packet communication paths for lhs, rhs, and pres data.
+// pres packets share the same DMA channel as lhs (M-axis) or rhs (N-axis),
+// depending on which axis is innermost (tpOrder[0]).
+static void configureInputComms(AiePlacement &placement, const TilingContext &tilingCtx) {
+  const auto &numCols            = tilingCtx.numCols;
+  const auto &numCompTilesPerCol = tilingCtx.numCompTilesPerCol;
+  const auto &compTM             = tilingCtx.compTM;
+  const auto &compTK             = tilingCtx.compTK;
+  const auto &compTN             = tilingCtx.compTN;
+  const auto &compTileSPm        = tilingCtx.compTileSPm;
+  const auto &compTileTPk        = tilingCtx.compTileTPk;
+  const auto &tpOrder            = tilingCtx.tpOrder;
+  const auto &elemType           = tilingCtx.elemType;
+  auto dmaWireBundle = WireBundle::DMA;
+
   // 1. Shim tile -> Comp tile (input)
   for (uint32_t col = 0; col < numCols; ++col) {
     // Generate input (LHS/RHS) communications for each Shim tile
@@ -806,6 +820,17 @@ optimizeAiePlacement(const TilingContext &tilingCtx) {
     placement.aieComms.push_back(lhsComm);
     placement.aieComms.push_back(rhsComm);
   }
+}
+
+// Configure comp->shim packet communication paths for res data.
+// Each compute tile sends its result to the shim tile in the same column.
+static void configureOutputComms(AiePlacement &placement, const TilingContext &tilingCtx) {
+  const auto &numCols            = tilingCtx.numCols;
+  const auto &numCompTilesPerCol = tilingCtx.numCompTilesPerCol;
+  const auto &compTM             = tilingCtx.compTM;
+  const auto &compTN             = tilingCtx.compTN;
+  const auto &elemType           = tilingCtx.elemType;
+  auto dmaWireBundle = WireBundle::DMA;
 
   // 2. Shim tile <- Comp tile (output)
   for (uint32_t col = 0; col < numCols; ++col) {
@@ -833,8 +858,13 @@ optimizeAiePlacement(const TilingContext &tilingCtx) {
       placement.aieComms.push_back(resComm);
     }
   }
+}
 
-  // Configure AIE DMAs, BDs for each tile
+// Configure MM2S (send) and S2MM (receive) DMAs and BD chains for all comms.
+// S2MM BDs on shim tiles add PKT_HDR_BYTES overhead to account for the packet header.
+static void configureDmas(AiePlacement &placement, const TilingContext &tilingCtx) {
+  const auto &elemType = tilingCtx.elemType;
+
   // 1. MM2S (Send)
   for (auto &comm : placement.aieComms) {
     auto &srcTile = placement.getAieTile(comm.srcIdx);
@@ -966,6 +996,23 @@ optimizeAiePlacement(const TilingContext &tilingCtx) {
       // TODO: implement
     }
   }
+}
+
+// Build the NPU DMA runtime schedule (NpuMemcpyNd sequence).
+// Determines the order and offsets of lhs/rhs/pres TX and res RX transfers
+// based on tpOrder[0] (innermost loop axis):
+//   0=M: rhs fixed, lhs cycles over TPm iterations
+//   1=N: lhs fixed, rhs cycles over TPn iterations
+//   2=K: lhs and rhs both cycle over TPk iterations, no pres
+static void buildSchedule(AiePlacement &placement, const TilingContext &tilingCtx) {
+  const auto &compTM      = tilingCtx.compTM;
+  const auto &compTK      = tilingCtx.compTK;
+  const auto &compTN      = tilingCtx.compTN;
+  const auto &compTileTPm = tilingCtx.compTileTPm;
+  const auto &compTileTPk = tilingCtx.compTileTPk;
+  const auto &compTileTPn = tilingCtx.compTileTPn;
+  const auto &tpOrder     = tilingCtx.tpOrder;
+  const auto &elemType    = tilingCtx.elemType;
 
   // Configure tile scheduling (runtime sequence)
   std::vector<AieNpuMemcpyNd> lhsTxSchedule;
@@ -1164,8 +1211,14 @@ optimizeAiePlacement(const TilingContext &tilingCtx) {
 
     placement.aieSchedule.insert(placement.aieSchedule.end(), resRxSchedule.begin(), resRxSchedule.end());
   }
+}
 
-  if (DebugAiePlacement) {
+// Print the computed AiePlacement to dbgs() when --debug-aie-placement is set.
+static void debugDumpPlacement(const AiePlacement &placement) {
+  if (!DebugAiePlacement)
+    return;
+
+  if (true) {
     llvm::dbgs() << "[AiePlacement] Computed AIE Placement:\n";
 
     // ---- Tiles ----
@@ -1332,7 +1385,18 @@ optimizeAiePlacement(const TilingContext &tilingCtx) {
 
     llvm::dbgs() << "\n";
   }
+}
 
+AiePlacement
+optimizeAiePlacement(const TilingContext &tilingCtx) {
+  AiePlacement placement;
+  placeTiles(placement, tilingCtx);
+  allocateBuffers(placement, tilingCtx);
+  configureInputComms(placement, tilingCtx);
+  configureOutputComms(placement, tilingCtx);
+  configureDmas(placement, tilingCtx);
+  buildSchedule(placement, tilingCtx);
+  debugDumpPlacement(placement);
   return placement;
 }
 
