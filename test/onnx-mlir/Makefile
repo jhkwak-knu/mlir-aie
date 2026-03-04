@@ -29,6 +29,7 @@ MLIR_SRCS   ?= $(MLIR_DIR)/onnx_matmul.mlir
 KERNEL_SRCS ?= $(SRC_DIR)/kernel.cc
 PASSES      ?= --convert-onnx-to-aie
 TC_JSON     ?= $(OUT_DIR)/tc.json
+SYSINFO_JSON ?= $(abspath $(ROOT_DIR)/../../include/onnx/Target/XDNA2/xdna2_info.json)
 # DEBUGS		?= --debug-system-info --debug-tile-param --debug-aie-placement
 DEBUGS		?=
 
@@ -56,7 +57,7 @@ $(BUILD_DIR) $(LOGS_DIR) $(MLIR_DIR) $(ONNX_DIR) $(REPORTS_DIR):
 #    Assuming $(MLIR_SRCS) is created by gen_onnx_matmul_mlir.sh beforehand,
 #    run aie-opt and write aie.mlir/host.mlir directly into $(BUILD_DIR).
 $(BUILD_DIR)/aie.mlir: $(MLIR_SRCS) | $(BUILD_DIR)
-	aie-opt $< $(PASSES) --tile-param-json=$(TC_JSON) --aie-mlir-output=$@ $(DEBUGS) \
+	aie-opt $< $(PASSES) --tile-param-json=$(TC_JSON) --system-info-json=$(SYSINFO_JSON) --aie-mlir-output=$@ $(DEBUGS) \
 		-o $(BUILD_DIR)/host.mlir
 
 # 2) Compile kernel (xchesscc)

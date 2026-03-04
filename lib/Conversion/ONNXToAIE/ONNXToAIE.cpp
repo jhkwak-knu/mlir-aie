@@ -52,6 +52,11 @@ static llvm::cl::opt<std::string>
                   llvm::cl::init(""));
 
 static llvm::cl::opt<std::string>
+    SystemInfoJson("system-info-json",
+                   llvm::cl::desc("Path to xdna2_info.json hardware config file"),
+                   llvm::cl::init(""));
+
+static llvm::cl::opt<std::string>
     AieMlirOutput("aie-mlir-output",
                   llvm::cl::desc("Output path for generated aie.mlir"),
                   llvm::cl::init("./aie.mlir"));
@@ -2118,7 +2123,11 @@ public:
     Location loc = op.getLoc();
 
     // Read the system information
-    std::string filePath = "/home/ace/ryzen_ai/mlir-aie-dev/mlir-aie/include/onnx/Target/XDNA2/xdna2_info.json";
+    if (SystemInfoJson.empty()) {
+      llvm::errs() << "Error: --system-info-json is required\n";
+      llvm::report_fatal_error("system info json path not specified");
+    }
+    std::string filePath = SystemInfoJson;
     auto systemInfo = loadSystemInfo(filePath);
     if (!systemInfo) {
       return rewriter.notifyMatchFailure(op, llvm::Twine("Unable to open JSON file: '") + filePath + "'");
