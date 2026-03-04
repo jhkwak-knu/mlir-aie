@@ -88,6 +88,8 @@ def write_tc_list(tc_cases: List[Dict[str, Any]], out_json_path: Path) -> None:
 
 
 # ---------- Tiling primitives ----------
+CTILE_MAX_COUNT = 32
+CTILE_STEP = 4
 CTILE_MEM_LIMIT = 64 * 1024 - 4 * 1024  # 64KB - 1KB (stack) - 1KB (heap) - 2KB (reserved)
 MEMTILE_MEM_LIMIT = 512 * 1024          # 512KB (unused)
 TM_UNIT, TK_UNIT, TN_UNIT = 1, 1, 1     # unit sizes for tiles
@@ -100,15 +102,6 @@ def _est_ws_bytes(TM: int, TK: int, TN: int, elem_bytes: int) -> int:
     """
     return elem_bytes * (TM * TK + TK * TN + TM * TN)
 
-def _factor_pairs(n: int) -> List[Tuple[int, int]]:
-    """
-    Return unordered factor pairs (a, b) such that a * b == n with a >= b.
-
-    Used to enumerate spatial parallelization splits (SPm, SPn) where order does not
-    matter. Time complexity is O(sqrt(n)).
-    """
-    return [(n // b, b) for b in range(1, int(math.isqrt(n)) + 1) if n % b == 0]
-
 def _divisors(n: int) -> List[int]:
     """All positive divisors of n (unordered)."""
     ds = set()
@@ -117,6 +110,16 @@ def _divisors(n: int) -> List[int]:
             ds.add(b)
             ds.add(n // b)
     return sorted(ds)
+
+def _factor_pairs(n: int) -> List[Tuple[int, int]]:
+    """
+    Enumerate all pairs (a,b) with a*b == n. (ordered)
+    """
+    pairs: List[Tuple[int, int]] = []
+    for a in _divisors(n):
+        b = n // a
+        pairs.append((a, b))
+    return pairs
 
 def _triple_factorizations(n: int) -> List[Tuple[int, int, int]]:
     """
@@ -130,7 +133,6 @@ def _triple_factorizations(n: int) -> List[Tuple[int, int, int]]:
             if a * b * c == n:
                 triples.append((a, b, c))
     return triples
-
 
 def make_tc_cases(op_cases: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[str]]:
     """
@@ -173,8 +175,8 @@ def make_tc_cases(op_cases: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]],
         for double_buffer in (False,):
             ct_limit = (CTILE_MEM_LIMIT // 2) if double_buffer else CTILE_MEM_LIMIT     # 30KB if enabled
 
-            # ---------- numLastSpm: 4..32 ----------
-            for numLastSpm in range(4, 32 + 1, 4):
+            # ---------- numLastSpm: number of compute tiles ----------
+            for numLastSpm in range(CTILE_STEP, CTILE_MAX_COUNT + 1, CTILE_STEP):
 
                 # ---------- # DRAM→L1: (SPm,SPn) ----------
                 for SPm, SPn in _factor_pairs(numLastSpm):
@@ -198,11 +200,11 @@ def make_tc_cases(op_cases: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]],
 
                     # Enumerate TP triples starting from TPtotal_init, increasing if needed
                     best = None  # (key, (TPm,TPk,TPn), tp_order, TM, TK, TN)
-                    tie_rank = {"M": 2, "N": 1, "K": 0}
+                    tie_rank = {"M": 1, "N": 0, "K": 2}
 
                     # Log header for this (SPm,SPn)
                     log_lines.append(
-                        f"[CASE#{idx}] MKN=({M},{K},{N}) elemType={elem_type} numLastSpm={numLastSpm} SP=(m={SPm},n={SPn}) "
+                        f"[OP CASE#{idx}] MKN=({M},{K},{N}) elemType={elem_type} numLastSpm={numLastSpm} SP=(m={SPm},n={SPn}) "
                         f"CTblock(M0,K0,N0)=({M0},{K0},{N0}) ct_limit={ct_limit}B ws_block={ws_bytes}B "
                         f"TPtotal_init={TPtotal_init} TPtotal_max={TPtotal_max}"
                     )
@@ -210,6 +212,7 @@ def make_tc_cases(op_cases: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]],
                     for TPtotal in range(TPtotal_init, TPtotal_max + 1):
                         triples = _triple_factorizations(TPtotal)
                         found_this_total = False
+
                         for (TPm, TPk, TPn) in triples:
                             # Divisibility constraints
                             if (M0 % TPm) or (K0 % TPk) or (N0 % TPn):
@@ -225,45 +228,69 @@ def make_tc_cases(op_cases: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]],
                                 continue
 
                             # Reuse scores (same formula), at this level using (M0,K0,N0)
-                            scores = {
-                                "M": K0 * N0 * max(TPm - 1, 0) * SPm,
-                                "N": M0 * K0 * max(TPn - 1, 0) * SPn,
-                                "K": 2 * M0 * N0 * max(TPk - 1, 0),
+                            MKTotal = (TM * TK) * TPm * TPn * TPk * SPm * SPn
+                            KNTotal = (TK * TN) * TPm * TPn * TPk * SPm * SPn
+                            MNTotal = (2 * TM * TN) * TPm * TPn * TPk * SPm * SPn
+
+                            spatial_reuse_rate = {
+                                "M": {"MK": SPn, "KN": SPm, "MN": 1},
+                                "N": {"MK": SPn, "KN": SPm, "MN": 1},
+                                "K": {"MK": SPn, "KN": SPm, "MN": 1},
                             }
+
+                            temporal_reuse_rate = {
+                                "M": {"MK": 1,   "KN": TPm, "MN": 1},
+                                "N": {"MK": TPn, "KN": 1,   "MN": 1},
+                                "K": {"MK": 1,   "KN": 1,   "MN": TPk},
+                            }
+
+                            total = {
+                                "MK": (TM * TK) * TPm * TPn * TPk * SPm * SPn,
+                                "KN": (TK * TN) * TPm * TPn * TPk * SPm * SPn,
+                                "MN": (2 * TM * TN) * TPm * TPn * TPk * SPm * SPn,
+                            }
+                            total_sum = sum(total.values())
+
+                            reuse = {}
+                            for axis in ("M", "N", "K"):
+                                s = 0
+                                for tensor in ("MK", "KN", "MN"):
+                                    t = total[tensor]
+                                    srr = spatial_reuse_rate[axis][tensor]
+                                    trr = temporal_reuse_rate[axis][tensor]
+                                    s += t * max(srr * trr - 1, 0) // max(srr * trr, 1)
+                                reuse[axis] = s
+                            
+                            score = {}
+                            for axis in ("M", "N", "K"):
+                                score[axis] = total_sum - reuse[axis]
                             
                             # Winner axis & extra transfer cost
-                            winner = max(("M","N","K"), key=lambda ax: (scores[ax], tie_rank[ax]))
-                            extra_cost = sum(v for ax, v in scores.items() if ax != winner)
-                            winner_score = scores[winner]
+                            winner = min(("M","N","K"), key=lambda ax: (score[ax], -reuse[ax], -tie_rank[ax]))
 
-                            # TP order: winner first, then default M->N->K
+                            # TP order: winner first, then default K->M->N
                             axis_id = {"M": 0, "N": 1, "K": 2}
-                            default_order = [axis_id["M"], axis_id["N"], axis_id["K"]]
+                            default_order = [axis_id["K"], axis_id["M"], axis_id["N"]]
                             win_id = axis_id[winner]
                             tp_order = [win_id] + [ax for ax in default_order if ax != win_id]
 
-                            # Selection key: minimize extra_cost; tie → larger winner_score;
-                            # then winner priority M>N>K; then smaller TP sum for compactness.
-                            key = (extra_cost, -winner_score, -tie_rank[winner], (TPm + TPk + TPn))
+                            # Selection key: minimize score; tie → larger reuse; then winner priority K->M->N;
+                            key = (score[winner], -reuse[winner], -tie_rank[winner])
                             
-                            # active_cnt = (1 if TPm > 1 else 0) + (1 if TPk > 1 else 0) + (1 if TPn > 1 else 0)
-                            # if active_cnt == 1:
-                            #     key = (extra_cost, -tie_rank[winner], (TPm + TPk + TPn))
-                            # else:
-                            #     key = (extra_cost, -winner_score, -tie_rank[winner], (TPm + TPk + TPn))
-
                             # ---- LOG per valid candidate ----
                             log_lines.append(
                                 "  TPtotal={}: TP=(m={},k={},n={}) Tiles(TM,TK,TN)=({},{},{}) ws_step={}B "
-                                "scores{{M:{}, N:{}, K:{}}} winner={} reuse={} extra={} tpOrder={}".format(
-                                    TPtotal, TPm, TPk, TPn, TM, TK, TN, ws_step,
-                                    scores["M"], scores["N"], scores["K"],
-                                    winner, winner_score, extra_cost, tp_order
+                                "total={} reuse{{M:{}, N:{}, K:{}}} score{{M:{}, N:{}, K:{}}} "
+                                "winner={} reuse={} score={} tpOrder={}".format(
+                                    TPtotal, TPm, TPk, TPn, TM, TK, TN, ws_step, total_sum,
+                                    reuse["M"], reuse["N"], reuse["K"],
+                                    score["M"], score["N"], score["K"],
+                                    winner, reuse[winner], score[winner], tp_order
                                 )
                             )
 
                             if (best is None) or (key < best[0]):
-                                best = (key, (TPm, TPk, TPn), tp_order, TM, TK, TN)
+                                best = (key, (TPm, TPk, TPn), tp_order, TM, TK, TN, total_sum, reuse[winner], score[winner])
                                 found_this_total = True
 
                         if found_this_total:
@@ -273,25 +300,15 @@ def make_tc_cases(op_cases: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]],
                         log_lines.append("  -> No feasible TP for this SPm/SPn; continue")
                         continue
 
-                    (_, (TPm, TPk, TPn), tp_order, TM, TK, TN) = best
+                    (_, (TPm, TPk, TPn), tp_order, TM, TK, TN, total, reuse, score) = best
 
                     # ---- LOG final selection for this (SPm,SPn) ----
                     log_lines.append(
                         "  [SELECT] TP=(m={},k={},n={}) Tiles(TM,TK,TN)=({},{},{}) tpOrder={} "
-                        "reuse_axis={} extra={} reuse={}".format(
+                        "reuse_axis={} total={} reuse={} score={}".format(
                             TPm, TPk, TPn, TM, TK, TN, tp_order,
                             ["M","N","K"][tp_order[0]],  # first in order is winner axis
-                            # recompute for logging clarity
-                            sum(v for ax, v in {
-                                "M": K0 * N0 * max(TPm - 1, 0) * SPm,
-                                "N": M0 * K0 * max(TPn - 1, 0) * SPn,
-                                "K": 2 * M0 * N0 * max(TPk - 1, 0),
-                            }.items() if ax != ["M","N","K"][tp_order[0]]),
-                            {
-                                "M": K0 * N0 * max(TPm - 1, 0) * SPm,
-                                "N": M0 * K0 * max(TPn - 1, 0) * SPn,
-                                "K": 2 * M0 * N0 * max(TPk - 1, 0),
-                            }[["M","N","K"][tp_order[0]]]
+                            total, reuse, score
                         )
                     )
 
