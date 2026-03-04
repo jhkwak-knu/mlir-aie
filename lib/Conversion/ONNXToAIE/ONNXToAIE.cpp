@@ -299,6 +299,11 @@ getAxisArrayOpt(const llvm::json::Object &obj, llvm::StringRef key) {
         llvm::report_fatal_error("tpOrder type mismatch");
       }
     }
+    if (out.size() != 3) {
+      llvm::errs() << "Error: '" << key << "' must have exactly 3 elements"
+                   << " (M=0, N=1, K=2), got " << out.size() << "\n";
+      llvm::report_fatal_error("tpOrder size error");
+    }
   }
   return out;
 }
@@ -600,7 +605,6 @@ static TilingContext buildTilingContext(const TileParam &tp) {
   tc.tpOrder             = lv.tpOrder;
   tc.elemType            = tp.elemType;
   tc.doubleBufferEnabled = tp.doubleBufferEnabled;
-  assert(tc.tpOrder.size() == 3 && "tpOrder must have exactly 3 elements");
   return tc;
 }
 
