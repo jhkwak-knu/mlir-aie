@@ -92,8 +92,14 @@ else
     echo "info: upgrading result CSV header (adding timing columns) ..."
     tmp_csv="$(mktemp)"
     echo "$NEW_HEADER" > "$tmp_csv"
-    # Append old rows with five additional timing fields defaulted to -1
+    # Append old rows with five additional timing fields defaulted to -1.
+    # tail failure is benign (CSV may not exist yet); only awk failure is an error.
     tail -n +2 "$RESULT_CSV" 2>/dev/null | awk -F',' '{print $0",-1,-1,-1,-1,-1"}' >> "$tmp_csv"
+    if [[ ${PIPESTATUS[1]} -ne 0 ]]; then
+      echo "error: awk failed during CSV header upgrade; aborting to preserve original" >&2
+      rm -f "$tmp_csv"
+      exit 1
+    fi
     mv "$tmp_csv" "$RESULT_CSV"
   fi
 fi
