@@ -643,7 +643,9 @@ struct AiePlacement {
 
   uint32_t findAieTileIdx(uint32_t col, uint32_t row) const {
     auto it = tileIdxMap.find({col, row});
-    assert(it != tileIdxMap.end() && "Tile not found");
+    if (it == tileIdxMap.end())
+      llvm::report_fatal_error(llvm::Twine("tile not found at col=") +
+                               llvm::Twine(col) + " row=" + llvm::Twine(row));
     return it->second;
   }
 };
