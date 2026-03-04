@@ -46,6 +46,19 @@ static llvm::cl::opt<bool>
                     llvm::cl::init(false));
 
 //===----------------------------------------------------------------------===//
+// Layout constants
+//===----------------------------------------------------------------------===//
+// Number of compute tiles stacked per column (rows 2-5 on XDNA2)
+static constexpr uint32_t NUM_COMP_TILES_PER_COL = 4;
+// Packet header prepended by the switch: 4 bytes, divided by elem size
+// to express as element count for buffer size/offset arithmetic
+static constexpr uint32_t PKT_HDR_BYTES          = 4;
+// pres packet IDs start above lhs/rhs range to avoid packet-filter collisions
+static constexpr uint32_t PRES_PKT_ID_OFFSET     = 16;
+// Upper bound that makes an SCF ForOp behave as an infinite loop in the core
+static constexpr int64_t  CORE_LOOP_INFINITE     = 0x7FFFFFFFFFFFFFFFLL;
+
+//===----------------------------------------------------------------------===//
 // System Information
 //===----------------------------------------------------------------------===//
 struct SpmLevel {
@@ -586,7 +599,7 @@ optimizeAiePlacement(const TileParam &tileParam) {
   AiePlacement placement;
 
   // Set variables
-  uint32_t numCompTilesPerCol = 4;
+  uint32_t numCompTilesPerCol = NUM_COMP_TILES_PER_COL;
   uint32_t numCols = tileParam.numLastSpm / numCompTilesPerCol;
 
   auto &compTileLevel = tileParam.levels[0];
@@ -618,7 +631,7 @@ optimizeAiePlacement(const TileParam &tileParam) {
     if (tile.row == 0) { // Shim tile
       uint32_t lhsBufSize = compTM * compTK;
       uint32_t rhsBufSize = compTK * compTN;
-      uint32_t resBufSize = compTM * compTN + (4 / getElemBytes(elemType));  // packet header (4B)
+      uint32_t resBufSize = compTM * compTN + (PKT_HDR_BYTES / getElemBytes(elemType));
 
       AieBuf lhsBuf{.name="lhs", .bufSize=lhsBufSize, .elemType=elemType};
       AieBuf rhsBuf{.name="rhs", .bufSize=rhsBufSize, .elemType=elemType};
@@ -748,7 +761,7 @@ optimizeAiePlacement(const TileParam &tileParam) {
 
           AiePacket pkt;
           pkt.name = std::string("pres") + std::to_string(l_idx);
-          pkt.packetId = (1u << presPacketCnt++) + 16;
+          pkt.packetId = (1u << presPacketCnt++) + PRES_PKT_ID_OFFSET;
           pkt.size = compTM * compTN;
           pkt.elemType = elemType;
 
@@ -897,7 +910,7 @@ optimizeAiePlacement(const TileParam &tileParam) {
           auto &dstDma = dstTile.getAieDma(dstDmaIdx);
           AieBufferDescriptor bd{.name=packet.name, .isPacket=true, .packetId=packet.packetId};
           bd.bufIdx = dstTile.findBufIdx(packet.name);
-          bd.bufSize = (dstTile.row == 0) ? (packet.size + (4 / getElemBytes(elemType))) : packet.size;
+          bd.bufSize = (dstTile.row == 0) ? (packet.size + (PKT_HDR_BYTES / getElemBytes(elemType))) : packet.size;
           bd.bufOffset = 0;
           bd.nextBdIdx = dstDma.bdIdx;
           dstTile.bds.push_back(bd);
@@ -990,8 +1003,8 @@ optimizeAiePlacement(const TileParam &tileParam) {
           do {
             auto &bd = tile.getAieBd(curBdIdx);
             uint32_t idx = static_cast<uint32_t>(std::strtoul(bd.name.c_str() + 3, nullptr, 10));
-            uint32_t off = compTM * compTN + (4 / getElemBytes(elemType));
-            
+            uint32_t off = compTM * compTN + (PKT_HDR_BYTES / getElemBytes(elemType));
+
             std::string name = std::string("res") + std::to_string(tile.col) + std::to_string(tile.row);
             std::array<int64_t,4> offset = {0, 0, 0, static_cast<int64_t>(off * idx)};
             std::array<int64_t,4> size = {1, 1, 1, static_cast<int64_t>(bd.bufSize)};
@@ -1083,7 +1096,7 @@ optimizeAiePlacement(const TileParam &tileParam) {
       }  
       
       for (auto &sch : resRxSchedule) {
-        sch.staticOffset[3] += (compTM * compTN + (4 / getElemBytes(elemType))) * resRxWaitCnt;
+        sch.staticOffset[3] += (compTM * compTN + (PKT_HDR_BYTES / getElemBytes(elemType))) * resRxWaitCnt;
       }
     }
   } else if (tpOrder[0] == 1) {    
@@ -1103,7 +1116,7 @@ optimizeAiePlacement(const TileParam &tileParam) {
       }
 
       for (auto &sch : resRxSchedule) {
-        sch.staticOffset[3] += (compTM * compTN + (4 / getElemBytes(elemType))) * resRxWaitCnt;
+        sch.staticOffset[3] += (compTM * compTN + (PKT_HDR_BYTES / getElemBytes(elemType))) * resRxWaitCnt;
       }  
     }
   } else { // tpOrder[0] == 2
@@ -1298,7 +1311,7 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
                     AiePlacement &placement,
                     const TileParam &tileParam) {
   // Set variables
-  uint32_t numCompTilesPerCol = 4;
+  uint32_t numCompTilesPerCol = NUM_COMP_TILES_PER_COL;
   uint32_t numCols = tileParam.numLastSpm / numCompTilesPerCol;
 
   auto &compTileLevel = tileParam.levels[0];
@@ -1638,7 +1651,7 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
       // Generate Arith ConstantOp
       auto c0 = builder.create<mlir::arith::ConstantOp>(loc, builder.getIndexAttr(0));
       auto c1 = builder.create<mlir::arith::ConstantOp>(loc, builder.getIndexAttr(1));
-      auto cMax = builder.create<mlir::arith::ConstantOp>(loc, builder.getIndexAttr(0x7FFFFFFFFFFFFFFFULL));
+      auto cMax = builder.create<mlir::arith::ConstantOp>(loc, builder.getIndexAttr(CORE_LOOP_INFINITE));
       auto cCnt = builder.create<mlir::arith::ConstantOp>(loc, builder.getIndexAttr(repeatCount));
 
       auto cRow = builder.create<mlir::arith::ConstantIntOp>(loc, compTM, /*width=*/getElemBytes(elemType)*8);
@@ -1853,7 +1866,7 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
 
     uint32_t lhsSize = ((compTM * compTileSPm) * compTK) * localTPm * localTPk;
     uint32_t rhsSize = (compTK * (compTN * compTileSPn)) * localTPk * localTPn;
-    uint32_t resSize = ((compTM * compTN + (4 / getElemBytes(elemType))) * compTileSPm * compTileSPn) * localTPm * localTPn;
+    uint32_t resSize = ((compTM * compTN + (PKT_HDR_BYTES / getElemBytes(elemType))) * compTileSPm * compTileSPn) * localTPm * localTPn;
 
     auto lhsMemrefType = MemRefType::get({lhsSize}, elemType);
     auto rhsMemrefType = MemRefType::get({rhsSize}, elemType);
