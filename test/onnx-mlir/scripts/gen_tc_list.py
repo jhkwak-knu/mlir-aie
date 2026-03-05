@@ -22,12 +22,14 @@ import math
 # data/     (op_list.json lives here)
 # out/      (tc_list.json is written here)
 THIS_FILE = Path(__file__).resolve()
-ROOT_DIR  = THIS_FILE.parents[1]
+ROOT_DIR  = THIS_FILE.parents[1]           # test/onnx-mlir/
+REPO_ROOT = THIS_FILE.parents[3]           # mlir-aie/
 DATA_DIR  = ROOT_DIR / "data"
 OUT_DIR   = ROOT_DIR / "out"
 
 DEFAULT_OP_PATH  = DATA_DIR / "op_list.json"
 DEFAULT_TC_PATH  = OUT_DIR / "tc_list.json"
+DEFAULT_SYS_PATH = REPO_ROOT / "include" / "onnx" / "Target" / "XDNA2" / "xdna2_info.json"
 
 
 # ---------- I/O primitives ----------
@@ -100,12 +102,41 @@ def write_tc_list(tc_cases: List[Dict[str, Any]], out_json_path: Path) -> None:
 
 
 # ---------- Tiling primitives ----------
-CTILE_MAX_COUNT = 32
-CTILE_STEP = 4
-CTILE_MEM_LIMIT = 64 * 1024 - 4 * 1024  # 64KB - 1KB (stack) - 1KB (heap) - 2KB (reserved)
-MEMTILE_MEM_LIMIT = 512 * 1024          # 512KB (unused)
+# SW overhead (stack + heap + reserved) subtracted from HW tile memory.
+# This is a software constant, not a hardware property.
+CTILE_RESERVED_BYTES = 4 * 1024
+
 TM_UNIT, TK_UNIT, TN_UNIT = 1, 1, 1     # unit sizes for tiles
 ELEM_SIZE_MAP = {"f16": 2, "bf16": 2, "f32": 4, "i8": 1, "i16": 2, "i32": 4, "ui8": 1, "ui16": 2, "ui32": 4}
+
+
+def load_system_info(sys_json_path: Path) -> Dict[str, Any]:
+    """
+    Read xdna2_info.json and return a flat dict of hardware parameters
+    used by the tiling search.
+    """
+    if not sys_json_path.is_file():
+        raise FileNotFoundError(f"system info JSON not found: {sys_json_path}")
+
+    with sys_json_path.open("r", encoding="utf-8") as f:
+        doc = json.load(f)
+
+    sys_obj = doc.get("system")
+    if not isinstance(sys_obj, dict):
+        raise ValueError("Invalid system info JSON: missing 'system' object")
+
+    spm_levels = sys_obj.get("spm_levels", [])
+    if not spm_levels:
+        raise ValueError("Invalid system info JSON: empty 'spm_levels'")
+
+    device = sys_obj.get("device", {})
+
+    return {
+        "total_cores":       int(sys_obj["total_cores"]),
+        "comp_tiles_per_col": int(device.get("comp_tiles_per_col", 4)),
+        "spm_size_bytes":    int(spm_levels[0]["spm_size_bytes"]),
+        "mem_tile_mem_bytes": int(device.get("mem_tile_mem_bytes", 524288)),
+    }
 
 def _est_ws_bytes(TM: int, TK: int, TN: int, elem_bytes: int) -> int:
     """
@@ -284,10 +315,14 @@ def _find_best_config(
     return best
 
 
-def make_tc_cases(op_cases: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[str]]:
+def make_tc_cases(op_cases: List[Dict[str, Any]], sys_info: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[str]]:
     """
-    Placeholder: turn op cases into tc cases.
+    Turn op cases into tc cases using hardware parameters from sys_info.
     """
+    ctile_max_count = sys_info["total_cores"]
+    ctile_step      = sys_info["comp_tiles_per_col"]
+    ctile_mem_limit = sys_info["spm_size_bytes"] - CTILE_RESERVED_BYTES
+
     tc_cases: List[Dict[str, Any]] = []
     log_lines: List[str] = []
 
@@ -323,10 +358,10 @@ def make_tc_cases(op_cases: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]],
         # ---------- outermost: double buffer toggle ----------
         # for double_buffer in (False, True):
         for double_buffer in (False,):
-            ct_limit = (CTILE_MEM_LIMIT // 2) if double_buffer else CTILE_MEM_LIMIT     # 30KB if enabled
+            ct_limit = (ctile_mem_limit // 2) if double_buffer else ctile_mem_limit
 
             # ---------- numLastSpm: number of compute tiles ----------
-            for numLastSpm in range(CTILE_STEP, CTILE_MAX_COUNT + 1, CTILE_STEP):
+            for numLastSpm in range(ctile_step, ctile_max_count + 1, ctile_step):
 
                 # ---------- # DRAM→L1: (SPm,SPn) ----------
                 for SPm, SPn in _factor_pairs(numLastSpm):
@@ -394,6 +429,7 @@ def make_tc_cases(op_cases: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]],
 def parse_args(argv: List[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Generate out/tc_list.json from data/op_list.json")
     p.add_argument("--op",  default=str(DEFAULT_OP_PATH), help="Path to input op_list.json (default: data/op_list.json)")
+    p.add_argument("--sys", default=str(DEFAULT_SYS_PATH), help="Path to xdna2_info.json hardware config (default: include/onnx/Target/XDNA2/xdna2_info.json)")
     p.add_argument("--out", default=str(DEFAULT_TC_PATH), help="Path to output tc_list.json (default: out/tc_list.json)")
     p.add_argument("--dry-run", action="store_true", help="Do not write, only print summary")
     return p.parse_args(argv)
@@ -402,6 +438,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
 def main(argv: List[str]) -> int:
     args = parse_args(argv)
     op_path  = Path(args.op).resolve()
+    sys_path = Path(args.sys).resolve()
     out_path = Path(args.out).resolve()
     log_path = out_path.with_name("tc_list.log")
 
@@ -414,8 +451,21 @@ def main(argv: List[str]) -> int:
 
     print(f"[INFO] Loaded {len(op_cases)} op cases from: {op_path}")
 
-    # 2) Make tc cases from op cases
-    tc_cases, log_lines = make_tc_cases(op_cases)
+    # 2) Read xdna2_info.json -> hardware parameters
+    try:
+        sys_info = load_system_info(sys_path)
+    except Exception as e:
+        print(f"[ERROR] Failed to load system info: {e}", file=sys.stderr)
+        return 2
+
+    print(f"[INFO] Loaded system info from: {sys_path}")
+    print(f"[INFO]   total_cores={sys_info['total_cores']}"
+          f" comp_tiles_per_col={sys_info['comp_tiles_per_col']}"
+          f" spm_size={sys_info['spm_size_bytes']}B"
+          f" ct_usable={sys_info['spm_size_bytes'] - CTILE_RESERVED_BYTES}B")
+
+    # 3) Make tc cases from op cases
+    tc_cases, log_lines = make_tc_cases(op_cases, sys_info)
 
     print(f"[INFO] Makes {len(tc_cases)} tc cases.")
 
