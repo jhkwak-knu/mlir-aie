@@ -18,15 +18,24 @@
 namespace onnx_to_aie {
 
 //===----------------------------------------------------------------------===//
-// Layout constants
+// Device configuration (loaded from JSON, with XDNA2 defaults)
 //===----------------------------------------------------------------------===//
-// Number of compute tiles stacked per column (rows 2-5 on XDNA2)
-static constexpr uint32_t NUM_COMP_TILES_PER_COL = 4;
-// Maximum number of AIE columns supported by the npu2 device family.
-// Corresponds to the size of the devices[] array in emitDeviceOp.
-static constexpr uint32_t NUM_MAX_COLS           = 8;
-// 4-byte header inserted by the DMA switch before each outgoing packet payload.
-static constexpr uint32_t PKT_HDR_BYTES          = 4;
+struct DeviceConfig {
+  uint32_t maxColumns       = 8; // max AIE columns (npu2 device family)
+  uint32_t compTilesPerCol  = 4; // compute tiles per column (rows 2-5 on XDNA2)
+  uint32_t shimRow          = 0; // shim tile row
+  uint32_t compTileFirstRow = 2; // first compute tile row
+  uint32_t memTileMemBytes  = 524288; // 512KB mem tile capacity (future use)
+  uint32_t pktHdrBytes      = 4; // DMA switch packet header size in bytes
+
+  uint32_t compTileLastRow() const {
+    return compTileFirstRow + compTilesPerCol - 1;
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// Layout constants (device-independent)
+//===----------------------------------------------------------------------===//
 // pres packet IDs start above lhs/rhs range to avoid packet-filter collisions
 static constexpr uint32_t PRES_PKT_ID_OFFSET     = 16;
 // Upper bound that makes an SCF ForOp behave as an infinite loop in the core
@@ -51,6 +60,7 @@ struct SystemInfo {
   uint32_t numSpmLevels;
   std::vector<SpmLevel> spmLevels;
   uint32_t totalCores;
+  DeviceConfig device; // defaults used when JSON lacks "device" section
 };
 
 std::optional<SystemInfo> loadSystemInfo(const std::string &filePath,
@@ -94,6 +104,7 @@ TileParam findOptimalTileParam(const SystemInfo &sysInfo,
 // Tiling context (derived values used throughout placement and emission)
 //===----------------------------------------------------------------------===//
 struct TilingContext {
+  DeviceConfig device;
   uint32_t numCols;
   uint32_t numCompTilesPerCol;
   uint32_t compTM, compTK, compTN;
@@ -104,7 +115,7 @@ struct TilingContext {
   bool doubleBufferEnabled;
 };
 
-TilingContext buildTilingContext(const TileParam &tp);
+TilingContext buildTilingContext(const TileParam &tp, const SystemInfo &sysInfo);
 
 /// Returns true when partial-sum (pres) input buffers are needed.
 /// This happens when K is split temporally (TPk > 1) AND K is not

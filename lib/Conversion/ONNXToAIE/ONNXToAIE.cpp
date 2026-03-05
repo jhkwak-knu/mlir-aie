@@ -106,7 +106,7 @@ public:
         sysInfo_, opInfo, TileParamJson, DebugTileParam);
 
     // Perform hardware-aware optimization for AIE
-    TilingContext tilingCtx = buildTilingContext(optimalTileParam);
+    TilingContext tilingCtx = buildTilingContext(optimalTileParam, sysInfo_);
     auto placement = optimizeAiePlacement(tilingCtx, DebugAiePlacement);
 
     // Generate AIE Ops

@@ -124,9 +124,11 @@ static void emitTileOps(OpBuilder &builder, Location loc,
 static void emitBufferAndLockOps(OpBuilder &builder, Location loc,
                                  AiePlacement &placement,
                                  const TilingContext &tilingCtx) {
+  const auto &device = tilingCtx.device;
+
   // Generate Ops for each tile
   for (auto &tile : placement.aieTiles) {
-    if (tile.row == 0) { // Shim tile
+    if (tile.row == device.shimRow) { // Shim tile
       // Generate Memref GlobalOp
       for (auto &buf : tile.bufs) {
         buf.symbol = std::string("global_") + buf.name + "_" + std::to_string(tile.col) + "_" + std::to_string(tile.row);
@@ -191,12 +193,14 @@ static void emitBufferAndLockOps(OpBuilder &builder, Location loc,
 // Creates PacketFlowOp/PacketSourceOp/PacketDestOp for each packet comm.
 // comp->shim flows set keep_pkt_header=true to preserve the packet header.
 static void emitPacketFlowOps(OpBuilder &builder, Location loc,
-                               const AiePlacement &placement) {
+                               const AiePlacement &placement,
+                               const TilingContext &tilingCtx) {
+  const auto &device = tilingCtx.device;
   for (auto &comm : placement.aieComms) {
     if (comm.isPacket) {
       const auto &srcTile = placement.getAieTile(comm.srcIdx);
       BoolAttr keep_pkt_header = nullptr;
-      if (srcTile.row != 0)
+      if (srcTile.row != device.shimRow)
         keep_pkt_header = builder.getBoolAttr(true);
 
       for (auto &packet : comm.packets) {
@@ -230,10 +234,12 @@ static void emitPacketFlowOps(OpBuilder &builder, Location loc,
 static void emitMemDmaOps(OpBuilder &builder, Location loc,
                           AiePlacement &placement,
                           const TilingContext &tilingCtx) {
+  const auto &device = tilingCtx.device;
+
   // Generate AIE DMAOp
   for (auto &tile : placement.aieTiles) {
     // Shim tile
-    if (tile.row == 0) {
+    if (tile.row == device.shimRow) {
       for (auto &dma : tile.dmas) {
         std::vector<bool> allocatedBuf(tile.bufs.size(), false);
         uint32_t firstBdIdx = dma.bdIdx;
@@ -374,10 +380,12 @@ static void emitCoreOps(OpBuilder &builder, Location loc,
   auto funcOp = builder.create<func::FuncOp>(loc, funcNameAttr, funcType);
   funcOp.setPrivate();
 
+  const auto &device = tilingCtx.device;
+
   // Configure operations of Compute tile
   for (auto &tile : placement.aieTiles) {
-    // Shim/Mem tile
-    if (tile.row < 2) {
+    // Shim/Mem tile: skip non-compute tiles
+    if (tile.row < device.compTileFirstRow) {
       continue;
     }
 
@@ -667,9 +675,11 @@ static void emitRuntimeSequenceOp(OpBuilder &builder, Location loc,
     uint32_t localTPn = (tpOrder[0] == AXIS_N) ? compTileTPn : 1;
     uint32_t localTPk = (tpOrder[0] == AXIS_K) ? compTileTPk : 1;
 
+    const auto &device = tilingCtx.device;
+
     uint32_t lhsSize = ((compTM * compTileSPm) * compTK) * localTPm * localTPk;
     uint32_t rhsSize = (compTK * (compTN * compTileSPn)) * localTPk * localTPn;
-    uint32_t resSize = ((compTM * compTN + (PKT_HDR_BYTES / getElemBytes(elemType))) * compTileSPm * compTileSPn) * localTPm * localTPn; // header overhead in elements
+    uint32_t resSize = ((compTM * compTN + (device.pktHdrBytes / getElemBytes(elemType))) * compTileSPm * compTileSPn) * localTPm * localTPn; // header overhead in elements
 
     auto lhsMemrefType = MemRefType::get({lhsSize}, elemType);
     auto rhsMemrefType = MemRefType::get({rhsSize}, elemType);
@@ -748,7 +758,7 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
   emitDeviceOp(builder, loc, tilingCtx);
   emitTileOps(builder, loc, placement);
   emitBufferAndLockOps(builder, loc, placement, tilingCtx);
-  emitPacketFlowOps(builder, loc, placement);
+  emitPacketFlowOps(builder, loc, placement, tilingCtx);
   emitMemDmaOps(builder, loc, placement, tilingCtx);
   emitCoreOps(builder, loc, placement, tilingCtx);
   emitRuntimeSequenceOp(builder, loc, placement, tilingCtx);

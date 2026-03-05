@@ -20,18 +20,19 @@ namespace onnx_to_aie {
 // placeTiles
 //===----------------------------------------------------------------------===//
 // Place shim and compute tiles in a column-major grid.
-// Each column has 1 shim tile (row=0) and NUM_COMP_TILES_PER_COL compute tiles (rows 5..2).
+// Each column has 1 shim tile and compTilesPerCol compute tiles (highest row first).
 static void placeTiles(AiePlacement &placement, const TilingContext &tilingCtx) {
   const auto &numCols            = tilingCtx.numCols;
   const auto &numCompTilesPerCol = tilingCtx.numCompTilesPerCol;
+  const auto &device             = tilingCtx.device;
 
   for (uint32_t i = 0; i < numCols; ++i) {
-    AieTile shimTile{.col=i, .row=0};
+    AieTile shimTile{.col=i, .row=device.shimRow};
     placement.aieTiles.push_back(shimTile);
     placement.tileIdxMap[{shimTile.col, shimTile.row}] = placement.aieTiles.size() - 1;
 
     for (uint32_t j = 0; j < numCompTilesPerCol; ++j) {
-      AieTile compTile{.col=i, .row=(5-j)};
+      AieTile compTile{.col=i, .row=(device.compTileLastRow() - j)};
       placement.aieTiles.push_back(compTile);
       placement.tileIdxMap[{compTile.col, compTile.row}] = placement.aieTiles.size() - 1;
     }
@@ -50,12 +51,13 @@ static void allocateBuffers(AiePlacement &placement, const TilingContext &tiling
   const auto &compTK   = tilingCtx.compTK;
   const auto &compTN   = tilingCtx.compTN;
   const auto &elemType = tilingCtx.elemType;
+  const auto &device   = tilingCtx.device;
 
   for (auto &tile : placement.aieTiles) {
-    if (tile.row == 0) { // Shim tile
+    if (tile.row == device.shimRow) { // Shim tile
       uint32_t lhsBufSize = compTM * compTK;
       uint32_t rhsBufSize = compTK * compTN;
-      uint32_t resBufSize = compTM * compTN + (PKT_HDR_BYTES / getElemBytes(elemType)); // header overhead in elements
+      uint32_t resBufSize = compTM * compTN + (device.pktHdrBytes / getElemBytes(elemType)); // header overhead in elements
 
       AieBuf lhsBuf{.name="lhs", .bufSize=lhsBufSize, .elemType=elemType};
       AieBuf rhsBuf{.name="rhs", .bufSize=rhsBufSize, .elemType=elemType};
@@ -101,12 +103,13 @@ static void configureInputComms(AiePlacement &placement, const TilingContext &ti
   const auto &compTileSPm        = tilingCtx.compTileSPm;
   const auto &tpOrder            = tilingCtx.tpOrder;
   const auto &elemType           = tilingCtx.elemType;
+  const auto &device             = tilingCtx.device;
   auto dmaWireBundle = WireBundle::DMA;
 
   // 1. Shim tile -> Comp tile (input)
   for (uint32_t col = 0; col < numCols; ++col) {
     // Generate input (LHS/RHS) communications for each Shim tile
-    uint32_t shimIdx = placement.findAieTileIdx(col, 0);
+    uint32_t shimIdx = placement.findAieTileIdx(col, device.shimRow);
     AieComm lhsComm{.name="lhs", .srcIdx=shimIdx, .srcBundle=dmaWireBundle, .srcCh=0, .isPacket=true};
     AieComm rhsComm{.name="rhs", .srcIdx=shimIdx, .srcBundle=dmaWireBundle, .srcCh=1, .isPacket=true};
     uint32_t lhsPacketCnt = 0;
@@ -121,7 +124,7 @@ static void configureInputComms(AiePlacement &placement, const TilingContext &ti
       uint32_t m_idx = l_idx % compTileSPm;
       uint32_t n_idx = l_idx / compTileSPm;
 
-      uint32_t compIdx = placement.findAieTileIdx(col, 5 - i);
+      uint32_t compIdx = placement.findAieTileIdx(col, device.compTileLastRow() - i);
 
       { // LHS packets
         auto it = lhsPackets.find(m_idx);
@@ -193,7 +196,7 @@ static void configureInputComms(AiePlacement &placement, const TilingContext &ti
       uint32_t presPacketCnt = 0;
       for (uint32_t i = 0; i < numCompTilesPerCol; ++i) {
         uint32_t l_idx = numCompTilesPerCol * col + i;
-        uint32_t compIdx = placement.findAieTileIdx(col, 5 - i);
+        uint32_t compIdx = placement.findAieTileIdx(col, device.compTileLastRow() - i);
 
         AiePacket pkt;
         pkt.name = std::string("pres") + std::to_string(l_idx);
@@ -225,17 +228,18 @@ static void configureOutputComms(AiePlacement &placement, const TilingContext &t
   const auto &compTM             = tilingCtx.compTM;
   const auto &compTN             = tilingCtx.compTN;
   const auto &elemType           = tilingCtx.elemType;
+  const auto &device             = tilingCtx.device;
   auto dmaWireBundle = WireBundle::DMA;
 
   // 2. Shim tile <- Comp tile (output)
   for (uint32_t col = 0; col < numCols; ++col) {
-    uint32_t shimIdx = placement.findAieTileIdx(col, 0);
+    uint32_t shimIdx = placement.findAieTileIdx(col, device.shimRow);
     uint32_t resPacketCnt = 0;
 
     // Generate and register RES communications for each Shim tile
     for (uint32_t i = 0; i < numCompTilesPerCol; ++i) {
       uint32_t l_idx = numCompTilesPerCol * col + i;
-      uint32_t compIdx = placement.findAieTileIdx(col, 5 - i);
+      uint32_t compIdx = placement.findAieTileIdx(col, device.compTileLastRow() - i);
 
       AiePacket pkt;
       pkt.name = std::string("res") + std::to_string(l_idx);
@@ -262,6 +266,7 @@ static void configureOutputComms(AiePlacement &placement, const TilingContext &t
 // S2MM BDs on shim tiles add PKT_HDR_BYTES overhead to account for the packet header.
 static void configureDmas(AiePlacement &placement, const TilingContext &tilingCtx) {
   const auto &elemType = tilingCtx.elemType;
+  const auto &device   = tilingCtx.device;
 
   // 1. MM2S (Send)
   for (auto &comm : placement.aieComms) {
@@ -379,7 +384,7 @@ static void configureDmas(AiePlacement &placement, const TilingContext &tilingCt
                                     ? "pres" : comm.name;
           bd.bufIdx = dstTile.findBufIdx(bufName);
           // shim tile receives the DMA switch header alongside the payload; add header overhead in elements
-          bd.bufSize = (dstTile.row == 0) ? (packet.size + (PKT_HDR_BYTES / getElemBytes(elemType))) : packet.size;
+          bd.bufSize = (dstTile.row == device.shimRow) ? (packet.size + (device.pktHdrBytes / getElemBytes(elemType))) : packet.size;
           bd.bufOffset = 0;
           bd.nextBdIdx = dstDma.bdIdx;
           dstTile.bds.push_back(bd);
@@ -458,11 +463,12 @@ static ShimBdSchedules collectShimBdSchedules(
   const auto &compTK   = tilingCtx.compTK;
   const auto &compTN   = tilingCtx.compTN;
   const auto &elemType = tilingCtx.elemType;
+  const auto &device   = tilingCtx.device;
 
   ShimBdSchedules sched;
 
   for (auto &tile : placement.aieTiles) {
-    if (tile.row != 0) continue; // only shim tiles
+    if (tile.row != device.shimRow) continue; // only shim tiles
 
     for (auto &dma : tile.dmas) {
       if (dma.dir == DMAChannelDir::MM2S) {
@@ -518,7 +524,7 @@ static ShimBdSchedules collectShimBdSchedules(
         do {
           auto &bd = tile.getAieBd(curBdIdx);
           uint32_t idx = static_cast<uint32_t>(std::strtoul(bd.name.c_str() + 3, nullptr, 10));
-          uint32_t off = compTM * compTN + (PKT_HDR_BYTES / getElemBytes(elemType)); // header overhead in elements
+          uint32_t off = compTM * compTN + (device.pktHdrBytes / getElemBytes(elemType)); // header overhead in elements
 
           std::string name = "res";
           std::array<int64_t,4> offset = {0, 0, 0, static_cast<int64_t>(off * idx)};
@@ -556,6 +562,7 @@ static void assembleScheduleByAxis(
   const auto &compTileTPn = tilingCtx.compTileTPn;
   const auto &tpOrder     = tilingCtx.tpOrder;
   const auto &elemType    = tilingCtx.elemType;
+  const auto &device      = tilingCtx.device;
 
   const uint32_t lhsTxWaitCnt  = static_cast<uint32_t>(std::count_if(
       lhsTxSchedule.begin(), lhsTxSchedule.end(),
@@ -590,7 +597,7 @@ static void assembleScheduleByAxis(
       }
 
       for (auto &sch : resRxSchedule) {
-        sch.staticOffset[3] += (compTM * compTN + (PKT_HDR_BYTES / getElemBytes(elemType))) * resRxWaitCnt; // header overhead in elements
+        sch.staticOffset[3] += (compTM * compTN + (device.pktHdrBytes / getElemBytes(elemType))) * resRxWaitCnt; // header overhead in elements
       }
     }
   } else if (tpOrder[0] == AXIS_N) {
@@ -610,7 +617,7 @@ static void assembleScheduleByAxis(
       }
 
       for (auto &sch : resRxSchedule) {
-        sch.staticOffset[3] += (compTM * compTN + (PKT_HDR_BYTES / getElemBytes(elemType))) * resRxWaitCnt; // header overhead in elements
+        sch.staticOffset[3] += (compTM * compTN + (device.pktHdrBytes / getElemBytes(elemType))) * resRxWaitCnt; // header overhead in elements
       }
     }
   } else { // tpOrder[0] == AXIS_K

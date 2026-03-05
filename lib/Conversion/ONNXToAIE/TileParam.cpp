@@ -227,6 +227,23 @@ std::optional<SystemInfo> loadSystemInfo(const std::string &filePath,
     }
   }
 
+  // Parse optional "device" section; absent fields keep DeviceConfig defaults.
+  if (auto *devObj = sysObj->getObject("device")) {
+    auto &d = info.device;
+    if (auto v = devObj->getInteger("max_columns"))
+      d.maxColumns = static_cast<uint32_t>(*v);
+    if (auto v = devObj->getInteger("comp_tiles_per_col"))
+      d.compTilesPerCol = static_cast<uint32_t>(*v);
+    if (auto v = devObj->getInteger("shim_row"))
+      d.shimRow = static_cast<uint32_t>(*v);
+    if (auto v = devObj->getInteger("comp_tile_first_row"))
+      d.compTileFirstRow = static_cast<uint32_t>(*v);
+    if (auto v = devObj->getInteger("mem_tile_mem_bytes"))
+      d.memTileMemBytes = static_cast<uint32_t>(*v);
+    if (auto v = devObj->getInteger("pkt_hdr_bytes"))
+      d.pktHdrBytes = static_cast<uint32_t>(*v);
+  }
+
   if (debug) {
     llvm::dbgs() << "[SystemInfo] Loaded SystemInfo:\n"
                  << "  name:         " << info.name       << "\n"
@@ -236,6 +253,14 @@ std::optional<SystemInfo> loadSystemInfo(const std::string &filePath,
       llvm::dbgs() << "    level=" << lvl.level
                    << " numSpms=" << lvl.numSpms
                    << " sizeBytes=" << lvl.spmSizeBytes << "\n";
+    const auto &d = info.device;
+    llvm::dbgs() << "  device:\n"
+                 << "    maxColumns=" << d.maxColumns
+                 << " compTilesPerCol=" << d.compTilesPerCol
+                 << " shimRow=" << d.shimRow
+                 << " compTileFirstRow=" << d.compTileFirstRow
+                 << " memTileMemBytes=" << d.memTileMemBytes
+                 << " pktHdrBytes=" << d.pktHdrBytes << "\n";
     llvm::dbgs() << "\n";
   }
 
@@ -380,26 +405,27 @@ TileParam findOptimalTileParam(const SystemInfo &sysInfo,
 //===----------------------------------------------------------------------===//
 // buildTilingContext / needsPres / getElemBytes
 //===----------------------------------------------------------------------===//
-TilingContext buildTilingContext(const TileParam &tp) {
+TilingContext buildTilingContext(const TileParam &tp, const SystemInfo &sysInfo) {
   TilingContext tc;
+  tc.device = sysInfo.device;
   const auto &lv = tp.levels[0];
-  tc.numCompTilesPerCol = NUM_COMP_TILES_PER_COL;
+  tc.numCompTilesPerCol = tc.device.compTilesPerCol;
 
-  // numLastSpm must be a positive multiple of NUM_COMP_TILES_PER_COL so that
+  // numLastSpm must be a positive multiple of compTilesPerCol so that
   // the tile grid fills complete columns without remainder.
-  if (tp.numLastSpm == 0 || tp.numLastSpm % NUM_COMP_TILES_PER_COL != 0)
+  if (tp.numLastSpm == 0 || tp.numLastSpm % tc.device.compTilesPerCol != 0)
     llvm::report_fatal_error(
         llvm::Twine("numLastSpm=") + llvm::Twine(tp.numLastSpm) +
         " must be a positive multiple of " +
-        llvm::Twine(NUM_COMP_TILES_PER_COL));
+        llvm::Twine(tc.device.compTilesPerCol));
 
   tc.numCols = tp.numLastSpm / tc.numCompTilesPerCol;
 
-  if (tc.numCols > NUM_MAX_COLS)
+  if (tc.numCols > tc.device.maxColumns)
     llvm::report_fatal_error(
         llvm::Twine("numCols=") + llvm::Twine(tc.numCols) +
         " exceeds maximum supported columns (" +
-        llvm::Twine(NUM_MAX_COLS) + ")");
+        llvm::Twine(tc.device.maxColumns) + ")");
   tc.compTM              = lv.tileSize.TM;
   tc.compTK              = lv.tileSize.TK;
   tc.compTN              = lv.tileSize.TN;
