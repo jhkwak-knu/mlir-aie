@@ -1487,9 +1487,6 @@ static void emitTileOps(OpBuilder &builder, Location loc,
 static void emitBufferAndLockOps(OpBuilder &builder, Location loc,
                                  AiePlacement &placement,
                                  const TilingContext &tilingCtx) {
-  const auto &compTileTPk = tilingCtx.compTileTPk;
-  const auto &tpOrder     = tilingCtx.tpOrder;
-
   // Generate Ops for each tile
   for (auto &tile : placement.aieTiles) {
     if (tile.row == 0) { // Shim tile
@@ -1537,7 +1534,7 @@ static void emitBufferAndLockOps(OpBuilder &builder, Location loc,
         }
 
         if (buf.name == "res") {
-          if ((compTileTPk > 1) && (tpOrder[0] != 2)) { // Calculator lock
+          if (needsPres(tilingCtx)) { // Calculator lock
             uint32_t numCalcToken = 0;
             auto idAttr = builder.getI32IntegerAttr(id++);
             auto initAttr = builder.getI32IntegerAttr(numCalcToken);
@@ -1590,9 +1587,6 @@ static void emitPacketFlowOps(OpBuilder &builder, Location loc,
 static void emitMemDmaOps(OpBuilder &builder, Location loc,
                           AiePlacement &placement,
                           const TilingContext &tilingCtx) {
-  const auto &compTileTPk = tilingCtx.compTileTPk;
-  const auto &tpOrder     = tilingCtx.tpOrder;
-
   // Generate AIE DMAOp
   for (auto &tile : placement.aieTiles) {
     // Shim tile
@@ -1677,7 +1671,7 @@ static void emitMemDmaOps(OpBuilder &builder, Location loc,
             uint32_t numToken = 1;
 
             if ((buf.name == "res") && (dma.dir == DMAChannelDir::S2MM)) {
-              if ((compTileTPk > 1) && (tpOrder[0] != 2)) {
+              if (needsPres(tilingCtx)) {
                 releaseLockValue = buf.calcLockValue;
               }
             }
@@ -1759,7 +1753,7 @@ static void emitCoreOps(OpBuilder &builder, Location loc,
         Args bufArgs{buf.bufValue, buf.consLockValue, buf.prodLockValue};
         rhsInitArgs.push_back(bufArgs);
       } else if (name == "res" || name == "resdb") {
-        auto acquireValue = ((compTileTPk > 1) && (tpOrder[0] != 2)) ? 
+        auto acquireValue = needsPres(tilingCtx) ?
                                       buf.calcLockValue : buf.prodLockValue;
         Args bufArgs{buf.bufValue, acquireValue, buf.consLockValue};
         resInitArgs.push_back(bufArgs);
@@ -1851,7 +1845,7 @@ static void emitCoreOps(OpBuilder &builder, Location loc,
         innerInitArgs.push_back(innerT);
 
         // Generate Memref StoreOp
-        if ((compTileTPk > 1) && (tpOrder[0] != 2)) {
+        if (needsPres(tilingCtx)) {
           builder.create<memref::StoreOp>(loc, trueI1, accVar);
         } else {
           builder.create<memref::StoreOp>(loc, falseI1, accVar);
