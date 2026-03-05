@@ -1068,13 +1068,147 @@ static void configureDmas(AiePlacement &placement, const TilingContext &tilingCt
   }
 }
 
-// Build the NPU DMA runtime schedule (NpuMemcpyNd sequence).
-// Determines the order and offsets of lhs/rhs/pres TX and res RX transfers
-// based on tpOrder[0] (innermost loop axis):
-//   0=M: rhs fixed, lhs cycles over TPm iterations
-//   1=N: lhs fixed, rhs cycles over TPn iterations
-//   2=K: lhs and rhs both cycle over TPk iterations, no pres
-static void buildSchedule(AiePlacement &placement, const TilingContext &tilingCtx) {
+// Group DMA entries that transfer the same data (same offset and size) so that
+// only the last entry in each group carries a merged wait-list.  This lets the
+// runtime issue parallel transfers on separate channels and wait once.
+static void syncChannelParallelSameData(std::vector<AieNpuMemcpyNd> &v) {
+  auto sameData = [](const AieNpuMemcpyNd &a, const AieNpuMemcpyNd &b) {
+    return a.staticOffset[3] == b.staticOffset[3] &&
+           a.staticSize[3]   == b.staticSize[3];
+  };
+
+  const size_t n = v.size();
+  std::vector<char> moved(n, 0);
+  std::vector<AieNpuMemcpyNd> out;
+  out.reserve(n);
+
+  for (size_t i = 0; i < n; ++i) {
+    if (moved[i]) continue;
+
+    std::vector<size_t> group{i};
+    moved[i] = 1;
+    for (size_t j = i + 1; j < n; ++j)
+      if (!moved[j] && sameData(v[i], v[j])) { group.push_back(j); moved[j] = 1; }
+
+    std::vector<AieNpuWait> mergedWait;
+    for (size_t k = 0; k < group.size(); ++k) {
+      auto item = v[group[k]];
+      mergedWait.insert(mergedWait.end(), item.waitBufs.begin(), item.waitBufs.end());
+      item.waitBufs.clear();
+
+      if (k == (group.size() - 1)) {
+        item.waitBufs = mergedWait;
+      }
+
+      out.push_back(std::move(item));
+    }
+  }
+
+  v.swap(out);
+}
+
+// Collect per-buffer DMA schedules from shim tiles by walking each DMA's
+// BD chain and categorising entries as lhs/rhs/pres TX or res RX.
+struct ShimBdSchedules {
+  std::vector<AieNpuMemcpyNd> lhsTx, rhsTx, presTx, resRx;
+};
+
+static ShimBdSchedules collectShimBdSchedules(
+    const AiePlacement &placement, const TilingContext &tilingCtx) {
+  const auto &compTM   = tilingCtx.compTM;
+  const auto &compTK   = tilingCtx.compTK;
+  const auto &compTN   = tilingCtx.compTN;
+  const auto &elemType = tilingCtx.elemType;
+
+  ShimBdSchedules sched;
+
+  for (auto &tile : placement.aieTiles) {
+    if (tile.row != 0) continue; // only shim tiles
+
+    for (auto &dma : tile.dmas) {
+      if (dma.dir == DMAChannelDir::MM2S) {
+        uint32_t firstBdIdx = dma.bdIdx;
+        uint32_t curBdIdx = firstBdIdx;
+
+        do {
+          auto &bd = tile.getAieBd(curBdIdx);
+          std::array<int64_t,4> defaultSize = {1, 1, 1, static_cast<int64_t>(bd.bufSize)};
+          std::array<int64_t,4> defaultStride = {0, 0, 0, 1};
+
+          if (bd.name.compare(0, 3, "lhs") == 0) {
+            uint32_t idx = static_cast<uint32_t>(std::strtoul(bd.name.c_str() + 3, nullptr, 10));
+            uint32_t off = compTM * compTK;
+
+            std::string name = "lhs";
+            std::array<int64_t,4> offset = {0, 0, 0, static_cast<int64_t>(off * idx)};
+            AieNpuMemcpyNd lhsTx{.name=name, .id=0, .shimCol=tile.col, .shimRow=tile.row, .bufIdx=bd.bufIdx, .isPacket=bd.isPacket, .packetType=0, .packetId=bd.packetId,
+                                  .issueToken=true, .waitBufs={AieNpuWait{tile.col, tile.row, bd.bufIdx}},
+                                  .staticOffset=offset, .staticSize=defaultSize, .staticStride=defaultStride};
+
+            sched.lhsTx.push_back(lhsTx);
+          } else if (bd.name.compare(0, 3, "rhs") == 0) {
+            uint32_t idx = static_cast<uint32_t>(std::strtoul(bd.name.c_str() + 3, nullptr, 10));
+            uint32_t off = compTK * compTN;
+
+            std::string name = "rhs";
+            std::array<int64_t,4> offset = {0, 0, 0, static_cast<int64_t>(off * idx)};
+            AieNpuMemcpyNd rhsTx{.name=name, .id=1, .shimCol=tile.col, .shimRow=tile.row, .bufIdx=bd.bufIdx, .isPacket=bd.isPacket, .packetType=0, .packetId=bd.packetId,
+                                  .issueToken=true, .waitBufs={AieNpuWait{tile.col, tile.row, bd.bufIdx}},
+                                  .staticOffset=offset, .staticSize=defaultSize, .staticStride=defaultStride};
+
+            sched.rhsTx.push_back(rhsTx);
+          } else { // tile.bufs[bd.bufIdx].name == "pres"
+            uint32_t idx = static_cast<uint32_t>(std::strtoul(bd.name.c_str() + 4, nullptr, 10));
+            uint32_t off = compTM * compTN;
+
+            std::string name = "pres";
+            std::array<int64_t,4> offset = {0, 0, 0, static_cast<int64_t>(off * idx)};
+            AieNpuMemcpyNd presTx{.name=name, .id=2, .shimCol=tile.col, .shimRow=tile.row, .bufIdx=bd.bufIdx, .isPacket=bd.isPacket, .packetType=0, .packetId=bd.packetId,
+                                  .issueToken=true, .waitBufs={AieNpuWait{tile.col, tile.row, bd.bufIdx}},
+                                  .staticOffset=offset, .staticSize=defaultSize, .staticStride=defaultStride};
+
+            sched.presTx.push_back(presTx);
+          }
+
+          curBdIdx = bd.nextBdIdx;
+        } while (curBdIdx != firstBdIdx);
+      } else { // dma.dir == DMAChannelDir::S2MM
+        uint32_t firstBdIdx = dma.bdIdx;
+        uint32_t curBdIdx = firstBdIdx;
+
+        do {
+          auto &bd = tile.getAieBd(curBdIdx);
+          uint32_t idx = static_cast<uint32_t>(std::strtoul(bd.name.c_str() + 3, nullptr, 10));
+          uint32_t off = compTM * compTN + (PKT_HDR_BYTES / getElemBytes(elemType)); // header overhead in elements
+
+          std::string name = "res";
+          std::array<int64_t,4> offset = {0, 0, 0, static_cast<int64_t>(off * idx)};
+          std::array<int64_t,4> size = {1, 1, 1, static_cast<int64_t>(bd.bufSize)};
+          std::array<int64_t,4> stride = {0, 0, 0, 1};
+          AieNpuMemcpyNd resRx{.name=name, .id=3, .shimCol=tile.col, .shimRow=tile.row, .bufIdx=bd.bufIdx, .isPacket=bd.isPacket, .packetType=0, .packetId=bd.packetId,
+                                  .issueToken=true, .waitBufs={AieNpuWait{tile.col, tile.row, bd.bufIdx}},
+                                  .staticOffset=offset, .staticSize=size, .staticStride=stride};
+
+          // resRxSchedule.insert(resRxSchedule.begin(), resRx);
+          sched.resRx.push_back(resRx);
+
+          curBdIdx = bd.nextBdIdx;
+        } while (curBdIdx != firstBdIdx);
+      }
+    }
+  }
+
+  return sched;
+}
+
+// Assemble the final NPU schedule by interleaving lhs/rhs/pres/res transfers
+// according to the innermost loop axis, advancing offsets each iteration.
+static void assembleScheduleByAxis(
+    AiePlacement &placement, const TilingContext &tilingCtx,
+    std::vector<AieNpuMemcpyNd> &lhsTxSchedule,
+    std::vector<AieNpuMemcpyNd> &rhsTxSchedule,
+    std::vector<AieNpuMemcpyNd> &presTxSchedule,
+    std::vector<AieNpuMemcpyNd> &resRxSchedule) {
   const auto &compTM      = tilingCtx.compTM;
   const auto &compTK      = tilingCtx.compTK;
   const auto &compTN      = tilingCtx.compTN;
@@ -1084,131 +1218,6 @@ static void buildSchedule(AiePlacement &placement, const TilingContext &tilingCt
   const auto &tpOrder     = tilingCtx.tpOrder;
   const auto &elemType    = tilingCtx.elemType;
 
-  // Configure tile scheduling (runtime sequence)
-  std::vector<AieNpuMemcpyNd> lhsTxSchedule;
-  std::vector<AieNpuMemcpyNd> rhsTxSchedule;
-  std::vector<AieNpuMemcpyNd> presTxSchedule;
-  std::vector<AieNpuMemcpyNd> resRxSchedule;
-
-  for (auto &tile : placement.aieTiles) {
-    if (tile.row != 0) { // Comp tile
-      continue;
-    }
-    else { // Shim tile
-      for (auto &dma : tile.dmas) {
-        if (dma.dir == DMAChannelDir::MM2S) {
-          uint32_t firstBdIdx = dma.bdIdx;
-          uint32_t curBdIdx = firstBdIdx;
-          
-          do {
-            auto &bd = tile.getAieBd(curBdIdx);
-            std::array<int64_t,4> defaultSize = {1, 1, 1, static_cast<int64_t>(bd.bufSize)};
-            std::array<int64_t,4> defaultStride = {0, 0, 0, 1};
-            
-            if (bd.name.compare(0, 3, "lhs") == 0) {
-              uint32_t idx = static_cast<uint32_t>(std::strtoul(bd.name.c_str() + 3, nullptr, 10));
-              uint32_t off = compTM * compTK;
-
-              std::string name = "lhs";
-              std::array<int64_t,4> offset = {0, 0, 0, static_cast<int64_t>(off * idx)};
-              AieNpuMemcpyNd lhsTx{.name=name, .id=0, .shimCol=tile.col, .shimRow=tile.row, .bufIdx=bd.bufIdx, .isPacket=bd.isPacket, .packetType=0, .packetId=bd.packetId,
-                                    .issueToken=true, .waitBufs={AieNpuWait{tile.col, tile.row, bd.bufIdx}},
-                                    .staticOffset=offset, .staticSize=defaultSize, .staticStride=defaultStride};
-
-              lhsTxSchedule.push_back(lhsTx);
-            } else if (bd.name.compare(0, 3, "rhs") == 0) {
-              uint32_t idx = static_cast<uint32_t>(std::strtoul(bd.name.c_str() + 3, nullptr, 10));
-              uint32_t off = compTK * compTN;
-
-              std::string name = "rhs";
-              std::array<int64_t,4> offset = {0, 0, 0, static_cast<int64_t>(off * idx)};
-              AieNpuMemcpyNd rhsTx{.name=name, .id=1, .shimCol=tile.col, .shimRow=tile.row, .bufIdx=bd.bufIdx, .isPacket=bd.isPacket, .packetType=0, .packetId=bd.packetId,
-                                    .issueToken=true, .waitBufs={AieNpuWait{tile.col, tile.row, bd.bufIdx}},
-                                    .staticOffset=offset, .staticSize=defaultSize, .staticStride=defaultStride};
-
-              rhsTxSchedule.push_back(rhsTx);
-            } else { // tile.bufs[bd.bufIdx].name == "pres"
-              uint32_t idx = static_cast<uint32_t>(std::strtoul(bd.name.c_str() + 4, nullptr, 10));
-              uint32_t off = compTM * compTN;
-
-              std::string name = "pres";
-              std::array<int64_t,4> offset = {0, 0, 0, static_cast<int64_t>(off * idx)};
-              AieNpuMemcpyNd presTx{.name=name, .id=2, .shimCol=tile.col, .shimRow=tile.row, .bufIdx=bd.bufIdx, .isPacket=bd.isPacket, .packetType=0, .packetId=bd.packetId,
-                                    .issueToken=true, .waitBufs={AieNpuWait{tile.col, tile.row, bd.bufIdx}},
-                                    .staticOffset=offset, .staticSize=defaultSize, .staticStride=defaultStride};
-
-              presTxSchedule.push_back(presTx);
-            }
-
-            curBdIdx = bd.nextBdIdx;
-          } while (curBdIdx != firstBdIdx);
-        } else { // dma.dir == DMAChannelDir::S2MM
-          uint32_t firstBdIdx = dma.bdIdx;
-          uint32_t curBdIdx = firstBdIdx;
-          
-          do {
-            auto &bd = tile.getAieBd(curBdIdx);
-            uint32_t idx = static_cast<uint32_t>(std::strtoul(bd.name.c_str() + 3, nullptr, 10));
-            uint32_t off = compTM * compTN + (PKT_HDR_BYTES / getElemBytes(elemType)); // header overhead in elements
-
-            std::string name = "res";
-            std::array<int64_t,4> offset = {0, 0, 0, static_cast<int64_t>(off * idx)};
-            std::array<int64_t,4> size = {1, 1, 1, static_cast<int64_t>(bd.bufSize)};
-            std::array<int64_t,4> stride = {0, 0, 0, 1};
-            AieNpuMemcpyNd resRx{.name=name, .id=3, .shimCol=tile.col, .shimRow=tile.row, .bufIdx=bd.bufIdx, .isPacket=bd.isPacket, .packetType=0, .packetId=bd.packetId,
-                                    .issueToken=true, .waitBufs={AieNpuWait{tile.col, tile.row, bd.bufIdx}},
-                                    .staticOffset=offset, .staticSize=size, .staticStride=stride};
-
-            // resRxSchedule.insert(resRxSchedule.begin(), resRx);
-            resRxSchedule.push_back(resRx);
-
-            curBdIdx = bd.nextBdIdx;
-          } while (curBdIdx != firstBdIdx);
-        }
-      }
-    }
-  }
-
-  auto syncChannelParallelSameData = [](std::vector<AieNpuMemcpyNd>& v) {
-    auto sameData = [](const AieNpuMemcpyNd& a, const AieNpuMemcpyNd& b) {
-      return a.staticOffset[3] == b.staticOffset[3] &&
-            a.staticSize[3]   == b.staticSize[3];
-    };
-
-    const size_t n = v.size();
-    std::vector<char> moved(n, 0);
-    std::vector<AieNpuMemcpyNd> out; out.reserve(n);
-
-    for (size_t i = 0; i < n; ++i) {
-      if (moved[i]) continue;
-
-      std::vector<size_t> group{ i };
-      moved[i] = 1;
-      for (size_t j = i + 1; j < n; ++j)
-        if (!moved[j] && sameData(v[i], v[j])) { group.push_back(j); moved[j] = 1; }
-
-      std::vector<AieNpuWait> mergedWait;
-      for (size_t k = 0; k < group.size(); ++k) {
-        auto item = v[group[k]];
-        mergedWait.insert(mergedWait.end(), item.waitBufs.begin(), item.waitBufs.end());
-        item.waitBufs.clear();
-
-        if (k == (group.size() - 1)) {
-          item.waitBufs = mergedWait;
-        }
-
-        out.push_back(std::move(item));
-      }
-    }
-
-    v.swap(out);
-  };
-
-  syncChannelParallelSameData(lhsTxSchedule);
-  syncChannelParallelSameData(rhsTxSchedule);
-  syncChannelParallelSameData(presTxSchedule);
-  syncChannelParallelSameData(resRxSchedule);
-
   const uint32_t lhsTxWaitCnt  = static_cast<uint32_t>(std::count_if(
       lhsTxSchedule.begin(), lhsTxSchedule.end(),
       [](const AieNpuMemcpyNd &s) { return !s.waitBufs.empty(); }));
@@ -1217,10 +1226,10 @@ static void buildSchedule(AiePlacement &placement, const TilingContext &tilingCt
       rhsTxSchedule.begin(), rhsTxSchedule.end(),
       [](const AieNpuMemcpyNd &s) { return !s.waitBufs.empty(); }));
 
-  const uint32_t presTxWaitCnt = static_cast<uint32_t>(std::count_if(  
+  const uint32_t presTxWaitCnt = static_cast<uint32_t>(std::count_if(
       presTxSchedule.begin(), presTxSchedule.end(),
       [](const AieNpuMemcpyNd &s) { return !s.waitBufs.empty(); }));
-        
+
   const uint32_t resRxWaitCnt  = static_cast<uint32_t>(std::count_if(
       resRxSchedule.begin(), resRxSchedule.end(),
       [](const AieNpuMemcpyNd &s) { return !s.waitBufs.empty(); }));
@@ -1273,7 +1282,7 @@ static void buildSchedule(AiePlacement &placement, const TilingContext &tilingCt
       for (auto &sch : lhsTxSchedule) {
         sch.staticOffset[3] += (compTM * compTK) * lhsTxWaitCnt;
       }
-      
+
       for (auto &sch : rhsTxSchedule) {
         sch.staticOffset[3] += (compTK * compTN) * rhsTxWaitCnt;
       }
@@ -1281,6 +1290,24 @@ static void buildSchedule(AiePlacement &placement, const TilingContext &tilingCt
 
     placement.aieSchedule.insert(placement.aieSchedule.end(), resRxSchedule.begin(), resRxSchedule.end());
   }
+}
+
+// Build the NPU DMA runtime schedule (NpuMemcpyNd sequence).
+// Determines the order and offsets of lhs/rhs/pres TX and res RX transfers
+// based on tpOrder[0] (innermost loop axis):
+//   AXIS_M: rhs fixed, lhs cycles over TPm iterations
+//   AXIS_N: lhs fixed, rhs cycles over TPn iterations
+//   AXIS_K: lhs and rhs both cycle over TPk iterations, no pres
+static void buildSchedule(AiePlacement &placement, const TilingContext &tilingCtx) {
+  auto sched = collectShimBdSchedules(placement, tilingCtx);
+
+  syncChannelParallelSameData(sched.lhsTx);
+  syncChannelParallelSameData(sched.rhsTx);
+  syncChannelParallelSameData(sched.presTx);
+  syncChannelParallelSameData(sched.resRx);
+
+  assembleScheduleByAxis(placement, tilingCtx,
+                         sched.lhsTx, sched.rhsTx, sched.presTx, sched.resRx);
 }
 
 // Print the computed AiePlacement to dbgs() when --debug-aie-placement is set.
@@ -1715,9 +1742,64 @@ static void emitMemDmaOps(OpBuilder &builder, Location loc,
 
 }
 
+// Maps tpOrder[0] axis to the corresponding reuse/inner1/inner2 buffer roles
+// and the repeat count for the inner SCF loop.
+using Args = SmallVector<Value, 3>;
+using InitArgs = SmallVector<Args, 2>;
+
+struct AxisBufferSelection {
+  InitArgs *reuse;   // buffer reused across inner loop iterations
+  InitArgs *inner1;  // first buffer cycled each iteration
+  InitArgs *inner2;  // second buffer cycled each iteration
+  uint32_t repeatCount;
+};
+
+static AxisBufferSelection selectAxisBuffers(
+    const std::vector<uint32_t> &tpOrder,
+    InitArgs &lhsInitArgs, InitArgs &rhsInitArgs, InitArgs &resInitArgs,
+    uint32_t compTileTPm, uint32_t compTileTPn, uint32_t compTileTPk) {
+  AxisBufferSelection sel;
+  if (tpOrder[0] == AXIS_M) {
+    sel = {&rhsInitArgs, &lhsInitArgs, &resInitArgs, compTileTPm};
+  } else if (tpOrder[0] == AXIS_N) {
+    sel = {&lhsInitArgs, &rhsInitArgs, &resInitArgs, compTileTPn};
+  } else { // AXIS_K
+    sel = {&resInitArgs, &lhsInitArgs, &rhsInitArgs, compTileTPk};
+  }
+  return sel;
+}
+
+// Build the kernel call argument list with lhs/rhs/res ordered according to
+// tpOrder[0].  The reuse buffer occupies a fixed slot while inner1/inner2
+// are placed in their canonical positions (A=lhs, B=rhs, C=res).
+static SmallVector<Value, 7> buildKernelCallArgs(
+    const std::vector<uint32_t> &tpOrder,
+    const Args &arg1, const Args &arg2, const Args &reuseArgs,
+    Value cRow, Value cCol, Value cDep, Value acc) {
+  SmallVector<Value, 7> callArgs;
+  if (tpOrder[0] == AXIS_M) { // reuse=rhs, arg1=lhs, arg2=res
+    callArgs.push_back(arg1[0]);
+    callArgs.push_back(reuseArgs[0]);
+    callArgs.push_back(arg2[0]);
+  } else if (tpOrder[0] == AXIS_N) { // reuse=lhs, arg1=rhs, arg2=res
+    callArgs.push_back(reuseArgs[0]);
+    callArgs.push_back(arg1[0]);
+    callArgs.push_back(arg2[0]);
+  } else { // AXIS_K: reuse=res, arg1=lhs, arg2=rhs
+    callArgs.push_back(arg1[0]);
+    callArgs.push_back(arg2[0]);
+    callArgs.push_back(reuseArgs[0]);
+  }
+  callArgs.push_back(cRow);
+  callArgs.push_back(cCol);
+  callArgs.push_back(cDep);
+  callArgs.push_back(acc);
+  return callArgs;
+}
+
 // Declares the extern_kernel FuncOp and creates CoreOp+SCF ForOp for each compute tile.
 // Inner loop iterates over the innermost axis (tpOrder[0]); outer loop runs infinitely.
-// Uses pres partial-sum accumulation when K is not the innermost reuse axis (TPk>1, tpOrder[0]!=2).
+// Uses pres partial-sum accumulation when K is not the innermost reuse axis (TPk>1, tpOrder[0]!=AXIS_K).
 static void emitCoreOps(OpBuilder &builder, Location loc,
                         AiePlacement &placement,
                         const TilingContext &tilingCtx) {
@@ -1749,17 +1831,14 @@ static void emitCoreOps(OpBuilder &builder, Location loc,
       continue;
     }
 
-    // Set vector for each buffer (lhs/rhs/res)
-    using Args = SmallVector<Value, 3>;
-    using InitArgs = SmallVector<Args, 2>;
-
+    // Collect per-buffer init args (lhs/rhs/res) from tile buffers
     InitArgs lhsInitArgs;
     InitArgs rhsInitArgs;
     InitArgs resInitArgs;
 
     for (auto &buf : tile.bufs) {
       const std::string &name = buf.name;
-      
+
       if (name == "lhs" || name == "lhsdb") {
         Args bufArgs{buf.bufValue, buf.consLockValue, buf.prodLockValue};
         lhsInitArgs.push_back(bufArgs);
@@ -1774,30 +1853,13 @@ static void emitCoreOps(OpBuilder &builder, Location loc,
       }
     }
 
-    InitArgs *reuseInitArgsPtr = nullptr;
-    InitArgs *inner1InitArgsPtr = nullptr;
-    InitArgs *inner2InitArgsPtr = nullptr;
-
-    if (tpOrder[0] == AXIS_M) {
-      reuseInitArgsPtr = &rhsInitArgs;
-      inner1InitArgsPtr = &lhsInitArgs;
-      inner2InitArgsPtr = &resInitArgs;
-    } else if (tpOrder[0] == AXIS_N) {
-      reuseInitArgsPtr = &lhsInitArgs;
-      inner1InitArgsPtr = &rhsInitArgs;
-      inner2InitArgsPtr = &resInitArgs;
-    } else { // tpOrder[0] == AXIS_K
-      reuseInitArgsPtr = &resInitArgs;
-      inner1InitArgsPtr = &lhsInitArgs;
-      inner2InitArgsPtr = &rhsInitArgs;
-    }
-
-    auto &reuseInitArgs = *reuseInitArgsPtr;
-    auto &inner1InitArgs = *inner1InitArgsPtr;
-    auto &inner2InitArgs = *inner2InitArgsPtr;
-
-    uint32_t repeatCount = (tpOrder[0] == AXIS_M) ? compTileTPm :
-                            ((tpOrder[0] == AXIS_N) ? compTileTPn : compTileTPk);
+    auto axisSel = selectAxisBuffers(tpOrder,
+        lhsInitArgs, rhsInitArgs, resInitArgs,
+        compTileTPm, compTileTPn, compTileTPk);
+    auto &reuseInitArgs = *axisSel.reuse;
+    auto &inner1InitArgs = *axisSel.inner1;
+    auto &inner2InitArgs = *axisSel.inner2;
+    uint32_t repeatCount = axisSel.repeatCount;
 
     // Generate Memref GlobalOp
     std::string flagName = std::string("flag_") + std::to_string(tile.col) + "_" + std::to_string(tile.row);
@@ -1888,22 +1950,8 @@ static void emitCoreOps(OpBuilder &builder, Location loc,
           // Generate Func CallOp
           Value acc = builder.create<memref::LoadOp>(loc, accVar.getResult(), ValueRange{});
 
-          SmallVector<Value, 4> commonArgs{cRow, cCol, cDep, acc};
-          SmallVector<Value, 7> callArgs;
-          if (tpOrder[0] == AXIS_M) { // arg1: lhs, arg2: res
-            callArgs.push_back(arg1[0]);
-            callArgs.push_back(reuseArgs[0]);
-            callArgs.push_back(arg2[0]);
-          } else if (tpOrder[0] == AXIS_N) { // arg1: rhs, arg2: res
-            callArgs.push_back(reuseArgs[0]);
-            callArgs.push_back(arg1[0]);
-            callArgs.push_back(arg2[0]);
-          } else { // tpOrder[0] == AXIS_K, arg1: lhs, arg2: rhs
-            callArgs.push_back(arg1[0]);
-            callArgs.push_back(arg2[0]);
-            callArgs.push_back(reuseArgs[0]);
-          }
-          callArgs.append(commonArgs.begin(), commonArgs.end());
+          auto callArgs = buildKernelCallArgs(tpOrder, arg1, arg2, reuseArgs,
+                                              cRow, cCol, cDep, acc);
 
           auto calleeAttr = SymbolRefAttr::get(builder.getContext(), "extern_kernel");
           builder.create<mlir::func::CallOp>(loc, calleeAttr, TypeRange{}, ValueRange(callArgs));
