@@ -82,6 +82,8 @@ run: host all | $(LOGS_DIR)
 		-i $(BUILD_DIR)/insts.bin \
 		-k MLIR_AIE -v 2 \
 		--tc-json $(TC_JSON) \
+		$(if $(JSON_OUTPUT),--json-output $(JSON_OUTPUT)) \
+		$(if $(STRICT_VERIFY),--strict-verify) \
 		> $(LOGS_DIR)/log.txt
 
 # Convenience: print paths
