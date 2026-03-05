@@ -146,6 +146,144 @@ def _triple_factorizations(n: int) -> List[Tuple[int, int, int]]:
                 triples.append((a, b, c))
     return triples
 
+def _estimate_cost(
+    SPm: int, SPn: int,
+    TPm: int, TPk: int, TPn: int,
+    TM: int, TK: int, TN: int,
+) -> Tuple[Dict[str, int], Dict[str, int], int, str, List[int]]:
+    """
+    Compute data-reuse cost for a given tiling configuration.
+    Returns (total_traffic, reuse_savings, total_sum, winner_axis, tpOrder).
+
+    total_traffic: per-tensor byte counts {"MK", "KN", "MN"}
+    reuse_savings: bytes saved per axis {"M", "N", "K"}
+    total_sum:     sum of all tensor traffic
+    winner_axis:   axis with lowest score ("M", "N", or "K")
+    tpOrder:       loop order [innermost, middle, outermost] as axis ids (0=M,1=N,2=K)
+    """
+    # Spatial reuse: how many times each tensor is reused across the SPm*SPn tile grid.
+    # All axes see the same spatial reuse (A reused SPn times, B reused SPm times).
+    spatial_reuse_rate = {
+        "M": {"MK": SPn, "KN": SPm, "MN": 1},
+        "N": {"MK": SPn, "KN": SPm, "MN": 1},
+        "K": {"MK": SPn, "KN": SPm, "MN": 1},
+    }
+
+    # Temporal reuse: depends on which axis is innermost (reuse axis).
+    # The reuse axis stays in local memory; other tensors cycle each iteration.
+    temporal_reuse_rate = {
+        "M": {"MK": 1,   "KN": TPm, "MN": 1},
+        "N": {"MK": TPn, "KN": 1,   "MN": 1},
+        "K": {"MK": 1,   "KN": 1,   "MN": TPk},
+    }
+
+    # Total element accesses per tensor across all iterations and tiles.
+    # MN factor of 2: read for accumulation + write output.
+    total = {
+        "MK": (TM * TK) * TPm * TPn * TPk * SPm * SPn,
+        "KN": (TK * TN) * TPm * TPn * TPk * SPm * SPn,
+        "MN": (2 * TM * TN) * TPm * TPn * TPk * SPm * SPn,
+    }
+    total_sum = sum(total.values())
+
+    # Reuse savings: redundant loads eliminated by keeping data on-chip.
+    # reuse[axis] = sum over tensors of: total * (reuse_factor - 1) / reuse_factor
+    reuse: Dict[str, int] = {}
+    for axis in ("M", "N", "K"):
+        s = 0
+        for tensor in ("MK", "KN", "MN"):
+            t = total[tensor]
+            srr = spatial_reuse_rate[axis][tensor]
+            trr = temporal_reuse_rate[axis][tensor]
+            s += t * max(srr * trr - 1, 0) // max(srr * trr, 1)
+        reuse[axis] = s
+
+    # Score = total traffic minus reuse savings; lower is better.
+    score: Dict[str, int] = {}
+    for axis in ("M", "N", "K"):
+        score[axis] = total_sum - reuse[axis]
+
+    # Winner: axis with lowest score; ties broken by largest reuse, then K>M>N priority.
+    tie_rank = {"M": 1, "N": 0, "K": 2}
+    winner = min(("M", "N", "K"), key=lambda ax: (score[ax], -reuse[ax], -tie_rank[ax]))
+
+    # tpOrder: winner first, then default K->M->N for remaining axes.
+    axis_id = {"M": 0, "N": 1, "K": 2}
+    default_order = [axis_id["K"], axis_id["M"], axis_id["N"]]
+    win_id = axis_id[winner]
+    tp_order = [win_id] + [ax for ax in default_order if ax != win_id]
+
+    return total, reuse, score, total_sum, winner, tp_order
+
+
+def _find_best_config(
+    M0: int, K0: int, N0: int,
+    SPm: int, SPn: int,
+    elem_bytes: int,
+    ct_limit: int,
+    log_lines: List[str],
+) -> Optional[Tuple[Any, ...]]:
+    """
+    Search for the best (TPm,TPk,TPn) factorization that fits in ct_limit.
+
+    Greedy: starts from the minimum TPtotal that could fit, stops at the first
+    feasible TPtotal value. Within each TPtotal, picks the factorization with
+    the lowest cost score.
+
+    Returns None if no feasible config exists, otherwise a tuple:
+      (key, (TPm,TPk,TPn), tp_order, TM, TK, TN, total_sum, reuse, score)
+    """
+    ws_bytes = _est_ws_bytes(M0, K0, N0, elem_bytes)
+    TPtotal_init = max(1, math.ceil(ws_bytes / ct_limit))
+    TPtotal_max  = max(1, M0 * K0 * N0)
+
+    tie_rank = {"M": 1, "N": 0, "K": 2}
+    best = None
+
+    for TPtotal in range(TPtotal_init, TPtotal_max + 1):
+        triples = _triple_factorizations(TPtotal)
+        found_this_total = False
+
+        for (TPm, TPk, TPn) in triples:
+            if (M0 % TPm) or (K0 % TPk) or (N0 % TPn):
+                continue
+
+            TM = M0 // TPm
+            TK = K0 // TPk
+            TN = N0 // TPn
+
+            ws_step = _est_ws_bytes(TM, TK, TN, elem_bytes)
+            if ws_step > ct_limit:
+                continue
+
+            total, reuse, score, total_sum, winner, tp_order = _estimate_cost(
+                SPm, SPn, TPm, TPk, TPn, TM, TK, TN
+            )
+
+            log_lines.append(
+                "  TPtotal={}: TP=(m={},k={},n={}) Tiles(TM,TK,TN)=({},{},{}) ws_step={}B "
+                "total={} reuse{{M:{}, N:{}, K:{}}} score{{M:{}, N:{}, K:{}}} "
+                "winner={} reuse={} score={} tpOrder={}".format(
+                    TPtotal, TPm, TPk, TPn, TM, TK, TN, ws_step, total_sum,
+                    reuse["M"], reuse["N"], reuse["K"],
+                    score["M"], score["N"], score["K"],
+                    winner, reuse[winner], score[winner], tp_order
+                )
+            )
+
+            key = (score[winner], -reuse[winner], -tie_rank[winner])
+
+            if (best is None) or (key < best[0]):
+                best = (key, (TPm, TPk, TPn), tp_order, TM, TK, TN, total_sum, reuse[winner], score[winner])
+                found_this_total = True
+
+        # Stop at first feasible TPtotal (greedy: smallest temporal split)
+        if found_this_total:
+            break
+
+    return best
+
+
 def make_tc_cases(op_cases: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[str]]:
     """
     Placeholder: turn op cases into tc cases.
@@ -197,22 +335,14 @@ def make_tc_cases(op_cases: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]],
                     if (M % SPm) or (N % SPn):
                         continue
 
-                    # ---------- # DRAM→L1: (SPm,SPn,TPm,TPn,TPk) ----------
                     # CT-assigned block before temporal splitting
                     M0 = M // SPm
                     N0 = N // SPn
                     K0 = K
 
-                    # Working-set for that block
                     ws_bytes = _est_ws_bytes(M0, K0, N0, elem_bytes)
-
-                    # Required total temporal factor (>=1)
                     TPtotal_init = max(1, math.ceil(ws_bytes / ct_limit))
-                    TPtotal_max  = max(1, M0 * K0 * N0)  # upper bound per spec
-
-                    # Enumerate TP triples starting from TPtotal_init, increasing if needed
-                    best = None  # (key, (TPm,TPk,TPn), tp_order, TM, TK, TN)
-                    tie_rank = {"M": 1, "N": 0, "K": 2}
+                    TPtotal_max  = max(1, M0 * K0 * N0)
 
                     # Log header for this (SPm,SPn)
                     log_lines.append(
@@ -221,88 +351,7 @@ def make_tc_cases(op_cases: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]],
                         f"TPtotal_init={TPtotal_init} TPtotal_max={TPtotal_max}"
                     )
 
-                    for TPtotal in range(TPtotal_init, TPtotal_max + 1):
-                        triples = _triple_factorizations(TPtotal)
-                        found_this_total = False
-
-                        for (TPm, TPk, TPn) in triples:
-                            # Divisibility constraints
-                            if (M0 % TPm) or (K0 % TPk) or (N0 % TPn):
-                                continue
-
-                            # Per-step tile sizes
-                            TM = M0 // TPm
-                            TK = K0 // TPk
-                            TN = N0 // TPn
-
-                            ws_step = _est_ws_bytes(TM, TK, TN, elem_bytes)
-                            if ws_step > ct_limit:
-                                continue
-
-                            # Reuse scores (same formula), at this level using (M0,K0,N0)
-                            spatial_reuse_rate = {
-                                "M": {"MK": SPn, "KN": SPm, "MN": 1},
-                                "N": {"MK": SPn, "KN": SPm, "MN": 1},
-                                "K": {"MK": SPn, "KN": SPm, "MN": 1},
-                            }
-
-                            temporal_reuse_rate = {
-                                "M": {"MK": 1,   "KN": TPm, "MN": 1},
-                                "N": {"MK": TPn, "KN": 1,   "MN": 1},
-                                "K": {"MK": 1,   "KN": 1,   "MN": TPk},
-                            }
-
-                            total = {
-                                "MK": (TM * TK) * TPm * TPn * TPk * SPm * SPn,
-                                "KN": (TK * TN) * TPm * TPn * TPk * SPm * SPn,
-                                "MN": (2 * TM * TN) * TPm * TPn * TPk * SPm * SPn,
-                            }
-                            total_sum = sum(total.values())
-
-                            reuse = {}
-                            for axis in ("M", "N", "K"):
-                                s = 0
-                                for tensor in ("MK", "KN", "MN"):
-                                    t = total[tensor]
-                                    srr = spatial_reuse_rate[axis][tensor]
-                                    trr = temporal_reuse_rate[axis][tensor]
-                                    s += t * max(srr * trr - 1, 0) // max(srr * trr, 1)
-                                reuse[axis] = s
-                            
-                            score = {}
-                            for axis in ("M", "N", "K"):
-                                score[axis] = total_sum - reuse[axis]
-                            
-                            # Winner axis & extra transfer cost
-                            winner = min(("M","N","K"), key=lambda ax: (score[ax], -reuse[ax], -tie_rank[ax]))
-
-                            # TP order: winner first, then default K->M->N
-                            axis_id = {"M": 0, "N": 1, "K": 2}
-                            default_order = [axis_id["K"], axis_id["M"], axis_id["N"]]
-                            win_id = axis_id[winner]
-                            tp_order = [win_id] + [ax for ax in default_order if ax != win_id]
-
-                            # Selection key: minimize score; tie → larger reuse; then winner priority K->M->N;
-                            key = (score[winner], -reuse[winner], -tie_rank[winner])
-                            
-                            # ---- LOG per valid candidate ----
-                            log_lines.append(
-                                "  TPtotal={}: TP=(m={},k={},n={}) Tiles(TM,TK,TN)=({},{},{}) ws_step={}B "
-                                "total={} reuse{{M:{}, N:{}, K:{}}} score{{M:{}, N:{}, K:{}}} "
-                                "winner={} reuse={} score={} tpOrder={}".format(
-                                    TPtotal, TPm, TPk, TPn, TM, TK, TN, ws_step, total_sum,
-                                    reuse["M"], reuse["N"], reuse["K"],
-                                    score["M"], score["N"], score["K"],
-                                    winner, reuse[winner], score[winner], tp_order
-                                )
-                            )
-
-                            if (best is None) or (key < best[0]):
-                                best = (key, (TPm, TPk, TPn), tp_order, TM, TK, TN, total_sum, reuse[winner], score[winner])
-                                found_this_total = True
-
-                        if found_this_total:
-                            break  # stop increasing TPtotal once feasible found
+                    best = _find_best_config(M0, K0, N0, SPm, SPn, elem_bytes, ct_limit, log_lines)
 
                     if best is None:
                         log_lines.append("  -> No feasible TP for this SPm/SPn; continue")
@@ -310,12 +359,11 @@ def make_tc_cases(op_cases: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]],
 
                     (_, (TPm, TPk, TPn), tp_order, TM, TK, TN, total, reuse, score) = best
 
-                    # ---- LOG final selection for this (SPm,SPn) ----
                     log_lines.append(
                         "  [SELECT] TP=(m={},k={},n={}) Tiles(TM,TK,TN)=({},{},{}) tpOrder={} "
                         "reuse_axis={} total={} reuse={} score={}".format(
                             TPm, TPk, TPn, TM, TK, TN, tp_order,
-                            ["M","N","K"][tp_order[0]],  # first in order is winner axis
+                            ["M","N","K"][tp_order[0]],
                             total, reuse, score
                         )
                     )
