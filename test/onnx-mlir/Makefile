@@ -2,9 +2,9 @@
 # Toolchain (Vitis-AI/AIEngine)
 # =========================
 AIETOOLS_DIR       ?= $(shell realpath $(dir $(shell which xchesscc))/../)
-AIE2_INCLUDE_DIR   ?= ${AIETOOLS_DIR}/data/aie2p/lib
+AIE2_INCLUDE_DIR   ?= $(AIETOOLS_DIR)/data/aie2p/lib
 AIE_ARCH           ?= aie2p
-CHESSCC_FLAGS      ?= --aiearch ${AIE_ARCH} -f -p me -P ${AIE2_INCLUDE_DIR} -I ${AIETOOLS_DIR}/include
+CHESSCC_FLAGS      ?= --aiearch $(AIE_ARCH) -f -p me -P $(AIE2_INCLUDE_DIR) -I $(AIETOOLS_DIR)/include
 AIECC_FLAGS        ?= --aie-generate-xclbin --no-compile-host --aie-generate-npu-insts --npu-insts-name=insts.bin
 
 # =========================
@@ -28,15 +28,15 @@ REPORTS_DIR:= $(OUT_DIR)/reports
 MLIR_SRCS   ?= $(MLIR_DIR)/onnx_matmul.mlir
 KERNEL_SRCS ?= $(SRC_DIR)/kernel.cc
 PASSES      ?= --convert-onnx-to-aie
+TC_JSON     ?= $(OUT_DIR)/tc.json
+SYSINFO_JSON ?= $(abspath $(ROOT_DIR)/../../include/onnx/Target/XDNA2/xdna2_info.json)
 # DEBUGS		?= --debug-system-info --debug-tile-param --debug-aie-placement
-DEBUGS		?= 
+DEBUGS		?=
 
 # Host executable name (CMakeLists.txt uses TARGET_NAME)
 TARGET      ?= onnx_matmul
 HOST_BUILD_DIR ?= $(BUILD_DIR)/host
 
-# Host macros (passed from run_tc_all.sh)
-CPPDEFS ?=
 CXXFLAGS ?=
 
 # =========================
@@ -53,26 +53,25 @@ $(BUILD_DIR) $(LOGS_DIR) $(MLIR_DIR) $(ONNX_DIR) $(REPORTS_DIR):
 
 # 1) Prepare conversion outputs: ONNX-MLIR -> AIE MLIR
 #    Assuming $(MLIR_SRCS) is created by gen_onnx_matmul_mlir.sh beforehand,
-#    run aie-opt and place aie.mlir/host.mlir into $(BUILD_DIR).
+#    run aie-opt and write aie.mlir/host.mlir directly into $(BUILD_DIR).
 $(BUILD_DIR)/aie.mlir: $(MLIR_SRCS) | $(BUILD_DIR)
-	aie-opt $< ${PASSES} ${DEBUGS} > host.mlir
-	# Assume some passes may produce aie.mlir separately
-	mv aie.mlir host.mlir $(BUILD_DIR)
+	aie-opt $< $(PASSES) --tile-param-json=$(TC_JSON) --system-info-json=$(SYSINFO_JSON) --aie-mlir-output=$@ $(DEBUGS) \
+		-o $(BUILD_DIR)/host.mlir
 
 # 2) Compile kernel (xchesscc)
 $(BUILD_DIR)/kernel.o: $(KERNEL_SRCS) | $(BUILD_DIR)
-	xchesscc ${CHESSCC_FLAGS} -c $< -o $@
+	xchesscc $(CHESSCC_FLAGS) -c $< -o $@
 
 # 3) Generate xclbin/insts.bin with aiecc.py
 $(BUILD_DIR)/final.xclbin: $(BUILD_DIR)/aie.mlir $(BUILD_DIR)/kernel.o
-	cd $(BUILD_DIR) && aiecc.py ${AIECC_FLAGS} --xclbin-name=$(@F) aie.mlir
+	cd $(BUILD_DIR) && aiecc.py $(AIECC_FLAGS) --xclbin-name=$(@F) aie.mlir
 
 # 4) Build host (assumes CMakeLists.txt lives at repo root)
 host: $(BUILD_DIR)/$(TARGET)
 
 $(BUILD_DIR)/$(TARGET): $(SRC_DIR)/host.cpp CMakeLists.txt | $(BUILD_DIR)
 	mkdir -p $(HOST_BUILD_DIR)
-	cd $(HOST_BUILD_DIR) && cmake $(ROOT_DIR) -DTARGET_NAME=$(TARGET) -DCMAKE_CXX_FLAGS:STRING="$(CPPDEFS) $(CXXFLAGS)"
+	cd $(HOST_BUILD_DIR) && cmake $(ROOT_DIR) -DTARGET_NAME=$(TARGET) -DCMAKE_CXX_FLAGS:STRING="$(CXXFLAGS)"
 	cd $(HOST_BUILD_DIR) && cmake --build . --config Release
 	cp $(HOST_BUILD_DIR)/$(TARGET) $(BUILD_DIR)/$(TARGET)
 
@@ -82,6 +81,9 @@ run: host all | $(LOGS_DIR)
 		-x $(BUILD_DIR)/final.xclbin \
 		-i $(BUILD_DIR)/insts.bin \
 		-k MLIR_AIE -v 2 \
+		--tc-json $(TC_JSON) \
+		$(if $(JSON_OUTPUT),--json-output $(JSON_OUTPUT)) \
+		$(if $(STRICT_VERIFY),--strict-verify) \
 		> $(LOGS_DIR)/log.txt
 
 # Convenience: print paths

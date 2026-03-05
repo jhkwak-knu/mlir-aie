@@ -92,8 +92,14 @@ else
     echo "info: upgrading result CSV header (adding timing columns) ..."
     tmp_csv="$(mktemp)"
     echo "$NEW_HEADER" > "$tmp_csv"
-    # Append old rows with five additional timing fields defaulted to -1
+    # Append old rows with five additional timing fields defaulted to -1.
+    # tail failure is benign (CSV may not exist yet); only awk failure is an error.
     tail -n +2 "$RESULT_CSV" 2>/dev/null | awk -F',' '{print $0",-1,-1,-1,-1,-1"}' >> "$tmp_csv"
+    if [[ ${PIPESTATUS[1]} -ne 0 ]]; then
+      echo "error: awk failed during CSV header upgrade; aborting to preserve original" >&2
+      rm -f "$tmp_csv"
+      exit 1
+    fi
     mv "$tmp_csv" "$RESULT_CSV"
   fi
 fi
@@ -141,8 +147,8 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
 
   # 3) generate MLIR
   if [[ -f "$GEN_SCRIPT" ]]; then
-    echo "running: bash $GEN_SCRIPT $M $K $N"
-    if ! bash "$GEN_SCRIPT" "$M" "$K" "$N"; then
+    echo "running: bash $GEN_SCRIPT $OUTPUT_JSON"
+    if ! bash "$GEN_SCRIPT" "$OUTPUT_JSON"; then
       echo "warn: generator failed"
       echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,GEN_FAIL,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
       if [[ -f "$CLEAN_SCRIPT" ]]; then bash "$CLEAN_SCRIPT" || true; fi
@@ -155,22 +161,31 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
     continue
   fi
 
-  # 4) build & run (Makefile 'run' target). Pass macros for host.cpp.
-  CPPDEFS="-DM_SIZE=$M -DK_SIZE=$K -DN_SIZE=$N"
-  echo "make -C \"$MAKE_DIR\" run CPPDEFS=\"$CPPDEFS\""
-  if ! make -C "$MAKE_DIR" run CPPDEFS="$CPPDEFS"; then
+  # 4) build & run (JSON_OUTPUT enables structured result parsing via jq)
+  JSON_RESULT="$LOGS_DIR/result.json"
+  echo "make -C \"$MAKE_DIR\" run JSON_OUTPUT=$JSON_RESULT"
+  if ! make -C "$MAKE_DIR" run JSON_OUTPUT="$JSON_RESULT"; then
     echo "warn: make run failed"
     echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,RUN_FAIL,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
     # if [[ -f "$CLEAN_SCRIPT" ]]; then bash "$CLEAN_SCRIPT" || true; fi
     continue
   fi
 
-  # 5) parse log.txt
+  # 5) parse results — prefer JSON (deterministic) over grep (fragile)
   STATUS="FAIL"; ERRORS=-1
   ITERS=-1; WARMUP=-1; AVG_US=-1; MIN_US=-1; MAX_US=-1
 
-  if [[ -f "$LOG_FILE" ]]; then
-    # PASS/FAIL & mismatches
+  if [[ -f "$JSON_RESULT" ]]; then
+    # Structured JSON written by host --json-output; no regex needed.
+    STATUS="$(jq -r '.status // "FAIL"' "$JSON_RESULT")"
+    ERRORS="$(jq -r '.errors // -1' "$JSON_RESULT")"
+    ITERS="$(jq -r '.iterations // -1' "$JSON_RESULT")"
+    WARMUP="$(jq -r '.warmup // -1' "$JSON_RESULT")"
+    AVG_US="$(jq -r '.avg_us // -1' "$JSON_RESULT")"
+    MIN_US="$(jq -r '.min_us // -1' "$JSON_RESULT")"
+    MAX_US="$(jq -r '.max_us // -1' "$JSON_RESULT")"
+  elif [[ -f "$LOG_FILE" ]]; then
+    # Fallback: grep-based log parsing for backward compatibility.
     if grep -q 'PASS!' "$LOG_FILE"; then
       STATUS="PASS"; ERRORS=0
     else
@@ -178,16 +193,13 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
       if [[ -n "${last_mis:-}" ]]; then ERRORS="$last_mis"; fi
     fi
 
-    # Iterations/Warmup: "Number of iterations: 5 (warmup iterations: 3)"
     it_line="$(grep -m1 -E '^Number of iterations:' "$LOG_FILE" || true)"
     if [[ -n "$it_line" ]]; then
       ITERS="$(echo "$it_line"  | grep -Eo 'Number of iterations:\s*[0-9]+' | awk '{print $NF}')"
-      # Extract warmup within brackets
       WARMUP="$(echo "$it_line" | grep -Eo '\(warmup iterations:\s*[0-9]+' | grep -Eo '[0-9]+' || true)"
       : "${ITERS:=-1}"; : "${WARMUP:=-1}"
     fi
 
-    # Avg/Min/Max NPU time: "Avg NPU time: 1279.2us."
     avg_line="$(grep -m1 -E '^Avg NPU time:' "$LOG_FILE" || true)"
     if [[ -n "$avg_line" ]]; then
       AVG_US="$(echo "$avg_line" | sed -E 's/.*Avg NPU time:\s*([0-9]+(\.[0-9]+)?)us.*/\1/')"
@@ -201,7 +213,6 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
       MAX_US="$(echo "$max_line" | sed -E 's/.*Max NPU time:\s*([0-9]+(\.[0-9]+)?)us.*/\1/')"
     fi
 
-    # Check number format (Return -1 if missing)
     for v in AVG_US MIN_US MAX_US; do
       val="${!v}"
       if ! [[ "$val" =~ ^[0-9]+([.][0-9]+)?$ ]]; then

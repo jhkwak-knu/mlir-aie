@@ -1,4 +1,7 @@
 add_mlir_conversion_library(MLIRONNXToAIE
+  TileParam.cpp
+  AiePlacement.cpp
+  AieEmitter.cpp
   ONNXToAIE.cpp
 
   ADDITIONAL_HEADER_DIRS

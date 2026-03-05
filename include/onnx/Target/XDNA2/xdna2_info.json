@@ -9,6 +9,14 @@
                 "spm_size_bytes": 65536
             }
         ],
-        "total_cores": 32
+        "total_cores": 32,
+        "device": {
+            "max_columns": 8,
+            "comp_tiles_per_col": 4,
+            "shim_row": 0,
+            "comp_tile_first_row": 2,
+            "mem_tile_mem_bytes": 524288,
+            "pkt_hdr_bytes": 4
+        }
     }
 }
