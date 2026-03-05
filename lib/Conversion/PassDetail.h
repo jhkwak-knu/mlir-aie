@@ -12,6 +12,7 @@
 #define AIE_CONVERSION_PASSDETAIL_H_
 
 #include "aie/Conversion/Passes.h"
+#include "onnx/Conversion/Passes.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
@@ -47,6 +48,12 @@ class XLLVMDialect;
 
 } // namespace xilinx
 
+namespace onnx {
+
+class ONNXDialect;
+
+} // namespace onnx
+
 namespace mlir {
 
 namespace LLVM {
@@ -55,6 +62,9 @@ class LLVMDialect;
 
 #define GEN_PASS_CLASSES
 #include "aie/Conversion/Passes.h.inc"
+
+#define GEN_PASS_CLASSES
+#include "onnx/Conversion/Passes.h.inc"
 } // namespace mlir
 
 #endif // AIE_CONVERSION_PASSDETAIL_H_

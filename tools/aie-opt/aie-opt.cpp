@@ -22,6 +22,8 @@
 #include "aie/Dialect/AIEX/Transforms/AIEXPasses.h"
 #include "aie/InitialAllDialect.h"
 #include "aie/version.h"
+#include "onnx/Dialect/ONNX/IR/ONNXDialect.hpp"
+#include "onnx/Conversion/Passes.h"
 
 using namespace llvm;
 using namespace mlir;
@@ -39,10 +41,12 @@ int main(int argc, char **argv) {
   xilinx::aievec::registerAIEVecAnalysisPasses();
   xilinx::aievec::registerAIEVecPasses();
   xilinx::aievec::registerAIEVecPipelines();
+  onnx::registerConversionPasses();
 
   DialectRegistry registry;
   registerAllDialects(registry);
   xilinx::registerAllDialects(registry);
+  registry.insert<onnx::ONNXDialect>();
 
   registerAllExtensions(registry);
 
