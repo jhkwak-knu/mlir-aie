@@ -442,9 +442,11 @@ static void emitCoreOps(OpBuilder &builder, Location loc,
       auto cMax = builder.create<mlir::arith::ConstantOp>(loc, builder.getIndexAttr(CORE_LOOP_INFINITE));
       auto cCnt = builder.create<mlir::arith::ConstantOp>(loc, builder.getIndexAttr(repeatCount));
 
-      auto cRow = builder.create<mlir::arith::ConstantIntOp>(loc, compTM, /*width=*/getElemBytes(elemType)*8);
-      auto cCol = builder.create<mlir::arith::ConstantIntOp>(loc, compTN, /*width=*/getElemBytes(elemType)*8);
-      auto cDep = builder.create<mlir::arith::ConstantIntOp>(loc, compTK, /*width=*/getElemBytes(elemType)*8);
+      // Dimension args (N_ROW, N_COL, N_DEP) are always uint32_t in the kernel
+      // signature, regardless of the element data type.
+      auto cRow = builder.create<mlir::arith::ConstantIntOp>(loc, compTM, /*width=*/32);
+      auto cCol = builder.create<mlir::arith::ConstantIntOp>(loc, compTN, /*width=*/32);
+      auto cDep = builder.create<mlir::arith::ConstantIntOp>(loc, compTK, /*width=*/32);
 
       auto trueI1 = builder.create<arith::ConstantIntOp>(loc, /*value=*/1, /*bitWidth=*/1);
       auto falseI1 = builder.create<arith::ConstantIntOp>(loc, /*value=*/0, /*bitWidth=*/1);

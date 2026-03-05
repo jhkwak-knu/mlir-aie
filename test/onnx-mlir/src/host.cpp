@@ -24,10 +24,15 @@
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_kernel.h"
 
+#include <stdfloat>
+
 #ifndef DATATYPES_USING_DEFINED
 #define DATATYPES_USING_DEFINED
-using DATATYPE = float; // Configure this to match your buffer data type
+using DATATYPE = std::bfloat16_t;
 #endif
+
+// Packet header is 4 bytes; number of DATATYPE elements it occupies.
+static constexpr size_t PKT_HDR_ELEMS = 4 / sizeof(DATATYPE);
 
 #include "nlohmann/json.hpp"
 using json = nlohmann::json;
@@ -74,7 +79,7 @@ static void printMatrix(const std::string name, const std::vector<DATATYPE> &mat
   std::cout << "Matrix " << name << "[" << rows << "][" << cols << "]:\n";
   for (int i = 0; i < rows; ++i) {
     for (int j = 0; j < cols; ++j) {
-      std::cout << mat[(i * cols) + j] << " ";
+      std::cout << static_cast<float>(mat[(i * cols) + j]) << " ";
     }
     std::cout << "\n";
   }
@@ -177,14 +182,17 @@ static MatrixSet initMatrices(const tilingParam &tp, int verbosity) {
   ms.C.assign(matCSize, 0);
 
   // Host reference: C[i][j] = sum_k A[i][k] * B[j][k]  (B transposed layout)
+  // Accumulate in float to avoid compounding bf16 rounding errors in the
+  // reference, then truncate the final result back to DATATYPE.
   ms.CRef.resize(matCSize);
   for (int i = 0; i < static_cast<int>(tp.M); ++i) {
     for (int j = 0; j < static_cast<int>(tp.N); ++j) {
-      int idx = (i * tp.N) + j;
-      ms.CRef[idx] = 0;
+      float acc = 0.0f;
       for (int k = 0; k < static_cast<int>(tp.K); ++k) {
-        ms.CRef[idx] += ms.A[(i * tp.K) + k] * ms.B[(j * tp.K) + k];
+        acc += static_cast<float>(ms.A[(i * tp.K) + k]) *
+               static_cast<float>(ms.B[(j * tp.K) + k]);
       }
+      ms.CRef[(i * tp.N) + j] = static_cast<DATATYPE>(acc);
     }
   }
 
@@ -359,8 +367,8 @@ int main(int argc, const char *argv[]) {
   int chunkASize = ((tp.TM * tp.TK) * tp.SPm) * chunkTPm * chunkTPk;
   int chunkBSize = ((tp.TN * tp.TK) * tp.SPn) * chunkTPn * chunkTPk;
   int chunkCSize = ((tp.TM * tp.TN) * tp.SPm * tp.SPn) * chunkTPm * chunkTPn;
-  // +4/sizeof(DATATYPE) accounts for packet header prepended to each output tile
-  int chunkOutCSize = ((tp.TM * tp.TN + (4 / sizeof(DATATYPE))) * tp.SPm * tp.SPn) * chunkTPm * chunkTPn;
+  // PKT_HDR_ELEMS accounts for the 4-byte packet header prepended to each output tile
+  int chunkOutCSize = ((tp.TM * tp.TN + PKT_HDR_ELEMS) * tp.SPm * tp.SPn) * chunkTPm * chunkTPn;
 
   // Partial sum input (pres) needed when K is split across temporal iterations
   // AND K is not the innermost (reuse) axis (otherwise tiles accumulate locally).
@@ -591,12 +599,12 @@ int main(int argc, const char *argv[]) {
           for (int i = 0; i < repeatCount; ++i) {
             for (int j = 0; j < (tp.SPm * tp.SPn); ++j) {
               uint32_t pkt_header, pkt_id;
-              std::memcpy(&pkt_header, &bufOut[(tp.TM * tp.TN + (4 / sizeof(DATATYPE))) * ((tp.SPm * tp.SPn) * i + j) + 0], sizeof(pkt_header));
+              std::memcpy(&pkt_header, &bufOut[(tp.TM * tp.TN + PKT_HDR_ELEMS) * ((tp.SPm * tp.SPn) * i + j) + 0], sizeof(pkt_header));
               pkt_id = pkt_header & 0x1F;
 
               std::cout << "OutC[" << ((tp.SPm * tp.SPn) * i + j) << "] (packet id = " << pkt_id << "): ";
               for (int k = 0; k < (tp.TM * tp.TN); ++k) {
-                std::cout << bufOut[(tp.TM * tp.TN + (4 / sizeof(DATATYPE))) * ((tp.SPm * tp.SPn) * i + j) + k + (4 / sizeof(DATATYPE))] << " ";
+                std::cout << static_cast<float>(bufOut[(tp.TM * tp.TN + PKT_HDR_ELEMS) * ((tp.SPm * tp.SPn) * i + j) + k + PKT_HDR_ELEMS]) << " ";
               }
               std::cout << "\n";
             }
@@ -617,7 +625,7 @@ int main(int argc, const char *argv[]) {
               int idx = outerOffset + innerOffset + k;
 
               uint32_t packetHeader, packetId;
-              std::memcpy(&packetHeader, &bufOut[(tp.TM * tp.TN + (4 / sizeof(DATATYPE))) * idx], sizeof(packetHeader));
+              std::memcpy(&packetHeader, &bufOut[(tp.TM * tp.TN + PKT_HDR_ELEMS) * idx], sizeof(packetHeader));
               packetId = packetHeader & 0x1F;
               if (packetId == 1) packetId = 0;
               else if (packetId == 2) packetId = 1;
@@ -628,7 +636,7 @@ int main(int argc, const char *argv[]) {
               std::pair<int,int> tilePos = chunkCTileOrder[matCIdx];
 
               const size_t tileElems  = static_cast<size_t>(tp.TM) * tp.TN;
-              const size_t blockElems = tileElems + 1;
+              const size_t blockElems = tileElems + PKT_HDR_ELEMS;
               const size_t start      = blockElems * static_cast<size_t>(idx) + 1;
               const size_t end        = start + tileElems;
 
@@ -648,7 +656,7 @@ int main(int argc, const char *argv[]) {
                   << "\n";
               }
               
-              std::vector<DATATYPE> tileValue(&bufOut[(tp.TM * tp.TN + 1) * idx + 1], &bufOut[(tp.TM * tp.TN + 1) * (idx + 1)]);
+              std::vector<DATATYPE> tileValue(&bufOut[(tp.TM * tp.TN + PKT_HDR_ELEMS) * idx + PKT_HDR_ELEMS], &bufOut[(tp.TM * tp.TN + PKT_HDR_ELEMS) * (idx + 1)]);
               write_tile_1d_strict<DATATYPE>(matC, tp.M, tp.N, tp.TM, tp.TN, tilePos.first, tilePos.second, tileValue);
             }
           }
@@ -662,15 +670,16 @@ int main(int argc, const char *argv[]) {
     }
 
     // Compare out to ref.
-    // Default: epsilon tolerance (relative 1e-5 + absolute 1e-6) to handle
-    // float accumulation order differences between host ref and AIE kernel.
+    // Default: epsilon tolerance to handle accumulation order differences
+    // between host ref and AIE kernel.  bf16 has ~2 decimal digits of
+    // precision, so wider tolerances are needed than for f32.
     // --strict-verify reverts to exact bitwise comparison for debugging.
     if(verify) {
       if (verbosity >= 1) {
         std::cout << "Verifying results ..." << std::endl;
       }
-      constexpr float REL_TOL = 1e-5f;
-      constexpr float ABS_TOL = 1e-6f;
+      constexpr float REL_TOL = 1e-2f;
+      constexpr float ABS_TOL = 5e-1f;
       for (int i = 0; i < tp.M; ++i) {
         for (int j = 0; j < tp.N; ++j) {
           float ref = matCRef[(i * tp.N) + j];
