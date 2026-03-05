@@ -150,6 +150,9 @@ void write_tile_1d_strict(std::vector<T>& mat,
 int main(int argc, const char *argv[]) {
   // Program arguments parsing
   cxxopts::Options options("onnx_matmul");
+  options.add_options()
+      ("tc-json", "Path to tc.json tiling config",
+       cxxopts::value<std::string>()->default_value("out/tc.json"));
   test_utils::add_default_options(options);
 
   cxxopts::ParseResult vm;
@@ -158,7 +161,7 @@ int main(int argc, const char *argv[]) {
   bool verify = vm["verify"].as<bool>();
 
   // Declaring design constants
-  auto tp = loadTilingParam("/home/ace/ryzen_ai/mlir-aie-dev/mlir-aie/test/onnx-mlir/out/tc.json");
+  auto tp = loadTilingParam(vm["tc-json"].as<std::string>());
   int matASize = tp.M * tp.K;
   int matBSize = tp.N * tp.K;
   int matCSize = tp.M * tp.N;

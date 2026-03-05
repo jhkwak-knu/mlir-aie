@@ -147,8 +147,8 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
 
   # 3) generate MLIR
   if [[ -f "$GEN_SCRIPT" ]]; then
-    echo "running: bash $GEN_SCRIPT $M $K $N"
-    if ! bash "$GEN_SCRIPT" "$M" "$K" "$N"; then
+    echo "running: bash $GEN_SCRIPT $OUTPUT_JSON"
+    if ! bash "$GEN_SCRIPT" "$OUTPUT_JSON"; then
       echo "warn: generator failed"
       echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,GEN_FAIL,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
       if [[ -f "$CLEAN_SCRIPT" ]]; then bash "$CLEAN_SCRIPT" || true; fi
@@ -161,10 +161,9 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
     continue
   fi
 
-  # 4) build & run (Makefile 'run' target). Pass macros for host.cpp.
-  CPPDEFS="-DM_SIZE=$M -DK_SIZE=$K -DN_SIZE=$N"
-  echo "make -C \"$MAKE_DIR\" run CPPDEFS=\"$CPPDEFS\""
-  if ! make -C "$MAKE_DIR" run CPPDEFS="$CPPDEFS"; then
+  # 4) build & run
+  echo "make -C \"$MAKE_DIR\" run"
+  if ! make -C "$MAKE_DIR" run; then
     echo "warn: make run failed"
     echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,RUN_FAIL,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
     # if [[ -f "$CLEAN_SCRIPT" ]]; then bash "$CLEAN_SCRIPT" || true; fi

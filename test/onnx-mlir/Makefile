@@ -37,8 +37,6 @@ DEBUGS		?=
 TARGET      ?= onnx_matmul
 HOST_BUILD_DIR ?= $(BUILD_DIR)/host
 
-# Host macros (passed from run_tc_all.sh)
-CPPDEFS ?=
 CXXFLAGS ?=
 
 # =========================
@@ -73,7 +71,7 @@ host: $(BUILD_DIR)/$(TARGET)
 
 $(BUILD_DIR)/$(TARGET): $(SRC_DIR)/host.cpp CMakeLists.txt | $(BUILD_DIR)
 	mkdir -p $(HOST_BUILD_DIR)
-	cd $(HOST_BUILD_DIR) && cmake $(ROOT_DIR) -DTARGET_NAME=$(TARGET) -DCMAKE_CXX_FLAGS:STRING="$(CPPDEFS) $(CXXFLAGS)"
+	cd $(HOST_BUILD_DIR) && cmake $(ROOT_DIR) -DTARGET_NAME=$(TARGET) -DCMAKE_CXX_FLAGS:STRING="$(CXXFLAGS)"
 	cd $(HOST_BUILD_DIR) && cmake --build . --config Release
 	cp $(HOST_BUILD_DIR)/$(TARGET) $(BUILD_DIR)/$(TARGET)
 
@@ -83,6 +81,7 @@ run: host all | $(LOGS_DIR)
 		-x $(BUILD_DIR)/final.xclbin \
 		-i $(BUILD_DIR)/insts.bin \
 		-k MLIR_AIE -v 2 \
+		--tc-json $(TC_JSON) \
 		> $(LOGS_DIR)/log.txt
 
 # Convenience: print paths
