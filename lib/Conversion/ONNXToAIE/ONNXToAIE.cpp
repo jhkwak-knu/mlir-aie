@@ -342,8 +342,17 @@ static TileSize getLevelTileSize(const llvm::json::Object &obj) {
   };
 }
 
-// TODO: Implement the tiling algorithm
+// TODO(algorithm): Implement the full spatio-temporal tiling optimization here.
+// During development and validation, tiling parameters are loaded from an
+// external JSON file (--tile-param-json) produced by gen_tc_list.py, which
+// enumerates all valid (SPm,SPn,TPm,TPk,TPn) candidates, applies the cost
+// model, and selects the optimal configuration. Once the cost model is
+// validated against real hardware, this function will perform the full
+// search and selection internally, using sysInfo (hardware constraints) and
+// opInfo (matrix dimensions / element type).
 TileParam findOptimalTileParam(const SystemInfo &sysInfo, const MatmulOpInfo &opInfo) {
+  // sysInfo is unused until the optimization algorithm is implemented.
+  (void)sysInfo;
 
   if (TileParamJson.empty()) {
     llvm::errs() << "Error: --tile-param-json is required\n";
