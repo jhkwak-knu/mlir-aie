@@ -76,6 +76,11 @@ static constexpr uint32_t PRES_PKT_ID_OFFSET     = 16;
 // Upper bound that makes an SCF ForOp behave as an infinite loop in the core
 static constexpr int64_t  CORE_LOOP_INFINITE     = 0x7FFFFFFFFFFFFFFFLL;
 
+// Axis indices used in tpOrder to select the innermost temporal loop axis.
+// tpOrder[0] determines which axis is reused across iterations:
+//   AXIS_M (0) -> RHS reuse, AXIS_N (1) -> LHS reuse, AXIS_K (2) -> local accumulation.
+enum AxisId : uint32_t { AXIS_M = 0, AXIS_N = 1, AXIS_K = 2 };
+
 //===----------------------------------------------------------------------===//
 // System Information
 //===----------------------------------------------------------------------===//
@@ -711,15 +716,15 @@ static void placeTiles(AiePlacement &placement, const TilingContext &tilingCtx) 
 // Returns true when a partial-sum buffer (pres) is needed.
 // pres is required when TPk > 1 and K is not the innermost loop axis,
 // because partial sums must be forwarded between K-axis iterations.
-// tpOrder[0] == 2 means K is innermost (local accumulation, no forwarding needed).
+// tpOrder[0] == AXIS_K means K is innermost (local accumulation, no forwarding needed).
 static bool needsPres(const TilingContext &ctx) {
-  return ctx.compTileTPk > 1 && ctx.tpOrder[0] != 2;
+  return ctx.compTileTPk > 1 && ctx.tpOrder[0] != AXIS_K;
 }
 
 // Allocate lhs/rhs/res (and optionally pres) buffers for each tile.
 // Shim tiles include a packet-header overhead in the res buffer.
 // pres buffer is needed when partial sums must be forwarded between tiles:
-//   TPk>1 and K is not the innermost (reuse) axis (tpOrder[0] != 2).
+//   TPk>1 and K is not the innermost (reuse) axis (tpOrder[0] != AXIS_K).
 static void allocateBuffers(AiePlacement &placement, const TilingContext &tilingCtx) {
   const auto &compTM   = tilingCtx.compTM;
   const auto &compTK   = tilingCtx.compTK;
@@ -854,10 +859,10 @@ static void configureInputComms(AiePlacement &placement, const TilingContext &ti
       AieComm *presComm;
       uint32_t dstCh;
 
-      if (tpOrder[0] == 0) { // M-axis innermost: share LHS DMA channel
+      if (tpOrder[0] == AXIS_M) { // M-axis innermost: share LHS DMA channel
         presComm = &lhsComm;
         dstCh = 0;
-      } else { // N-axis innermost (tpOrder[0] == 1): share RHS DMA channel
+      } else { // N-axis innermost (tpOrder[0] == AXIS_N): share RHS DMA channel
         presComm = &rhsComm;
         dstCh = 1;
       }
@@ -1220,7 +1225,7 @@ static void buildSchedule(AiePlacement &placement, const TilingContext &tilingCt
       resRxSchedule.begin(), resRxSchedule.end(),
       [](const AieNpuMemcpyNd &s) { return !s.waitBufs.empty(); }));
 
-  if (tpOrder[0] == 0) {
+  if (tpOrder[0] == AXIS_M) {
     placement.aieSchedule.insert(placement.aieSchedule.end(), rhsTxSchedule.begin(), rhsTxSchedule.end());
 
     for (uint32_t i = 0; i < compTileTPm; ++i) {
@@ -1234,13 +1239,13 @@ static void buildSchedule(AiePlacement &placement, const TilingContext &tilingCt
 
       for (auto &sch : presTxSchedule) {
         sch.staticOffset[3] += (compTM * compTN) * presTxWaitCnt;
-      }  
-      
+      }
+
       for (auto &sch : resRxSchedule) {
         sch.staticOffset[3] += (compTM * compTN + (PKT_HDR_BYTES / getElemBytes(elemType))) * resRxWaitCnt; // header overhead in elements
       }
     }
-  } else if (tpOrder[0] == 1) {    
+  } else if (tpOrder[0] == AXIS_N) {
     placement.aieSchedule.insert(placement.aieSchedule.end(), lhsTxSchedule.begin(), lhsTxSchedule.end());
 
     for (uint32_t i = 0; i < compTileTPn; ++i) {
@@ -1251,16 +1256,16 @@ static void buildSchedule(AiePlacement &placement, const TilingContext &tilingCt
       for (auto &sch : rhsTxSchedule) {
         sch.staticOffset[3] += (compTK * compTN) * rhsTxWaitCnt;
       }
-      
+
       for (auto &sch : presTxSchedule) {
         sch.staticOffset[3] += (compTM * compTN) * presTxWaitCnt;
       }
 
       for (auto &sch : resRxSchedule) {
         sch.staticOffset[3] += (compTM * compTN + (PKT_HDR_BYTES / getElemBytes(elemType))) * resRxWaitCnt; // header overhead in elements
-      }  
+      }
     }
-  } else { // tpOrder[0] == 2
+  } else { // tpOrder[0] == AXIS_K
     for (uint32_t i = 0; i < compTileTPk; ++i) {
       placement.aieSchedule.insert(placement.aieSchedule.end(), lhsTxSchedule.begin(), lhsTxSchedule.end());
       placement.aieSchedule.insert(placement.aieSchedule.end(), rhsTxSchedule.begin(), rhsTxSchedule.end());
@@ -1773,15 +1778,15 @@ static void emitCoreOps(OpBuilder &builder, Location loc,
     InitArgs *inner1InitArgsPtr = nullptr;
     InitArgs *inner2InitArgsPtr = nullptr;
 
-    if (tpOrder[0] == 0) {
+    if (tpOrder[0] == AXIS_M) {
       reuseInitArgsPtr = &rhsInitArgs;
       inner1InitArgsPtr = &lhsInitArgs;
       inner2InitArgsPtr = &resInitArgs;
-    } else if (tpOrder[0] == 1) {
+    } else if (tpOrder[0] == AXIS_N) {
       reuseInitArgsPtr = &lhsInitArgs;
       inner1InitArgsPtr = &rhsInitArgs;
       inner2InitArgsPtr = &resInitArgs;
-    } else { // tpOrder[0] == 2
+    } else { // tpOrder[0] == AXIS_K
       reuseInitArgsPtr = &resInitArgs;
       inner1InitArgsPtr = &lhsInitArgs;
       inner2InitArgsPtr = &rhsInitArgs;
@@ -1791,8 +1796,8 @@ static void emitCoreOps(OpBuilder &builder, Location loc,
     auto &inner1InitArgs = *inner1InitArgsPtr;
     auto &inner2InitArgs = *inner2InitArgsPtr;
 
-    uint32_t repeatCount = (tpOrder[0] == 0) ? compTileTPm :
-                            ((tpOrder[0] == 1) ? compTileTPn : compTileTPk);
+    uint32_t repeatCount = (tpOrder[0] == AXIS_M) ? compTileTPm :
+                            ((tpOrder[0] == AXIS_N) ? compTileTPn : compTileTPk);
 
     // Generate Memref GlobalOp
     std::string flagName = std::string("flag_") + std::to_string(tile.col) + "_" + std::to_string(tile.row);
@@ -1885,15 +1890,15 @@ static void emitCoreOps(OpBuilder &builder, Location loc,
 
           SmallVector<Value, 4> commonArgs{cRow, cCol, cDep, acc};
           SmallVector<Value, 7> callArgs;
-          if (tpOrder[0] == 0) { // arg1: lhs, arg2: res
+          if (tpOrder[0] == AXIS_M) { // arg1: lhs, arg2: res
             callArgs.push_back(arg1[0]);
             callArgs.push_back(reuseArgs[0]);
             callArgs.push_back(arg2[0]);
-          } else if (tpOrder[0] == 1) { // arg1: rhs, arg2: res
+          } else if (tpOrder[0] == AXIS_N) { // arg1: rhs, arg2: res
             callArgs.push_back(reuseArgs[0]);
             callArgs.push_back(arg1[0]);
             callArgs.push_back(arg2[0]);
-          } else { // tpOrder[0] == 2, arg1: lhs, arg2: rhs
+          } else { // tpOrder[0] == AXIS_K, arg1: lhs, arg2: rhs
             callArgs.push_back(arg1[0]);
             callArgs.push_back(arg2[0]);
             callArgs.push_back(reuseArgs[0]);
@@ -1908,7 +1913,7 @@ static void emitCoreOps(OpBuilder &builder, Location loc,
           builder.create<UseLockOp>(loc, arg1[2], LockAction::Release, 1);
 
           // Generate Memref StoreOp (acc)
-          if ((compTileTPk > 1) && (tpOrder[0] == 2)) {
+          if ((compTileTPk > 1) && (tpOrder[0] == AXIS_K)) {
             builder.create<memref::StoreOp>(loc, trueI1, accVar);
           }
 
@@ -1917,6 +1922,14 @@ static void emitCoreOps(OpBuilder &builder, Location loc,
             builder.create<mlir::scf::YieldOp>(loc, ValueRange{arg1[0], arg1[1], arg1[2],
                                                                 arg2[0], arg2[1], arg2[2], innerT});
           } else {
+            // TODO: complete double-buffer implementation
+            // DB requires lhsdb/rhsdb/resdb buffers so that inner1InitArgs
+            // and inner2InitArgs each have 2 entries (db0 and db1).
+            if (inner1InitArgs.size() < 2 || inner2InitArgs.size() < 2)
+              llvm::report_fatal_error(
+                  "double buffer args not initialized: "
+                  "lhsdb/rhsdb/resdb buffers must be allocated");
+
             Value innerT2 = builder.create<arith::XOrIOp>(loc, /*lhs=*/innerT, /*rhs=*/trueI1);
 
             llvm::SmallVector<Type, 7> packTys{
@@ -1969,6 +1982,14 @@ static void emitCoreOps(OpBuilder &builder, Location loc,
             innerLoopOp.getResult(3), innerLoopOp.getResult(4), innerLoopOp.getResult(5),
             innerLoopOp.getResult(6), outerT});
         } else {
+          // TODO: complete double-buffer implementation
+          // DB requires lhsdb/rhsdb/resdb buffers so that reuseInitArgs
+          // has 2 entries (db0 and db1).
+          if (reuseInitArgs.size() < 2)
+            llvm::report_fatal_error(
+                "double buffer args not initialized: "
+                "lhsdb/rhsdb/resdb buffers must be allocated");
+
           Value outerT2 = builder.create<arith::XOrIOp>(loc, /*lhs=*/outerT, /*rhs=*/trueI1);
 
           llvm::SmallVector<Type, 4> packTys{
@@ -2041,9 +2062,9 @@ static void emitRuntimeSequenceOp(OpBuilder &builder, Location loc,
     Block *seqBlock = builder.createBlock(&seqRegion);
     builder.setInsertionPointToStart(seqBlock);
 
-    uint32_t localTPm = (tpOrder[0] == 0) ? compTileTPm : 1;
-    uint32_t localTPn = (tpOrder[0] == 1) ? compTileTPn : 1;
-    uint32_t localTPk = (tpOrder[0] == 2) ? compTileTPk : 1;
+    uint32_t localTPm = (tpOrder[0] == AXIS_M) ? compTileTPm : 1;
+    uint32_t localTPn = (tpOrder[0] == AXIS_N) ? compTileTPn : 1;
+    uint32_t localTPk = (tpOrder[0] == AXIS_K) ? compTileTPk : 1;
 
     uint32_t lhsSize = ((compTM * compTileSPm) * compTK) * localTPm * localTPk;
     uint32_t rhsSize = (compTK * (compTN * compTileSPn)) * localTPk * localTPn;

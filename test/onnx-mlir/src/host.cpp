@@ -31,6 +31,11 @@ using DATATYPE = float; // Configure this to match your buffer data type
 #include "nlohmann/json.hpp"
 using json = nlohmann::json;
 
+// Axis indices used in tpOrder to select the innermost temporal loop axis.
+// tpOrder[0] determines which axis is reused across iterations:
+//   AXIS_M (0) -> RHS reuse, AXIS_N (1) -> LHS reuse, AXIS_K (2) -> local accumulation.
+enum AxisId : uint32_t { AXIS_M = 0, AXIS_N = 1, AXIS_K = 2 };
+
 struct tilingParam {
   uint32_t M, K, N;
   uint32_t SPm, SPn, TPm, TPk, TPn;
@@ -166,16 +171,16 @@ int main(int argc, const char *argv[]) {
   int matBSize = tp.N * tp.K;
   int matCSize = tp.M * tp.N;
 
-  int chunkTPm = (tp.tpOrder[0] == 0) ? tp.TPm : 1;
-  int chunkTPn = (tp.tpOrder[0] == 1) ? tp.TPn : 1;
-  int chunkTPk = (tp.tpOrder[0] == 2) ? tp.TPk : 1;
+  int chunkTPm = (tp.tpOrder[0] == AXIS_M) ? tp.TPm : 1;
+  int chunkTPn = (tp.tpOrder[0] == AXIS_N) ? tp.TPn : 1;
+  int chunkTPk = (tp.tpOrder[0] == AXIS_K) ? tp.TPk : 1;
 
   int chunkASize = ((tp.TM * tp.TK) * tp.SPm) * chunkTPm * chunkTPk;
   int chunkBSize = ((tp.TN * tp.TK) * tp.SPn) * chunkTPn * chunkTPk;
   int chunkCSize = ((tp.TM * tp.TN) * tp.SPm * tp.SPn) * chunkTPm * chunkTPn;
   int chunkOutCSize = ((tp.TM * tp.TN + (4 / sizeof(DATATYPE))) * tp.SPm * tp.SPn) * chunkTPm * chunkTPn;
 
-  bool useInC = (tp.TPk > 1) && (tp.tpOrder[0] != 2);
+  bool useInC = (tp.TPk > 1) && (tp.tpOrder[0] != AXIS_K);
 
   // Initialize matrix A
   std::vector<DATATYPE> matA(matASize);
@@ -323,7 +328,7 @@ int main(int argc, const char *argv[]) {
   std::array<int,3> matCSizes;
   std::array<std::pair<int,int>,3> matCSteps;
 
-  if (reuseTPAxis == 0) {
+  if (reuseTPAxis == AXIS_M) {
     matAOuterOffset = {matAStepBase[2]};
     matAInnerOffset = defaultStep;
     matASizes = std::array<int,3>{matASizeBase[0], matASizeBase[1], defaultSize};
@@ -338,7 +343,7 @@ int main(int argc, const char *argv[]) {
     matCInnerOffset = matCStepBase[3];
     matCSizes = std::array<int,3>{matCSizeBase[0], matCSizeBase[1], matCSizeBase[2]};
     matCSteps = std::array<std::pair<int,int>,3>{matCStepBase[0], matCStepBase[1], matCStepBase[2]};
-  } else if (reuseTPAxis == 1) {
+  } else if (reuseTPAxis == AXIS_N) {
     matAOuterOffset = matAStepBase[2];
     matAInnerOffset = matAStepBase[1];
     matASizes = std::array<int,3>{matASizeBase[0], defaultSize, defaultSize};
@@ -353,7 +358,7 @@ int main(int argc, const char *argv[]) {
     matCInnerOffset = matCStepBase[2];
     matCSizes = std::array<int,3>{matCSizeBase[0], matCSizeBase[1], matCSizeBase[3]};
     matCSteps = std::array<std::pair<int,int>,3>{matCStepBase[0], matCStepBase[1], matCStepBase[3]};
-  } else { // reuseTPAxis == 2
+  } else { // reuseTPAxis == AXIS_K
     matAOuterOffset = defaultStep;
     matAInnerOffset = matAStepBase[1];
     matASizes = std::array<int,3>{matASizeBase[0], matASizeBase[2], defaultSize};
@@ -511,7 +516,7 @@ int main(int argc, const char *argv[]) {
         bo_outC.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
 
         if (verbosity >= 2) {
-          int repeatCount = (reuseTPAxis != 2) ? reuseTP : 1;
+          int repeatCount = (reuseTPAxis != AXIS_K) ? reuseTP : 1;
           for (int i = 0; i < repeatCount; ++i) {
             for (int j = 0; j < (tp.SPm * tp.SPn); ++j) {
               uint32_t pkt_header, pkt_id;
@@ -528,7 +533,7 @@ int main(int argc, const char *argv[]) {
         }
 
         // store partial sums to matC
-        int repeatCount = (reuseTPAxis != 2) ? reuseTP : 1;
+        int repeatCount = (reuseTPAxis != AXIS_K) ? reuseTP : 1;
         for (int i = 0; i < repeatCount; ++i) {
           int outerOffset = tp.SPm * tp.SPn * i;
 
