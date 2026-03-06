@@ -59,18 +59,18 @@ static tilingParam loadTilingParam(const std::string& path) {
   tp.K  = j.at("K").get<uint32_t>();
   tp.N  = j.at("N").get<uint32_t>();
 
-  // Flat schema: tiling fields at root level (no levels[] nesting).
-  tp.SPm = j.at("SPm").get<uint32_t>();
-  tp.SPn = j.at("SPn").get<uint32_t>();
-  tp.TPm = j.at("TPm").get<uint32_t>();
-  tp.TPk = j.at("TPk").get<uint32_t>();
-  tp.TPn = j.at("TPn").get<uint32_t>();
-  tp.TM  = j.at("TM").get<uint32_t>();
-  tp.TK  = j.at("TK").get<uint32_t>();
-  tp.TN  = j.at("TN").get<uint32_t>();
+  const auto& L0 = j.at("levels").at(0);
+  tp.SPm = L0.at("SPm").get<uint32_t>();
+  tp.SPn = L0.at("SPn").get<uint32_t>();
+  tp.TPm = L0.at("TPm").get<uint32_t>();
+  tp.TPk = L0.at("TPk").get<uint32_t>();
+  tp.TPn = L0.at("TPn").get<uint32_t>();
+  tp.TM  = L0.at("TM").get<uint32_t>();
+  tp.TK  = L0.at("TK").get<uint32_t>();
+  tp.TN  = L0.at("TN").get<uint32_t>();
 
-  if (j.contains("tpOrder")) {
-    for (auto& v : j["tpOrder"]) tp.tpOrder.push_back(v.get<uint32_t>());
+  if (L0.contains("tpOrder")) {
+    for (auto& v : L0["tpOrder"]) tp.tpOrder.push_back(v.get<uint32_t>());
   }
   return tp;
 }

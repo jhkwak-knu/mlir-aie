@@ -309,7 +309,6 @@ TileParam findOptimalTileParam(const SystemInfo &sysInfo,
     llvm::report_fatal_error("tile param json root type error");
   }
 
-  // Flat schema: all tiling fields at root level (no levels[] nesting).
   TileParam tp;
   tp.opSize = TileSize{
       .TM = getU32Req(*rootObj, "M"),
@@ -320,14 +319,32 @@ TileParam findOptimalTileParam(const SystemInfo &sysInfo,
   tp.numCores            = getU32Req(*rootObj, "numCores");
   tp.doubleBufferEnabled = getBoolReq(*rootObj, "doubleBuffer");
 
-  tp.SPm  = getU32Req(*rootObj, "SPm");
-  tp.SPn  = getU32Req(*rootObj, "SPn");
-  tp.TPm  = getU32Req(*rootObj, "TPm");
-  tp.TPk  = getU32Req(*rootObj, "TPk");
-  tp.TPn  = getU32Req(*rootObj, "TPn");
+  auto *levelsArr = rootObj->getArray("levels");
+  if (!levelsArr) {
+    llvm::errs() << "Error: 'levels' array missing in tc.json\n";
+    llvm::report_fatal_error("levels missing");
+  }
+  if (levelsArr->size() != 1) {
+    llvm::errs() << "Error: only single-level tiling is supported, got "
+                 << levelsArr->size() << " levels\n";
+    llvm::report_fatal_error("multi-level tiling not supported");
+  }
 
-  tp.tileSize = getLevelTileSize(*rootObj);
-  tp.tpOrder  = getAxisArrayOpt(*rootObj, "tpOrder");
+  auto *Lobj = (*levelsArr)[0].getAsObject();
+  if (!Lobj) {
+    llvm::errs() << "Error: levels[0] is not an object\n";
+    llvm::report_fatal_error("level type error");
+  }
+
+  LevelParam lv;
+  lv.SPm  = getU32Req(*Lobj, "SPm");
+  lv.SPn  = getU32Req(*Lobj, "SPn");
+  lv.TPm  = getU32Req(*Lobj, "TPm");
+  lv.TPk  = getU32Req(*Lobj, "TPk");
+  lv.TPn  = getU32Req(*Lobj, "TPn");
+  lv.tileSize = getLevelTileSize(*Lobj);
+  lv.tpOrder  = getAxisArrayOpt(*Lobj, "tpOrder");
+  tp.levels.push_back(std::move(lv));
 
   if (debug) {
     llvm::dbgs() << "[TileParam] Loaded TileParam:\n"
@@ -341,25 +358,28 @@ TileParam findOptimalTileParam(const SystemInfo &sysInfo,
     llvm::dbgs() << "\n";
 
     llvm::dbgs() << "  numCores:     " << tp.numCores << "\n"
-                << "  doubleBuffer: " << (tp.doubleBufferEnabled ? "true" : "false") << "\n"
-                << "  SPm=" << tp.SPm
-                << " SPn=" << tp.SPn << " |"
-                << " TPm=" << tp.TPm
-                << " TPk=" << tp.TPk
-                << " TPn=" << tp.TPn << " |"
+                << "  doubleBuffer: " << (tp.doubleBufferEnabled ? "true" : "false") << "\n";
+
+    const auto &l0 = tp.levels[0];
+    llvm::dbgs() << "  levels[0]:"
+                << " SPm=" << l0.SPm
+                << " SPn=" << l0.SPn << " |"
+                << " TPm=" << l0.TPm
+                << " TPk=" << l0.TPk
+                << " TPn=" << l0.TPn << " |"
                 << " tile(M/K/N)="
-                << tp.tileSize.TM << "/"
-                << tp.tileSize.TK << "/"
-                << tp.tileSize.TN << " |"
+                << l0.tileSize.TM << "/"
+                << l0.tileSize.TK << "/"
+                << l0.tileSize.TN << " |"
                 << " tpOrder=";
 
-    if (tp.tpOrder.empty()) {
+    if (l0.tpOrder.empty()) {
       llvm::dbgs() << "[]\n";
     } else {
       llvm::dbgs() << "[";
-      for (size_t j = 0; j < tp.tpOrder.size(); ++j) {
-        llvm::dbgs() << tp.tpOrder[j];
-        if (j + 1 < tp.tpOrder.size()) llvm::dbgs() << ",";
+      for (size_t j = 0; j < l0.tpOrder.size(); ++j) {
+        llvm::dbgs() << l0.tpOrder[j];
+        if (j + 1 < l0.tpOrder.size()) llvm::dbgs() << ",";
       }
       llvm::dbgs() << "]\n";
     }
@@ -392,15 +412,17 @@ TilingContext buildTilingContext(const TileParam &tp, const SystemInfo &sysInfo)
         llvm::Twine("numCols=") + llvm::Twine(tc.numCols) +
         " exceeds maximum supported columns (" +
         llvm::Twine(tc.device.maxColumns) + ")");
-  tc.compTM              = tp.tileSize.TM;
-  tc.compTK              = tp.tileSize.TK;
-  tc.compTN              = tp.tileSize.TN;
-  tc.compTileSPm         = tp.SPm;
-  tc.compTileSPn         = tp.SPn;
-  tc.compTileTPm         = tp.TPm;
-  tc.compTileTPk         = tp.TPk;
-  tc.compTileTPn         = tp.TPn;
-  tc.tpOrder             = tp.tpOrder;
+
+  const auto &lv = tp.levels[0];
+  tc.compTM              = lv.tileSize.TM;
+  tc.compTK              = lv.tileSize.TK;
+  tc.compTN              = lv.tileSize.TN;
+  tc.compTileSPm         = lv.SPm;
+  tc.compTileSPn         = lv.SPn;
+  tc.compTileTPm         = lv.TPm;
+  tc.compTileTPk         = lv.TPk;
+  tc.compTileTPn         = lv.TPn;
+  tc.tpOrder             = lv.tpOrder;
   tc.elemType            = tp.elemType;
   tc.doubleBufferEnabled = tp.doubleBufferEnabled;
   return tc;

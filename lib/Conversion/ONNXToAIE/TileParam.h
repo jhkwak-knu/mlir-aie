@@ -78,16 +78,24 @@ struct TileSize {
   uint32_t TM, TK, TN;
 };
 
+/// Per-level tiling parameters.  Currently only level 0 (DRAM <-> compute
+/// tile) is used; the array structure mirrors xdna2_info.json's spm_levels[]
+/// so that future mem-tile (L2) support can be added without schema changes.
+struct LevelParam {
+  uint32_t SPm, SPn;
+  uint32_t TPm, TPk, TPn;
+  TileSize tileSize;
+  std::vector<uint32_t> tpOrder;
+};
+
 struct TileParam {
   TileSize opSize;
   mlir::Type elemType;
   uint32_t numCores;
   bool doubleBufferEnabled;
-  // Tiling parameters (single-level, flattened from former levels[0])
-  uint32_t SPm, SPn;
-  uint32_t TPm, TPk, TPn;
-  TileSize tileSize;
-  std::vector<uint32_t> tpOrder;
+  /// One entry per memory-hierarchy level.  Only single-level (levels[0])
+  /// is supported; the parser rejects inputs with levels.size() != 1.
+  std::vector<LevelParam> levels;
 };
 
 TileParam findOptimalTileParam(const SystemInfo &sysInfo,

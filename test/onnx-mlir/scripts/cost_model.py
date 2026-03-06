@@ -526,10 +526,14 @@ def cost_result_to_tc(op: OpCase, cr: CostResult) -> Dict[str, Any]:
         "elemType": op.elem_type,
         "numCores": c.num_cores,
         "doubleBuffer": False,
-        "SPm": c.SPm, "SPn": c.SPn,
-        "TPm": c.TPm, "TPk": c.TPk, "TPn": c.TPn,
-        "TM": c.TM, "TK": c.TK, "TN": c.TN,
-        "tpOrder": tp_order_full,
+        "levels": [
+            {
+                "SPm": c.SPm, "SPn": c.SPn,
+                "TPm": c.TPm, "TPk": c.TPk, "TPn": c.TPn,
+                "TM": c.TM, "TK": c.TK, "TN": c.TN,
+                "tpOrder": tp_order_full,
+            }
+        ],
     }
 
 

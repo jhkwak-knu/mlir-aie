@@ -403,16 +403,19 @@ def make_tc_cases(op_cases: List[Dict[str, Any]], sys_info: Dict[str, Any]) -> T
                         )
                     )
 
-                    # Emit flat tc case (no levels[] nesting)
                     tc_cases.append({
                         "M": M, "K": K, "N": N,
                         "elemType": elem_type,
                         "numCores": numLastSpm,
                         "doubleBuffer": double_buffer,
-                        "SPm": SPm, "SPn": SPn,
-                        "TPm": TPm, "TPk": TPk, "TPn": TPn,
-                        "TM": TM, "TK": TK, "TN": TN,
-                        "tpOrder": tp_order,
+                        "levels": [
+                            {
+                                "SPm": SPm, "SPn": SPn,
+                                "TPm": TPm, "TPk": TPk, "TPn": TPn,
+                                "TM": TM, "TK": TK, "TN": TN,
+                                "tpOrder": tp_order,
+                            }
+                        ],
                     })
 
     return tc_cases, log_lines
