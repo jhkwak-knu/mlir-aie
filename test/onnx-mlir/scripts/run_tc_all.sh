@@ -125,11 +125,11 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
   mkdir -p "$(dirname "$OUTPUT_JSON")"
   mv "$tmp_out" "$OUTPUT_JSON"
 
-  # 2) read fields
-  numSpm=$(read_num '.levels[0].numSpm')
-  SPm=$(read_num '.levels[0].SPm'); SPn=$(read_num '.levels[0].SPn')
-  TPm=$(read_num '.levels[0].TPm'); TPk=$(read_num '.levels[0].TPk'); TPn=$(read_num '.levels[0].TPn')
-  TM=$(read_num '.levels[0].TM'); TK=$(read_num '.levels[0].TK'); TN=$(read_num '.levels[0].TN')
+  # 2) read fields (flat schema: tiling fields at root level)
+  numSpm=$(read_num '.numCores')
+  SPm=$(read_num '.SPm'); SPn=$(read_num '.SPn')
+  TPm=$(read_num '.TPm'); TPk=$(read_num '.TPk'); TPn=$(read_num '.TPn')
+  TM=$(read_num '.TM'); TK=$(read_num '.TK'); TN=$(read_num '.TN')
   M=$(read_num '.M');   K=$(read_num '.K');   N=$(read_num '.N')
   DB_STR=$(read_bool_str '.doubleBuffer')
 

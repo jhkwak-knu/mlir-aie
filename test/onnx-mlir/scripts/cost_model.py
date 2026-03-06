@@ -512,8 +512,67 @@ def print_cost_summary(op: OpCase, ranked: List[CostResult]) -> None:
 
 
 # ============================================================
+# tc_list.json output (flat schema for the build/run pipeline)
+# ============================================================
+def cost_result_to_tc(op: OpCase, cr: CostResult) -> Dict[str, Any]:
+    """Convert a CostResult to a flat tc.json entry for the pipeline."""
+    c = cr.candidate
+    # tpOrder: [innermost, middle, outermost] as axis IDs (0=M, 1=N, 2=K)
+    # cr.tp_order is the innermost axis; fill remaining with K>M>N default.
+    default_order = [TP_ORDER_K, TP_ORDER_M, TP_ORDER_N]
+    tp_order_full = [cr.tp_order] + [ax for ax in default_order if ax != cr.tp_order]
+    return {
+        "M": op.M, "K": op.K, "N": op.N,
+        "elemType": op.elem_type,
+        "numCores": c.num_cores,
+        "doubleBuffer": False,
+        "SPm": c.SPm, "SPn": c.SPn,
+        "TPm": c.TPm, "TPk": c.TPk, "TPn": c.TPn,
+        "TM": c.TM, "TK": c.TK, "TN": c.TN,
+        "tpOrder": tp_order_full,
+    }
+
+
+def write_tc_list(tc_cases: List[Dict[str, Any]], out_path: Path) -> None:
+    """Write tc_list.json for the build/run pipeline."""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as f:
+        json.dump({"cases": tc_cases}, f, indent=2)
+
+
+# ============================================================
 # CLI
 # ============================================================
+def select_validation_candidates(
+    ranked: List[CostResult],
+) -> List[CostResult]:
+    """
+    Pick candidates for hardware validation:
+      - Best EDP per core count (algorithm's choice)
+      - Worst EDP per core count (counter-example for comparison)
+    """
+    best_by_cores: Dict[int, CostResult] = {}
+    worst_by_cores: Dict[int, CostResult] = {}
+    for r in ranked:
+        nc = r.candidate.num_cores
+        if nc not in best_by_cores:
+            best_by_cores[nc] = r
+        # Keep updating worst — ranked is sorted ascending, so last seen is worst.
+        worst_by_cores[nc] = r
+
+    selected: List[CostResult] = []
+    seen_keys = set()
+    for nc in sorted(best_by_cores):
+        for cr in (best_by_cores[nc], worst_by_cores[nc]):
+            c = cr.candidate
+            key = (c.num_cores, c.SPm, c.SPn, c.TPm, c.TPk, c.TPn, cr.tp_order)
+            if key not in seen_keys:
+                seen_keys.add(key)
+                selected.append(cr)
+
+    return selected
+
+
 def parse_args(argv: List[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Exhaustive search + constraint filtering for parallelization configs")
@@ -522,7 +581,9 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     p.add_argument("--sys", default=str(DEFAULT_SYS_PATH),
                    help="Path to xdna2_info.json")
     p.add_argument("--out", default="",
-                   help="Path to write valid candidates JSON (optional)")
+                   help="Path to write cost results JSON (optional)")
+    p.add_argument("--validate", default="",
+                   help="Path to write validation tc_list.json (optional)")
     p.add_argument("--op-index", type=int, default=-1,
                    help="Run only this 0-based op index (-1 = all)")
     return p.parse_args(argv)
@@ -607,6 +668,20 @@ def main(argv: List[str]) -> int:
         with out_path.open("w", encoding="utf-8") as f:
             json.dump(output, f, indent=2)
         print(f"\n[INFO] Wrote {out_path}")
+
+    # Write validation tc_list.json if requested
+    if args.validate:
+        val_path = Path(args.validate).resolve()
+        tc_cases: List[Dict[str, Any]] = []
+        for idx, ranked in all_ranked.items():
+            op = ops[idx]
+            selected = select_validation_candidates(ranked)
+            for cr in selected:
+                tc_cases.append(cost_result_to_tc(op, cr))
+            print(f"\n[INFO] Op M{op.M}_K{op.K}_N{op.N}: "
+                  f"{len(selected)} validation candidates selected")
+        write_tc_list(tc_cases, val_path)
+        print(f"[INFO] Wrote {val_path} ({len(tc_cases)} cases)")
 
     return 0
 

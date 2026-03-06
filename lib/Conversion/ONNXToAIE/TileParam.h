@@ -78,21 +78,16 @@ struct TileSize {
   uint32_t TM, TK, TN;
 };
 
-struct LevelParam {
-  uint32_t numSpm;
+struct TileParam {
+  TileSize opSize;
+  mlir::Type elemType;
+  uint32_t numCores;
+  bool doubleBufferEnabled;
+  // Tiling parameters (single-level, flattened from former levels[0])
   uint32_t SPm, SPn;
   uint32_t TPm, TPk, TPn;
   TileSize tileSize;
   std::vector<uint32_t> tpOrder;
-};
-
-struct TileParam {
-  TileSize opSize;
-  mlir::Type elemType;
-  uint32_t numLevel;
-  uint32_t numLastSpm;
-  bool doubleBufferEnabled;
-  std::vector<LevelParam> levels;
 };
 
 TileParam findOptimalTileParam(const SystemInfo &sysInfo,

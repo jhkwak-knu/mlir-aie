@@ -749,7 +749,6 @@ static void emitRuntimeSequenceOp(OpBuilder &builder, Location loc,
 void generateAieOps(ConversionPatternRewriter &rewriter,
                     AiePlacement &placement,
                     const TilingContext &tilingCtx,
-                    const TileParam &tileParam,
                     const std::string &outputPath) {
   MLIRContext *ctx = rewriter.getContext();
   auto loc = mlir::UnknownLoc::get(ctx);

@@ -110,8 +110,7 @@ public:
     auto placement = optimizeAiePlacement(tilingCtx, DebugAiePlacement);
 
     // Generate AIE Ops
-    generateAieOps(rewriter, placement, tilingCtx, optimalTileParam,
-                   AieMlirOutput);
+    generateAieOps(rewriter, placement, tilingCtx, AieMlirOutput);
 
     // Dummy to prevent result type errors
     auto resultType = op.getResult().getType();
