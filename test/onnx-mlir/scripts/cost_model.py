@@ -547,6 +547,12 @@ def write_tc_list(tc_cases: List[Dict[str, Any]], out_path: Path) -> None:
 # ============================================================
 # CLI
 # ============================================================
+def _needs_pres(cr: CostResult) -> bool:
+    """Partial-sum path required: TPk>1 and K is not the innermost axis."""
+    return cr.candidate.TPk > 1 and cr.tp_order != TP_ORDER_K
+
+
+
 def select_validation_candidates(
     ranked: List[CostResult],
 ) -> List[CostResult]:
@@ -554,14 +560,18 @@ def select_validation_candidates(
     Pick candidates for hardware validation:
       - Best EDP per core count (algorithm's choice)
       - Worst EDP per core count (counter-example for comparison)
+
+    Excluded candidates:
+      - pres path required (MLIR pass segfault on emit)
     """
+    runnable = [r for r in ranked if not _needs_pres(r)]
+
     best_by_cores: Dict[int, CostResult] = {}
     worst_by_cores: Dict[int, CostResult] = {}
-    for r in ranked:
+    for r in runnable:
         nc = r.candidate.num_cores
         if nc not in best_by_cores:
             best_by_cores[nc] = r
-        # Keep updating worst — ranked is sorted ascending, so last seen is worst.
         worst_by_cores[nc] = r
 
     selected: List[CostResult] = []

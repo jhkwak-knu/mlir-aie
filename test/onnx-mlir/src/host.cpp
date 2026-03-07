@@ -34,6 +34,18 @@ using DATATYPE = std::bfloat16_t;
 // Packet header is 4 bytes; number of DATATYPE elements it occupies.
 static constexpr size_t PKT_HDR_ELEMS = 4 / sizeof(DATATYPE);
 
+// AIE2 to_vector<bfloat16>() uses truncation (round-toward-zero), not
+// round-to-nearest-even.  This helper replicates that behaviour so the
+// host reference matches the NPU's intermediate bf16 precision.
+static inline float bf16_trunc(float v) {
+  uint32_t bits;
+  std::memcpy(&bits, &v, sizeof(bits));
+  bits &= 0xFFFF0000u;          // zero the lower 16 bits (truncate)
+  float out;
+  std::memcpy(&out, &bits, sizeof(out));
+  return out;
+}
+
 #include "nlohmann/json.hpp"
 using json = nlohmann::json;
 
@@ -182,15 +194,26 @@ static MatrixSet initMatrices(const tilingParam &tp, int verbosity) {
   ms.C.assign(matCSize, 0);
 
   // Host reference: C[i][j] = sum_k A[i][k] * B[j][k]  (B transposed layout)
-  // Accumulate in float to avoid compounding bf16 rounding errors in the
-  // reference, then truncate the final result back to DATATYPE.
+  //
+  // The NPU kernel accumulates in float32 within each TK-sized chunk, then
+  // stores the result as bf16 via to_vector<bfloat16>() which uses truncation
+  // (round-toward-zero).  When TPk > 1, the next iteration loads that bf16
+  // value back into the float32 accumulator and continues.  We replicate this
+  // bf16 truncation at each temporal boundary so the reference matches the
+  // hardware's intermediate precision.
   ms.CRef.resize(matCSize);
   for (int i = 0; i < static_cast<int>(tp.M); ++i) {
     for (int j = 0; j < static_cast<int>(tp.N); ++j) {
       float acc = 0.0f;
-      for (int k = 0; k < static_cast<int>(tp.K); ++k) {
-        acc += static_cast<float>(ms.A[(i * tp.K) + k]) *
-               static_cast<float>(ms.B[(j * tp.K) + k]);
+      for (int tk = 0; tk < static_cast<int>(tp.TPk); ++tk) {
+        int kStart = tk * static_cast<int>(tp.TK);
+        int kEnd   = kStart + static_cast<int>(tp.TK);
+        for (int k = kStart; k < kEnd; ++k) {
+          acc += static_cast<float>(ms.A[(i * tp.K) + k]) *
+                 static_cast<float>(ms.B[(j * tp.K) + k]);
+        }
+        // Match AIE2 to_vector<bfloat16>() truncation at temporal boundary
+        acc = bf16_trunc(acc);
       }
       ms.CRef[(i * tp.N) + j] = static_cast<DATATYPE>(acc);
     }
@@ -260,49 +283,59 @@ static TileOrderConfig buildTileOrders(const tilingParam &tp) {
   cfg.innerTP = tpValues[cfg.innerTPAxis];
   cfg.outerTP = tpValues[cfg.outerTPAxis];
 
+  // Inner/outer offsets are determined by which axis each host loop variable
+  // advances.  A is M×K, B is N×K, C is M×N — an axis that does not index
+  // the matrix yields a zero offset.
+  auto matAOffsetFor = [&](int axis) -> std::pair<int,int> {
+    if (axis == AXIS_M) return matAStepBase[1]; // TPm step
+    if (axis == AXIS_K) return matAStepBase[2]; // TPk step
+    return defaultStep;                         // N: A is independent of N
+  };
+  auto matBOffsetFor = [&](int axis) -> std::pair<int,int> {
+    if (axis == AXIS_N) return matBStepBase[1]; // TPn step
+    if (axis == AXIS_K) return matBStepBase[2]; // TPk step
+    return defaultStep;                         // M: B is independent of M
+  };
+  auto matCOffsetFor = [&](int axis) -> std::pair<int,int> {
+    if (axis == AXIS_M) return matCStepBase[2]; // TPm step
+    if (axis == AXIS_N) return matCStepBase[3]; // TPn step
+    return defaultStep;                         // K: C is independent of K
+  };
+
+  cfg.matAInnerOffset = matAOffsetFor(cfg.innerTPAxis);
+  cfg.matAOuterOffset = matAOffsetFor(cfg.outerTPAxis);
+  cfg.matBInnerOffset = matBOffsetFor(cfg.innerTPAxis);
+  cfg.matBOuterOffset = matBOffsetFor(cfg.outerTPAxis);
+  cfg.matCInnerOffset = matCOffsetFor(cfg.innerTPAxis);
+  cfg.matCOuterOffset = matCOffsetFor(cfg.outerTPAxis);
+
+  // Chunk sizes and tile-order steps depend on the reuse axis: the reuse
+  // dimension is folded into the chunk, while the other two are host loops.
   if (cfg.reuseTPAxis == AXIS_M) {
-    cfg.matAOuterOffset = matAStepBase[2];
-    cfg.matAInnerOffset = defaultStep;
     cfg.matASizes = {matASizeBase[0], matASizeBase[1], defaultSize};
     cfg.matASteps = {matAStepBase[0], matAStepBase[1], defaultStep};
 
-    cfg.matBOuterOffset = matBStepBase[2];
-    cfg.matBInnerOffset = matBStepBase[1];
     cfg.matBSizes = {matBSizeBase[0], defaultSize, defaultSize};
     cfg.matBSteps = {matBStepBase[0], defaultStep, defaultStep};
 
-    cfg.matCOuterOffset = defaultStep;
-    cfg.matCInnerOffset = matCStepBase[3];
     cfg.matCSizes = {matCSizeBase[0], matCSizeBase[1], matCSizeBase[2]};
     cfg.matCSteps = {matCStepBase[0], matCStepBase[1], matCStepBase[2]};
   } else if (cfg.reuseTPAxis == AXIS_N) {
-    cfg.matAOuterOffset = matAStepBase[2];
-    cfg.matAInnerOffset = matAStepBase[1];
     cfg.matASizes = {matASizeBase[0], defaultSize, defaultSize};
     cfg.matASteps = {matAStepBase[0], defaultStep, defaultStep};
 
-    cfg.matBOuterOffset = matBStepBase[2];
-    cfg.matBInnerOffset = defaultStep;
     cfg.matBSizes = {matBSizeBase[0], matBSizeBase[1], defaultSize};
     cfg.matBSteps = {matBStepBase[0], matBStepBase[1], defaultStep};
 
-    cfg.matCOuterOffset = defaultStep;
-    cfg.matCInnerOffset = matCStepBase[2];
     cfg.matCSizes = {matCSizeBase[0], matCSizeBase[1], matCSizeBase[3]};
     cfg.matCSteps = {matCStepBase[0], matCStepBase[1], matCStepBase[3]};
   } else { // AXIS_K
-    cfg.matAOuterOffset = defaultStep;
-    cfg.matAInnerOffset = matAStepBase[1];
     cfg.matASizes = {matASizeBase[0], matASizeBase[2], defaultSize};
     cfg.matASteps = {matAStepBase[0], matAStepBase[2], defaultStep};
 
-    cfg.matBOuterOffset = matBStepBase[1];
-    cfg.matBInnerOffset = defaultStep;
     cfg.matBSizes = {matBSizeBase[0], matBSizeBase[2], defaultSize};
     cfg.matBSteps = {matBStepBase[0], matBStepBase[2], defaultStep};
 
-    cfg.matCOuterOffset = defaultStep;
-    cfg.matCInnerOffset = defaultStep;
     cfg.matCSizes = {matCSizeBase[0], matCSizeBase[1], defaultSize};
     cfg.matCSteps = {matCStepBase[0], matCStepBase[1], defaultStep};
   }
