@@ -112,10 +112,14 @@ static void configureInputComms(AiePlacement &placement, const TilingContext &ti
     uint32_t shimIdx = placement.findAieTileIdx(col, device.shimRow);
     AieComm lhsComm{.name="lhs", .srcIdx=shimIdx, .srcBundle=dmaWireBundle, .srcCh=0, .isPacket=true};
     AieComm rhsComm{.name="rhs", .srcIdx=shimIdx, .srcBundle=dmaWireBundle, .srcCh=1, .isPacket=true};
-    uint32_t lhsPacketCnt = 0;
-    uint32_t rhsPacketCnt = 0;
 
-    // Find the input (LHS/RHS) packets required by the compute tiles in this column
+    // Find the input (LHS/RHS) packets required by the compute tiles in this column.
+    // Packet IDs use destination-based bitmask: each tile at position i in the
+    // column sets bit i.  Multicast packets OR the bits of all destination tiles.
+    // This guarantees that at every intermediate switchbox the pathfinder's
+    // 5-bit mask/value routing can distinguish pass-through flows from delivery
+    // flows, because delivery tiles have their position bit set while
+    // pass-through flows for other tiles do not.
     llvm::MapVector<uint32_t, AiePacket> lhsPackets;
     llvm::MapVector<uint32_t, AiePacket> rhsPackets;
 
@@ -131,7 +135,7 @@ static void configureInputComms(AiePlacement &placement, const TilingContext &ti
         if (it == lhsPackets.end()) {
           AiePacket pkt;
           pkt.name     = std::string("lhs") + std::to_string(m_idx);
-          pkt.packetId = (1u << lhsPacketCnt++);
+          pkt.packetId = (1u << i);
           pkt.size     = compTM * compTK;
           pkt.elemType = elemType;
 
@@ -141,6 +145,7 @@ static void configureInputComms(AiePlacement &placement, const TilingContext &ti
 
           lhsPackets.insert({m_idx, std::move(pkt)});
         } else {
+          it->second.packetId |= (1u << i);
           it->second.dstIdxs.push_back(compIdx);
           it->second.dstBundles.push_back(dmaWireBundle);
           it->second.dstChs.push_back(0);
@@ -152,7 +157,7 @@ static void configureInputComms(AiePlacement &placement, const TilingContext &ti
         if (it == rhsPackets.end()) {
           AiePacket pkt;
           pkt.name     = std::string("rhs") + std::to_string(n_idx);
-          pkt.packetId = (1u << rhsPacketCnt++);
+          pkt.packetId = (1u << i);
           pkt.size     = compTK * compTN;
           pkt.elemType = elemType;
 
@@ -162,6 +167,7 @@ static void configureInputComms(AiePlacement &placement, const TilingContext &ti
 
           rhsPackets.insert({n_idx, std::move(pkt)});
         } else {
+          it->second.packetId |= (1u << i);
           it->second.dstIdxs.push_back(compIdx);
           it->second.dstBundles.push_back(dmaWireBundle);
           it->second.dstChs.push_back(1);
@@ -376,12 +382,15 @@ static void configureDmas(AiePlacement &placement, const TilingContext &tilingCt
           auto &dstDma = dstTile.getAieDma(dstDmaIdx);
           AieBufferDescriptor bd{.name=packet.name, .isPacket=true, .packetId=packet.packetId};
           // Resolve buffer index: packet names like "lhs0" map to buf "lhs".
-          // pres packets are appended to lhs/rhs comms but need the "pres" buffer
-          // (comp tiles don't have "pres" buf, so findBufIdx returns -1 — that's
-          // expected because pres data is received into the shared DMA channel and
-          // the BD size controls the transfer independently of the buffer mapping).
-          std::string bufName = (packet.name.compare(0, 4, "pres") == 0)
-                                    ? "pres" : comm.name;
+          // pres packets need special handling: shim tiles have a dedicated
+          // "pres" buffer, but comp tiles receive pres (partial-sum) data
+          // into the "res" buffer which serves as the accumulator input.
+          std::string bufName;
+          if (packet.name.compare(0, 4, "pres") == 0) {
+            bufName = (dstTile.row == device.shimRow) ? "pres" : "res";
+          } else {
+            bufName = comm.name;
+          }
           bd.bufIdx = dstTile.findBufIdx(bufName);
           // shim tile receives the DMA switch header alongside the payload; add header overhead in elements
           bd.bufSize = (dstTile.row == device.shimRow) ? (packet.size + (device.pktHdrBytes / getElemBytes(elemType))) : packet.size;

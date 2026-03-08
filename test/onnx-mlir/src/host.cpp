@@ -659,11 +659,11 @@ int main(int argc, const char *argv[]) {
 
               uint32_t packetHeader, packetId;
               std::memcpy(&packetHeader, &bufOut[(tp.TM * tp.TN + PKT_HDR_ELEMS) * idx], sizeof(packetHeader));
-              packetId = packetHeader & 0x1F;
-              if (packetId == 1) packetId = 0;
-              else if (packetId == 2) packetId = 1;
-              else if (packetId == 4) packetId = 2;
-              else if (packetId == 8) packetId = 3;
+              // RES packet IDs are power-of-2: {1,2,4,8} → tile index {0,1,2,3}.
+              // Extract 5-bit ID, then find the set bit position (log2).
+              uint32_t rawId = packetHeader & 0x1F;
+              packetId = 0;
+              while (rawId > 1) { rawId >>= 1; ++packetId; }
               int matCIdx = outerOffset + innerOffset + packetId;
 
               std::pair<int,int> tilePos = chunkCTileOrder[matCIdx];

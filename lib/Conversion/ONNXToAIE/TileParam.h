@@ -36,7 +36,13 @@ struct DeviceConfig {
 //===----------------------------------------------------------------------===//
 // Layout constants (device-independent)
 //===----------------------------------------------------------------------===//
-// pres packet IDs start above lhs/rhs range to avoid packet-filter collisions
+// Packet IDs use power-of-2 assignment: (1u << tileIndex) per type.
+// Each ID has exactly one bit set, so the pathfinder can distinguish
+// individual flows with a single-bit mask — minimising arbiter and
+// msel usage in the AIE2 switchbox (6 arbiters, 4 msels each).
+// LHS/RHS/RES share the same ID space {1,2,4,8} on disjoint DMA
+// channels / directions, so they never collide in the switch fabric.
+// PRES adds offset 16 (bit4) to separate from LHS on a shared channel.
 static constexpr uint32_t PRES_PKT_ID_OFFSET     = 16;
 // Upper bound that makes an SCF ForOp behave as an infinite loop in the core
 static constexpr int64_t  CORE_LOOP_INFINITE     = 0x7FFFFFFFFFFFFFFFLL;
