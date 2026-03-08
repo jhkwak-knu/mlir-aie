@@ -478,6 +478,18 @@ void AIEPathfinderPass::runOnPacketFlow(DeviceOp device, OpBuilder &builder) {
   std::vector<std::pair<std::pair<PhysPort, int>, SmallVector<PhysPort, 4>>>
       sortedPacketFlows = getSortedPacketFlows(packetFlows, ctrlPacketFlows);
 
+  // Sort flows so that those with more destination ports come first.
+  // This ensures multi-port flows (e.g., {DMA:0, North:X}) establish the
+  // arbiter assignment before single-port flows ({DMA:0}) are processed,
+  // allowing the single-port flows to find a partial match and reuse
+  // the same arbiter — preventing the "master port tied to two arbiters"
+  // error that occurs when single-port flows are processed first and
+  // allocate a different arbiter for a shared port.
+  std::stable_sort(sortedPacketFlows.begin(), sortedPacketFlows.end(),
+                   [](const auto &a, const auto &b) {
+                     return a.second.size() > b.second.size();
+                   });
+
   packetFlows.insert(ctrlPacketFlows.begin(), ctrlPacketFlows.end());
 
   // Check all multi-cast flows (same source, same ID). They should be
@@ -535,11 +547,15 @@ void AIEPathfinderPass::runOnPacketFlow(DeviceOp device, OpBuilder &builder) {
 
       if (matched) {
         foundMatchedDest = true;
-        if (mismatched)
+        if (!mismatched && ports.size() == packetFlow.second.size()) {
+          // Exact match — reuse this amsel; no need to search further.
+          foundPartialMatchArbiter = -1;
+          break;
+        }
+        // Partial match — record the arbiter but keep searching in case
+        // an exact match exists later in the map.
+        if (foundPartialMatchArbiter < 0)
           foundPartialMatchArbiter = getArbiterIDFromAmsel(amselValue);
-        else if (ports.size() != packetFlow.second.size())
-          foundPartialMatchArbiter = getArbiterIDFromAmsel(amselValue);
-        break;
       }
     }
 
