@@ -621,7 +621,7 @@ int main(int argc, const char *argv[]) {
         run.wait();
         auto stop = std::chrono::high_resolution_clock::now();
 
-        npu_time = std::chrono::duration<double, std::micro>(stop - start).count();
+        npu_time += std::chrono::duration<double, std::micro>(stop - start).count();
 
         // Sync device to host memories
         bo_outC.sync(XCL_BO_SYNC_BO_FROM_DEVICE);

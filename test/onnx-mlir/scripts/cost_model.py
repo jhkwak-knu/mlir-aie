@@ -526,6 +526,7 @@ def cost_result_to_tc(op: OpCase, cr: CostResult) -> Dict[str, Any]:
         "elemType": op.elem_type,
         "numCores": c.num_cores,
         "doubleBuffer": False,
+        "t_total_pred": round(cr.t_total, 2),
         "levels": [
             {
                 "SPm": c.SPm, "SPn": c.SPn,
@@ -551,29 +552,10 @@ def select_validation_candidates(
     ranked: List[CostResult],
 ) -> List[CostResult]:
     """
-    Pick candidates for hardware validation:
-      - Best EDP per core count (algorithm's choice)
-      - Worst EDP per core count (counter-example for comparison)
+    Return all candidates sorted by predicted T_total (ascending).
+    Used for full-spectrum validation against actual NPU measurements.
     """
-    best_by_cores: Dict[int, CostResult] = {}
-    worst_by_cores: Dict[int, CostResult] = {}
-    for r in ranked:
-        nc = r.candidate.num_cores
-        if nc not in best_by_cores:
-            best_by_cores[nc] = r
-        worst_by_cores[nc] = r
-
-    selected: List[CostResult] = []
-    seen_keys = set()
-    for nc in sorted(best_by_cores):
-        for cr in (best_by_cores[nc], worst_by_cores[nc]):
-            c = cr.candidate
-            key = (c.num_cores, c.SPm, c.SPn, c.TPm, c.TPk, c.TPn, cr.tp_order)
-            if key not in seen_keys:
-                seen_keys.add(key)
-                selected.append(cr)
-
-    return selected
+    return sorted(ranked, key=lambda r: r.t_total)
 
 
 def parse_args(argv: List[str]) -> argparse.Namespace:

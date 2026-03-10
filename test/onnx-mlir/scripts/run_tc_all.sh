@@ -3,11 +3,12 @@
 #                 append results to result.csv, then clean before next case.
 #
 # Usage:
-#   ./run_tc_all.sh [-i INPUT_JSON] [-o OUTPUT_JSON] [-r RESULT_CSV] [-n INDEX]
+#   ./run_tc_all.sh [-i INPUT_JSON] [-o OUTPUT_JSON] [-r RESULT_CSV] [-n INDEX] [-s START]
 #     -i: input file   (default: out/tc_list.json)
 #     -o: tc.json path (default: out/tc.json)
 #     -r: result csv   (default: out/reports/result.csv)
 #     -n: 1-based case index to run only that single case
+#     -s: 1-based start index to resume from (skips earlier cases)
 
 set -uo pipefail  # intentionally NOT using -e to continue on errors
 
@@ -21,6 +22,7 @@ INPUT_JSON="$TC_LIST"                  # out/tc_list.json
 OUTPUT_JSON="$OUT_DIR/tc.json"         # out/tc.json
 RESULT_CSV="$REPORTS_DIR/result.csv"   # out/reports/result.csv
 SINGLE_IDX=""                          # optional: run only this 1-based index
+START_FROM=""                          # optional: resume from this 1-based index
 
 usage() {
   cat <<EOF
@@ -31,17 +33,19 @@ Options:
   -o FILE   Per-case extracted JSON (default: $OUTPUT_JSON)
   -r FILE   Result CSV path (default: $RESULT_CSV)
   -n INDEX  Run only the INDEX-th case (1-based)
+  -s START  Resume from the START-th case (1-based, appends to existing CSV)
   -h        Help
 EOF
   exit 1
 }
 
-while getopts ":i:o:r:n:h" opt; do
+while getopts ":i:o:r:n:s:h" opt; do
   case "$opt" in
     i) INPUT_JSON="$OPTARG" ;;
     o) OUTPUT_JSON="$OPTARG" ;;
     r) RESULT_CSV="$OPTARG" ;;
     n) SINGLE_IDX="$OPTARG" ;;
+    s) START_FROM="$OPTARG" ;;
     h) usage ;;
     \?) echo "Unknown option: -$OPTARG" >&2; usage ;;
     :)  echo "Option -$OPTARG requires an argument." >&2; usage ;;
@@ -66,7 +70,7 @@ if [[ "$TOTAL_CASES" -le 0 ]]; then
   exit 3
 fi
 
-# range decide (single-case support)
+# range decide (single-case and resume support)
 if [[ -n "${SINGLE_IDX:-}" ]]; then
   if ! [[ "$SINGLE_IDX" =~ ^[0-9]+$ ]] || [[ "$SINGLE_IDX" -lt 1 ]] || [[ "$SINGLE_IDX" -gt "$TOTAL_CASES" ]]; then
     echo "error: invalid -n index: $SINGLE_IDX (valid range: 1..$TOTAL_CASES)" >&2
@@ -75,6 +79,14 @@ if [[ -n "${SINGLE_IDX:-}" ]]; then
   START_IDX="$SINGLE_IDX"
   END_IDX="$SINGLE_IDX"
   echo "Found $TOTAL_CASES cases in $INPUT_JSON (running only case #$SINGLE_IDX)"
+elif [[ -n "${START_FROM:-}" ]]; then
+  if ! [[ "$START_FROM" =~ ^[0-9]+$ ]] || [[ "$START_FROM" -lt 1 ]] || [[ "$START_FROM" -gt "$TOTAL_CASES" ]]; then
+    echo "error: invalid -s index: $START_FROM (valid range: 1..$TOTAL_CASES)" >&2
+    exit 4
+  fi
+  START_IDX="$START_FROM"
+  END_IDX="$TOTAL_CASES"
+  echo "Found $TOTAL_CASES cases in $INPUT_JSON (resuming from case #$START_FROM)"
 else
   START_IDX=1
   END_IDX="$TOTAL_CASES"
@@ -82,7 +94,7 @@ else
 fi
 
 # CSV header (+upgrade if old header exists)
-NEW_HEADER="case_index,numSpm,SPm,SPn,TPm,TPk,TPn,TM,TK,TN,M,K,N,doubleBuffer,status,errors,iters,warmup,avg_us,min_us,max_us"
+NEW_HEADER="case_index,numSpm,SPm,SPn,TPm,TPk,TPn,TM,TK,TN,M,K,N,doubleBuffer,t_total_pred,status,errors,iters,warmup,avg_us,min_us,max_us"
 if [[ ! -f "$RESULT_CSV" ]]; then
   mkdir -p "$(dirname "$RESULT_CSV")"
   echo "$NEW_HEADER" > "$RESULT_CSV"
@@ -116,7 +128,7 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
   tmp_out="$(mktemp)"
   if ! jq --indent 4 ".cases[$((idx-1))]" "$INPUT_JSON" > "$tmp_out"; then
     echo "warn: failed to extract case #$idx"
-    echo "$idx,0,0,0,0,0,0,0,0,0,0,0,0,false,EXTRACT_FAIL,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
+    echo "$idx,0,0,0,0,0,0,0,0,0,0,0,0,false,-,EXTRACT_FAIL,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
     rm -f "$tmp_out"
     # cleanup then continue
     if [[ -f "$CLEAN_SCRIPT" ]]; then bash "$CLEAN_SCRIPT" || true; fi
@@ -132,12 +144,13 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
   TM=$(read_num '.levels[0].TM'); TK=$(read_num '.levels[0].TK'); TN=$(read_num '.levels[0].TN')
   M=$(read_num '.M');   K=$(read_num '.K');   N=$(read_num '.N')
   DB_STR=$(read_bool_str '.doubleBuffer')
+  T_PRED=$(jq -r '.t_total_pred // "-"' "$OUTPUT_JSON")
 
   for v in numSpm SPm SPn TPm TPk TPn TM TK TN M K N; do
     val="${!v}"
     if ! [[ "$val" =~ ^-?[0-9]+$ ]]; then
       echo "warn: $v not integer (got: $val); marking as PARSE_FAIL"
-      echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,PARSE_FAIL,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
+      echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,$T_PRED,PARSE_FAIL,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
       if [[ -f "$CLEAN_SCRIPT" ]]; then bash "$CLEAN_SCRIPT" || true; fi
       continue 2
     fi
@@ -150,13 +163,13 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
     echo "running: bash $GEN_SCRIPT $OUTPUT_JSON"
     if ! bash "$GEN_SCRIPT" "$OUTPUT_JSON"; then
       echo "warn: generator failed"
-      echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,GEN_FAIL,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
+      echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,$T_PRED,GEN_FAIL,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
       if [[ -f "$CLEAN_SCRIPT" ]]; then bash "$CLEAN_SCRIPT" || true; fi
       continue
     fi
   else
     echo "warn: generator script not found: $GEN_SCRIPT"
-    echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,GEN_MISSING,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
+    echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,$T_PRED,GEN_MISSING,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
     if [[ -f "$CLEAN_SCRIPT" ]]; then bash "$CLEAN_SCRIPT" || true; fi
     continue
   fi
@@ -166,7 +179,7 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
   echo "make -C \"$MAKE_DIR\" run JSON_OUTPUT=$JSON_RESULT"
   if ! make -C "$MAKE_DIR" run JSON_OUTPUT="$JSON_RESULT"; then
     echo "warn: make run failed"
-    echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,RUN_FAIL,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
+    echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,$T_PRED,RUN_FAIL,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
     # if [[ -f "$CLEAN_SCRIPT" ]]; then bash "$CLEAN_SCRIPT" || true; fi
     continue
   fi
@@ -224,7 +237,7 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
   fi
 
   # 6) append to CSV
-  echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,$STATUS,$ERRORS,$ITERS,$WARMUP,$AVG_US,$MIN_US,$MAX_US" >> "$RESULT_CSV"
+  echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,$T_PRED,$STATUS,$ERRORS,$ITERS,$WARMUP,$AVG_US,$MIN_US,$MAX_US" >> "$RESULT_CSV"
   echo "Result: case #$idx -> $STATUS (errors=$ERRORS, avg=${AVG_US}us, min=${MIN_US}us, max=${MAX_US}us) appended to $RESULT_CSV"
 
   # 7) clean before next case
