@@ -493,6 +493,10 @@ int main(int argc, const char *argv[]) {
   for (unsigned iter = 0; iter < num_iter; iter++) {
     double npu_time = 0;
 
+    // Reset matC so previous iteration's partial sums don't leak into
+    // the next iteration's pres input (inC is populated from matC).
+    std::fill(matC.begin(), matC.end(), static_cast<DATATYPE>(0));
+
     for (int i = 0; i < toc.outerTP; ++i) {
       for (int j = 0; j < toc.innerTP; ++j) {
         // set chunk data
