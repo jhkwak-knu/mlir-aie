@@ -50,7 +50,7 @@ MMUL_R, MMUL_S, MMUL_T = 4, 8, 4
 #          LPDDR5X-7500 measured bandwidth ~80 GB/s (Chips and Cheese),
 #          Horowitz 2014 scaled to N4P for energy estimates.
 PEAK_MACS       = 256    # MACs/Cycle/Tile (BF16)
-BANDWIDTH_BPC   = 53     # Bytes/Cycle (80 GB/s @ 1.5 GHz AIE clock)
+BANDWIDTH_BPC   = 4      # Bytes/Cycle (NoC stream bandwidth per channel)
 ALPHA_CYCLES    = 20     # Cycles per temporal iteration (pipeline drain/fill)
 E_MAC_PJ        = 0.2    # pJ per MAC (TSMC N4P estimate)
 E_DRAM_PJ       = 40     # pJ per Byte DRAM access (LPDDR5X estimate)
