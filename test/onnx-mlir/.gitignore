@@ -1,2 +1,4 @@
 out*
 metadata.xml
+__pycache__/
+*.pyc
