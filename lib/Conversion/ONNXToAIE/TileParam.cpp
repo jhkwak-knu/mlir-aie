@@ -45,6 +45,12 @@ static bool getBoolReq(const llvm::json::Object &obj, llvm::StringRef key) {
   llvm::report_fatal_error("missing bool");
 }
 
+static bool getBoolOpt(const llvm::json::Object &obj, llvm::StringRef key,
+                       bool def) {
+  if (auto v = obj.getBoolean(key)) return *v;
+  return def;
+}
+
 static mlir::Type getElemTypeReq(const llvm::json::Object &obj,
                                  llvm::StringRef key,
                                  mlir::MLIRContext &ctx) {
@@ -318,6 +324,7 @@ TileParam findOptimalTileParam(const SystemInfo &sysInfo,
   tp.elemType            = getElemTypeReq(*rootObj, "elemType", *opInfo.elemType.getContext());
   tp.numCores            = getU32Req(*rootObj, "numCores");
   tp.doubleBufferEnabled = getBoolReq(*rootObj, "doubleBuffer");
+  tp.traceEnabled        = getBoolOpt(*rootObj, "trace", false);
 
   auto *levelsArr = rootObj->getArray("levels");
   if (!levelsArr) {
@@ -425,6 +432,7 @@ TilingContext buildTilingContext(const TileParam &tp, const SystemInfo &sysInfo)
   tc.tpOrder             = lv.tpOrder;
   tc.elemType            = tp.elemType;
   tc.doubleBufferEnabled = tp.doubleBufferEnabled;
+  tc.traceEnabled        = tp.traceEnabled;
   return tc;
 }
 

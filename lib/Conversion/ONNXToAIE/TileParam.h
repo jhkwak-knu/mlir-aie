@@ -99,6 +99,7 @@ struct TileParam {
   mlir::Type elemType;
   uint32_t numCores;
   bool doubleBufferEnabled;
+  bool traceEnabled = false;
   /// One entry per memory-hierarchy level.  Only single-level (levels[0])
   /// is supported; the parser rejects inputs with levels.size() != 1.
   std::vector<LevelParam> levels;
@@ -122,6 +123,7 @@ struct TilingContext {
   std::vector<uint32_t> tpOrder;
   mlir::Type elemType;
   bool doubleBufferEnabled;
+  bool traceEnabled = false;
 };
 
 TilingContext buildTilingContext(const TileParam &tp, const SystemInfo &sysInfo);
