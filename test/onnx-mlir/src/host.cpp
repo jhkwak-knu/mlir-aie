@@ -444,6 +444,18 @@ int main(int argc, const char *argv[]) {
                       XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(6));
   }
 
+  int traceSz = vm["trace_sz"].as<int>();
+  std::string traceFile = vm["trace_file"].as<std::string>();
+
+  xrt::bo bo_trace;
+  if (traceSz > 0) {
+    // trace arg is last: group_id(6) without pres, group_id(7) with pres
+    int traceGroupId = useInC ? 7 : 6;
+    bo_trace = xrt::bo(device, traceSz, XRT_BO_FLAGS_HOST_ONLY,
+                       kernel.group_id(traceGroupId));
+    memset(bo_trace.map<char*>(), 0, traceSz);
+  }
+
   if (verbosity >= 1)
     std::cout << "Writing data into buffer objects.\n";
 
@@ -617,10 +629,18 @@ int main(int argc, const char *argv[]) {
         auto start = std::chrono::high_resolution_clock::now();
         unsigned int opcode = 3;
         xrt::run run;
-        if (useInC) {
-          run = kernel(opcode, bo_instr, instr_v.size(), bo_inA, bo_inB, bo_outC, bo_inC);
+        if (useInC && traceSz > 0) {
+          run = kernel(opcode, bo_instr, instr_v.size(),
+                       bo_inA, bo_inB, bo_outC, bo_inC, bo_trace);
+        } else if (useInC) {
+          run = kernel(opcode, bo_instr, instr_v.size(),
+                       bo_inA, bo_inB, bo_outC, bo_inC);
+        } else if (traceSz > 0) {
+          run = kernel(opcode, bo_instr, instr_v.size(),
+                       bo_inA, bo_inB, bo_outC, bo_trace);
         } else {
-          run = kernel(opcode, bo_instr, instr_v.size(), bo_inA, bo_inB, bo_outC);
+          run = kernel(opcode, bo_instr, instr_v.size(),
+                       bo_inA, bo_inB, bo_outC);
         }
         run.wait();
         auto stop = std::chrono::high_resolution_clock::now();
@@ -703,6 +723,11 @@ int main(int argc, const char *argv[]) {
 
     if (iter < n_warmup_iterations) {
       /* Warmup iterations do not count towards average runtime. */
+      // Clear trace buffer after last warmup so only measurement data remains.
+      if (traceSz > 0 && iter == n_warmup_iterations - 1) {
+        memset(bo_trace.map<char*>(), 0, traceSz);
+        bo_trace.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+      }
       continue;
     }
 
@@ -741,6 +766,36 @@ int main(int argc, const char *argv[]) {
     npu_time_total += npu_time;
     npu_time_min = (npu_time < npu_time_min) ? npu_time : npu_time_min;
     npu_time_max = (npu_time > npu_time_max) ? npu_time : npu_time_max;
+  }
+
+  // Save trace data after all iterations (last iteration's trace is captured)
+  if (traceSz > 0) {
+    bo_trace.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    // Write trace buffer as hex words, matching parse_trace.py expected format
+    {
+      uint32_t *traceOut = reinterpret_cast<uint32_t*>(bo_trace.map<char*>());
+      size_t totalWords = static_cast<size_t>(traceSz) / sizeof(uint32_t);
+
+      // Skip leading zeros (DMA write pointer may not start at offset 0).
+      size_t start = 0;
+      while (start < totalWords && traceOut[start] == 0)
+        ++start;
+
+      // Find last non-zero word to avoid trailing zeros.
+      size_t end = totalWords;
+      while (end > start && traceOut[end - 1] == 0)
+        --end;
+
+      FILE *fp = fopen(traceFile.c_str(), "w");
+      if (fp) {
+        for (size_t i = start; i < end; i++) {
+          fprintf(fp, "%08x\n", traceOut[i]);
+        }
+        fclose(fp);
+      }
+    }
+    std::cout << "Trace data written to " << traceFile
+              << " (" << traceSz << " bytes)" << std::endl;
   }
 
   // ------------------------------------------------------

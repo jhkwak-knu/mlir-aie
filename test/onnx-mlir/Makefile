@@ -84,6 +84,8 @@ run: host all | $(LOGS_DIR)
 		--tc-json $(TC_JSON) \
 		$(if $(JSON_OUTPUT),--json-output $(JSON_OUTPUT)) \
 		$(if $(STRICT_VERIFY),--strict-verify) \
+		$(if $(TRACE_SZ),--trace_sz $(TRACE_SZ)) \
+		$(if $(TRACE_FILE),--trace_file $(TRACE_FILE)) \
 		> $(LOGS_DIR)/log.txt
 
 # Convenience: print paths
