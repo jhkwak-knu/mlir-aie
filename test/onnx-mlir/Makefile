@@ -16,7 +16,6 @@ SCRIPTS_DIR:= $(ROOT_DIR)/scripts
 DATA_DIR   := $(ROOT_DIR)/data
 OUT_DIR    := $(ROOT_DIR)/out
 BUILD_DIR  := $(OUT_DIR)/build
-ONNX_DIR   := $(OUT_DIR)/onnx
 MLIR_DIR   := $(OUT_DIR)/mlir
 LOGS_DIR   := $(OUT_DIR)/logs
 REPORTS_DIR:= $(OUT_DIR)/reports
@@ -48,7 +47,7 @@ CXXFLAGS ?=
 all: $(BUILD_DIR)/final.xclbin
 
 # Prepare directories
-$(BUILD_DIR) $(LOGS_DIR) $(MLIR_DIR) $(ONNX_DIR) $(REPORTS_DIR):
+$(BUILD_DIR) $(LOGS_DIR) $(MLIR_DIR) $(REPORTS_DIR):
 	mkdir -p $@
 
 # 1) Prepare conversion outputs: ONNX-MLIR -> AIE MLIR

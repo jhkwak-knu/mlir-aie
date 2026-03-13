@@ -4,12 +4,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
-TEST_DIR="$ROOT_DIR/test/onnx-mlir"
-TC_JSON="$TEST_DIR/out/tc.json"
-RESULT_CSV="$TEST_DIR/out/reports/structural_test_result.csv"
-
-mkdir -p "$(dirname "$RESULT_CSV")"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/../common.sh"
+TC_JSON="$OUT_DIR/tc.json"
+RESULT_CSV="$REPORTS_DIR/structural_test_result.csv"
 
 # CSV header
 echo "case,SPm,SPn,numCores,numCols,tpOrder,TPk,pres,M,K,N,build_status,run_status,avg_us" > "$RESULT_CSV"
@@ -88,22 +86,22 @@ EOF
   AVG_US="-"
 
   # Build
-  cd "$TEST_DIR"
+  cd "$ROOT_DIR"
   make clean > /dev/null 2>&1 || true
-  if bash scripts/generate/gen_onnx_matmul_mlir.sh out/tc.json > /dev/null 2>&1 && \
+  if bash "$SCRIPTS_DIR/generate/gen_onnx_matmul_mlir.sh" "$TC_JSON" > /dev/null 2>&1 && \
      make > /dev/null 2>&1; then
     BUILD_STATUS="PASS"
     echo "  Build: PASS"
 
     # Run
     if make run > /dev/null 2>&1; then
-      if grep -q 'PASS!' out/logs/log.txt 2>/dev/null; then
+      if grep -q 'PASS!' $LOGS_DIR/log.txt 2>/dev/null; then
         RUN_STATUS="PASS"
-        AVG_US=$(grep 'Avg NPU time' out/logs/log.txt 2>/dev/null | sed 's/.*: \(.*\)us\./\1/' || echo "-")
+        AVG_US=$(grep 'Avg NPU time' $LOGS_DIR/log.txt 2>/dev/null | sed 's/.*: \(.*\)us\./\1/' || echo "-")
         echo "  Run:   PASS (Avg ${AVG_US}us)"
         PASS_COUNT=$((PASS_COUNT + 1))
       else
-        MISMATCH=$(grep -o '[0-9]* mismatches' out/logs/log.txt 2>/dev/null || echo "unknown error")
+        MISMATCH=$(grep -o '[0-9]* mismatches' $LOGS_DIR/log.txt 2>/dev/null || echo "unknown error")
         echo "  Run:   FAIL ($MISMATCH)"
         FAIL_COUNT=$((FAIL_COUNT + 1))
       fi
@@ -115,8 +113,8 @@ EOF
     echo "  Build: FAIL"
     FAIL_COUNT=$((FAIL_COUNT + 1))
     # Capture error for debugging
-    if [ -f out/logs/log.txt ]; then
-      tail -5 out/logs/log.txt 2>/dev/null || true
+    if [ -f $LOGS_DIR/log.txt ]; then
+      tail -5 $LOGS_DIR/log.txt 2>/dev/null || true
     fi
   fi
 
