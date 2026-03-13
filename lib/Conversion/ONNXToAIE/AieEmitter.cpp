@@ -34,7 +34,6 @@ static constexpr uint32_t TRACE_EVTGEN_ADDR = 0x34008;  // event generation
 
 // Core tile event codes
 static constexpr uint8_t EVT_NONE         = 0x00;
-static constexpr uint8_t EVT_LOCK_STALL   = 0x1A; // LOCK_STALL (CoreEvent=26)
 static constexpr uint8_t EVT_INSTR_EVT_0  = 0x21; // INSTR_EVENT_0 (CoreEvent=33) — kernel start
 static constexpr uint8_t EVT_INSTR_EVT_1  = 0x22; // INSTR_EVENT_1 (CoreEvent=34) — kernel end
 static constexpr uint8_t EVT_BCAST_14   = 0x79;  // BROADCAST_14 (107+14)
@@ -42,12 +41,32 @@ static constexpr uint8_t EVT_BCAST_15   = 0x7A;  // BROADCAST_15 (107+15)
 static constexpr uint8_t EVT_USER_EVT_0 = 0x7E;  // USER_EVENT_0 (stop signal)
 static constexpr uint8_t EVT_USER_EVT_1 = 0x7F;  // USER_EVENT_1 (start signal)
 
+// Memory module trace register addresses (AIE2 compute tile)
+static constexpr uint32_t MEM_TRACE_CTRL0_ADDR  = 0x140D0;  // start/stop/mode
+static constexpr uint32_t MEM_TRACE_CTRL1_ADDR  = 0x140D4;  // packet config
+static constexpr uint32_t MEM_TRACE_EVENT0_ADDR = 0x140E0;  // events 0-3
+static constexpr uint32_t MEM_TRACE_EVENT1_ADDR = 0x140E4;  // events 4-7
+static constexpr uint32_t MEM_TRACE_TIMER_ADDR  = 0x14000;  // timer control
+
+// Memory module DMA event codes (MemEvent values)
+// S2MM ch0 = LHS input (+PRES when M-inner), ch1 = RHS input (+PRES when N-inner)
+// MM2S ch0 = RES output
+// STALLED_LOCK: level event, active while DMA waits for lock acquisition.
+// Transfer duration = FINISHED_BD timestamp - STALLED_LOCK fall timestamp.
+static constexpr uint8_t MEM_EVT_DMA_S2MM_0_STARV = 35;  // LHS stream starvation
+static constexpr uint8_t MEM_EVT_DMA_S2MM_1_STARV = 36;  // RHS stream starvation
+static constexpr uint8_t MEM_EVT_DMA_MM2S_0_STALL = 33;  // RES lock stall
+static constexpr uint8_t MEM_EVT_DMA_S2MM_0_DONE  = 23;  // LHS done
+static constexpr uint8_t MEM_EVT_DMA_S2MM_1_DONE  = 24;  // RHS done
+static constexpr uint8_t MEM_EVT_DMA_MM2S_0_DONE  = 25;  // RES done
+// MemEvent BROADCAST_14/15 have same code (121/122) as CoreEvent — reuse EVT_BCAST_*
+
 // Shim DMA trace config
-static constexpr uint32_t TRACE_BD_ID     = 15;
-static constexpr uint32_t TRACE_PER_TILE  = 65536;  // bytes per tile (64KB)
-static constexpr uint32_t XDNA2_COL_SHIFT = 25;
-static constexpr uint32_t TRACE_BCAST_NUM     = 15;  // broadcast channel for start
-static constexpr uint32_t TRACE_BCAST_STOP_NUM = 14; // broadcast channel for stop
+static constexpr uint32_t TRACE_BD_ID      = 15;
+static constexpr uint32_t TRACE_PER_STREAM = 65536;  // bytes per trace stream (64KB)
+static constexpr uint32_t XDNA2_COL_SHIFT  = 25;
+static constexpr uint32_t TRACE_BCAST_NUM      = 15;  // broadcast channel for start
+static constexpr uint32_t TRACE_BCAST_STOP_NUM = 14;  // broadcast channel for stop
 
 //===----------------------------------------------------------------------===//
 // Type aliases used by emitCoreOps
@@ -237,18 +256,35 @@ static void emitTraceFlowOps(OpBuilder &builder, Location loc,
       uint32_t compIdx = placement.findAieTileIdx(col, row);
       auto &compTile = placement.getAieTile(compIdx);
 
-      uint32_t pktId = i + 1;
-
-      auto flowOp = builder.create<PacketFlowOp>(
-          loc, static_cast<int8_t>(pktId),
+      // Core trace: Trace port 0, pktId 1..N
+      uint32_t corePktId = i + 1;
+      auto coreFlowOp = builder.create<PacketFlowOp>(
+          loc, static_cast<int8_t>(corePktId),
           /*keep_pkt_header=*/builder.getBoolAttr(true), /*bp_id=*/nullptr);
       {
         OpBuilder::InsertionGuard g(builder);
-        Region &flowRegion = flowOp.getBodyRegion();
+        Region &flowRegion = coreFlowOp.getBodyRegion();
         Block *flowBlock = builder.createBlock(&flowRegion);
         builder.setInsertionPointToStart(flowBlock);
         builder.create<PacketSourceOp>(
             loc, compTile.value, WireBundle::Trace, 0);
+        builder.create<PacketDestOp>(
+            loc, shimTile.value, WireBundle::DMA, 1);
+        builder.create<EndOp>(loc);
+      }
+
+      // Memory module trace: Trace port 1, pktId (N+1)..2N
+      uint32_t memPktId = i + 1 + tilingCtx.numCompTilesPerCol;
+      auto memFlowOp = builder.create<PacketFlowOp>(
+          loc, static_cast<int8_t>(memPktId),
+          /*keep_pkt_header=*/builder.getBoolAttr(true), /*bp_id=*/nullptr);
+      {
+        OpBuilder::InsertionGuard g(builder);
+        Region &flowRegion = memFlowOp.getBodyRegion();
+        Block *flowBlock = builder.createBlock(&flowRegion);
+        builder.setInsertionPointToStart(flowBlock);
+        builder.create<PacketSourceOp>(
+            loc, compTile.value, WireBundle::Trace, 1);
         builder.create<PacketDestOp>(
             loc, shimTile.value, WireBundle::DMA, 1);
         builder.create<EndOp>(loc);
@@ -776,10 +812,11 @@ static void emitRuntimeSequenceOp(OpBuilder &builder, Location loc,
     }
 
     // Add trace buffer argument (last arg) when trace is enabled
+    // 2 streams per tile: core trace + memory module trace
     Value arg_trace;
     if (tilingCtx.traceEnabled) {
-      uint32_t numTiles = tilingCtx.numCols * tilingCtx.numCompTilesPerCol;
-      uint32_t totalTraceBytes = TRACE_PER_TILE * numTiles;
+      uint32_t numStreams = tilingCtx.numCols * tilingCtx.numCompTilesPerCol * 2;
+      uint32_t totalTraceBytes = TRACE_PER_STREAM * numStreams;
       auto traceType = MemRefType::get(
           {static_cast<int64_t>(totalTraceBytes / 4)}, builder.getI32Type());
       arg_trace = seqBlock->addArgument(traceType, loc);
@@ -787,16 +824,18 @@ static void emitRuntimeSequenceOp(OpBuilder &builder, Location loc,
 
     // Emit trace setup ops before DMA schedule so tracing captures all activity
     if (tilingCtx.traceEnabled) {
-      // Per-tile: configure trace events, packet routing, and timer sync
+      // Per-tile: configure core trace and memory module trace
       for (uint32_t col = 0; col < tilingCtx.numCols; ++col) {
         for (uint32_t i = 0; i < tilingCtx.numCompTilesPerCol; ++i) {
           uint32_t row = device.compTileLastRow() - i;
           auto colAttr = builder.getI32IntegerAttr(col);
           auto rowAttr = builder.getI32IntegerAttr(row);
-          uint32_t pktId = i + 1;
+          uint32_t corePktId = i + 1;
+          uint32_t memPktId  = i + 1 + tilingCtx.numCompTilesPerCol;
+
+          //--- Core trace (0x340xx) ---
 
           // Trace Control 0: start=BROADCAST_15, stop=BROADCAST_14, mode=event-time
-          // 0xAABB000C: AA=stop_event, BB=start_event, C=mode(0=event-time)
           builder.create<xilinx::AIEX::NpuWrite32Op>(loc,
               TRACE_CTRL0_ADDR,
               static_cast<uint32_t>((EVT_BCAST_14 << 24) | (EVT_BCAST_15 << 16)),
@@ -805,14 +844,14 @@ static void emitRuntimeSequenceOp(OpBuilder &builder, Location loc,
           // Trace Control 1: packet mode, type=CORE(0), packet_id
           builder.create<xilinx::AIEX::NpuWrite32Op>(loc,
               TRACE_CTRL1_ADDR,
-              static_cast<uint32_t>((0u << 12) | (pktId & 0x1F)),
+              static_cast<uint32_t>((0u << 12) | (corePktId & 0x1F)),
               nullptr, colAttr, rowAttr);
 
-          // Event Group 0: [3]=LOCK_STALL [2]=NONE [1]=INSTR_EVENT_1 [0]=INSTR_EVENT_0
-          uint32_t eg0 = (EVT_LOCK_STALL << 24) | (EVT_NONE << 16) |
-                         (EVT_INSTR_EVT_1 << 8) | EVT_INSTR_EVT_0;
+          // Event Group 0: [3]=NONE [2]=NONE [1]=INSTR_EVENT_1 [0]=INSTR_EVENT_0
+          uint32_t coreEg0 = (EVT_NONE << 24) | (EVT_NONE << 16) |
+                             (EVT_INSTR_EVT_1 << 8) | EVT_INSTR_EVT_0;
           builder.create<xilinx::AIEX::NpuWrite32Op>(loc,
-              TRACE_EVENT0_ADDR, eg0, nullptr, colAttr, rowAttr);
+              TRACE_EVENT0_ADDR, coreEg0, nullptr, colAttr, rowAttr);
 
           // Event Group 1: [7..4] = all NONE (disabled)
           builder.create<xilinx::AIEX::NpuWrite32Op>(loc,
@@ -823,12 +862,48 @@ static void emitRuntimeSequenceOp(OpBuilder &builder, Location loc,
               TRACE_TIMER_ADDR,
               static_cast<uint32_t>((EVT_BCAST_15 & 0x7F) << 8),
               nullptr, colAttr, rowAttr);
+
+          //--- Memory module trace (0x140xx) ---
+
+          // Trace Control 0: same start/stop broadcast events
+          builder.create<xilinx::AIEX::NpuWrite32Op>(loc,
+              MEM_TRACE_CTRL0_ADDR,
+              static_cast<uint32_t>((EVT_BCAST_14 << 24) | (EVT_BCAST_15 << 16)),
+              nullptr, colAttr, rowAttr);
+
+          // Trace Control 1: packet mode, type=MEM(1), packet_id
+          builder.create<xilinx::AIEX::NpuWrite32Op>(loc,
+              MEM_TRACE_CTRL1_ADDR,
+              static_cast<uint32_t>((1u << 12) | (memPktId & 0x1F)),
+              nullptr, colAttr, rowAttr);
+
+          // Event Group 0: [3]=S2MM_1_DONE [2]=S2MM_1_STARV [1]=S2MM_0_DONE [0]=S2MM_0_STARV
+          uint32_t memEg0 = (MEM_EVT_DMA_S2MM_1_DONE  << 24) |
+                            (MEM_EVT_DMA_S2MM_1_STARV << 16) |
+                            (MEM_EVT_DMA_S2MM_0_DONE  << 8)  |
+                             MEM_EVT_DMA_S2MM_0_STARV;
+          builder.create<xilinx::AIEX::NpuWrite32Op>(loc,
+              MEM_TRACE_EVENT0_ADDR, memEg0, nullptr, colAttr, rowAttr);
+
+          // Event Group 1: [7..6]=NONE [5]=MM2S_0_DONE [4]=MM2S_0_STALL
+          uint32_t memEg1 = (EVT_NONE << 24) | (EVT_NONE << 16) |
+                            (MEM_EVT_DMA_MM2S_0_DONE  << 8) |
+                             MEM_EVT_DMA_MM2S_0_STALL;
+          builder.create<xilinx::AIEX::NpuWrite32Op>(loc,
+              MEM_TRACE_EVENT1_ADDR, memEg1, nullptr, colAttr, rowAttr);
+
+          // Timer control: reset on BROADCAST_15 for cross-tile synchronization
+          builder.create<xilinx::AIEX::NpuWrite32Op>(loc,
+              MEM_TRACE_TIMER_ADDR,
+              static_cast<uint32_t>((EVT_BCAST_15 & 0x7F) << 8),
+              nullptr, colAttr, rowAttr);
         }
       }
 
       // Per-column: configure shim DMA BD for trace collection
+      // 2 streams per tile (core + mem) share the same shim DMA BD
       for (uint32_t col = 0; col < tilingCtx.numCols; ++col) {
-        uint32_t traceSizeBytes = TRACE_PER_TILE * tilingCtx.numCompTilesPerCol;
+        uint32_t traceSizeBytes = TRACE_PER_STREAM * tilingCtx.numCompTilesPerCol * 2;
         uint32_t traceOffsetBytes = col * traceSizeBytes;
         // NpuWriteBdOp buffer_length/offset are in 32-bit words (AIE2 addr gen granularity)
         uint32_t traceLenWords = traceSizeBytes / 4;
