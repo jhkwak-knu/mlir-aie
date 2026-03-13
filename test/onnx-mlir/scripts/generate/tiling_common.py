@@ -23,8 +23,8 @@ from typing import Any, Dict, List, Optional, Tuple
 # Path constants
 # ============================================================
 THIS_FILE = Path(__file__).resolve()
-ROOT_DIR  = THIS_FILE.parents[1]           # test/onnx-mlir/
-REPO_ROOT = THIS_FILE.parents[3]           # mlir-aie/
+ROOT_DIR  = THIS_FILE.parents[2]           # test/onnx-mlir/
+REPO_ROOT = THIS_FILE.parents[4]           # mlir-aie/
 DATA_DIR  = ROOT_DIR / "data"
 OUT_DIR   = ROOT_DIR / "out"
 

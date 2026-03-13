@@ -37,26 +37,26 @@ All commands run from `test/onnx-mlir/`.
 
 ### Step 1 – Generate test case list
 ```bash
-python3 scripts/gen_tc_list.py --op data/op_list.json --out out/tc_list.json
+python3 scripts/generate/cost_model.py --op data/op_list.json --validate out/tc_list.json
 # Dry-run (validate only, no output):
-python3 scripts/gen_tc_list.py --op data/op_list.json --dry-run
+python3 scripts/generate/cost_model.py --op data/op_list.json --op-index 0
 ```
 
 ### Step 2 – Run all test cases (batch)
 ```bash
-bash scripts/run_tc_all.sh -i out/tc_list.json -r out/reports/result.csv
+bash scripts/run/run_tc_all.sh -i out/tc_list.json -r out/reports/result.csv
 ```
 
 ### Step 3 – Run a single test case (by 1-based index)
 ```bash
-bash scripts/run_tc_all.sh -i out/tc_list.json -n 1
+bash scripts/run/run_tc_all.sh -i out/tc_list.json -n 1
 # Artifacts kept in out/ for inspection (no auto-clean in single-case mode)
 ```
 
 ### Manual single-case flow
 ```bash
 # 1. Generate ONNX MLIR (M K N)
-bash scripts/gen_onnx_matmul_mlir.sh 64 64 64
+bash scripts/generate/gen_onnx_matmul_mlir.sh 64 64 64
 
 # 2. Full build + run (reads out/tc.json for tiling config)
 make run CPPDEFS="-DM_SIZE=64 -DK_SIZE=64 -DN_SIZE=64"
@@ -126,7 +126,7 @@ test/onnx-mlir/
 - **Spatial**: `SPm × SPn` compute tiles handle M/N axis splits (`M0 = M/SPm`, `N0 = N/SPn`)
 - **Temporal**: `TPm × TPk × TPn` sequential iterations per tile, innermost tile = `TM × TK × TN`
 - **Memory constraint**: `elem_bytes × (TM×TK + TK×TN + TM×TN) ≤ 60KB` (CTILE_MEM_LIMIT)
-- **tpOrder**: `[axis0, axis1, axis2]` — axis indices `0=M, 1=N, 2=K` — controls loop nesting order selected by data-reuse analysis in `gen_tc_list.py`
+- **tpOrder**: `[axis0, axis1, axis2]` — axis indices `0=M, 1=N, 2=K` — controls loop nesting order selected by data-reuse analysis in `cost_model.py`
 
 **Packet routing**: Static packet IDs are pre-allocated per tile to avoid packet filtering bugs. Output quadrant IDs map: `1,2,4,8 → 0,1,2,3`.
 

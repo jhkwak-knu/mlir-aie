@@ -4,7 +4,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 TEST_DIR="$ROOT_DIR/test/onnx-mlir"
 TC_JSON="$TEST_DIR/out/tc.json"
 RESULT_CSV="$TEST_DIR/out/reports/structural_test_result.csv"
@@ -90,7 +90,7 @@ EOF
   # Build
   cd "$TEST_DIR"
   make clean > /dev/null 2>&1 || true
-  if bash scripts/gen_onnx_matmul_mlir.sh out/tc.json > /dev/null 2>&1 && \
+  if bash scripts/generate/gen_onnx_matmul_mlir.sh out/tc.json > /dev/null 2>&1 && \
      make > /dev/null 2>&1; then
     BUILD_STATUS="PASS"
     echo "  Build: PASS"

@@ -6,7 +6,7 @@ set -euo pipefail
 # resolve dirs and load common paths
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 # shellcheck source=/dev/null
-source "$SCRIPT_DIR/common.sh"
+source "$SCRIPT_DIR/../common.sh"
 
 # 1) build clean (Makefile lives at repo root)
 if [[ -f "$ROOT_DIR/Makefile" ]]; then

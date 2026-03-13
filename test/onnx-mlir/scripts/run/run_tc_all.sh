@@ -15,7 +15,7 @@ set -uo pipefail  # intentionally NOT using -e to continue on errors
 # resolve dirs and common paths
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 # shellcheck source=/dev/null
-source "$SCRIPT_DIR/common.sh"
+source "$SCRIPT_DIR/../common.sh"
 
 # defaults under new tree
 INPUT_JSON="$TC_LIST"                  # out/tc_list.json
@@ -52,8 +52,8 @@ while getopts ":i:o:r:n:s:h" opt; do
   esac
 done
 
-GEN_SCRIPT="$SCRIPTS_DIR/gen_onnx_matmul_mlir.sh"
-CLEAN_SCRIPT="$SCRIPTS_DIR/clean_tc_all.sh"
+GEN_SCRIPT="$SCRIPTS_DIR/generate/gen_onnx_matmul_mlir.sh"
+CLEAN_SCRIPT="$SCRIPTS_DIR/run/clean_tc_all.sh"
 MAKE_DIR="$ROOT_DIR"                   # Makefile at repo root
 LOG_FILE="$LOGS_DIR/log.txt"
 
