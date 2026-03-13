@@ -19,3 +19,10 @@ rm -f "$MLIR_DIR/onnx_matmul.mlir"
 
 # 3) (optional) clear last log to avoid stale parsing
 rm -f "$LOGS_DIR/log.txt"
+
+# 4) remove trace artifacts
+rm -f "$LOGS_DIR/trace_raw.txt"
+rm -f "$LOGS_DIR/trace.json"
+rm -f "$LOGS_DIR/trace_summary.json"
+rm -f "$LOGS_DIR/parse_trace_err.txt"
+rm -f "$LOGS_DIR/analyze_trace_err.txt"

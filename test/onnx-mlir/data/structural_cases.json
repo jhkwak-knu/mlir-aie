@@ -1,0 +1,220 @@
+{
+  "cases": [
+    {
+      "M": 16, "K": 16, "N": 64, "elemType": "bf16",
+      "numCores": 4, "doubleBuffer": false,
+      "description": "LHS_broadcast_spatial_only",
+      "levels": [{
+        "SPm": 1, "SPn": 4, "TPm": 1, "TPk": 1, "TPn": 1,
+        "TM": 16, "TK": 16, "TN": 16, "tpOrder": [2, 0, 1]
+      }]
+    },
+    {
+      "M": 16, "K": 32, "N": 64, "elemType": "bf16",
+      "numCores": 4, "doubleBuffer": false,
+      "description": "LHS_broadcast_K_loop",
+      "levels": [{
+        "SPm": 1, "SPn": 4, "TPm": 1, "TPk": 2, "TPn": 1,
+        "TM": 16, "TK": 16, "TN": 16, "tpOrder": [2, 0, 1]
+      }]
+    },
+    {
+      "M": 16, "K": 32, "N": 64, "elemType": "bf16",
+      "numCores": 4, "doubleBuffer": false,
+      "description": "LHS_broadcast_M_pres",
+      "levels": [{
+        "SPm": 1, "SPn": 4, "TPm": 1, "TPk": 2, "TPn": 1,
+        "TM": 16, "TK": 16, "TN": 16, "tpOrder": [0, 2, 1]
+      }]
+    },
+    {
+      "M": 16, "K": 32, "N": 64, "elemType": "bf16",
+      "numCores": 4, "doubleBuffer": false,
+      "description": "LHS_broadcast_N_pres",
+      "levels": [{
+        "SPm": 1, "SPn": 4, "TPm": 1, "TPk": 2, "TPn": 1,
+        "TM": 16, "TK": 16, "TN": 16, "tpOrder": [1, 2, 0]
+      }]
+    },
+    {
+      "M": 32, "K": 16, "N": 32, "elemType": "bf16",
+      "numCores": 4, "doubleBuffer": false,
+      "description": "symmetric_multicast_spatial_only",
+      "levels": [{
+        "SPm": 2, "SPn": 2, "TPm": 1, "TPk": 1, "TPn": 1,
+        "TM": 16, "TK": 16, "TN": 16, "tpOrder": [2, 0, 1]
+      }]
+    },
+    {
+      "M": 32, "K": 32, "N": 32, "elemType": "bf16",
+      "numCores": 4, "doubleBuffer": false,
+      "description": "symmetric_multicast_K_loop",
+      "levels": [{
+        "SPm": 2, "SPn": 2, "TPm": 1, "TPk": 2, "TPn": 1,
+        "TM": 16, "TK": 16, "TN": 16, "tpOrder": [2, 0, 1]
+      }]
+    },
+    {
+      "M": 32, "K": 32, "N": 32, "elemType": "bf16",
+      "numCores": 4, "doubleBuffer": false,
+      "description": "symmetric_multicast_M_pres",
+      "levels": [{
+        "SPm": 2, "SPn": 2, "TPm": 1, "TPk": 2, "TPn": 1,
+        "TM": 16, "TK": 16, "TN": 16, "tpOrder": [0, 2, 1]
+      }]
+    },
+    {
+      "M": 32, "K": 32, "N": 32, "elemType": "bf16",
+      "numCores": 4, "doubleBuffer": false,
+      "description": "symmetric_multicast_N_pres",
+      "levels": [{
+        "SPm": 2, "SPn": 2, "TPm": 1, "TPk": 2, "TPn": 1,
+        "TM": 16, "TK": 16, "TN": 16, "tpOrder": [1, 2, 0]
+      }]
+    },
+    {
+      "M": 64, "K": 16, "N": 16, "elemType": "bf16",
+      "numCores": 4, "doubleBuffer": false,
+      "description": "RHS_broadcast_spatial_only",
+      "levels": [{
+        "SPm": 4, "SPn": 1, "TPm": 1, "TPk": 1, "TPn": 1,
+        "TM": 16, "TK": 16, "TN": 16, "tpOrder": [2, 0, 1]
+      }]
+    },
+    {
+      "M": 64, "K": 32, "N": 16, "elemType": "bf16",
+      "numCores": 4, "doubleBuffer": false,
+      "description": "RHS_broadcast_K_loop",
+      "levels": [{
+        "SPm": 4, "SPn": 1, "TPm": 1, "TPk": 2, "TPn": 1,
+        "TM": 16, "TK": 16, "TN": 16, "tpOrder": [2, 0, 1]
+      }]
+    },
+    {
+      "M": 64, "K": 32, "N": 16, "elemType": "bf16",
+      "numCores": 4, "doubleBuffer": false,
+      "description": "RHS_broadcast_M_pres",
+      "levels": [{
+        "SPm": 4, "SPn": 1, "TPm": 1, "TPk": 2, "TPn": 1,
+        "TM": 16, "TK": 16, "TN": 16, "tpOrder": [0, 2, 1]
+      }]
+    },
+    {
+      "M": 64, "K": 32, "N": 16, "elemType": "bf16",
+      "numCores": 4, "doubleBuffer": false,
+      "description": "RHS_broadcast_N_pres",
+      "levels": [{
+        "SPm": 4, "SPn": 1, "TPm": 1, "TPk": 2, "TPn": 1,
+        "TM": 16, "TK": 16, "TN": 16, "tpOrder": [1, 2, 0]
+      }]
+    },
+    {
+      "M": 16, "K": 16, "N": 128, "elemType": "bf16",
+      "numCores": 8, "doubleBuffer": false,
+      "description": "2col_LHS_broadcast_spatial",
+      "levels": [{
+        "SPm": 1, "SPn": 8, "TPm": 1, "TPk": 1, "TPn": 1,
+        "TM": 16, "TK": 16, "TN": 16, "tpOrder": [2, 0, 1]
+      }]
+    },
+    {
+      "M": 16, "K": 32, "N": 128, "elemType": "bf16",
+      "numCores": 8, "doubleBuffer": false,
+      "description": "2col_LHS_broadcast_M_pres",
+      "levels": [{
+        "SPm": 1, "SPn": 8, "TPm": 1, "TPk": 2, "TPn": 1,
+        "TM": 16, "TK": 16, "TN": 16, "tpOrder": [0, 2, 1]
+      }]
+    },
+    {
+      "M": 32, "K": 16, "N": 64, "elemType": "bf16",
+      "numCores": 8, "doubleBuffer": false,
+      "description": "2col_symmetric_spatial",
+      "levels": [{
+        "SPm": 2, "SPn": 4, "TPm": 1, "TPk": 1, "TPn": 1,
+        "TM": 16, "TK": 16, "TN": 16, "tpOrder": [2, 0, 1]
+      }]
+    },
+    {
+      "M": 32, "K": 32, "N": 64, "elemType": "bf16",
+      "numCores": 8, "doubleBuffer": false,
+      "description": "2col_symmetric_M_pres",
+      "levels": [{
+        "SPm": 2, "SPn": 4, "TPm": 1, "TPk": 2, "TPn": 1,
+        "TM": 16, "TK": 16, "TN": 16, "tpOrder": [0, 2, 1]
+      }]
+    },
+    {
+      "M": 64, "K": 16, "N": 32, "elemType": "bf16",
+      "numCores": 8, "doubleBuffer": false,
+      "description": "2col_RHS_broadcast_spatial",
+      "levels": [{
+        "SPm": 4, "SPn": 2, "TPm": 1, "TPk": 1, "TPn": 1,
+        "TM": 16, "TK": 16, "TN": 16, "tpOrder": [2, 0, 1]
+      }]
+    },
+    {
+      "M": 64, "K": 32, "N": 32, "elemType": "bf16",
+      "numCores": 8, "doubleBuffer": false,
+      "description": "2col_RHS_broadcast_M_pres",
+      "levels": [{
+        "SPm": 4, "SPn": 2, "TPm": 1, "TPk": 2, "TPn": 1,
+        "TM": 16, "TK": 16, "TN": 16, "tpOrder": [0, 2, 1]
+      }]
+    },
+    {
+      "M": 128, "K": 16, "N": 16, "elemType": "bf16",
+      "numCores": 8, "doubleBuffer": false,
+      "description": "SPm8_all_unicast_spatial",
+      "levels": [{
+        "SPm": 8, "SPn": 1, "TPm": 1, "TPk": 1, "TPn": 1,
+        "TM": 16, "TK": 16, "TN": 16, "tpOrder": [2, 0, 1]
+      }]
+    },
+    {
+      "M": 128, "K": 32, "N": 16, "elemType": "bf16",
+      "numCores": 8, "doubleBuffer": false,
+      "description": "SPm8_all_unicast_M_pres",
+      "levels": [{
+        "SPm": 8, "SPn": 1, "TPm": 1, "TPk": 2, "TPn": 1,
+        "TM": 16, "TK": 16, "TN": 16, "tpOrder": [0, 2, 1]
+      }]
+    },
+    {
+      "M": 32, "K": 16, "N": 128, "elemType": "bf16",
+      "numCores": 16, "doubleBuffer": false,
+      "description": "4col_symmetric_spatial",
+      "levels": [{
+        "SPm": 2, "SPn": 8, "TPm": 1, "TPk": 1, "TPn": 1,
+        "TM": 16, "TK": 16, "TN": 16, "tpOrder": [2, 0, 1]
+      }]
+    },
+    {
+      "M": 32, "K": 32, "N": 128, "elemType": "bf16",
+      "numCores": 16, "doubleBuffer": false,
+      "description": "4col_symmetric_M_pres",
+      "levels": [{
+        "SPm": 2, "SPn": 8, "TPm": 1, "TPk": 2, "TPn": 1,
+        "TM": 16, "TK": 16, "TN": 16, "tpOrder": [0, 2, 1]
+      }]
+    },
+    {
+      "M": 48, "K": 16, "N": 64, "elemType": "bf16",
+      "numCores": 12, "doubleBuffer": false,
+      "description": "asymmetric_SPm3_spatial",
+      "levels": [{
+        "SPm": 3, "SPn": 4, "TPm": 1, "TPk": 1, "TPn": 1,
+        "TM": 16, "TK": 16, "TN": 16, "tpOrder": [2, 0, 1]
+      }]
+    },
+    {
+      "M": 48, "K": 32, "N": 64, "elemType": "bf16",
+      "numCores": 12, "doubleBuffer": false,
+      "description": "asymmetric_SPm3_M_pres",
+      "levels": [{
+        "SPm": 3, "SPn": 4, "TPm": 1, "TPk": 2, "TPn": 1,
+        "TM": 16, "TK": 16, "TN": 16, "tpOrder": [0, 2, 1]
+      }]
+    }
+  ]
+}

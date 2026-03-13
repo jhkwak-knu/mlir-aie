@@ -913,6 +913,74 @@ def report_summary(tiles: list[TileData], combined_res: list[DmaTransfer],
 
 
 # ---------------------------------------------------------------------------
+# Machine-readable summary
+# ---------------------------------------------------------------------------
+
+def compute_summary_dict(tiles: list[TileData], combined_res: list[DmaTransfer],
+                         tc: dict, iters_per_dispatch: int,
+                         n_dispatches: int, clock_mhz: float) -> dict:
+    """Compute machine-readable summary metrics for JSON export."""
+    ref = tiles[0]
+
+    # Dispatch wall-clock (per tile, averaged over tiles and dispatches)
+    dispatch_durs = []
+    kernel_totals = []
+    for td in tiles:
+        for d in range(n_dispatches):
+            base = d * iters_per_dispatch
+            last = base + iters_per_dispatch - 1
+            if last >= len(td.kernels):
+                continue
+            lhs_first = td.lhs_xfers[base] if base < len(td.lhs_xfers) else None
+            res_last = td.res_xfers[last] if last < len(td.res_xfers) else None
+            t_start = lhs_first.start_ts if lhs_first else td.kernels[base].evt0_ts
+            t_end = res_last.done_ts if res_last else td.kernels[last].evt1_ts
+            dispatch_durs.append(t_end - t_start)
+            kernel_totals.append(sum(
+                td.kernels[base + p].duration for p in range(iters_per_dispatch)
+            ))
+
+    avg_dispatch = sum(dispatch_durs) / len(dispatch_durs) if dispatch_durs else 0
+    avg_kernel = sum(kernel_totals) / len(kernel_totals) if kernel_totals else 0
+
+    # Steady-state iteration (iter 1+ average, reference tile + combined RES)
+    ss_kern, ss_total = [], []
+    for d in range(n_dispatches):
+        for pos in range(1, iters_per_dispatch):
+            idx = d * iters_per_dispatch + pos
+            if idx >= len(ref.kernels):
+                continue
+            k = ref.kernels[idx]
+            ss_kern.append(k.duration)
+            lhs = ref.lhs_xfers[idx] if idx < len(ref.lhs_xfers) else None
+            res = combined_res[idx] if idx < len(combined_res) else None
+            t_start = lhs.start_ts if lhs else k.evt0_ts
+            t_end = res.done_ts if res else k.evt1_ts
+            ss_total.append(t_end - t_start)
+
+    avg_ss_kern = sum(ss_kern) / len(ss_kern) if ss_kern else 0
+    avg_ss_total = sum(ss_total) / len(ss_total) if ss_total else 0
+
+    # Effective metrics
+    M, K, N = tc['M'], tc['K'], tc['N']
+    flops = 2 * M * K * N
+    dispatch_s = avg_dispatch / clock_mhz / 1e6
+
+    return {
+        "dispatch_cy": round(avg_dispatch),
+        "dispatch_us": round(avg_dispatch / clock_mhz, 2),
+        "kernel_total_cy": round(avg_kernel),
+        "kernel_pct": round(avg_kernel / avg_dispatch * 100, 1) if avg_dispatch > 0 else 0,
+        "ss_iter_cy": round(avg_ss_total),
+        "ss_iter_us": round(avg_ss_total / clock_mhz, 2),
+        "ss_kernel_cy": round(avg_ss_kern),
+        "ss_kernel_util_pct": round(avg_ss_kern / avg_ss_total * 100, 1) if avg_ss_total > 0 else 0,
+        "gflops": round(flops / dispatch_s / 1e9, 2) if dispatch_s > 0 else 0,
+        "n_tiles": len(tiles),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -931,6 +999,8 @@ def main():
                         help=f"NPU clock MHz (default: {XDNA2_DEFAULT_CLOCK_MHZ})")
     parser.add_argument("--output", default=None,
                         help="Output file path (default: stdout)")
+    parser.add_argument("--json-summary", default=None,
+                        help="Write machine-readable summary JSON to this path")
     args = parser.parse_args()
 
     if args.output:
@@ -978,6 +1048,15 @@ def main():
                     args.clock_mhz)
     report_summary(tiles, combined_res, tc, iters_per_dispatch,
                    args.n_dispatches, args.clock_mhz)
+
+    # Write machine-readable summary JSON if requested
+    if args.json_summary:
+        summary = compute_summary_dict(tiles, combined_res, tc,
+                                       iters_per_dispatch, args.n_dispatches,
+                                       args.clock_mhz)
+        with open(args.json_summary, "w") as f:
+            json.dump(summary, f, indent=2)
+        print(f"Summary JSON written to {args.json_summary}", file=sys.stderr)
 
     if args.output:
         sys.stdout.close()

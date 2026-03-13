@@ -23,6 +23,8 @@ OUTPUT_JSON="$OUT_DIR/tc.json"         # out/tc.json
 RESULT_CSV="$REPORTS_DIR/result.csv"   # out/reports/result.csv
 SINGLE_IDX=""                          # optional: run only this 1-based index
 START_FROM=""                          # optional: resume from this 1-based index
+TRACE_ENABLED=""                       # optional: enable NPU trace collection
+TRACE_SZ_DEFAULT=1048576               # 1MB trace buffer
 
 usage() {
   cat <<EOF
@@ -34,18 +36,20 @@ Options:
   -r FILE   Result CSV path (default: $RESULT_CSV)
   -n INDEX  Run only the INDEX-th case (1-based)
   -s START  Resume from the START-th case (1-based, appends to existing CSV)
+  -t        Enable NPU trace collection and analysis
   -h        Help
 EOF
   exit 1
 }
 
-while getopts ":i:o:r:n:s:h" opt; do
+while getopts ":i:o:r:n:s:th" opt; do
   case "$opt" in
     i) INPUT_JSON="$OPTARG" ;;
     o) OUTPUT_JSON="$OPTARG" ;;
     r) RESULT_CSV="$OPTARG" ;;
     n) SINGLE_IDX="$OPTARG" ;;
     s) START_FROM="$OPTARG" ;;
+    t) TRACE_ENABLED=1 ;;
     h) usage ;;
     \?) echo "Unknown option: -$OPTARG" >&2; usage ;;
     :)  echo "Option -$OPTARG requires an argument." >&2; usage ;;
@@ -56,6 +60,15 @@ GEN_SCRIPT="$SCRIPTS_DIR/generate/gen_onnx_matmul_mlir.sh"
 CLEAN_SCRIPT="$SCRIPTS_DIR/run/clean_tc_all.sh"
 MAKE_DIR="$ROOT_DIR"                   # Makefile at repo root
 LOG_FILE="$LOGS_DIR/log.txt"
+
+# Trace-related paths (mlir-aie repo root is two levels above test/onnx-mlir)
+REPO_ROOT="$(cd "$ROOT_DIR/../.." && pwd)"
+PARSE_TRACE="$REPO_ROOT/programming_examples/utils/parse_trace.py"
+ANALYZE_TRACE="$SCRIPTS_DIR/analyze/analyze_trace.py"
+TRACE_RAW="$LOGS_DIR/trace_raw.txt"
+TRACE_JSON="$LOGS_DIR/trace.json"
+TRACE_SUMMARY="$LOGS_DIR/trace_summary.json"
+AIE_MLIR="$BUILD_DIR/aie.mlir"
 
 # deps
 command -v jq   &>/dev/null || { echo "error: 'jq' required" >&2; exit 127; }
@@ -94,19 +107,26 @@ else
 fi
 
 # CSV header (+upgrade if old header exists)
-NEW_HEADER="case_index,numSpm,SPm,SPn,TPm,TPk,TPn,TM,TK,TN,M,K,N,doubleBuffer,t_total_pred,status,errors,iters,warmup,avg_us,min_us,max_us"
+NEW_HEADER="case_index,numSpm,SPm,SPn,TPm,TPk,TPn,TM,TK,TN,M,K,N,doubleBuffer,t_total_pred,status,errors,iters,warmup,avg_us,min_us,max_us,trace_dispatch_us,trace_kern_pct,trace_gflops,host_overhead_us"
 if [[ ! -f "$RESULT_CSV" ]]; then
   mkdir -p "$(dirname "$RESULT_CSV")"
   echo "$NEW_HEADER" > "$RESULT_CSV"
 else
   CUR_HEADER="$(head -n1 "$RESULT_CSV" || true)"
-  if ! echo "$CUR_HEADER" | grep -q 'avg_us'; then
-    echo "info: upgrading result CSV header (adding timing columns) ..."
+  if ! echo "$CUR_HEADER" | grep -q 'trace_dispatch_us'; then
+    echo "info: upgrading result CSV header (adding trace columns) ..."
     tmp_csv="$(mktemp)"
     echo "$NEW_HEADER" > "$tmp_csv"
-    # Append old rows with five additional timing fields defaulted to -1.
-    # tail failure is benign (CSV may not exist yet); only awk failure is an error.
-    tail -n +2 "$RESULT_CSV" 2>/dev/null | awk -F',' '{print $0",-1,-1,-1,-1,-1"}' >> "$tmp_csv"
+    # Determine how many columns exist to pad correctly.
+    n_cols=$(echo "$CUR_HEADER" | awk -F',' '{print NF}')
+    # Target: 26 columns. Pad missing columns with -1.
+    n_pad=$((26 - n_cols))
+    if [[ $n_pad -gt 0 ]]; then
+      pad=$(printf ',-1%.0s' $(seq 1 $n_pad))
+      tail -n +2 "$RESULT_CSV" 2>/dev/null | awk -v p="$pad" -F',' '{print $0 p}' >> "$tmp_csv"
+    else
+      tail -n +2 "$RESULT_CSV" 2>/dev/null >> "$tmp_csv"
+    fi
     if [[ ${PIPESTATUS[1]} -ne 0 ]]; then
       echo "error: awk failed during CSV header upgrade; aborting to preserve original" >&2
       rm -f "$tmp_csv"
@@ -128,7 +148,7 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
   tmp_out="$(mktemp)"
   if ! jq --indent 4 ".cases[$((idx-1))]" "$INPUT_JSON" > "$tmp_out"; then
     echo "warn: failed to extract case #$idx"
-    echo "$idx,0,0,0,0,0,0,0,0,0,0,0,0,false,-,EXTRACT_FAIL,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
+    echo "$idx,0,0,0,0,0,0,0,0,0,0,0,0,false,-,EXTRACT_FAIL,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
     rm -f "$tmp_out"
     # cleanup then continue
     if [[ -f "$CLEAN_SCRIPT" ]]; then bash "$CLEAN_SCRIPT" || true; fi
@@ -150,7 +170,7 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
     val="${!v}"
     if ! [[ "$val" =~ ^-?[0-9]+$ ]]; then
       echo "warn: $v not integer (got: $val); marking as PARSE_FAIL"
-      echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,$T_PRED,PARSE_FAIL,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
+      echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,$T_PRED,PARSE_FAIL,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
       if [[ -f "$CLEAN_SCRIPT" ]]; then bash "$CLEAN_SCRIPT" || true; fi
       continue 2
     fi
@@ -163,23 +183,27 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
     echo "running: bash $GEN_SCRIPT $OUTPUT_JSON"
     if ! bash "$GEN_SCRIPT" "$OUTPUT_JSON"; then
       echo "warn: generator failed"
-      echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,$T_PRED,GEN_FAIL,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
+      echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,$T_PRED,GEN_FAIL,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
       if [[ -f "$CLEAN_SCRIPT" ]]; then bash "$CLEAN_SCRIPT" || true; fi
       continue
     fi
   else
     echo "warn: generator script not found: $GEN_SCRIPT"
-    echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,$T_PRED,GEN_MISSING,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
+    echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,$T_PRED,GEN_MISSING,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
     if [[ -f "$CLEAN_SCRIPT" ]]; then bash "$CLEAN_SCRIPT" || true; fi
     continue
   fi
 
   # 4) build & run (JSON_OUTPUT enables structured result parsing via jq)
   JSON_RESULT="$LOGS_DIR/result.json"
-  echo "make -C \"$MAKE_DIR\" run JSON_OUTPUT=$JSON_RESULT"
-  if ! make -C "$MAKE_DIR" run JSON_OUTPUT="$JSON_RESULT"; then
+  TRACE_MAKE_ARGS=""
+  if [[ -n "$TRACE_ENABLED" ]]; then
+    TRACE_MAKE_ARGS="TRACE_SZ=$TRACE_SZ_DEFAULT TRACE_FILE=$TRACE_RAW"
+  fi
+  echo "make -C \"$MAKE_DIR\" run JSON_OUTPUT=$JSON_RESULT $TRACE_MAKE_ARGS"
+  if ! make -C "$MAKE_DIR" run JSON_OUTPUT="$JSON_RESULT" $TRACE_MAKE_ARGS; then
     echo "warn: make run failed"
-    echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,$T_PRED,RUN_FAIL,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
+    echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,$T_PRED,RUN_FAIL,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
     # if [[ -f "$CLEAN_SCRIPT" ]]; then bash "$CLEAN_SCRIPT" || true; fi
     continue
   fi
@@ -236,11 +260,39 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
     STATUS="NO_LOG"; ERRORS=-1
   fi
 
-  # 6) append to CSV
-  echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,$T_PRED,$STATUS,$ERRORS,$ITERS,$WARMUP,$AVG_US,$MIN_US,$MAX_US" >> "$RESULT_CSV"
+  # 6) trace post-processing
+  TRACE_DISPATCH_US=-1; TRACE_KERN_PCT=-1; TRACE_GFLOPS=-1; HOST_OVERHEAD_US=-1
+
+  if [[ -n "$TRACE_ENABLED" && -f "$TRACE_RAW" ]]; then
+    # Step 1: parse raw hex trace -> trace.json (Perfetto format)
+    if python3 "$PARSE_TRACE" --input "$TRACE_RAW" --mlir "$AIE_MLIR" \
+         --output "$TRACE_JSON" 2>"$LOGS_DIR/parse_trace_err.txt"; then
+
+      # Step 2: analyze trace -> summary JSON
+      if python3 "$ANALYZE_TRACE" --trace "$TRACE_JSON" --tc "$OUTPUT_JSON" \
+           --json-summary "$TRACE_SUMMARY" 2>"$LOGS_DIR/analyze_trace_err.txt"; then
+
+        TRACE_DISPATCH_US=$(jq -r '.dispatch_us // -1' "$TRACE_SUMMARY")
+        TRACE_KERN_PCT=$(jq -r '.kernel_pct // -1' "$TRACE_SUMMARY")
+        TRACE_GFLOPS=$(jq -r '.gflops // -1' "$TRACE_SUMMARY")
+
+        # Host overhead = host chrono time - NPU trace dispatch time
+        if [[ "$AVG_US" != "-1" && "$TRACE_DISPATCH_US" != "-1" ]]; then
+          HOST_OVERHEAD_US=$(python3 -c "print(round($AVG_US - $TRACE_DISPATCH_US, 2))")
+        fi
+      else
+        echo "warn: analyze_trace.py failed for case #$idx"
+      fi
+    else
+      echo "warn: parse_trace.py failed for case #$idx"
+    fi
+  fi
+
+  # 7) append to CSV
+  echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,$T_PRED,$STATUS,$ERRORS,$ITERS,$WARMUP,$AVG_US,$MIN_US,$MAX_US,$TRACE_DISPATCH_US,$TRACE_KERN_PCT,$TRACE_GFLOPS,$HOST_OVERHEAD_US" >> "$RESULT_CSV"
   echo "Result: case #$idx -> $STATUS (errors=$ERRORS, avg=${AVG_US}us, min=${MIN_US}us, max=${MAX_US}us) appended to $RESULT_CSV"
 
-  # 7) clean before next case
+  # 8) clean before next case
   if [[ -z "${SINGLE_IDX:-}" ]]; then
     if [[ -f "$CLEAN_SCRIPT" ]]; then
       echo "cleaning via $CLEAN_SCRIPT ..."
