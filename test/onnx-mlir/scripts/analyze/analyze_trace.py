@@ -318,6 +318,33 @@ def detect_all_transfers(tiles: list[TileData], tc: dict):
         td.res_xfers = detect_mm2s_transfers(
             td.mm2s0_stall, td.mm2s0_done, sizes["res"])
 
+        # Fix phantom kernels: init/teardown code can emit extra
+        # INSTR_EVENT pairs.  kernel[i] pairs with LHS[i] by index,
+        # so we trim trailing extras (no matching LHS) and correct
+        # timestamps of early phantoms whose evt0 fires far before
+        # the paired LHS is done (>5000 cy gap vs ~200 cy normal).
+        if td.lhs_xfers:
+            expected = len(td.lhs_xfers)
+            td.kernels = td.kernels[:expected]
+
+            # Collect gaps (kernel_start − LHS_done) for non-phantom
+            PHANTOM_THRESH = -5000  # cycles
+            normal_gaps = []
+            for i, k in enumerate(td.kernels):
+                gap = k.evt0_ts - td.lhs_xfers[i].done_ts
+                if gap > PHANTOM_THRESH:
+                    normal_gaps.append(gap)
+            ref_gap = min(normal_gaps) if normal_gaps else 0
+
+            # Replace phantom timestamps with estimates
+            for i, k in enumerate(td.kernels):
+                gap = k.evt0_ts - td.lhs_xfers[i].done_ts
+                if gap < PHANTOM_THRESH:
+                    est_start = td.lhs_xfers[i].done_ts + ref_gap
+                    est_end = est_start + k.duration
+                    td.kernels[i] = KernelExec(est_start, est_end,
+                                               k.duration)
+
 
 def compute_combined_res(tiles: list[TileData]) -> list[DmaTransfer]:
     """Compute combined RES transfers from shim perspective.
