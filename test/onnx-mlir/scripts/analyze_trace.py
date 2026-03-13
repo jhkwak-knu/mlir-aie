@@ -902,6 +902,15 @@ def report_summary(tiles: list[TileData], combined_res: list[DmaTransfer],
         print(f"  DMA transfer:      "
               f"{(avg_lhs + avg_res) / avg_total * 100:.1f}%")
 
+        # Combined DMA bandwidth: total bytes / total transfer cycles
+        total_dma_bytes = sizes["lhs"] + sizes["rhs"] + res_total_bytes
+        total_dma_cy = avg_lhs + avg_rhs + avg_res
+        if total_dma_cy > 0:
+            combined_bw = total_dma_bytes / total_dma_cy
+            print(f"  DMA bandwidth:     {combined_bw:.2f} B/cy "
+                  f"({total_dma_bytes:,} B / {fmt_cy(total_dma_cy)} cy, "
+                  f"LHS+RHS+RES)")
+
 
 # ---------------------------------------------------------------------------
 # Main
