@@ -170,6 +170,59 @@ void write_tile_1d_strict(std::vector<T>& mat,
   }
 }
 
+// ---------------------------------------------------------------------------
+// mmul-tiled layout conversion for bf16 mmul<4,8,8>.
+//
+// Row-major tile data is reordered into subtile-contiguous layout so the AIE
+// kernel can use sequential vector loads (aie::load_v) instead of scattered
+// scalar accesses.
+// ---------------------------------------------------------------------------
+
+// bf16 mmul<4,8,8> subtile dimensions (optimal for aie2p).
+constexpr int MMUL_R = 4;  // A/C row subtile height
+constexpr int MMUL_S = 8;  // A/B K subtile width
+constexpr int MMUL_T = 8;  // B/C column subtile width
+
+// Convert row-major data [rows x cols] to mmul-tiled layout where each
+// (sub_rows x sub_cols) subtile is stored contiguously.
+// Output order: for each M-subtile, for each N-subtile, for each row in
+// the subtile, sub_cols contiguous elements.
+template <typename T, int sub_rows, int sub_cols>
+std::vector<T> tile_to_mmul_layout(const T* rowmaj,
+                                   size_t rows, size_t cols) {
+  std::vector<T> tiled(rows * cols);
+  size_t idx = 0;
+  for (size_t mt = 0; mt < rows / sub_rows; ++mt) {
+    for (size_t nt = 0; nt < cols / sub_cols; ++nt) {
+      for (size_t ii = 0; ii < static_cast<size_t>(sub_rows); ++ii) {
+        const T* src = rowmaj + (mt * sub_rows + ii) * cols + nt * sub_cols;
+        std::copy(src, src + sub_cols, tiled.data() + idx);
+        idx += sub_cols;
+      }
+    }
+  }
+  return tiled;
+}
+
+// Convert mmul-tiled layout back to row-major [rows x cols].
+// Inverse of tile_to_mmul_layout.
+template <typename T, int sub_rows, int sub_cols>
+std::vector<T> untile_from_mmul_layout(const T* tiled,
+                                       size_t rows, size_t cols) {
+  std::vector<T> rowmaj(rows * cols);
+  size_t idx = 0;
+  for (size_t mt = 0; mt < rows / sub_rows; ++mt) {
+    for (size_t nt = 0; nt < cols / sub_cols; ++nt) {
+      for (size_t ii = 0; ii < static_cast<size_t>(sub_rows); ++ii) {
+        T* dst = rowmaj.data() + (mt * sub_rows + ii) * cols + nt * sub_cols;
+        std::copy(tiled + idx, tiled + idx + sub_cols, dst);
+        idx += sub_cols;
+      }
+    }
+  }
+  return rowmaj;
+}
+
 // Holds test matrices: input A/B, output C, and CPU reference CRef.
 struct MatrixSet {
   std::vector<DATATYPE> A, B, C, CRef;
@@ -537,13 +590,17 @@ int main(int argc, const char *argv[]) {
           auto tileVec = extract_tile_1d_strict<DATATYPE>(
               matA, tp.M, tp.K, tp.TM, tp.TK, tileRow, tileCol);
 
-          if (chunkACount + tileVec.size() > chunkASize) {
+          // Convert row-major tile to mmul-tiled layout: [TM/4][TK/8][4*8]
+          auto tiledA = tile_to_mmul_layout<DATATYPE, MMUL_R, MMUL_S>(
+              tileVec.data(), tp.TM, tp.TK);
+
+          if (chunkACount + tiledA.size() > chunkASize) {
             std::cerr << "Overflow while writing bufInA\n";
             std::exit(EXIT_FAILURE);
           }
 
-          std::copy(tileVec.begin(), tileVec.end(), bufInA + chunkACount);
-          chunkACount += tileVec.size();
+          std::copy(tiledA.begin(), tiledA.end(), bufInA + chunkACount);
+          chunkACount += tiledA.size();
         }
         if (verbosity >= 2) printMatrix("Chunk A", std::vector<DATATYPE>(bufInA, bufInA + chunkASize), chunkASize / tp.TK, tp.TK);
 
@@ -567,13 +624,18 @@ int main(int argc, const char *argv[]) {
           auto tileVec = extract_tile_1d_strict<DATATYPE>(
               matB, tp.N, tp.K, tp.TN, tp.TK, tileRow, tileCol);
 
-          if (chunkBCount + tileVec.size() > chunkBSize) {
+          // Convert row-major tile to mmul-tiled layout: [TN/8][TK/8][8*8]
+          // B is [N x K] row-major (pre-transposed); subtile is MMUL_T x MMUL_S.
+          auto tiledB = tile_to_mmul_layout<DATATYPE, MMUL_T, MMUL_S>(
+              tileVec.data(), tp.TN, tp.TK);
+
+          if (chunkBCount + tiledB.size() > chunkBSize) {
             std::cerr << "Overflow while writing bufInB\n";
             std::exit(EXIT_FAILURE);
           }
 
-          std::copy(tileVec.begin(), tileVec.end(), bufInB + chunkBCount);
-          chunkBCount += tileVec.size();
+          std::copy(tiledB.begin(), tiledB.end(), bufInB + chunkBCount);
+          chunkBCount += tiledB.size();
         }
         if (verbosity >= 2) printMatrix("Chunk B", std::vector<DATATYPE>(bufInB, bufInB + chunkBSize), chunkBSize / tp.TK, tp.TK);
 
@@ -601,13 +663,17 @@ int main(int argc, const char *argv[]) {
             auto tileVec = extract_tile_1d_strict<DATATYPE>(
                 matC, tp.M, tp.N, tp.TM, tp.TN, tileRow, tileCol);
 
-            if (chunkCCount + tileVec.size() > chunkCSize) {
+            // Convert partial-sum C to mmul-tiled layout: [TM/4][TN/8][4*8]
+            auto tiledC = tile_to_mmul_layout<DATATYPE, MMUL_R, MMUL_T>(
+                tileVec.data(), tp.TM, tp.TN);
+
+            if (chunkCCount + tiledC.size() > chunkCSize) {
               std::cerr << "Overflow while writing bufInC\n";
               std::exit(EXIT_FAILURE);
             }
 
-            std::copy(tileVec.begin(), tileVec.end(), bufInC + chunkCCount);
-            chunkCCount += tileVec.size();
+            std::copy(tiledC.begin(), tiledC.end(), bufInC + chunkCCount);
+            chunkCCount += tiledC.size();
           }
           if (verbosity >= 2) printMatrix("Chunk C", std::vector<DATATYPE>(bufInC, bufInC + chunkCSize), chunkCSize / tp.TN, tp.TN);
         }
@@ -713,7 +779,10 @@ int main(int argc, const char *argv[]) {
                   << "\n";
               }
               
-              std::vector<DATATYPE> tileValue(&bufOut[(tp.TM * tp.TN + PKT_HDR_ELEMS) * idx + PKT_HDR_ELEMS], &bufOut[(tp.TM * tp.TN + PKT_HDR_ELEMS) * (idx + 1)]);
+              // Output tile is in mmul-tiled layout; convert back to row-major.
+              const DATATYPE* tiledOut = &bufOut[(tp.TM * tp.TN + PKT_HDR_ELEMS) * idx + PKT_HDR_ELEMS];
+              auto tileValue = untile_from_mmul_layout<DATATYPE, MMUL_R, MMUL_T>(
+                  tiledOut, tp.TM, tp.TN);
               write_tile_1d_strict<DATATYPE>(matC, tp.M, tp.N, tp.TM, tp.TN, tilePos.first, tilePos.second, tileValue);
             }
           }
