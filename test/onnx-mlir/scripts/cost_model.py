@@ -17,34 +17,20 @@ import argparse
 import json
 import math
 import sys
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Tuple
 
-# ============================================================
-# Paths
-# ============================================================
-THIS_FILE = Path(__file__).resolve()
-ROOT_DIR  = THIS_FILE.parents[1]           # test/onnx-mlir/
-REPO_ROOT = THIS_FILE.parents[3]           # mlir-aie/
-DATA_DIR  = ROOT_DIR / "data"
-OUT_DIR   = ROOT_DIR / "out"
-
-DEFAULT_OP_PATH  = DATA_DIR / "op_list.json"
-DEFAULT_SYS_PATH = REPO_ROOT / "include" / "onnx" / "Target" / "XDNA2" / "xdna2_info.json"
-
-# SW overhead subtracted from HW tile memory (stack, heap, reserved).
-CTILE_RESERVED_BYTES = 4 * 1024
-
-ELEM_SIZE_MAP = {
-    "f16": 2, "bf16": 2, "f32": 4,
-    "i8": 1, "i16": 2, "i32": 4,
-    "ui8": 1, "ui16": 2, "ui32": 4,
-}
-
-# bf16 mmul<4,8,8> shape constraints on tile dimensions (aie2p).
-# 2x2 expansion requires TM % (2*MMUL_R) == 0 and TN % (2*MMUL_T) == 0.
-MMUL_R, MMUL_S, MMUL_T = 4, 8, 8
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from tiling_common import (                       # noqa: E402
+    DEFAULT_OP_PATH, DEFAULT_SYS_PATH,
+    CTILE_RESERVED_BYTES, ELEM_SIZE_MAP, MMUL_R, MMUL_S, MMUL_T,
+    TP_AXIS_M, TP_AXIS_N, TP_AXIS_K,
+    OpCase, SystemInfo,
+    divisors, factor_pairs, ws_bytes,
+    load_op_list, load_system_info, write_tc_list,
+    build_tp_order,
+)
 
 # Hardware coefficients for XDNA2 (Ryzen AI 9 HX 370, Strix Point, TSMC N4P).
 # Sources: AMD XDNA2 spec (256 MACs/cycle BF16 per tile, 32 tiles, ~1.5 GHz),
@@ -56,39 +42,6 @@ ALPHA_CYCLES    = 20     # Cycles per temporal iteration (pipeline drain/fill)
 E_MAC_PJ        = 0.2    # pJ per MAC (TSMC N4P estimate)
 E_DRAM_PJ       = 40     # pJ per Byte DRAM access (LPDDR5X estimate)
 P_STATIC_PJ     = 27     # pJ/Cycle per Tile (default mode, 0.04W @ 1.5 GHz)
-
-# tpOrder axis indices (innermost temporal loop axis).
-TP_ORDER_M, TP_ORDER_N, TP_ORDER_K = 0, 1, 2
-
-
-# ============================================================
-# Data structures
-# ============================================================
-@dataclass
-class OpCase:
-    """Single matrix multiplication specification."""
-    M: int
-    K: int
-    N: int
-    elem_type: str = "bf16"
-
-    @property
-    def elem_bytes(self) -> int:
-        return ELEM_SIZE_MAP.get(self.elem_type.lower(), 4)
-
-
-@dataclass
-class SystemInfo:
-    """Hardware parameters loaded from xdna2_info.json."""
-    total_cores: int
-    comp_tiles_per_col: int
-    max_columns: int
-    spm_size_bytes: int
-    mem_tile_mem_bytes: int
-
-    @property
-    def ct_usable_bytes(self) -> int:
-        return self.spm_size_bytes - CTILE_RESERVED_BYTES
 
 
 @dataclass
@@ -135,67 +88,8 @@ class CostResult:
 
 
 # ============================================================
-# I/O
-# ============================================================
-def load_op_list(path: Path) -> List[OpCase]:
-    if not path.is_file():
-        raise FileNotFoundError(f"op_list.json not found: {path}")
-    with path.open("r", encoding="utf-8") as f:
-        doc = json.load(f)
-    cases = doc.get("cases")
-    if not isinstance(cases, list):
-        raise ValueError("Invalid op_list.json: missing 'cases' array")
-    return [
-        OpCase(
-            M=int(c["M"]), K=int(c["K"]), N=int(c["N"]),
-            elem_type=str(c.get("elemType", "bf16")),
-        )
-        for c in cases
-    ]
-
-
-def load_system_info(path: Path) -> SystemInfo:
-    if not path.is_file():
-        raise FileNotFoundError(f"system info not found: {path}")
-    with path.open("r", encoding="utf-8") as f:
-        doc = json.load(f)
-    sys_obj = doc["system"]
-    device = sys_obj.get("device", {})
-    spm_levels = sys_obj.get("spm_levels", [])
-    if not spm_levels:
-        raise ValueError("empty spm_levels")
-    return SystemInfo(
-        total_cores=int(sys_obj["total_cores"]),
-        comp_tiles_per_col=int(device.get("comp_tiles_per_col", 4)),
-        max_columns=int(device.get("max_columns", 8)),
-        spm_size_bytes=int(spm_levels[0]["spm_size_bytes"]),
-        mem_tile_mem_bytes=int(device.get("mem_tile_mem_bytes", 524288)),
-    )
-
-
-# ============================================================
 # Stage 1: Exhaustive enumeration
 # ============================================================
-def _divisors(n: int) -> List[int]:
-    """All positive divisors of n, sorted ascending."""
-    ds = set()
-    for d in range(1, int(math.isqrt(n)) + 1):
-        if n % d == 0:
-            ds.add(d)
-            ds.add(n // d)
-    return sorted(ds)
-
-
-def _factor_pairs(n: int) -> List[Tuple[int, int]]:
-    """All (a, b) pairs with a * b == n, sorted."""
-    return [(d, n // d) for d in _divisors(n)]
-
-
-def ws_bytes(TM: int, TK: int, TN: int, elem_bytes: int) -> int:
-    """Working-set size for one compute tile: A(TM×TK) + B(TK×TN) + C(TM×TN)."""
-    return elem_bytes * (TM * TK + TK * TN + TM * TN)
-
-
 def enumerate_candidates(op: OpCase, sys_info: SystemInfo) -> List[Candidate]:
     """
     Enumerate ALL (num_cores, SPm, SPn, TPm, TPk, TPn) combinations.
@@ -226,12 +120,12 @@ def enumerate_candidates(op: OpCase, sys_info: SystemInfo) -> List[Candidate]:
     candidates: List[Candidate] = []
     eb = op.elem_bytes
 
-    divs_M = _divisors(op.M)
-    divs_K = _divisors(op.K)
-    divs_N = _divisors(op.N)
+    divs_M = divisors(op.M)
+    divs_K = divisors(op.K)
+    divs_N = divisors(op.N)
 
     for num_cores in range(1, sys_info.total_cores + 1):
-        for SPm, SPn in _factor_pairs(num_cores):
+        for SPm, SPn in factor_pairs(num_cores):
             for TPm in divs_M:
                 for TPk in divs_K:
                     for TPn in divs_N:
@@ -342,12 +236,12 @@ def total_data_bytes(op: OpCase, c: Candidate, tp_order: int) -> int:
     M, K, N = op.M, op.K, op.N
     eb = op.elem_bytes
 
-    if tp_order == TP_ORDER_M:
+    if tp_order == TP_AXIS_M:
         # M innermost: RHS reused across TPm iterations and SPm cores.
         lhs = M * K * c.TPn
         rhs = K * N
         out = 2 * M * N * c.TPk
-    elif tp_order == TP_ORDER_N:
+    elif tp_order == TP_AXIS_N:
         # N innermost: LHS reused across TPn iterations and SPn cores.
         lhs = M * K
         rhs = K * N * c.TPm
@@ -473,7 +367,7 @@ def print_search_summary(
                   f"Tile=({c.TM},{c.TK},{c.TN}) ws={c.ws_bytes}B")
 
 
-TP_ORDER_NAMES = {0: "M", 1: "N", 2: "K"}
+TP_AXIS_NAMES = {0: "M", 1: "N", 2: "K"}
 
 
 def print_cost_summary(op: OpCase, ranked: List[CostResult]) -> None:
@@ -499,7 +393,7 @@ def print_cost_summary(op: OpCase, ranked: List[CostResult]) -> None:
         c = r.candidate
         print(f"  {nc:>5d}  ({c.SPm:>2d},{c.SPn:>2d})  "
               f"({c.TPm:>2d},{c.TPk:>2d},{c.TPn:>2d})  "
-              f"    {TP_ORDER_NAMES[r.tp_order]}  "
+              f"    {TP_AXIS_NAMES[r.tp_order]}  "
               f"{r.t_total:>12.1f}  {r.e_total:>12.1f}  {r.edp:>14.1f}")
 
     # Overall top 5
@@ -508,7 +402,7 @@ def print_cost_summary(op: OpCase, ranked: List[CostResult]) -> None:
         c = r.candidate
         print(f"  #{i+1}  cores={c.num_cores} SP=({c.SPm},{c.SPn}) "
               f"TP=({c.TPm},{c.TPk},{c.TPn}) "
-              f"tpOrder={TP_ORDER_NAMES[r.tp_order]}  "
+              f"tpOrder={TP_AXIS_NAMES[r.tp_order]}  "
               f"T={r.t_total:.1f} E={r.e_total:.1f} EDP={r.edp:.1f}")
 
 
@@ -518,10 +412,7 @@ def print_cost_summary(op: OpCase, ranked: List[CostResult]) -> None:
 def cost_result_to_tc(op: OpCase, cr: CostResult) -> Dict[str, Any]:
     """Convert a CostResult to a flat tc.json entry for the pipeline."""
     c = cr.candidate
-    # tpOrder: [innermost, middle, outermost] as axis IDs (0=M, 1=N, 2=K)
-    # cr.tp_order is the innermost axis; fill remaining with K>M>N default.
-    default_order = [TP_ORDER_K, TP_ORDER_M, TP_ORDER_N]
-    tp_order_full = [cr.tp_order] + [ax for ax in default_order if ax != cr.tp_order]
+    tp_order_full = build_tp_order(cr.tp_order)
     return {
         "M": op.M, "K": op.K, "N": op.N,
         "elemType": op.elem_type,
@@ -537,13 +428,6 @@ def cost_result_to_tc(op: OpCase, cr: CostResult) -> Dict[str, Any]:
             }
         ],
     }
-
-
-def write_tc_list(tc_cases: List[Dict[str, Any]], out_path: Path) -> None:
-    """Write tc_list.json for the build/run pipeline."""
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with out_path.open("w", encoding="utf-8") as f:
-        json.dump({"cases": tc_cases}, f, indent=2)
 
 
 # ============================================================
