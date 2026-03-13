@@ -59,8 +59,11 @@ $(BUILD_DIR)/aie.mlir: $(MLIR_SRCS) | $(BUILD_DIR)
 		-o $(BUILD_DIR)/host.mlir
 
 # 2) Compile kernel (xchesscc)
-$(BUILD_DIR)/kernel.o: $(KERNEL_SRCS) | $(BUILD_DIR)
-	xchesscc $(CHESSCC_FLAGS) -c $< -o $@
+#    Extract tile dimensions from tc.json so the kernel uses compile-time constants.
+TILE_DIMS = $(shell python3 -c "import json; j=json.load(open('$(TC_JSON)')); L=j['levels'][0]; print('-DM_TILE=%d -DK_TILE=%d -DN_TILE=%d' % (L['TM'], L['TK'], L['TN']))")
+
+$(BUILD_DIR)/kernel.o: $(KERNEL_SRCS) $(TC_JSON) | $(BUILD_DIR)
+	xchesscc $(CHESSCC_FLAGS) $(TILE_DIMS) -c $< -o $@
 
 # 3) Generate xclbin/insts.bin with aiecc.py
 $(BUILD_DIR)/final.xclbin: $(BUILD_DIR)/aie.mlir $(BUILD_DIR)/kernel.o
