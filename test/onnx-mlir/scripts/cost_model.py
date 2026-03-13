@@ -42,8 +42,9 @@ ELEM_SIZE_MAP = {
     "ui8": 1, "ui16": 2, "ui32": 4,
 }
 
-# bf16 mmul<4,8,4> shape constraints on tile dimensions.
-MMUL_R, MMUL_S, MMUL_T = 4, 8, 4
+# bf16 mmul<4,8,8> shape constraints on tile dimensions (aie2p).
+# 2x2 expansion requires TM % (2*MMUL_R) == 0 and TN % (2*MMUL_T) == 0.
+MMUL_R, MMUL_S, MMUL_T = 4, 8, 8
 
 # Hardware coefficients for XDNA2 (Ryzen AI 9 HX 370, Strix Point, TSMC N4P).
 # Sources: AMD XDNA2 spec (256 MACs/cycle BF16 per tile, 32 tiles, ~1.5 GHz),
@@ -283,8 +284,8 @@ def c4_column_alignment(c: Candidate, sys_info: SystemInfo) -> bool:
 
 
 def c5_mmul_shape(c: Candidate) -> bool:
-    """C5: Tile dimensions must satisfy bf16 mmul<4,8,4> alignment."""
-    return (c.TM % MMUL_R == 0) and (c.TK % MMUL_S == 0) and (c.TN % MMUL_T == 0)
+    """C5: Tile dimensions must satisfy bf16 mmul<4,8,8> 2x2 expansion alignment."""
+    return (c.TM % (2 * MMUL_R) == 0) and (c.TK % MMUL_S == 0) and (c.TN % (2 * MMUL_T) == 0)
 
 
 @dataclass
