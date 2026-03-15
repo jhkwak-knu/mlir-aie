@@ -19,16 +19,16 @@ import math
 import sys
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import List, Dict, Any, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tiling_common import (                       # noqa: E402
-    DEFAULT_OP_PATH, DEFAULT_SYS_PATH,
+    DEFAULT_OP_PATH, DEFAULT_SYS_PATH, DEFAULT_CALIB_PATH,
     CTILE_RESERVED_BYTES, ELEM_SIZE_MAP, MMUL_R, MMUL_S, MMUL_T,
     TP_AXIS_M, TP_AXIS_N, TP_AXIS_K,
-    OpCase, SystemInfo,
+    OpCase, SystemInfo, CalibCoeffs, DEFAULT_COEFFS,
     divisors, factor_pairs, ws_bytes,
-    load_op_list, load_system_info, write_tc_list,
+    load_op_list, load_system_info, load_calibration, write_tc_list,
     build_tp_order,
 )
 
@@ -257,18 +257,31 @@ def total_data_bytes(op: OpCase, c: Candidate, tp_order: int) -> int:
 
 # --- Performance functions (unit: Cycles) ---
 
-def perf_compute(op: OpCase, c: Candidate) -> float:
-    """T_comp: compute time assuming all cores run in parallel at peak."""
-    return (op.M * op.N * op.K) / (c.SPm * c.SPn * PEAK_MACS)
+def perf_compute(
+    op: OpCase, c: Candidate, coeffs: Optional[CalibCoeffs] = None,
+) -> float:
+    """T_comp: compute time assuming all cores run in parallel."""
+    macs = coeffs.eff_macs if coeffs else PEAK_MACS
+    return (op.M * op.N * op.K) / (c.SPm * c.SPn * macs)
 
 
-def perf_comm(op: OpCase, c: Candidate, tp_order: int) -> float:
+def perf_comm(
+    op: OpCase, c: Candidate, tp_order: int,
+    coeffs: Optional[CalibCoeffs] = None,
+) -> float:
     """T_comm: data transfer time through shared DRAM bandwidth."""
-    return total_data_bytes(op, c, tp_order) / BANDWIDTH_BPC
+    bw = coeffs.bw_eff_bpc if coeffs else BANDWIDTH_BPC
+    return total_data_bytes(op, c, tp_order) / bw
 
 
-def perf_overhead(c: Candidate) -> float:
-    """T_overhead: pipeline drain/fill cost per temporal iteration."""
+def perf_overhead(
+    c: Candidate, coeffs: Optional[CalibCoeffs] = None,
+) -> float:
+    """T_overhead: sync + per-core + startup cost (D+B model when calibrated)."""
+    if coeffs and coeffs.calibrated:
+        return (coeffs.l_sync_cy * c.tp_total
+                + coeffs.l_core_cy * c.num_cores
+                + coeffs.l_startup_cy)
     return ALPHA_CYCLES * (c.TPm * c.TPn * c.TPk)
 
 
@@ -291,11 +304,14 @@ def energy_static(c: Candidate, t_total: float) -> float:
 
 # --- Combined evaluation ---
 
-def evaluate_candidate(op: OpCase, c: Candidate, tp_order: int) -> CostResult:
+def evaluate_candidate(
+    op: OpCase, c: Candidate, tp_order: int,
+    coeffs: Optional[CalibCoeffs] = None,
+) -> CostResult:
     """Evaluate a single candidate with a specific tpOrder."""
-    tc = perf_compute(op, c)
-    tm = perf_comm(op, c, tp_order)
-    to = perf_overhead(c)
+    tc = perf_compute(op, c, coeffs)
+    tm = perf_comm(op, c, tp_order, coeffs)
+    to = perf_overhead(c, coeffs)
     tt = tc + tm + to
 
     edc = energy_dynamic_comp(op)
@@ -314,14 +330,17 @@ def evaluate_candidate(op: OpCase, c: Candidate, tp_order: int) -> CostResult:
 # ============================================================
 # Stage 4: EDP-based optimal selection
 # ============================================================
-def select_optimal(valid: List[Candidate], op: OpCase) -> List[CostResult]:
+def select_optimal(
+    valid: List[Candidate], op: OpCase,
+    coeffs: Optional[CalibCoeffs] = None,
+) -> List[CostResult]:
     """
     For each candidate, evaluate all 3 tpOrders, keep the one with lowest EDP.
     Return the full list sorted by EDP ascending.
     """
     best_per_candidate: List[CostResult] = []
     for c in valid:
-        results = [evaluate_candidate(op, c, tpo) for tpo in (0, 1, 2)]
+        results = [evaluate_candidate(op, c, tpo, coeffs) for tpo in (0, 1, 2)]
         best = min(results, key=lambda r: r.edp)
         best_per_candidate.append(best)
 
@@ -456,15 +475,20 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
                    help="Path to write validation tc_list.json (optional)")
     p.add_argument("--op-index", type=int, default=-1,
                    help="Run only this 0-based op index (-1 = all)")
+    p.add_argument("--calib", default=str(DEFAULT_CALIB_PATH),
+                   help="Path to calibration.json (empty string to skip)")
     return p.parse_args(argv)
 
 
-def process_op(op: OpCase, sys_info: SystemInfo) -> List[CostResult]:
+def process_op(
+    op: OpCase, sys_info: SystemInfo,
+    coeffs: Optional[CalibCoeffs] = None,
+) -> List[CostResult]:
     """Run Stage 1 through Stage 4 for a single op case."""
     all_candidates = enumerate_candidates(op, sys_info)
     valid, filter_results = filter_candidates(all_candidates, op, sys_info)
     print_search_summary(op, len(all_candidates), valid, filter_results)
-    ranked = select_optimal(valid, op)
+    ranked = select_optimal(valid, op, coeffs)
     print_cost_summary(op, ranked)
     return ranked
 
@@ -486,12 +510,25 @@ def main(argv: List[str]) -> int:
         print(f"[ERROR] {e}", file=sys.stderr)
         return 1
 
+    # Load calibration coefficients
+    if args.calib:
+        coeffs = load_calibration(Path(args.calib).resolve())
+    else:
+        coeffs = DEFAULT_COEFFS
+
     print(f"[INFO] {len(ops)} ops from {op_path}")
     print(f"[INFO] HW: {sys_info.total_cores} cores, "
           f"{sys_info.comp_tiles_per_col} tiles/col, "
           f"{sys_info.max_columns} cols, "
           f"{sys_info.spm_size_bytes}B/tile "
           f"(usable {sys_info.ct_usable_bytes}B)")
+    if coeffs.calibrated:
+        print(f"[INFO] Calibration: eff_macs={coeffs.eff_macs}, "
+              f"l_sync={coeffs.l_sync_cy:.0f}, "
+              f"l_core={coeffs.l_core_cy:.0f}, "
+              f"l_startup={coeffs.l_startup_cy:.0f}")
+    else:
+        print(f"[INFO] Calibration: not loaded (using defaults)")
 
     # Select ops to process
     if args.op_index >= 0:
@@ -504,7 +541,7 @@ def main(argv: List[str]) -> int:
 
     all_ranked: Dict[int, List[CostResult]] = {}
     for idx, op in targets:
-        ranked = process_op(op, sys_info)
+        ranked = process_op(op, sys_info, coeffs)
         all_ranked[idx] = ranked
 
     # Write output if requested

@@ -28,8 +28,9 @@ REPO_ROOT = THIS_FILE.parents[4]           # mlir-aie/
 DATA_DIR  = ROOT_DIR / "data"
 OUT_DIR   = ROOT_DIR / "out"
 
-DEFAULT_OP_PATH  = DATA_DIR / "op_list.json"
-DEFAULT_SYS_PATH = REPO_ROOT / "include" / "onnx" / "Target" / "XDNA2" / "xdna2_info.json"
+DEFAULT_OP_PATH    = DATA_DIR / "op_list.json"
+DEFAULT_SYS_PATH   = REPO_ROOT / "include" / "onnx" / "Target" / "XDNA2" / "xdna2_info.json"
+DEFAULT_CALIB_PATH = DATA_DIR / "calibration.json"
 
 
 # ============================================================
@@ -83,6 +84,28 @@ class SystemInfo:
         return self.spm_size_bytes - CTILE_RESERVED_BYTES
 
 
+@dataclass
+class CalibCoeffs:
+    """Cost model coefficients loaded from calibration.json."""
+    eff_macs: float       # Effective MACs/cycle/tile
+    bw_eff_bpc: float     # Effective DMA bandwidth (bytes/cycle)
+    l_sync_cy: float      # Per-temporal-step sync cost (cycles)
+    l_core_cy: float      # Per-core setup cost (cycles)
+    l_startup_cy: float   # One-time NPU startup cost (cycles)
+    calibrated: bool      # True if loaded from file, False if defaults
+
+
+# Pre-calibration fallback: matches original hardcoded constants in cost_model.py
+DEFAULT_COEFFS = CalibCoeffs(
+    eff_macs=256.0,       # PEAK_MACS
+    bw_eff_bpc=4.0,       # BANDWIDTH_BPC
+    l_sync_cy=20.0,       # ALPHA_CYCLES
+    l_core_cy=0.0,
+    l_startup_cy=0.0,
+    calibrated=False,
+)
+
+
 # ============================================================
 # I/O
 # ============================================================
@@ -121,6 +144,22 @@ def load_system_info(path: Path) -> SystemInfo:
         max_columns=int(device.get("max_columns", 8)),
         spm_size_bytes=int(spm_levels[0]["spm_size_bytes"]),
         mem_tile_mem_bytes=int(device.get("mem_tile_mem_bytes", 524288)),
+    )
+
+
+def load_calibration(path: Path = DEFAULT_CALIB_PATH) -> CalibCoeffs:
+    """Load calibration.json. Returns DEFAULT_COEFFS if file is missing."""
+    if not path.is_file():
+        return DEFAULT_COEFFS
+    with path.open("r", encoding="utf-8") as f:
+        doc = json.load(f)
+    return CalibCoeffs(
+        eff_macs=float(doc["eff_macs"]),
+        bw_eff_bpc=float(doc["bw_eff_bpc"]),
+        l_sync_cy=float(doc["l_sync_cy"]),
+        l_core_cy=float(doc.get("l_core_cy", 0)),
+        l_startup_cy=float(doc.get("l_startup_cy", 0)),
+        calibrated=True,
     )
 
 

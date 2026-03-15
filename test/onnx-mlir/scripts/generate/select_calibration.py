@@ -34,8 +34,8 @@ from cost_model import (                                  # noqa: E402
 from tiling_common import (                               # noqa: E402
     DEFAULT_OP_PATH, DEFAULT_SYS_PATH,
     TP_AXIS_M, TP_AXIS_N, TP_AXIS_K,
-    OpCase, SystemInfo,
-    load_op_list, load_system_info, write_tc_list,
+    OpCase, SystemInfo, CalibCoeffs,
+    load_op_list, load_system_info, load_calibration, write_tc_list,
 )
 
 TARGET_CORES = [4, 8, 16, 32]
@@ -55,9 +55,11 @@ def _case_key(cr: CostResult) -> Tuple:
             c.TPm, c.TPk, c.TPn, cr.tp_order)
 
 
-def _edp_best(op: OpCase, c: Candidate) -> CostResult:
+def _edp_best(
+    op: OpCase, c: Candidate, coeffs: CalibCoeffs = None,
+) -> CostResult:
     """Return the tpOrder with lowest EDP for a candidate."""
-    results = [evaluate_candidate(op, c, tpo) for tpo in (0, 1, 2)]
+    results = [evaluate_candidate(op, c, tpo, coeffs) for tpo in (0, 1, 2)]
     return min(results, key=lambda r: r.edp)
 
 
@@ -83,6 +85,7 @@ def log_sample(values: List[int], max_count: int) -> List[int]:
 # ============================================================
 def select_group_a(
     valid: List[Candidate], op: OpCase,
+    coeffs: CalibCoeffs = None,
 ) -> List[CostResult]:
     """Group A: Min TP_total per core count, EDP-best tpOrder.
 
@@ -102,7 +105,7 @@ def select_group_a(
         for c in min_tp_candidates:
             sp = (c.SPm, c.SPn)
             if sp not in seen_sp:
-                results.append(_edp_best(op, c))
+                results.append(_edp_best(op, c, coeffs))
                 seen_sp.add(sp)
             if len(seen_sp) >= 2:
                 break
@@ -111,6 +114,7 @@ def select_group_a(
 
 def select_group_b(
     valid: List[Candidate], op: OpCase, core_count: int = 4,
+    coeffs: CalibCoeffs = None,
 ) -> List[CostResult]:
     """Group B: Fixed cores, varying TP_total with log-spaced sampling.
 
@@ -129,7 +133,7 @@ def select_group_b(
         candidates = [c for c in subset if c.tp_total == tp]
         # Pick EDP-best among candidates with this TP_total
         best = min(
-            (_edp_best(op, c) for c in candidates),
+            (_edp_best(op, c, coeffs) for c in candidates),
             key=lambda r: r.edp,
         )
         results.append(best)
@@ -138,6 +142,7 @@ def select_group_b(
 
 def select_group_c(
     valid: List[Candidate], op: OpCase,
+    coeffs: CalibCoeffs = None,
 ) -> List[CostResult]:
     """Group C: tpOrder comparison — same config with all 3 tpOrders.
 
@@ -169,12 +174,13 @@ def select_group_c(
     results: List[CostResult] = []
     for c in configs:
         for tpo in (TP_AXIS_M, TP_AXIS_N, TP_AXIS_K):
-            results.append(evaluate_candidate(op, c, tpo))
+            results.append(evaluate_candidate(op, c, tpo, coeffs))
     return results
 
 
 def select_group_d(
     valid: List[Candidate], op: OpCase,
+    coeffs: CalibCoeffs = None,
 ) -> List[CostResult]:
     """Group D: SP shape comparison — different (SPm,SPn) at same core count.
 
@@ -200,7 +206,7 @@ def select_group_d(
                 (c for c in sp_candidates if c.tp_total == min_tp),
                 key=lambda c: c.ws_bytes,
             )
-            results.append(_edp_best(op, best_c))
+            results.append(_edp_best(op, best_c, coeffs))
             shapes_picked += 1
             if shapes_picked >= MAX_SP_SHAPES:
                 break
@@ -211,6 +217,7 @@ def select_group_d(
 
 def select_group_e(
     valid: List[Candidate], op: OpCase, core_count: int = 4,
+    coeffs: CalibCoeffs = None,
 ) -> List[CostResult]:
     """Group E: TP axis isolation — only one TP axis > 1.
 
@@ -248,7 +255,7 @@ def select_group_e(
             matching = [c for c in axis_list
                         if getattr(c, axis_name) == tp_val]
             if matching:
-                results.append(_edp_best(op, matching[0]))
+                results.append(_edp_best(op, matching[0], coeffs))
                 picked = True
         if picked:
             used_vals.add(tp_val)
@@ -264,17 +271,18 @@ def select_group_e(
 # ============================================================
 def select_calibration(
     valid: List[Candidate], op: OpCase,
+    coeffs: CalibCoeffs = None,
 ) -> List[CostResult]:
     """Combine all groups, deduplicate, sort by t_total ascending."""
     all_results: List[CostResult] = []
     group_counts: Dict[str, int] = {}
 
     groups = [
-        ("A: core_variation", select_group_a(valid, op)),
-        ("B: tp_variation",   select_group_b(valid, op)),
-        ("C: tpOrder_compare", select_group_c(valid, op)),
-        ("D: sp_shape",       select_group_d(valid, op)),
-        ("E: tp_axis_isolation", select_group_e(valid, op)),
+        ("A: core_variation",    select_group_a(valid, op, coeffs)),
+        ("B: tp_variation",      select_group_b(valid, op, coeffs=coeffs)),
+        ("C: tpOrder_compare",   select_group_c(valid, op, coeffs)),
+        ("D: sp_shape",          select_group_d(valid, op, coeffs)),
+        ("E: tp_axis_isolation", select_group_e(valid, op, coeffs=coeffs)),
     ]
 
     seen: Set[Tuple] = set()
@@ -353,7 +361,13 @@ def main(argv: List[str]) -> int:
         print(f"[ERROR] {e}", file=sys.stderr)
         return 1
 
+    coeffs = load_calibration()
+
     print(f"[INFO] {len(ops)} ops from {op_path}")
+    if coeffs.calibrated:
+        print(f"[INFO] Calibration loaded: eff_macs={coeffs.eff_macs}")
+    else:
+        print(f"[INFO] Calibration: not loaded (using defaults)")
 
     if args.op_index >= 0:
         if args.op_index >= len(ops):
@@ -375,7 +389,7 @@ def main(argv: List[str]) -> int:
             print(f"[WARN] No valid candidates for M={op.M}, K={op.K}, N={op.N}")
             continue
 
-        results, group_counts = select_calibration(valid, op)
+        results, group_counts = select_calibration(valid, op, coeffs)
         print_selection_summary(op, results, group_counts)
         total_selected += len(results)
 
