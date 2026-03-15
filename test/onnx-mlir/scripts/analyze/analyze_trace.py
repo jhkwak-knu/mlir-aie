@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-XDNA2_DEFAULT_CLOCK_MHZ = 1300
+XDNA2_DEFAULT_CLOCK_MHZ = 1500
 # Starvation/stall gaps longer than this are inter-iteration idle periods,
 # not fill-latency bursts within a single transfer.
 LONG_GAP_THRESHOLD = 1000  # cycles
@@ -293,18 +293,40 @@ def compute_data_sizes(tc: dict) -> dict:
     }
 
 
+def _pair_kernel_events(
+    evt0_ts: list[int], evt1_ts: list[int]
+) -> list[KernelExec]:
+    """Pair EVENT_0 (start) with the nearest following EVENT_1 (end).
+
+    Both lists must be sorted ascending.  For each start timestamp, we
+    find the first end timestamp that is >= the start using bisect.
+    This handles stale events at the beginning, duplicate events
+    mid-stream, and dropped events without mis-pairing.
+    """
+    import bisect
+    kernels = []
+    consumed = 0  # tracks how far into evt1_ts we've consumed
+    for start in evt0_ts:
+        # Find the first evt1 >= start that hasn't been consumed yet
+        pos = bisect.bisect_left(evt1_ts, start, lo=consumed)
+        if pos >= len(evt1_ts):
+            break
+        end = evt1_ts[pos]
+        kernels.append(KernelExec(start, end, end - start))
+        consumed = pos + 1
+    return kernels
+
+
 def detect_all_transfers(tiles: list[TileData], tc: dict):
     """Detect DMA transfers for all tiles and build kernel lists."""
     sizes = compute_data_sizes(tc)
 
     for td in tiles:
-        # Kernels
-        n = min(len(td.evt0_ts), len(td.evt1_ts))
-        td.kernels = [
-            KernelExec(td.evt0_ts[i], td.evt1_ts[i],
-                       td.evt1_ts[i] - td.evt0_ts[i])
-            for i in range(n)
-        ]
+        # Kernels: pair each EVENT_0 with the next EVENT_1 by timestamp.
+        # Index-based pairing breaks when stale or duplicate events shift
+        # the alignment.  Using bisect guarantees correct matching even
+        # when extra events are present.
+        td.kernels = _pair_kernel_events(td.evt0_ts, td.evt1_ts)
 
         # S2MM_0 → LHS input
         td.lhs_xfers = detect_s2mm_transfers(
@@ -318,32 +340,26 @@ def detect_all_transfers(tiles: list[TileData], tc: dict):
         td.res_xfers = detect_mm2s_transfers(
             td.mm2s0_stall, td.mm2s0_done, sizes["res"])
 
-        # Fix phantom kernels: init/teardown code can emit extra
-        # INSTR_EVENT pairs.  kernel[i] pairs with LHS[i] by index,
-        # so we trim trailing extras (no matching LHS) and correct
-        # timestamps of early phantoms whose evt0 fires far before
-        # the paired LHS is done (>5000 cy gap vs ~200 cy normal).
-        if td.lhs_xfers:
-            expected = len(td.lhs_xfers)
-            td.kernels = td.kernels[:expected]
-
-            # Collect gaps (kernel_start − LHS_done) for non-phantom
-            PHANTOM_THRESH = -5000  # cycles
-            normal_gaps = []
-            for i, k in enumerate(td.kernels):
-                gap = k.evt0_ts - td.lhs_xfers[i].done_ts
-                if gap > PHANTOM_THRESH:
-                    normal_gaps.append(gap)
-            ref_gap = min(normal_gaps) if normal_gaps else 0
-
-            # Replace phantom timestamps with estimates
-            for i, k in enumerate(td.kernels):
-                gap = k.evt0_ts - td.lhs_xfers[i].done_ts
-                if gap < PHANTOM_THRESH:
-                    est_start = td.lhs_xfers[i].done_ts + ref_gap
-                    est_end = est_start + k.duration
-                    td.kernels[i] = KernelExec(est_start, est_end,
-                                               k.duration)
+        # Drop stale DMA transfers from initialization.  NPU DMA engines
+        # execute a BD during setup before real computation starts,
+        # producing exactly one extra event at the front of each list.
+        # Rules:
+        #   - RES (output): done_ts must be >= first kernel start, since
+        #     output can only complete after the kernel that produces it.
+        #   - LHS/RHS (input): done_ts is naturally before the kernel
+        #     start (data must arrive first).  A stale input transfer is
+        #     one whose done_ts is well before the first kernel AND the
+        #     count exceeds the kernel count (indicating an init extra).
+        if td.kernels:
+            first_k_ts = td.kernels[0].evt0_ts
+            if td.res_xfers and td.res_xfers[0].done_ts < first_k_ts:
+                td.res_xfers = td.res_xfers[1:]
+            if (td.lhs_xfers and td.lhs_xfers[0].done_ts < first_k_ts
+                    and len(td.lhs_xfers) > len(td.kernels)):
+                td.lhs_xfers = td.lhs_xfers[1:]
+            if (td.rhs_xfers and td.rhs_xfers[0].done_ts < first_k_ts
+                    and len(td.rhs_xfers) > len(td.kernels)):
+                td.rhs_xfers = td.rhs_xfers[1:]
 
 
 def compute_combined_res(tiles: list[TileData]) -> list[DmaTransfer]:
@@ -558,9 +574,10 @@ def report_dispatch_breakdown(tiles: list[TileData], tc: dict,
             if last < len(td.kernels):
                 k_first = td.kernels[base]
                 k_last = td.kernels[last]
-                # Index-based matching: first LHS of dispatch, last RES
-                lhs_first = td.lhs_xfers[base] if base < len(td.lhs_xfers) else None
-                res_last = td.res_xfers[last] if last < len(td.res_xfers) else None
+                lhs_first = _find_lhs_for_kernel(td.lhs_xfers,
+                                                 k_first.evt0_ts)
+                res_last = _find_res_for_kernel(td.res_xfers,
+                                                k_last.evt1_ts)
 
                 t_start = lhs_first.start_ts if lhs_first else k_first.evt0_ts
                 t_end = res_last.done_ts if res_last else k_last.evt1_ts
@@ -943,6 +960,32 @@ def report_summary(tiles: list[TileData], combined_res: list[DmaTransfer],
 # Machine-readable summary
 # ---------------------------------------------------------------------------
 
+def _find_lhs_for_kernel(lhs_xfers: list[DmaTransfer],
+                         kernel_start: int) -> DmaTransfer | None:
+    """Find the LHS (input) transfer that feeds this kernel.
+
+    The right LHS is the one whose done_ts is closest to (but <=) the
+    kernel start, since input data must arrive before the kernel runs.
+    """
+    import bisect
+    done_times = [x.done_ts for x in lhs_xfers]
+    pos = bisect.bisect_right(done_times, kernel_start) - 1
+    return lhs_xfers[pos] if pos >= 0 else None
+
+
+def _find_res_for_kernel(res_xfers: list[DmaTransfer],
+                         kernel_end: int) -> DmaTransfer | None:
+    """Find the RES (output) transfer for this kernel.
+
+    The right RES is the one whose start_ts is closest to (but >=) the
+    kernel end, since output DMA starts after the kernel finishes.
+    """
+    import bisect
+    start_times = [x.start_ts for x in res_xfers]
+    pos = bisect.bisect_left(start_times, kernel_end)
+    return res_xfers[pos] if pos < len(res_xfers) else None
+
+
 def compute_summary_dict(tiles: list[TileData], combined_res: list[DmaTransfer],
                          tc: dict, iters_per_dispatch: int,
                          n_dispatches: int, clock_mhz: float) -> dict:
@@ -950,6 +993,8 @@ def compute_summary_dict(tiles: list[TileData], combined_res: list[DmaTransfer],
     ref = tiles[0]
 
     # Dispatch wall-clock (per tile, averaged over tiles and dispatches)
+    # Match DMA events to kernels by timestamp, not by index, to handle
+    # data-reuse patterns where DMA count != kernel count.
     dispatch_durs = []
     kernel_totals = []
     for td in tiles:
@@ -958,8 +1003,10 @@ def compute_summary_dict(tiles: list[TileData], combined_res: list[DmaTransfer],
             last = base + iters_per_dispatch - 1
             if last >= len(td.kernels):
                 continue
-            lhs_first = td.lhs_xfers[base] if base < len(td.lhs_xfers) else None
-            res_last = td.res_xfers[last] if last < len(td.res_xfers) else None
+            lhs_first = _find_lhs_for_kernel(td.lhs_xfers,
+                                             td.kernels[base].evt0_ts)
+            res_last = _find_res_for_kernel(td.res_xfers,
+                                            td.kernels[last].evt1_ts)
             t_start = lhs_first.start_ts if lhs_first else td.kernels[base].evt0_ts
             t_end = res_last.done_ts if res_last else td.kernels[last].evt1_ts
             dispatch_durs.append(t_end - t_start)
@@ -979,8 +1026,8 @@ def compute_summary_dict(tiles: list[TileData], combined_res: list[DmaTransfer],
                 continue
             k = ref.kernels[idx]
             ss_kern.append(k.duration)
-            lhs = ref.lhs_xfers[idx] if idx < len(ref.lhs_xfers) else None
-            res = combined_res[idx] if idx < len(combined_res) else None
+            lhs = _find_lhs_for_kernel(ref.lhs_xfers, k.evt0_ts)
+            res = _find_res_for_kernel(combined_res, k.evt1_ts)
             t_start = lhs.start_ts if lhs else k.evt0_ts
             t_end = res.done_ts if res else k.evt1_ts
             ss_total.append(t_end - t_start)
