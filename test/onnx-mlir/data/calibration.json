@@ -1,0 +1,18 @@
+{
+  "version": 2,
+  "target": "xdna2",
+  "model": "D+B",
+  "eff_macs": 23.15,
+  "bw_eff_bpc": 4.0,
+  "l_sync_cy": 34794,
+  "l_startup_cy": 76000,
+  "l_config_cy": 0,
+  "l_core_cy": 8500,
+  "clock_mhz": 1500,
+  "fitted_from": {
+    "n_samples": 159,
+    "spearman_rho": 0.9729,
+    "mape_pct": 32.6,
+    "ground_truth": "min_us"
+  }
+}
