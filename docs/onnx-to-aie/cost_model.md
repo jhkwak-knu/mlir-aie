@@ -312,66 +312,176 @@ Step 2 — L_SYNC from 4-core temporal cases vs TP_total.
 **Key finding**: Coefficients fitted on 32x32x32 do NOT transfer to 256x256x256.
 This motivated the cross-size calibration effort (Phase 2).
 
-### 5.3 Cross-Size Calibrated Coefficients (calibrate.py, 159 cases)
+### 5.3 Cross-Size Calibrated Coefficients v2 (calibrate.py, 159 cases)
 
-Fitted from 159 cases across 6 matrix sizes (32 to 1024), using the Phase A/C
-procedure described in Section 3.2.
+Initial cross-size calibration (v2). EFF_MACS fitted from trace, overhead via
+OLS + grid search. Ground truth: min_us.
 
-#### EFF_MACS (Phase A)
+| Model | L_SYNC | L_STARTUP | L_CORE | BW_EFF | rho | MAPE |
+|-------|--------|-----------|--------|--------|-----|------|
+| **D+B** | **34,794** | **76,000** | **8,500** | **4.00** | **0.9729** | **32.6%** |
 
-| Metric | Value |
-|--------|-------|
-| EFF_MACS | 23.15 MACs/cycle |
-| N samples | 134 (with valid kernel trace) |
-| Range | [0.0, 26.2] MACs/cycle |
+### 5.4 Trace-Based Measurement Analysis
 
-Compared to the theoretical peak of 256 MACs/cycle, the effective rate is ~9%.
-This reflects the mmul<4,8,8> kernel's 2x2 expansion pattern which achieves
-~51 MACs/cycle for the kernel alone, but trace measurement includes kernel
-dispatch overhead, reducing the effective rate.
+NPU trace 데이터의 신뢰도를 체계적으로 분석하여 v5 캘리브레이션의 기반을 마련했다.
 
-#### Overhead Model Comparison (Phase C)
+#### 5.4.1 Host NPU Time (min_us, avg_us)
 
-Models A~D and E~F use unconstrained OLS, which suffers from multicollinearity
-between TP_total, N_cores, and data_bytes. Model D+B uses a hybrid approach
-(OLS for L_SYNC + MAPE-minimizing grid search for L_CORE and L_STARTUP) to
-avoid this issue.
+Host chrono로 측정하는 `runKernel()` 실행 시간. 10회 측정, 3회 warmup.
 
-| Model | L_SYNC | L_STARTUP | L_CONFIG | L_CORE | BW_EFF | rho | MAPE |
-|-------|--------|-----------|----------|--------|--------|-----|------|
-| A | 34,794 | 0 | 0 | 0 | 4.00 (fixed) | 0.9679 | 45.5% |
-| B (OLS) | 34,786 | 1,752,318 | 0 | 0 | 4.00 (fixed) | 0.9679 | 244.4% |
-| C | 6,412 | 0 | 1,802,550 | 0 | 4.00 (fixed) | 0.9626 | 410.9% |
-| D (OLS) | 34,791 | 0 | 0 | 181,239 | 4.00 (fixed) | 0.8876 | 177.1% |
-| **D+B** | **34,794** | **76,000** | 0 | **8,500** | **4.00 (fixed)** | **0.9729** | **32.6%** |
-| E | 5,620 | 0 | 0 | 0 | 0.05 (fitted) | 0.9037 | 744.5% |
-| F | 4,982 | 0 | 0 | -10,215,133 | 0.05 (fitted) | 0.7976 | 10,408.6% |
+| Size | N | (max-min)/avg | min/avg | 판정 |
+|------|---|---------------|---------|------|
+| 32 | 16 | 51.4% | 0.863 | 짧은 실행 시간으로 인한 자연적 분산 |
+| 64 | 27 | 41.6% | 0.801 | |
+| 128 | 29 | 41.8% | 0.808 | |
+| 256 | 32 | 23.4% | 0.925 | 양호 |
+| 512 | 28 | 7.7% | 0.977 | 우수 |
+| 1024 | 27 | 5.7% | 0.967 | 우수 |
 
-**Selected: Model D+B** — highest Spearman rho (0.9729) and lowest MAPE (32.6%).
+**결론**: min_us, avg_us 모두 신뢰 가능. 소규모 행렬의 높은 분산은 실행 시간이 짧아
+시스템 노이즈가 지배하기 때문이며, 비용 모델 ground truth로 적합.
 
-Note: Models B and D with unconstrained OLS produce physically unreasonable
-coefficients. The constrained D+B approach finds per-component values that are
-both physically interpretable and statistically superior.
+#### 5.4.2 Trace Time (dispatch_cy, ss_iter_cy, matmul_npu_us)
 
-#### calibration.json (Final Output)
+NPU trace에서 추출한 시간 지표들의 신뢰도 분석.
+
+**hw_timer (dispatch_cy)**: BROADCAST_15 Start 명령의 하드웨어 카운터값.
+
+```
+dispatch N Start → [NPU 실행] → Stop → [host idle: memcpy+sync] → dispatch N+1 Start
+                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^
+                                        hw_timer가 이 구간도 포함!
+```
+
+실증 데이터로 확인:
+
+| Case | dispatch_us | min_us | dispatch < min? | idle_us |
+|------|-------------|--------|-----------------|---------|
+| 001 (32x32) | 93.8 | 114.7 | YES | 72.2 |
+| 084 (256x256) | 620.4 | 578.6 | **NO** | 56.8 |
+
+dispatch_cy에 host turnaround (~56-72 us)이 포함되므로 NPU-only 시간으로 사용 불가.
+
+**ss_iter_cy (kernel-to-kernel gap)**: Dispatch 내 연속 커널 시작 간격.
+trace 이벤트 timestamp 기반으로 NPU-only에 가깝지만, `ss_iter * ipd * hs`로
+matmul_npu_us를 계산하면 outlier가 평균을 왜곡하는 문제가 있다.
+
+**ss_kernel_cy**: 커널 이벤트 페어링 (start -> end). 가장 신뢰할 수 있는 지표.
+
+| 지표 | NPU-only? | 신뢰도 | 용도 |
+|------|-----------|--------|------|
+| min_us | 아니오 (XRT overhead 포함) | 높음 | Ground truth |
+| dispatch_cy | 아니오 (host idle 포함) | 중간 | 참고용 |
+| ss_iter_cy | 예 (근사) | 중간 | 구성요소 분석 |
+| ss_kernel_cy | 예 (정확) | 높음 | EFF_MACS 직접 측정 |
+
+#### 5.4.3 _group_boundaries() 버그 수정
+
+`apply_timestamp_corrections()`에서 dispatch 경계를 감지하는 `_group_boundaries()` 함수에
+hw_timer 값 비교 로직 버그가 있었다.
+
+**문제**: 연속 dispatch의 hw_timer 값이 유사하면 (실행 시간이 비슷한 반복 dispatch)
+1000-cycle threshold에 의해 서로 다른 dispatch가 하나로 병합됨.
+
+```
+tile(2,1) hw_timer 값:
+[1]  118,710  ← dispatch 0
+[2]  416,147  ← dispatch 1 (outlier)
+[3]  118,726  ← dispatch 2
+[4]  119,457  ← |119457-118726|=731 < 1000 → dispatch 2에 병합! (BUG)
+...
+[10] 118,706  ← 병합
+```
+
+결과: 10개 dispatch → 4개 그룹 → ss_iter가 3개 값으로만 계산 → outlier 과대영향.
+
+**수정**: hw_timer 값 대신 accumulated timer 간격으로 비교.
+같은 dispatch 경계의 중복 Start만 병합하고, 다른 dispatch의 Start는 분리.
+
+```python
+# Before (bug): hw_timer 값 비교
+if not groups or abs(hw - groups[-1][1]) > 1000:
+
+# After (fix): accumulated timer 간격 비교
+if not groups or (acc - groups[-1][0]) > 1000:
+```
+
+#### 5.4.4 EFF_MACS Trace 직접 측정
+
+ss_kernel_cy로부터 순수 커널 효율을 직접 측정:
+
+```
+EFF_MACS = (TM x TK x TN) / ss_kernel_cy
+```
+
+| 필터 | N | EFF_MACS median |
+|------|---|-----------------|
+| 전체 | 159 | 23.31 |
+| dq >= 0.5 | 136 | **24.28** |
+| dq >= 0.75 | 122 | 24.25 |
+| dq >= 0.99 | 103 | 24.22 |
+
+dq >= 0.5에서 안정적으로 수렴. 타일 크기별 편차가 있으나 (TK=8: ~11, TK=128: ~25),
+단일 대표값으로 24.28 MACs/cy를 사용.
+
+#### 5.4.5 구성요소 분해 결과
+
+trace에서 확인된 실행 시간 구성 비율 (min_us 기준):
+
+| Size | Compute% | DMA% | Overhead% | OH_us |
+|------|----------|------|-----------|-------|
+| 32 | 0.2% | 53.9% | 46.0% | 75.6 |
+| 64 | 0.8% | 69.2% | 28.9% | 78.5 |
+| 128 | 4.6% | 70.4% | 20.7% | 59.1 |
+| 256 | 23.0% | 41.9% | 25.5% | 93.7 |
+| 512 | 22.2% | 54.7% | 15.3% | 310.3 |
+
+소규모 행렬은 DMA + overhead가 지배적이고, 256+ 크기에서 compute 비중이 20%+.
+
+### 5.5 Cross-Size Calibrated Coefficients v5 (Current)
+
+Trace 분석 결과를 반영한 최종 캘리브레이션. v2 대비 변경점:
+
+1. **EFF_MACS = 24.28 (trace 고정)**: ss_kernel_cy에서 직접 측정한 값을 fitting 대신
+   고정값으로 사용. 커널 dispatch overhead가 제거되어 v2의 23.15보다 정확.
+
+2. **archive tc.json 사용**: tc_list.json 재생성으로 인한 불일치 해결. archive_v3의
+   per-case tc.json에서 tpOrder를 로드.
+
+3. **3단계 ultra-fine 그리드 서치**: coarse(2000/10000) → fine(500/2000) →
+   ultra-fine(100/500)로 L_CORE/L_STARTUP 최적화 정밀도 향상.
+
+4. **Ground truth = min_us**: 모든 159건 사용 (trace quality 필터 불필요).
+
+#### Coefficient Evolution (v2 → v5)
+
+| Parameter | v2 | v5 | Change | 원인 |
+|-----------|------|------|--------|------|
+| EFF_MACS | 23.15 (fitted) | **24.28** (trace fixed) | +4.9% | 순수 커널 효율 직접 측정 |
+| L_SYNC | 34,794 | **34,532** | -0.8% | EFF_MACS 변경에 따른 잔차 재조정 |
+| L_CORE | 8,500 | **7,700** | -9.4% | ultra-fine grid로 정밀 최적화 |
+| L_STARTUP | 76,000 | **46,500** | -38.8% | 동일 |
+
+#### calibration.json v5
 
 ```json
 {
-  "version": 2,
-  "target": "xdna2",
+  "version": 5,
   "model": "D+B",
-  "eff_macs": 23.15,
+  "eff_macs": 24.28,
   "bw_eff_bpc": 4.0,
-  "l_sync_cy": 34794,
-  "l_startup_cy": 76000,
-  "l_config_cy": 0,
-  "l_core_cy": 8500,
+  "l_sync_cy": 34532,
+  "l_startup_cy": 46500,
+  "l_core_cy": 7700,
   "clock_mhz": 1500,
   "fitted_from": {
     "n_samples": 159,
-    "spearman_rho": 0.9729,
-    "mape_pct": 32.6,
-    "ground_truth": "min_us"
+    "spearman_rho": 0.9765,
+    "mape_pct": 35.0,
+    "ground_truth": "min_us",
+    "eff_macs_source": "trace ss_kernel_cy median (136 cases, dq>=0.5)",
+    "eff_macs_fixed": true,
+    "tc_source": "archive_v3"
   }
 }
 ```
@@ -380,99 +490,94 @@ both physically interpretable and statistically superior.
 
 | Parameter | Value | Unit | Physical Meaning |
 |-----------|-------|------|-----------------|
-| EFF_MACS | 23.15 | MACs/cycle/core | Effective kernel throughput (includes dispatch overhead) |
+| EFF_MACS | 24.28 | MACs/cycle/core | Pure kernel throughput (trace-measured, no dispatch overhead) |
 | BW_EFF | 4.0 | bytes/cycle | NoC DMA stream bandwidth (fixed) |
-| L_SYNC | 34,794 | cycles (23.2 us) | Per-temporal-step DMA reconfiguration + synchronization |
-| L_CORE | 8,500 | cycles (5.7 us) | Per-core tile initialization, lock + BD setup |
-| L_STARTUP | 76,000 | cycles (50.7 us) | One-time NPU wakeup + instruction transfer |
+| L_SYNC | 34,532 | cycles (23.0 us) | Per-temporal-step DMA reconfiguration + synchronization |
+| L_CORE | 7,700 | cycles (5.1 us) | Per-core tile initialization, lock + BD setup |
+| L_STARTUP | 46,500 | cycles (31.0 us) | One-time NPU wakeup + instruction transfer |
 | CLOCK | 1,500 | MHz | XDNA2 tile clock frequency |
 
 ---
 
-## 6. Evaluation Results
+## 6. Evaluation Results (v5)
 
-### 6.1 Design-Time vs Calibrated (Overall)
+### 6.1 Overall Metrics
 
-| Metric | Design-Time (alpha=20) | Model A | **Model D+B** |
-|--------|----------------------|---------|--------------|
-| Spearman rho | 0.8965 | 0.9679 (+0.07) | **0.9729** (+0.08) |
-| MAPE | 88.1% | 45.5% (-42.6pp) | **32.6%** (-55.5pp) |
-| tp=1 MAPE | — | 76.0% | **20.4%** |
-| tp>1 MAPE | — | 40.6% | **34.9%** |
+| Metric | Design-Time | D+B v2 | **D+B v5** |
+|--------|-------------|--------|------------|
+| Spearman rho | 0.8965 | 0.9729 | **0.9765** |
+| MAPE | 88.1% | 32.6% | **35.0%** |
+| MdAPE | — | — | **33.2%** |
+| Bias% | — | — | +12.1% |
+| Top-1 selection | — | — | **3/6 (50%)** |
+| Top-3 selection | — | — | **6/6 (100%)** |
 | N samples | 159 | 159 | 159 |
 
-Model D+B improves over Model A in both rank ordering (rho +0.005) and
-absolute accuracy (MAPE -12.9pp). The most dramatic improvement is in
-tp=1 cases (76% to 20%) where L_STARTUP and L_CORE terms now capture
-the fixed overhead that Model A cannot represent.
+v5는 v2 대비 rho 개선 (+0.004)되었으나 MAPE가 약간 증가 (+2.4pp).
+이는 EFF_MACS를 trace 직접 측정값(24.28)으로 고정한 결과이며, T_comp의 정확도가
+향상된 대신 overhead 항이 더 많은 분산을 흡수하기 때문이다.
+
+**핵심 개선**: Top-3 selection 100% 달성 — 모든 행렬 크기에서 모델이 예측한
+최적 config이 실측 Top-3 안에 포함된다.
 
 ### 6.2 Per-Size Breakdown
 
-| Size | N | Old rho | D+B rho | Old MAPE | A MAPE | D+B MAPE |
-|------|---|---------|---------|----------|--------|----------|
-| 32x32x32 | 16 | 0.9113 | 0.9142 | 99.0% | 54.1% | **29.9%** |
-| 64x64x64 | 27 | 0.8323 | **0.9492** | 97.3% | 57.1% | **27.1%** |
-| 128x128x128 | 29 | 0.7807 | **0.8775** | 92.5% | 54.2% | **30.8%** |
-| 256x256x256 | 32 | 0.9299 | 0.8579 | 83.5% | 39.3% | **36.5%** |
-| 512x512x512 | 28 | 0.9304 | 0.9173 | 81.6% | 37.9% | **35.2%** |
-| 1024x1024x1024 | 27 | 0.8549 | **0.9381** | 79.7% | 34.6% | **34.1%** |
+| Size | N | rho | MAPE | MdAPE | Bias% |
+|------|---|-----|------|-------|-------|
+| 32x32x32 | 16 | 0.9098 | 30.4% | 26.7% | -19.0% |
+| 64x64x64 | 27 | **0.9722** | 24.5% | 22.0% | -5.8% |
+| 128x128x128 | 29 | **0.9774** | 27.4% | 28.3% | +3.9% |
+| 256x256x256 | 32 | **0.9826** | 37.7% | 32.5% | +28.7% |
+| 512x512x512 | 28 | 0.9186 | 40.5% | 37.6% | +24.1% |
+| 1024x1024x1024 | 27 | 0.9072 | 47.1% | 52.0% | +24.8% |
 
 **Observations**:
-- MAPE is uniformly 27~36% across all sizes (vs 34~57% for Model A).
-- Rho improves significantly for small sizes (64x64 +0.12, 128x128 +0.10)
-  where the L_CORE term differentiates multi-core configurations.
-- 256x256 rho slightly degrades (0.93→0.86) — the K-inner performance
-  reversal effect (see Section 7.1) is not captured by any model.
+- 64~256 크기에서 rho 0.97+ (v2 대비 크게 개선)
+- 소규모 행렬(32, 64)은 under-predict (bias -19%, -6%): overhead 비중이 높아
+  모델이 실제보다 낮게 예측
+- 대규모 행렬(256+)은 over-predict (bias +24~29%): T_dma/T_sync 과대추정
 
 ### 6.3 Per-Core-Count Breakdown
 
-| Cores | N | A MAPE | D+B MAPE | Improvement |
-|-------|---|--------|----------|-------------|
-| 4 | 118 | 43.3% | **34.5%** | -8.8pp |
-| 8 | 14 | 52.4% | **31.1%** | -21.3pp |
-| 16 | 13 | 48.8% | **21.8%** | -27.0pp |
-| 32 | 14 | 53.7% | **32.1%** | -21.6pp |
+| Cores | N | MAPE | Bias% |
+|-------|---|------|-------|
+| 4 | 118 | 40.9% | +18.6% |
+| 8 | 14 | **15.2%** | +5.8% |
+| 16 | 13 | **14.8%** | -9.2% |
+| 32 | 14 | 23.0% | -17.1% |
 
-Multi-core configurations see the largest improvement. The 8~32 core cases
-had 48~54% MAPE under Model A because the per-core overhead was entirely
-unmodeled. Model D+B reduces this to 22~32%.
+8~16 코어에서 MAPE 15% 수준으로 우수한 정확도.
 
-### 6.4 Worst-Case Predictions
+### 6.4 Optimal Configuration Selection
 
-| Case | Cores | SP | TP | T_pred (us) | T_actual (us) | Error |
-|------|-------|----|----|-------------|--------------|-------|
-| 156 | 4 | (2,2) | (64,128,32) | 6,122,668 | 3,123,991 | 96.0% |
-| 129 | 4 | (2,2) | (32,64,16) | 765,485 | 404,399 | 89.3% |
-| 157 | 4 | (4,1) | (32,128,64) | 6,122,668 | 3,272,894 | 87.1% |
-| 126 | 8 | (8,1) | (2,4,4) | 2,457 | 10,911 | 77.5% |
+| Size | N | Top-1 | Top-3 | Regret% |
+|------|---|-------|-------|---------|
+| 32x32x32 | 16 | no | **YES** | +10.4% |
+| 64x64x64 | 27 | no | **YES** | +14.1% |
+| 128x128x128 | 29 | no | **YES** | +12.8% |
+| 256x256x256 | 32 | **YES** | **YES** | 0.0% |
+| 512x512x512 | 28 | **YES** | **YES** | 0.0% |
+| 1024x1024x1024 | 27 | **YES** | **YES** | 0.0% |
 
-The top worst cases are now dominated by **high-TP cases** (156, 129, 157)
-where the model overestimates by ~2x. This suggests per-step overhead
-decreases at very high iteration counts (DMA BD caching, instruction reuse).
-The tp=1 cases (formerly 89% error) have dropped to <70% error.
+Top-1: 3/6 (50%), **Top-3: 6/6 (100%)**
 
-### 6.5 Analysis of Rejected Models
+256+ 크기에서 Top-1 정확도 100%. 소규모에서의 10~14% regret은 overhead 지배적
+환경에서 config 간 차이가 작기 때문이다.
 
-**Model B (OLS, L_STARTUP)**: Unconstrained OLS yields L_STARTUP = 1.75M
-cycles (~1.2 ms), inflated because the intercept absorbs per-core costs.
-MAPE = 244%. The same L_STARTUP mechanism works in D+B because L_CORE
-separates the core-proportional component.
+### 6.5 Component Dominance
 
-**Model C (L_CONFIG x N_host_calls)**: N_host_calls is highly correlated
-with TP_total, causing multicollinearity. Additionally, N_host_calls is
-implementation-dependent (host-side loop structure), reducing universality.
+| Size | Compute% | DMA% | Overhead% |
+|------|----------|------|-----------|
+| 32 | 0.2% | 1.4% | **98.5%** |
+| 64 | 0.9% | 3.6% | **95.6%** |
+| 128 | 5.1% | 10.8% | 84.1% |
+| 256 | 14.6% | 18.6% | 66.8% |
+| 512 | 15.4% | 24.7% | 59.9% |
+| 1024 | 15.8% | 27.0% | 57.2% |
 
-**Model D (OLS, L_CORE x N_cores)**: Unconstrained 2-variable OLS
-produces L_CORE = 181,239 (120 us/core, physically unreasonable).
-N_cores and TP_total are inversely correlated in the dataset, causing
-the OLS to confound per-core cost with per-iteration cost. The
-MAPE-minimizing grid search in D+B avoids this by constraining both
-variables to physically plausible ranges.
-
-**Models E/F (fitted BW)**: BW_FIT = 0.05 B/cycle — unrealistically low
-(80x slower than the theoretical 4 B/cycle). Severe multicollinearity
-between `data_bytes` and `tp_total` prevents the OLS solver from
-separating DMA time from sync overhead.
+소규모 행렬에서는 T_overhead가 98%+를 차지하여 L_SYNC/L_CORE/L_STARTUP의 정확도가
+전체 예측을 결정한다. 256+ 크기에서 compute/DMA 비중이 증가하며 EFF_MACS와 BW_EFF의
+역할이 커진다.
 
 ---
 
@@ -483,40 +588,40 @@ separating DMA time from sync overhead.
 1. **Non-linear temporal overhead**: The per-step cost is not truly constant.
    At very high TP_total (>4096), the model overestimates by ~50% — likely
    due to DMA BD caching and instruction reuse reducing per-step overhead.
-   A power-law model (L_SYNC x TP^beta, beta < 1) could capture this,
-   but would complicate the cost function for EDP optimization.
 
 2. **Serial compute-DMA**: The current implementation runs compute and DMA
    sequentially (no double buffering). Kernel utilization is 0.3~11%.
    The cost model assumes serial execution, which is correct for now but
    will need revision when double buffering is implemented.
 
-3. **K-inner performance reversal**: For sizes >= 256, K-inner tpOrder
-   is empirically slower than M/N-inner despite having fewer DMA ops and
-   less total data transfer. Root cause is not fully understood (see
-   cost_model_validation.md for investigation details). The cost model
-   does not capture this effect.
+3. **EFF_MACS tile-size dependency**: Single EFF_MACS (24.28) cannot capture
+   tile-size-dependent kernel efficiency. TK=8 tiles achieve only ~11 MACs/cy
+   while TK=128+ achieves ~25 MACs/cy. This causes systematic under/over-
+   prediction for specific tile configurations.
 
-4. **EFF_MACS variability**: The fitted EFF_MACS (23.15) includes kernel
-   dispatch overhead mixed into the trace measurement, making it lower
-   than the pure kernel throughput (51.4 MACs/cycle from mmul<4,8,8>).
+4. **Trace matmul_npu_us limitations**: Trace-derived NPU-only time has
+   structural issues: (a) dispatch_cy includes host turnaround, (b) ss_iter
+   outliers distort mean-based aggregation, (c) matmul_npu_us is unsuitable
+   as calibration ground truth. min_us remains the reliable ground truth.
+
+5. **Large-size over-prediction bias**: 256+ sizes have +24~29% systematic
+   bias. T_dma model (fixed 4 B/cy) may overestimate for large contiguous
+   transfers that achieve higher effective bandwidth.
 
 ### 7.2 Future Improvements
 
-1. **Double buffering**: Implementing compute-DMA overlap will fundamentally
-   change the cost model from `T = T_comp + T_dma + T_sync` to
-   `T = max(T_comp, T_dma) + T_sync`, requiring re-calibration.
+1. **Double buffering**: Implementing compute-DMA overlap will change
+   `T = T_comp + T_dma + T_sync` to `T = max(T_comp, T_dma) + T_sync`.
 
-2. **Per-tpOrder coefficients**: Fitting separate L_SYNC values for
-   K-inner vs M/N-inner could capture the K-inner penalty, at the cost
-   of model simplicity.
+2. **EFF_MACS(TK) function**: Per-TK kernel efficiency to capture tile-size
+   dependency. Could reduce MAPE significantly for mixed tile configurations.
 
-3. **Piecewise BW model**: Using different BW_eff for small vs large
-   transfers could address the DMA-bound case inaccuracy.
+3. **Trace-based overhead decomposition**: Use per-dispatch fixed overhead
+   (~115K cy from trace) to refine overhead model structure (separate
+   per-dispatch from per-iteration overhead).
 
-4. **Diminishing per-step cost**: Investigate sub-linear L_SYNC behavior
-   at high TP_total. If confirmed, a log or power-law term could reduce
-   worst-case error from 96% to a more reasonable range.
+4. **Piecewise BW model**: Size-dependent DMA bandwidth to address large-size
+   over-prediction bias.
 
 ---
 
@@ -530,18 +635,37 @@ separating DMA time from sync overhead.
 - **Driver**: amdxdna (timeout=60s)
 - **Measurement**: min_us from warmup=3, iterations=10 runs
 
-## Appendix B: Calibration Command
+## Appendix B: Calibration Commands
 
 ```bash
 cd test/onnx-mlir
+
+# v5 calibration (trace-fixed EFF_MACS + archive tpOrder)
 python3 scripts/analyze/calibrate.py \
-  --csv out/calibration/result.csv \
-  --tc out/calibration/tc_list.json \
+  --csv out/calibration/result_v8_trace.csv \
+  --tc-archive out/calibration/archive_v3 \
+  --ground-truth min_us \
+  --model D+B \
+  --fix-eff-macs 24.28 \
   --output data/calibration.json
+
+# Validation with charts
+python3 scripts/analyze/validate_perf_model.py \
+  --csv out/calibration/result_v8_trace.csv \
+  --tc-archive out/calibration/archive_v3 \
+  --calib data/calibration.json \
+  --ground-truth min_us \
+  --plot out/calibration/plots_v8_final
 ```
 
-Output includes:
-- Phase A: EFF_MACS with distribution statistics
-- Phase C: 7-model comparison table (rho, MAPE, fitted coefficients)
-- Per-size validation (rho and MAPE breakdown)
-- Top 10 worst-case predictions
+### Source Files
+
+| File | Role |
+|------|------|
+| `scripts/analyze/calibrate.py` | D+B coefficient fitting (7-model comparison) |
+| `scripts/analyze/validate_perf_model.py` | 9-section validation report + charts |
+| `scripts/analyze/analyze_trace.py` | NPU trace analysis, ss_iter/dispatch timing |
+| `scripts/analyze/reanalyze_batch.py` | Batch re-analysis of archived trace data |
+| `scripts/analyze/predict_trace_events.py` | Trace data quality scoring |
+| `scripts/analyze/analyze_perf.py` | 9-section performance analysis report |
+| `data/calibration.json` | Fitted coefficients (v5) |
