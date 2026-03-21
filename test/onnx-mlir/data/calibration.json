@@ -1,18 +1,40 @@
 {
-  "version": 2,
+  "version": 5,
   "target": "xdna2",
   "model": "D+B",
-  "eff_macs": 23.15,
+  "eff_macs": 24.28,
   "bw_eff_bpc": 4.0,
-  "l_sync_cy": 34794,
-  "l_startup_cy": 76000,
+  "l_sync_cy": 34532,
+  "l_startup_cy": 46500,
   "l_config_cy": 0,
-  "l_core_cy": 8500,
+  "l_core_cy": 7700,
   "clock_mhz": 1500,
   "fitted_from": {
     "n_samples": 159,
-    "spearman_rho": 0.9729,
-    "mape_pct": 32.6,
-    "ground_truth": "min_us"
+    "spearman_rho": 0.9765,
+    "mape_pct": 35.0,
+    "ground_truth": "min_us",
+    "eff_macs_source": "trace ss_kernel_cy median (136 cases, dq>=0.5)",
+    "eff_macs_fixed": true,
+    "tc_source": "archive_v3"
+  },
+  "energy": {
+    "model": "T-B",
+    "params": {
+      "e_mac_pj": 16.133,
+      "e_dram_pj": 1370.2434,
+      "p_base_uw": 2896414.9,
+      "p_core_uw": 107280.3
+    },
+    "time_column": "avg_us",
+    "time_description": "RAPL measures full execution window including host overhead",
+    "fitted_from": {
+      "n_samples": 96,
+      "min_wall_s": 0.005,
+      "spearman_rho": 0.9794,
+      "mape_pct": 36.7,
+      "ground_truth": "npu_per_iter_uj",
+      "note": "Retained from v3; v7 RAPL data quality insufficient for recalibration"
+    }
   }
 }
