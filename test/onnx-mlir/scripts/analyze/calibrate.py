@@ -69,10 +69,12 @@ class CalibRow:
     K: int
     N: int
     # Measurements
+    actual_us: float     # ground truth (selected via --ground-truth)
     min_us: float
     avg_us: float
     t_total_pred: float
     ss_kernel_cy: int
+    data_quality: float  # trace data quality (0.0-1.0+)
     # tpOrder from tc_list.json
     tp_order: List[int]  # [innermost, middle, outermost]
 
@@ -98,22 +100,65 @@ class CalibRow:
 # ---------------------------------------------------------------------------
 # Loading
 # ---------------------------------------------------------------------------
-def load_and_merge(csv_path: Path, tc_path: Path) -> List[CalibRow]:
-    """Load CSV + tc_list.json, merge on case_index, keep PASS rows only."""
-    with tc_path.open("r", encoding="utf-8") as f:
-        tc_doc = json.load(f)
-    tc_cases = tc_doc["cases"]
+def load_and_merge(
+    csv_path: Path,
+    tc_path: Optional[Path] = None,
+    ground_truth_col: str = "min_us",
+    min_quality: float = 0.0,
+    tc_archive_path: Optional[Path] = None,
+) -> List[CalibRow]:
+    """Load CSV + tiling config, merge on case_index, keep PASS rows only.
+
+    Tiling config (tpOrder) can come from either:
+      - tc_path: tc_list.json (legacy, 0-based indexing)
+      - tc_archive_path: archive directory with per-case tc.json
+
+    Args:
+        ground_truth_col: CSV column to use as ground truth (default: min_us).
+        min_quality: Minimum data_quality threshold; rows below are skipped.
+        tc_archive_path: Path to archive directory (e.g. archive_v3/).
+    """
+    tc_cases = None
+    if tc_path and not tc_archive_path:
+        with tc_path.open("r", encoding="utf-8") as f:
+            tc_doc = json.load(f)
+        tc_cases = tc_doc["cases"]
 
     rows: List[CalibRow] = []
+    skipped_quality = 0
     with csv_path.open("r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             if row["status"] != "PASS":
                 continue
+
+            # Quality filter (trace-based ground truth requires quality gate)
+            dq = float(row.get("data_quality", "1.0"))
+            if dq < min_quality:
+                skipped_quality += 1
+                continue
+
             idx = int(row["case_index"])
-            # tc_list is 0-based, case_index is 1-based
-            tc = tc_cases[idx - 1]
+
+            # Load tiling config from archive or tc_list
+            if tc_archive_path:
+                tc_file = tc_archive_path / f"case_{idx:03d}" / "tc.json"
+                if not tc_file.is_file():
+                    continue
+                with tc_file.open("r", encoding="utf-8") as f2:
+                    tc = json.load(f2)
+            elif tc_cases:
+                tc = tc_cases[idx - 1]
+            else:
+                continue
             lvl = tc["levels"][0]
+
+            gt_val = row.get(ground_truth_col, "")
+            if not gt_val or gt_val in ("-", ""):
+                continue
+            actual_us = float(gt_val)
+            if actual_us <= 0:
+                continue
 
             rows.append(CalibRow(
                 case_index=idx,
@@ -121,12 +166,16 @@ def load_and_merge(csv_path: Path, tc_path: Path) -> List[CalibRow]:
                 TPm=int(row["TPm"]), TPk=int(row["TPk"]), TPn=int(row["TPn"]),
                 TM=int(row["TM"]), TK=int(row["TK"]), TN=int(row["TN"]),
                 M=int(row["M"]), K=int(row["K"]), N=int(row["N"]),
+                actual_us=actual_us,
                 min_us=float(row["min_us"]),
                 avg_us=float(row["avg_us"]),
                 t_total_pred=float(row["t_total_pred"]),
-                ss_kernel_cy=int(row["ss_kernel_cy"]),
+                ss_kernel_cy=int(row.get("ss_kernel_cy", "0")),
+                data_quality=dq,
                 tp_order=lvl["tpOrder"],
             ))
+    if skipped_quality > 0:
+        print(f"[INFO] Skipped {skipped_quality} cases below min_quality={min_quality}")
     return rows
 
 
@@ -157,7 +206,7 @@ def compute_residuals(
     """For each row, compute residual = T_actual - T_comp - T_dma (in cycles)."""
     results = []
     for r in rows:
-        t_actual_cy = r.min_us * CLOCK_MHZ
+        t_actual_cy = r.actual_us * CLOCK_MHZ
         t_comp = (r.M * r.K * r.N) / (r.n_cores * eff_macs)
         op = OpCase(M=r.M, K=r.K, N=r.N, elem_type="bf16")
         cand = Candidate(
@@ -241,7 +290,7 @@ def compute_residuals_no_dma(
     """Residual = T_actual - T_comp (no DMA subtracted), plus data_bytes per row."""
     results = []
     for r in rows:
-        t_actual_cy = r.min_us * CLOCK_MHZ
+        t_actual_cy = r.actual_us * CLOCK_MHZ
         t_comp = (r.M * r.K * r.N) / (r.n_cores * eff_macs)
         op = OpCase(M=r.M, K=r.K, N=r.N, elem_type="bf16")
         cand = Candidate(
@@ -288,7 +337,7 @@ def fit_model_db(
     Returns (l_sync, l_core, l_startup, overhead_preds).
     """
     # Precompute T_actual and (T_comp + T_dma) per row for fast MAPE eval
-    t_actuals_cy = [r.min_us * CLOCK_MHZ for r in rows]
+    t_actuals_cy = [r.actual_us * CLOCK_MHZ for r in rows]
     t_base_cy = [t_act - res for t_act, (_, res) in zip(t_actuals_cy, residuals)]
 
     def _mape_for(l_sync: float, l_core: int, l_startup: int) -> float:
@@ -321,6 +370,16 @@ def fit_model_db(
     STARTUP_FINE = range(max(0, best_ls - 10000), best_ls + 10001, 2000)
     for lc in CORE_FINE:
         for ls in STARTUP_FINE:
+            lsync = _fit_sync(lc, ls)
+            mape = _mape_for(lsync, lc, ls)
+            if mape < best_mape:
+                best_mape, best_lc, best_ls = mape, lc, ls
+
+    # Ultra-fine grid: +/- 1K around best L_CORE, +/- 2K around best L_STARTUP
+    CORE_ULTRA = range(max(0, best_lc - 1000), best_lc + 1001, 100)
+    STARTUP_ULTRA = range(max(0, best_ls - 2000), best_ls + 2001, 500)
+    for lc in CORE_ULTRA:
+        for ls in STARTUP_ULTRA:
             lsync = _fit_sync(lc, ls)
             mape = _mape_for(lsync, lc, ls)
             if mape < best_mape:
@@ -453,7 +512,7 @@ def evaluate_model(
             t_pred_cy = t_comp + t_dma + overhead_preds_cy[i]
         t_pred_us = t_pred_cy / CLOCK_MHZ
         t_preds_us.append(t_pred_us)
-        t_actuals_us.append(r.min_us)
+        t_actuals_us.append(r.actual_us)
 
     rho = spearman_rank_correlation(t_preds_us, t_actuals_us)
     mape = compute_mape(t_preds_us, t_actuals_us)
@@ -504,7 +563,7 @@ def validate_by_size(
     for key, group in sorted(groups.items()):
         old_preds = [r.t_total_pred for r, _ in group]
         new_preds_g = [p for _, p in group]
-        actuals = [r.min_us for r, _ in group]
+        actuals = [r.actual_us for r, _ in group]
 
         old_rho = spearman_rank_correlation(old_preds, actuals)
         new_rho = spearman_rank_correlation(new_preds_g, actuals)
@@ -581,7 +640,7 @@ def print_report(
     print(f"\n--- Per-case detail (top 10 worst error) ---")
     errors = []
     for r, pred in zip(rows, best.predictions):
-        err_pct = abs(pred - r.min_us) / r.min_us * 100 if r.min_us > 0 else 0
+        err_pct = abs(pred - r.actual_us) / r.actual_us * 100 if r.actual_us > 0 else 0
         errors.append((r, pred, err_pct))
     errors.sort(key=lambda x: -x[2])
 
@@ -604,10 +663,27 @@ def write_calibration_json(
     best: FitResult,
     eff_macs: float,
     n_samples: int,
+    ground_truth_col: str = "min_us",
+    min_quality: float = 0.0,
 ) -> None:
     """Write calibration.json with fitted coefficients."""
+    fitted_from: Dict[str, Any] = {
+        "n_samples": n_samples,
+        "spearman_rho": round(best.rho, 4),
+        "mape_pct": round(best.mape, 1),
+        "ground_truth": ground_truth_col,
+    }
+    if min_quality > 0:
+        fitted_from["min_quality"] = min_quality
+    if ground_truth_col != "min_us":
+        fitted_from["ground_truth_description"] = (
+            "hw_timer-based NPU-only execution time"
+            if ground_truth_col == "matmul_npu_us"
+            else ground_truth_col
+        )
+
     doc: Dict[str, Any] = {
-        "version": 2,
+        "version": 4,
         "target": "xdna2",
         "model": best.model,
         "eff_macs": round(eff_macs, 2),
@@ -617,12 +693,7 @@ def write_calibration_json(
         "l_config_cy": round(best.l_config),
         "l_core_cy": round(best.l_core),
         "clock_mhz": CLOCK_MHZ,
-        "fitted_from": {
-            "n_samples": n_samples,
-            "spearman_rho": round(best.rho, 4),
-            "mape_pct": round(best.mape, 1),
-            "ground_truth": "min_us",
-        },
+        "fitted_from": fitted_from,
     }
     atomic_write_json(doc, out_path)
 
@@ -650,25 +721,45 @@ def main(argv: List[str]) -> int:
         description="Fit cost model coefficients from NPU measurements")
     parser.add_argument("--csv", required=True,
                         help="Path to result.csv")
-    parser.add_argument("--tc", required=True,
-                        help="Path to tc_list.json")
+    tc_group = parser.add_mutually_exclusive_group(required=True)
+    tc_group.add_argument("--tc",
+                          help="Path to tc_list.json")
+    tc_group.add_argument("--tc-archive",
+                          help="Path to archive directory (per-case tc.json)")
     parser.add_argument("--output", default="data/calibration.json",
                         help="Path to write calibration.json")
+    parser.add_argument("--ground-truth", default="min_us",
+                        help="CSV column for ground truth (default: min_us)")
+    parser.add_argument("--min-quality", type=float, default=0.0,
+                        help="Minimum data_quality threshold (default: 0.0)")
+    parser.add_argument("--model", default="",
+                        help="Force specific model (e.g. 'D+B') instead of auto-select")
+    parser.add_argument("--fix-eff-macs", type=float, default=0.0,
+                        help="Fix EFF_MACS to this value (skip Phase A fitting)")
     args = parser.parse_args(argv)
 
     csv_path = Path(args.csv).resolve()
-    tc_path = Path(args.tc).resolve()
+    tc_path = Path(args.tc).resolve() if args.tc else None
+    tc_archive_path = Path(args.tc_archive).resolve() if args.tc_archive else None
     out_path = Path(args.output).resolve()
+    gt_col = args.ground_truth
+    min_q = args.min_quality
 
     # Load data
-    rows = load_and_merge(csv_path, tc_path)
+    rows = load_and_merge(csv_path, tc_path, gt_col, min_q,
+                          tc_archive_path=tc_archive_path)
     if not rows:
         print("[ERROR] No PASS rows found", file=sys.stderr)
         return 1
     print(f"[INFO] Loaded {len(rows)} PASS cases")
 
     # Phase A: EFF_MACS
-    eff_macs, eff_samples = fit_eff_macs(rows)
+    if args.fix_eff_macs > 0:
+        eff_macs = args.fix_eff_macs
+        eff_samples = []
+        print(f"[INFO] EFF_MACS fixed at {eff_macs:.2f} (--fix-eff-macs)")
+    else:
+        eff_macs, eff_samples = fit_eff_macs(rows)
 
     # Phase C: Overhead fitting
     residuals = compute_residuals(rows, eff_macs)
@@ -711,11 +802,20 @@ def main(argv: List[str]) -> int:
                            l_sync_f, l_core=l_core_f, bw_eff=bw_f)
 
     fits = [fit_a, fit_b, fit_c, fit_d, fit_db, fit_e, fit_f]
-    best = select_best_model(fits)
+    if args.model:
+        forced = [f for f in fits if f.model == args.model]
+        if not forced:
+            print(f"[ERROR] Model '{args.model}' not found in: "
+                  f"{[f.model for f in fits]}", file=sys.stderr)
+            return 1
+        best = forced[0]
+        print(f"[INFO] Forced model selection: {args.model}")
+    else:
+        best = select_best_model(fits)
 
     # Old model comparison (t_total_pred is in cycles)
     old_preds_us = [r.t_total_pred / CLOCK_MHZ for r in rows]
-    actuals = [r.min_us for r in rows]
+    actuals = [r.actual_us for r in rows]
     old_rho = spearman_rank_correlation(old_preds_us, actuals)
     old_mape = compute_mape(old_preds_us, actuals)
 
@@ -727,7 +827,7 @@ def main(argv: List[str]) -> int:
                  size_metrics, old_rho, old_mape)
 
     # Write output
-    write_calibration_json(out_path, best, eff_macs, len(rows))
+    write_calibration_json(out_path, best, eff_macs, len(rows), gt_col, min_q)
     print(f"\n[INFO] Wrote {out_path}")
 
     return 0

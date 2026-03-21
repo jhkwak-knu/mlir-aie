@@ -93,6 +93,14 @@ class CalibCoeffs:
     l_core_cy: float      # Per-core setup cost (cycles)
     l_startup_cy: float   # One-time NPU startup cost (cycles)
     calibrated: bool      # True if loaded from file, False if defaults
+    # Energy calibration (v3)
+    energy_model: str = ""           # E-A, E-B, E-C, E-D (empty = not calibrated)
+    energy_params: Dict[str, float] = None  # Model-specific fitted parameters
+    energy_calibrated: bool = False  # True if energy section exists in calibration.json
+
+    def __post_init__(self):
+        if self.energy_params is None:
+            self.energy_params = {}
 
 
 # Pre-calibration fallback: matches original hardcoded constants in cost_model.py
@@ -148,11 +156,21 @@ def load_system_info(path: Path) -> SystemInfo:
 
 
 def load_calibration(path: Path = DEFAULT_CALIB_PATH) -> CalibCoeffs:
-    """Load calibration.json. Returns DEFAULT_COEFFS if file is missing."""
+    """Load calibration.json. Returns DEFAULT_COEFFS if file is missing.
+
+    Supports v2 (perf only) and v3 (perf + energy).
+    """
     if not path.is_file():
         return DEFAULT_COEFFS
     with path.open("r", encoding="utf-8") as f:
         doc = json.load(f)
+
+    # Energy calibration (v3)
+    energy_section = doc.get("energy", {})
+    energy_model = energy_section.get("model", "")
+    energy_params = energy_section.get("params", {})
+    energy_calibrated = bool(energy_model)
+
     return CalibCoeffs(
         eff_macs=float(doc["eff_macs"]),
         bw_eff_bpc=float(doc["bw_eff_bpc"]),
@@ -160,6 +178,9 @@ def load_calibration(path: Path = DEFAULT_CALIB_PATH) -> CalibCoeffs:
         l_core_cy=float(doc.get("l_core_cy", 0)),
         l_startup_cy=float(doc.get("l_startup_cy", 0)),
         calibrated=True,
+        energy_model=energy_model,
+        energy_params=energy_params,
+        energy_calibrated=energy_calibrated,
     )
 
 

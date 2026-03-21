@@ -286,20 +286,153 @@ def perf_overhead(
 
 
 # --- Energy functions (unit: pJ) ---
+# When coeffs.energy_calibrated is True, energy_total_calibrated() is used
+# instead of the three component functions below.
 
-def energy_dynamic_comp(op: OpCase) -> float:
+def energy_dynamic_comp(
+    op: OpCase, coeffs: Optional[CalibCoeffs] = None,
+) -> float:
     """E_dynamic_comp: total MAC energy (constant across candidates)."""
-    return op.M * op.N * op.K * E_MAC_PJ
+    if coeffs and coeffs.energy_calibrated:
+        e_mac = coeffs.energy_params.get("e_mac_pj", E_MAC_PJ)
+    else:
+        e_mac = E_MAC_PJ
+    return op.M * op.N * op.K * e_mac
 
 
-def energy_dynamic_comm(op: OpCase, c: Candidate, tp_order: int) -> float:
+def energy_dynamic_comm(
+    op: OpCase, c: Candidate, tp_order: int,
+    coeffs: Optional[CalibCoeffs] = None,
+) -> float:
     """E_dynamic_comm: DRAM access energy proportional to transfer volume."""
-    return total_data_bytes(op, c, tp_order) * E_DRAM_PJ
+    if coeffs and coeffs.energy_calibrated:
+        e_dram = coeffs.energy_params.get("e_byte_pj", E_DRAM_PJ)
+    else:
+        e_dram = E_DRAM_PJ
+    return total_data_bytes(op, c, tp_order) * e_dram
 
 
-def energy_static(c: Candidate, t_total: float) -> float:
+def energy_static(
+    c: Candidate, t_total: float,
+    coeffs: Optional[CalibCoeffs] = None,
+) -> float:
     """E_static: leakage energy for active tiles over total execution time."""
-    return (c.SPm * c.SPn) * P_STATIC_PJ * t_total
+    if coeffs and coeffs.energy_calibrated:
+        p_static = coeffs.energy_params.get("p_static_pj", P_STATIC_PJ)
+    else:
+        p_static = P_STATIC_PJ
+    return (c.SPm * c.SPn) * p_static * t_total
+
+
+def energy_total_calibrated(
+    op: OpCase, c: Candidate, tp_order: int,
+    t_comp: float, t_comm: float, t_overhead: float, t_total: float,
+    coeffs: CalibCoeffs,
+) -> Tuple[float, float, float, float]:
+    """Compute energy using fully calibrated model (E-A/E-B/E-C/E-D).
+
+    Returns (e_comp_pj, e_comm_pj, e_static_pj, e_total_pj).
+    For models that don't decompose into components, e_comp/e_comm/e_static
+    are set to 0 and e_total contains the full prediction.
+    """
+    CLOCK_MHZ = 1500
+    params = coeffs.energy_params
+    model = coeffs.energy_model
+
+    if model == "E-A":
+        p_active_uw = params.get("p_active_uw", 0)
+        e_startup_uj = params.get("e_startup_uj", 0)
+        t_total_us = t_total / CLOCK_MHZ
+        e_total_pj = (p_active_uw * t_total_us / 1e6 + e_startup_uj) * 1e6
+        return 0.0, 0.0, 0.0, e_total_pj
+
+    elif model == "E-B":
+        p_comp = params.get("p_comp_uw", 0)
+        p_dma = params.get("p_dma_uw", 0)
+        p_idle = params.get("p_idle_uw", 0)
+        e_startup = params.get("e_startup_uj", 0)
+        e_comp = p_comp * (t_comp / CLOCK_MHZ) / 1e6 * 1e6   # uW*us/1e6=uJ, *1e6=pJ
+        e_comm = p_dma * (t_comm / CLOCK_MHZ) / 1e6 * 1e6
+        e_static = p_idle * (t_overhead / CLOCK_MHZ) / 1e6 * 1e6
+        e_total_pj = e_comp + e_comm + e_static + e_startup * 1e6
+        return e_comp, e_comm, e_static, e_total_pj
+
+    elif model == "E-C":
+        # Component-based: same structure as theoretical, just different constants
+        e_mac = params.get("e_mac_pj", E_MAC_PJ)
+        e_byte = params.get("e_byte_pj", E_DRAM_PJ)
+        p_static = params.get("p_static_pj", P_STATIC_PJ)
+        e_startup = params.get("e_startup_uj", 0)
+        e_comp = op.M * op.N * op.K * e_mac
+        e_comm = total_data_bytes(op, c, tp_order) * e_byte
+        e_st = (c.SPm * c.SPn) * p_static * t_total
+        e_total_pj = e_comp + e_comm + e_st + e_startup * 1e6
+        return e_comp, e_comm, e_st, e_total_pj
+
+    elif model == "E-D":
+        p_core_uw = params.get("p_core_uw", 0)
+        e_startup = params.get("e_startup_uj", 0)
+        t_total_us = t_total / CLOCK_MHZ
+        n_cores = c.SPm * c.SPn
+        e_total_pj = (p_core_uw * n_cores * t_total_us / 1e6 + e_startup) * 1e6
+        return 0.0, 0.0, 0.0, e_total_pj
+
+    elif model == "E-F":
+        p_base_uw = params.get("p_base_uw", 0)
+        p_core_uw = params.get("p_core_uw", 0)
+        e_startup = params.get("e_startup_uj", 0)
+        t_total_us = t_total / CLOCK_MHZ
+        n_cores = c.SPm * c.SPn
+        e_total_pj = ((p_base_uw + p_core_uw * n_cores) * t_total_us / 1e6
+                      + e_startup) * 1e6
+        return 0.0, 0.0, 0.0, e_total_pj
+
+    elif model == "T-A":
+        # Calibrated theoretical: E = E_mac*MACs + E_dram*bytes + P_static*N*T
+        e_mac = params.get("e_mac_pj", E_MAC_PJ)
+        e_dram = params.get("e_dram_pj", E_DRAM_PJ)
+        p_static = params.get("p_static_pj", P_STATIC_PJ)
+        n_cores = c.SPm * c.SPn
+        e_comp = op.M * op.N * op.K * e_mac
+        e_comm = total_data_bytes(op, c, tp_order) * e_dram
+        e_st = n_cores * p_static * t_total
+        return e_comp, e_comm, e_st, e_comp + e_comm + e_st
+
+    elif model == "T-B":
+        # Base + per-core power: E = E_mac*MACs + E_dram*bytes + (P_base + P_core*N)*T
+        e_mac = params.get("e_mac_pj", E_MAC_PJ)
+        e_dram = params.get("e_dram_pj", E_DRAM_PJ)
+        p_base_uw = params.get("p_base_uw", 0)
+        p_core_uw = params.get("p_core_uw", 0)
+        n_cores = c.SPm * c.SPn
+        t_total_us = t_total / CLOCK_MHZ
+        e_comp = op.M * op.N * op.K * e_mac
+        e_comm = total_data_bytes(op, c, tp_order) * e_dram
+        # P(uW) * t(us) = uW*us = pJ
+        e_st = (p_base_uw + p_core_uw * n_cores) * t_total_us
+        return e_comp, e_comm, e_st, e_comp + e_comm + e_st
+
+    elif model == "T-C":
+        # Base + per-core + startup: same as T-B + E_startup
+        e_mac = params.get("e_mac_pj", E_MAC_PJ)
+        e_dram = params.get("e_dram_pj", E_DRAM_PJ)
+        p_base_uw = params.get("p_base_uw", 0)
+        p_core_uw = params.get("p_core_uw", 0)
+        e_startup = params.get("e_startup_uj", 0)
+        n_cores = c.SPm * c.SPn
+        t_total_us = t_total / CLOCK_MHZ
+        e_comp = op.M * op.N * op.K * e_mac
+        e_comm = total_data_bytes(op, c, tp_order) * e_dram
+        e_st = (p_base_uw + p_core_uw * n_cores) * t_total_us
+        e_total_pj = e_comp + e_comm + e_st + e_startup * 1e6
+        return e_comp, e_comm, e_st, e_total_pj
+
+    else:
+        # Unknown model — fall back to theoretical constants
+        edc = op.M * op.N * op.K * E_MAC_PJ
+        edm = total_data_bytes(op, c, tp_order) * E_DRAM_PJ
+        es = (c.SPm * c.SPn) * P_STATIC_PJ * t_total
+        return edc, edm, es, edc + edm + es
 
 
 # --- Combined evaluation ---
@@ -314,10 +447,14 @@ def evaluate_candidate(
     to = perf_overhead(c, coeffs)
     tt = tc + tm + to
 
-    edc = energy_dynamic_comp(op)
-    edm = energy_dynamic_comm(op, c, tp_order)
-    es = energy_static(c, tt)
-    et = edc + edm + es
+    if coeffs and coeffs.energy_calibrated:
+        edc, edm, es, et = energy_total_calibrated(
+            op, c, tp_order, tc, tm, to, tt, coeffs)
+    else:
+        edc = energy_dynamic_comp(op, coeffs)
+        edm = energy_dynamic_comm(op, c, tp_order, coeffs)
+        es = energy_static(c, tt, coeffs)
+        et = edc + edm + es
 
     return CostResult(
         candidate=c, tp_order=tp_order,
