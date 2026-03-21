@@ -112,8 +112,8 @@ else
 fi
 
 # CSV header (+upgrade if old header exists)
-NEW_HEADER="case_index,numSpm,SPm,SPn,TPm,TPk,TPn,TM,TK,TN,M,K,N,doubleBuffer,t_total_pred,status,errors,iters,warmup,avg_us,min_us,max_us,trace_dispatch_us,trace_kern_pct,trace_gflops,host_overhead_us,ss_iter_cy,ss_kernel_cy"
-NUM_COLUMNS=28
+NEW_HEADER="case_index,numSpm,SPm,SPn,TPm,TPk,TPn,TM,TK,TN,M,K,N,doubleBuffer,t_total_pred,status,errors,iters,warmup,avg_us,min_us,max_us,trace_dispatch_us,trace_kern_pct,trace_gflops,host_overhead_us,ss_iter_cy,ss_kernel_cy,idle_pkg_mw,active_pkg_mw,npu_power_mw,npu_energy_uj,npu_energy_per_iter_uj,wall_elapsed_s,host_steps,matmul_npu_us"
+NUM_COLUMNS=36
 if [[ ! -f "$RESULT_CSV" ]]; then
   mkdir -p "$(dirname "$RESULT_CSV")"
   echo "$NEW_HEADER" > "$RESULT_CSV"
@@ -157,7 +157,7 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
   tmp_out="$(mktemp)"
   if ! jq --indent 4 ".cases[$((idx-1))]" "$INPUT_JSON" > "$tmp_out"; then
     echo "warn: failed to extract case #$idx"
-    echo "$idx,0,0,0,0,0,0,0,0,0,0,0,0,false,-,EXTRACT_FAIL,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
+    echo "$idx,0,0,0,0,0,0,0,0,0,0,0,0,false,-,EXTRACT_FAIL,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
     rm -f "$tmp_out"
     # cleanup then continue
     if [[ -f "$CLEAN_SCRIPT" ]]; then bash "$CLEAN_SCRIPT" || true; fi
@@ -186,7 +186,7 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
     val="${!v}"
     if ! [[ "$val" =~ ^-?[0-9]+$ ]]; then
       echo "warn: $v not integer (got: $val); marking as PARSE_FAIL"
-      echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,$T_PRED,PARSE_FAIL,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
+      echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,$T_PRED,PARSE_FAIL,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
       if [[ -f "$CLEAN_SCRIPT" ]]; then bash "$CLEAN_SCRIPT" || true; fi
       continue 2
     fi
@@ -199,13 +199,13 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
     echo "running: bash $GEN_SCRIPT $OUTPUT_JSON"
     if ! bash "$GEN_SCRIPT" "$OUTPUT_JSON"; then
       echo "warn: generator failed"
-      echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,$T_PRED,GEN_FAIL,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
+      echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,$T_PRED,GEN_FAIL,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
       if [[ -f "$CLEAN_SCRIPT" ]]; then bash "$CLEAN_SCRIPT" || true; fi
       continue
     fi
   else
     echo "warn: generator script not found: $GEN_SCRIPT"
-    echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,$T_PRED,GEN_MISSING,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
+    echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,$T_PRED,GEN_MISSING,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
     if [[ -f "$CLEAN_SCRIPT" ]]; then bash "$CLEAN_SCRIPT" || true; fi
     continue
   fi
@@ -215,16 +215,16 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
   TRACE_MAKE_ARGS=""
   if [[ -n "$TRACE_ENABLED" ]]; then
     # Trace buffer must match MLIR-generated size:
-    # TRACE_PER_STREAM(64KB) * compTilesPerCol(4) * 2(core+mem) * numCols
+    # TRACE_PER_STREAM(256KB) * compTilesPerCol(4) * 2(core+mem) * numCols
     # numCols = numSpm / compTilesPerCol = numSpm / 4
     TRACE_NUM_COLS=$(( numSpm / 4 ))
-    TRACE_SZ=$(( 65536 * 4 * 2 * TRACE_NUM_COLS ))
+    TRACE_SZ=$(( 262144 * 4 * 2 * TRACE_NUM_COLS ))
     TRACE_MAKE_ARGS="TRACE_SZ=$TRACE_SZ TRACE_FILE=$TRACE_RAW"
   fi
   echo "make -C \"$MAKE_DIR\" run JSON_OUTPUT=$JSON_RESULT $TRACE_MAKE_ARGS"
   if ! make -C "$MAKE_DIR" run JSON_OUTPUT="$JSON_RESULT" $TRACE_MAKE_ARGS; then
     echo "warn: make run failed"
-    echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,$T_PRED,RUN_FAIL,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
+    echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,$T_PRED,RUN_FAIL,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
     # if [[ -f "$CLEAN_SCRIPT" ]]; then bash "$CLEAN_SCRIPT" || true; fi
     continue
   fi
@@ -232,6 +232,8 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
   # 5) parse results — prefer JSON (deterministic) over grep (fragile)
   STATUS="FAIL"; ERRORS=-1
   ITERS=-1; WARMUP=-1; AVG_US=-1; MIN_US=-1; MAX_US=-1
+  IDLE_PKG_MW=-1; ACTIVE_PKG_MW=-1; NPU_POWER_MW=-1
+  NPU_ENERGY_UJ=-1; NPU_ENERGY_PER_ITER_UJ=-1; WALL_ELAPSED_S=-1
 
   if [[ -f "$JSON_RESULT" ]]; then
     # Structured JSON written by host --json-output; no regex needed.
@@ -242,6 +244,13 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
     AVG_US="$(jq -r '.avg_us // -1' "$JSON_RESULT")"
     MIN_US="$(jq -r '.min_us // -1' "$JSON_RESULT")"
     MAX_US="$(jq -r '.max_us // -1' "$JSON_RESULT")"
+    # Energy fields (host RAPL measurement)
+    IDLE_PKG_MW="$(jq -r '.idle_pkg_mw // -1' "$JSON_RESULT")"
+    ACTIVE_PKG_MW="$(jq -r '.active_pkg_mw // -1' "$JSON_RESULT")"
+    NPU_POWER_MW="$(jq -r '.npu_power_mw // -1' "$JSON_RESULT")"
+    NPU_ENERGY_UJ="$(jq -r '.npu_energy_uj // -1' "$JSON_RESULT")"
+    NPU_ENERGY_PER_ITER_UJ="$(jq -r '.npu_energy_per_iter_uj // -1' "$JSON_RESULT")"
+    WALL_ELAPSED_S="$(jq -r '.wall_elapsed_s // -1' "$JSON_RESULT")"
   elif [[ -f "$LOG_FILE" ]]; then
     # Fallback: grep-based log parsing for backward compatibility.
     if grep -q 'PASS!' "$LOG_FILE"; then
@@ -284,6 +293,7 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
   # 6) trace post-processing
   TRACE_DISPATCH_US=-1; TRACE_KERN_PCT=-1; TRACE_GFLOPS=-1; HOST_OVERHEAD_US=-1
   SS_ITER_CY=-1; SS_KERNEL_CY=-1
+  HOST_STEPS=-1; MATMUL_NPU_US=-1
 
   if [[ -n "$TRACE_ENABLED" && -f "$TRACE_RAW" ]]; then
     # Step 1: parse raw hex trace -> trace.json (Perfetto format)
@@ -292,6 +302,8 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
 
       # Step 2: analyze trace -> summary JSON
       if python3 "$ANALYZE_TRACE" --trace "$TRACE_JSON" --tc "$OUTPUT_JSON" \
+           --trace-raw "$TRACE_RAW" \
+           --n-dispatches 0 \
            --json-summary "$TRACE_SUMMARY" 2>"$LOGS_DIR/analyze_trace_err.txt"; then
 
         TRACE_DISPATCH_US=$(jq -r '.dispatch_us // -1' "$TRACE_SUMMARY")
@@ -301,9 +313,12 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
         SS_ITER_CY=$(jq -r '.ss_iter_cy // -1' "$TRACE_SUMMARY")
         SS_KERNEL_CY=$(jq -r '.ss_kernel_cy // -1' "$TRACE_SUMMARY")
 
-        # Host overhead = host chrono time - NPU trace dispatch time
-        if [[ "$AVG_US" != "-1" && "$TRACE_DISPATCH_US" != "-1" ]]; then
-          HOST_OVERHEAD_US=$(python3 -c "print(round($AVG_US - $TRACE_DISPATCH_US, 2))")
+        HOST_STEPS=$(jq -r '.host_steps // -1' "$TRACE_SUMMARY")
+        MATMUL_NPU_US=$(jq -r '.matmul_npu_us // -1' "$TRACE_SUMMARY")
+
+        # Host overhead = host chrono time - NPU trace matmul time (per-matmul units)
+        if [[ "$AVG_US" != "-1" && "$MATMUL_NPU_US" != "-1" ]]; then
+          HOST_OVERHEAD_US=$(python3 -c "print(round($AVG_US - $MATMUL_NPU_US, 2))")
         fi
       else
         echo "warn: analyze_trace.py failed for case #$idx"
@@ -314,7 +329,7 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
   fi
 
   # 7) append to CSV
-  echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,$T_PRED,$STATUS,$ERRORS,$ITERS,$WARMUP,$AVG_US,$MIN_US,$MAX_US,$TRACE_DISPATCH_US,$TRACE_KERN_PCT,$TRACE_GFLOPS,$HOST_OVERHEAD_US,$SS_ITER_CY,$SS_KERNEL_CY" >> "$RESULT_CSV"
+  echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,$T_PRED,$STATUS,$ERRORS,$ITERS,$WARMUP,$AVG_US,$MIN_US,$MAX_US,$TRACE_DISPATCH_US,$TRACE_KERN_PCT,$TRACE_GFLOPS,$HOST_OVERHEAD_US,$SS_ITER_CY,$SS_KERNEL_CY,$IDLE_PKG_MW,$ACTIVE_PKG_MW,$NPU_POWER_MW,$NPU_ENERGY_UJ,$NPU_ENERGY_PER_ITER_UJ,$WALL_ELAPSED_S,$HOST_STEPS,$MATMUL_NPU_US" >> "$RESULT_CSV"
   echo "Result: case #$idx -> $STATUS (errors=$ERRORS, avg=${AVG_US}us, min=${MIN_US}us, max=${MAX_US}us) appended to $RESULT_CSV"
 
   # 7b) archive per-case artifacts before cleanup

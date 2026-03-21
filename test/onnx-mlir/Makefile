@@ -88,6 +88,7 @@ run: host all | $(LOGS_DIR)
 		$(if $(STRICT_VERIFY),--strict-verify) \
 		$(if $(TRACE_SZ),--trace_sz $(TRACE_SZ)) \
 		$(if $(TRACE_FILE),--trace_file $(TRACE_FILE)) \
+		$(HOST_ARGS) \
 		> $(LOGS_DIR)/log.txt
 
 # Convenience: print paths

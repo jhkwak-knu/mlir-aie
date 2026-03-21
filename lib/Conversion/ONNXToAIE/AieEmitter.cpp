@@ -63,7 +63,7 @@ static constexpr uint8_t MEM_EVT_DMA_MM2S_0_DONE  = 25;  // RES done
 
 // Shim DMA trace config
 static constexpr uint32_t TRACE_BD_ID      = 15;
-static constexpr uint32_t TRACE_PER_STREAM = 65536;  // bytes per trace stream (64KB)
+static constexpr uint32_t TRACE_PER_STREAM = 262144;  // bytes per trace stream (256KB)
 static constexpr uint32_t XDNA2_COL_SHIFT  = 25;
 static constexpr uint32_t TRACE_BCAST_NUM      = 15;  // broadcast channel for start
 static constexpr uint32_t TRACE_BCAST_STOP_NUM = 14;  // broadcast channel for stop

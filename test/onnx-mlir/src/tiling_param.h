@@ -82,9 +82,13 @@ static inline tilingParam loadTilingParam(const std::string& path) {
 }
 
 // Write structured JSON result to a file for machine-readable log parsing.
+// Energy fields are set to -1 when RAPL measurement is unavailable.
 static inline void writeJsonResult(const std::string &path, const std::string &status,
                                    int errors, int iterations, int warmup,
-                                   double avgUs, double minUs, double maxUs) {
+                                   double avgUs, double minUs, double maxUs,
+                                   double idlePkgMw, double activePkgMw,
+                                   double npuPowerMw, double npuEnergyUj,
+                                   double npuEnergyPerIterUj, double wallElapsedS) {
   json j;
   j["status"] = status;
   j["errors"] = errors;
@@ -93,6 +97,12 @@ static inline void writeJsonResult(const std::string &path, const std::string &s
   j["avg_us"] = avgUs;
   j["min_us"] = minUs;
   j["max_us"] = maxUs;
+  j["idle_pkg_mw"] = idlePkgMw;
+  j["active_pkg_mw"] = activePkgMw;
+  j["npu_power_mw"] = npuPowerMw;
+  j["npu_energy_uj"] = npuEnergyUj;
+  j["npu_energy_per_iter_uj"] = npuEnergyPerIterUj;
+  j["wall_elapsed_s"] = wallElapsedS;
 
   std::ofstream ofs(path);
   if (!ofs) {

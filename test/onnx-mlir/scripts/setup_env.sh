@@ -10,6 +10,8 @@ MLIR_AIE_INSTALL="$MLIR_AIE_ROOT/install"
 AMD_XDNA_TIMEOUT_PATH="/sys/module/amdxdna/parameters/timeout_in_sec"
 AMD_XDNA_TIMEOUT_SEC=60
 
+RAPL_ENERGY_PATH="/sys/class/powercap/intel-rapl:0/energy_uj"
+
 # Activate ironenv (affects current shell because this script is sourced)
 if [[ ! -f "$IRONENV_ACTIVATE" ]]; then
   echo "[error] activate not found: $IRONENV_ACTIVATE" >&2
@@ -37,6 +39,20 @@ if ! echo "$AMD_XDNA_TIMEOUT_SEC" | sudo tee "$AMD_XDNA_TIMEOUT_PATH" >/dev/null
   return 1 2>/dev/null || exit 1
 fi
 echo "[info] amdxdna timeout (after):  $(cat "$AMD_XDNA_TIMEOUT_PATH") sec"
+echo
+
+# Grant read access to RAPL energy counter (resets on reboot)
+if [[ -f "$RAPL_ENERGY_PATH" ]]; then
+  if [[ ! -r "$RAPL_ENERGY_PATH" ]]; then
+    echo "[info] granting read access to RAPL energy counter ..."
+    if ! sudo chmod o+r "$RAPL_ENERGY_PATH"; then
+      echo "[warn] failed to chmod $RAPL_ENERGY_PATH; energy measurement will be unavailable" >&2
+    fi
+  fi
+  echo "[info] RAPL energy counter: readable"
+else
+  echo "[warn] RAPL energy counter not found: $RAPL_ENERGY_PATH" >&2
+fi
 echo
 
 # Print the information of virtual env

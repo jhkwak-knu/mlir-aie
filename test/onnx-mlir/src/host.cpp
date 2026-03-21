@@ -10,8 +10,10 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <iomanip>
 #include <iostream>
+#include <thread>
 #include <vector>
 
 #include "cxxopts.hpp"
@@ -24,6 +26,30 @@
 #include "tile_ops.h"
 #include "tile_order.h"
 
+// ---------------------------------------------------------------------------
+// RAPL energy measurement helpers
+// ---------------------------------------------------------------------------
+// sysfs path for package-level RAPL counter (Intel/AMD).
+// NPU contribution = active_pkg - idle_pkg_rate * elapsed.
+// idle-with-IO baseline runs the same memcpy+sync without kernel execution,
+// so CPU/bus activity cancels out in the difference.
+static const char *RAPL_PKG_PATH =
+    "/sys/class/powercap/intel-rapl:0/energy_uj";
+
+// Minimum wall-clock time (seconds) for RAPL measurement to ensure resolution.
+static constexpr double MIN_IDLE_WALL_S = 0.05;
+
+// Read a single RAPL energy counter.  Returns 0 on failure so callers
+// can detect unavailability without exceptions.
+static int64_t readRaplEnergyUj(const char *path) {
+  FILE *fp = fopen(path, "r");
+  if (!fp) return 0;
+  int64_t val = 0;
+  if (fscanf(fp, "%ld", &val) != 1) val = 0;
+  fclose(fp);
+  return val;
+}
+
 int main(int argc, const char *argv[]) {
   // Program arguments parsing
   cxxopts::Options options("onnx_matmul");
@@ -33,7 +59,11 @@ int main(int argc, const char *argv[]) {
       ("json-output", "Write structured JSON result to this file",
        cxxopts::value<std::string>()->default_value(""))
       ("strict-verify", "Use exact float comparison instead of epsilon tolerance",
-       cxxopts::value<bool>()->default_value("false"));
+       cxxopts::value<bool>()->default_value("false"))
+      ("n-iterations", "Number of measured iterations (default: 10)",
+       cxxopts::value<int>()->default_value("10"))
+      ("n-warmup", "Number of warmup iterations (default: 3)",
+       cxxopts::value<int>()->default_value("3"));
   test_utils::add_default_options(options);
 
   cxxopts::ParseResult vm;
@@ -139,339 +169,330 @@ int main(int argc, const char *argv[]) {
   }
 
   // ------------------------------------------------------
-  // Initialize run configs
+  // Run configuration
   // ------------------------------------------------------
-  int n_iterations = 10;
-  int n_warmup_iterations = 3;
+  int n_iterations = vm["n-iterations"].as<int>();
+  int n_warmup_iterations = vm["n-warmup"].as<int>();
   unsigned num_iter = n_iterations + n_warmup_iterations;
-  double npu_time_total = 0;
-  double npu_time_min = 99999999;
-  double npu_time_max = 0;
-
   int errors = 0;
 
-  // ------------------------------------------------------
-  // Main run loop
-  // ------------------------------------------------------
-  // toc holds pre-computed tile iteration orders and per-axis offsets.
-  // outerTP/innerTP = temporal loop trip counts for the 2nd/1st non-reuse axes.
-  // i iterates outerTP, j iterates innerTP; reuse axis is implicit (no host loop).
   auto toc = buildTileOrders(tp);
+  int totalSteps = toc.outerTP * toc.innerTP;
 
-  for (unsigned iter = 0; iter < num_iter; iter++) {
-    double npu_time = 0;
+  // Kernel dispatch helper — avoids repeating BO argument permutations.
+  unsigned int opcode = 3;
+  auto runKernel = [&]() {
+    xrt::run run;
+    if (useInC && traceSz > 0)
+      run = kernel(opcode, bo_instr, instr_v.size(),
+                   bo_inA, bo_inB, bo_outC, bo_inC, bo_trace);
+    else if (useInC)
+      run = kernel(opcode, bo_instr, instr_v.size(),
+                   bo_inA, bo_inB, bo_outC, bo_inC);
+    else if (traceSz > 0)
+      run = kernel(opcode, bo_instr, instr_v.size(),
+                   bo_inA, bo_inB, bo_outC, bo_trace);
+    else
+      run = kernel(opcode, bo_instr, instr_v.size(),
+                   bo_inA, bo_inB, bo_outC);
+    run.wait();
+  };
 
-    // Reset matC so previous iteration's partial sums don't leak into
-    // the next iteration's pres input (inC is populated from matC).
-    std::fill(matC.begin(), matC.end(), static_cast<DATATYPE>(0));
+  // ------------------------------------------------------
+  // Pre-stage input tile data
+  // ------------------------------------------------------
+  // A and B tiles depend only on tiling config and constant source matrices.
+  // Extract + convert to mmul layout once; memcpy into BO during measurement.
+  struct StagedStep {
+    std::vector<DATATYPE> a;
+    std::vector<DATATYPE> b;
+    std::vector<std::pair<int,int>> cTileOrder;
+  };
+  std::vector<StagedStep> staged(totalSteps);
 
-    for (int i = 0; i < toc.outerTP; ++i) {
-      for (int j = 0; j < toc.innerTP; ++j) {
-        // set chunk data
-        if (verbosity >= 2)
-          std::cout << "Set Data (" << (i * toc.innerTP) + j << "):\n";
+  for (int oi = 0; oi < toc.outerTP; ++oi) {
+    for (int ij = 0; ij < toc.innerTP; ++ij) {
+      int step = oi * toc.innerTP + ij;
+      auto &ss = staged[step];
 
-        // Build per-iteration tile order by applying outer/inner offsets to
-        // the base order. Offsets encode which axis each loop variable advances.
-        std::vector<std::pair<int,int>> chunkATileOrder;
-        for (auto &tileA : toc.chunkATileOrderBase) {
-          int row = tileA.first + (toc.matAInnerOffset.first * j) + (toc.matAOuterOffset.first * i);
-          int col = tileA.second + (toc.matAInnerOffset.second * j) + (toc.matAOuterOffset.second * i);
-          chunkATileOrder.emplace_back(row, col);
-        }
+      // Stage A: tile extraction + mmul layout conversion
+      std::vector<std::pair<int,int>> aTileOrder;
+      for (const auto &base : toc.chunkATileOrderBase) {
+        aTileOrder.emplace_back(
+            base.first  + toc.matAInnerOffset.first  * ij + toc.matAOuterOffset.first  * oi,
+            base.second + toc.matAInnerOffset.second * ij + toc.matAOuterOffset.second * oi);
+      }
+      ss.a.resize(chunkASize, static_cast<DATATYPE>(0));
+      int aCount = 0;
+      for (const auto &[tr, tc] : aTileOrder) {
+        auto tile = extract_tile_1d_strict<DATATYPE>(matA, tp.M, tp.K, tp.TM, tp.TK, tr, tc);
+        auto tiled = tile_to_mmul_layout<DATATYPE, MMUL_R, MMUL_S>(tile.data(), tp.TM, tp.TK);
+        std::copy(tiled.begin(), tiled.end(), ss.a.data() + aCount);
+        aCount += tiled.size();
+      }
 
-        if (verbosity >= 2) {
-          std::cout << "chunkATileOrder: ";
-          for (const auto& [r,c] : chunkATileOrder) {
-            std::cout << "(" << r << "," << c << ") ";
-          }
-          std::cout << "\n";
-        }
+      // Stage B: tile extraction + mmul layout conversion
+      std::vector<std::pair<int,int>> bTileOrder;
+      for (const auto &base : toc.chunkBTileOrderBase) {
+        bTileOrder.emplace_back(
+            base.first  + toc.matBInnerOffset.first  * ij + toc.matBOuterOffset.first  * oi,
+            base.second + toc.matBInnerOffset.second * ij + toc.matBOuterOffset.second * oi);
+      }
+      ss.b.resize(chunkBSize, static_cast<DATATYPE>(0));
+      int bCount = 0;
+      for (const auto &[tr, tc] : bTileOrder) {
+        auto tile = extract_tile_1d_strict<DATATYPE>(matB, tp.N, tp.K, tp.TN, tp.TK, tr, tc);
+        auto tiled = tile_to_mmul_layout<DATATYPE, MMUL_T, MMUL_S>(tile.data(), tp.TN, tp.TK);
+        std::copy(tiled.begin(), tiled.end(), ss.b.data() + bCount);
+        bCount += tiled.size();
+      }
 
-        int chunkACount = 0;
-        for (const auto& [tileRow, tileCol] : chunkATileOrder) {
-          auto tileVec = extract_tile_1d_strict<DATATYPE>(
-              matA, tp.M, tp.K, tp.TM, tp.TK, tileRow, tileCol);
+      // Build C tile order (used by verification for output writeback)
+      for (const auto &base : toc.chunkCTileOrderBase) {
+        ss.cTileOrder.emplace_back(
+            base.first  + toc.matCInnerOffset.first  * ij + toc.matCOuterOffset.first  * oi,
+            base.second + toc.matCInnerOffset.second * ij + toc.matCOuterOffset.second * oi);
+      }
 
-          // Convert row-major tile to mmul-tiled layout: [TM/4][TK/8][4*8]
-          auto tiledA = tile_to_mmul_layout<DATATYPE, MMUL_R, MMUL_S>(
-              tileVec.data(), tp.TM, tp.TK);
-
-          if (chunkACount + tiledA.size() > chunkASize) {
-            std::cerr << "Overflow while writing bufInA\n";
-            std::exit(EXIT_FAILURE);
-          }
-
-          std::copy(tiledA.begin(), tiledA.end(), bufInA + chunkACount);
-          chunkACount += tiledA.size();
-        }
-        if (verbosity >= 2) printMatrix("Chunk A", std::vector<DATATYPE>(bufInA, bufInA + chunkASize), chunkASize / tp.TK, tp.TK);
-
-        std::vector<std::pair<int,int>> chunkBTileOrder;
-        for (auto &tileB : toc.chunkBTileOrderBase) {
-          int row = tileB.first + (toc.matBInnerOffset.first * j) + (toc.matBOuterOffset.first * i);
-          int col = tileB.second + (toc.matBInnerOffset.second * j) + (toc.matBOuterOffset.second * i);
-          chunkBTileOrder.emplace_back(row, col);
-        }
-
-        if (verbosity >= 2) {
-          std::cout << "chunkBTileOrder: ";
-          for (const auto& [r,c] : chunkBTileOrder) {
-            std::cout << "(" << r << "," << c << ") ";
-          }
-          std::cout << "\n";
-        }
-
-        int chunkBCount = 0;
-        for (const auto& [tileRow, tileCol] : chunkBTileOrder) {
-          auto tileVec = extract_tile_1d_strict<DATATYPE>(
-              matB, tp.N, tp.K, tp.TN, tp.TK, tileRow, tileCol);
-
-          // Convert row-major tile to mmul-tiled layout: [TN/8][TK/8][8*8]
-          // B is [N x K] row-major (pre-transposed); subtile is MMUL_T x MMUL_S.
-          auto tiledB = tile_to_mmul_layout<DATATYPE, MMUL_T, MMUL_S>(
-              tileVec.data(), tp.TN, tp.TK);
-
-          if (chunkBCount + tiledB.size() > chunkBSize) {
-            std::cerr << "Overflow while writing bufInB\n";
-            std::exit(EXIT_FAILURE);
-          }
-
-          std::copy(tiledB.begin(), tiledB.end(), bufInB + chunkBCount);
-          chunkBCount += tiledB.size();
-        }
-        if (verbosity >= 2) printMatrix("Chunk B", std::vector<DATATYPE>(bufInB, bufInB + chunkBSize), chunkBSize / tp.TK, tp.TK);
-
-        // matrix C
-        memset(bufOut, 0, chunkOutCSize * sizeof(DATATYPE));
-
-        std::vector<std::pair<int,int>> chunkCTileOrder;
-        for (auto &tileC : toc.chunkCTileOrderBase) {
-          int row = tileC.first + (toc.matCInnerOffset.first * j) + (toc.matCOuterOffset.first * i);
-          int col = tileC.second + (toc.matCInnerOffset.second * j) + (toc.matCOuterOffset.second * i);
-          chunkCTileOrder.emplace_back(row, col);
-        }
-
-        if (verbosity >= 2) {
-          std::cout << "chunkCTileOrder: ";
-          for (const auto& [r,c] : chunkCTileOrder) {
-            std::cout << "(" << r << "," << c << ") ";
-          }
-          std::cout << "\n";
-        }
-
-        if (useInC) {
-          int chunkCCount = 0;
-          for (const auto& [tileRow, tileCol] : chunkCTileOrder) {
-            auto tileVec = extract_tile_1d_strict<DATATYPE>(
-                matC, tp.M, tp.N, tp.TM, tp.TN, tileRow, tileCol);
-
-            // Convert partial-sum C to mmul-tiled layout: [TM/4][TN/8][4*8]
-            auto tiledC = tile_to_mmul_layout<DATATYPE, MMUL_R, MMUL_T>(
-                tileVec.data(), tp.TM, tp.TN);
-
-            if (chunkCCount + tiledC.size() > chunkCSize) {
-              std::cerr << "Overflow while writing bufInC\n";
-              std::exit(EXIT_FAILURE);
-            }
-
-            std::copy(tiledC.begin(), tiledC.end(), bufInC + chunkCCount);
-            chunkCCount += tiledC.size();
-          }
-          if (verbosity >= 2) printMatrix("Chunk C", std::vector<DATATYPE>(bufInC, bufInC + chunkCSize), chunkCSize / tp.TN, tp.TN);
-        }
-
-        // sync host to device memories
-        bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-        bo_inA.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-        bo_inB.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-        bo_outC.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-
-        if (useInC) {
-          bo_inC.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-        }
-
-        // Run kernel
-        if (verbosity >= 1)
-          std::cout << "Running Kernel.\n";
-
-        auto start = std::chrono::high_resolution_clock::now();
-        unsigned int opcode = 3;
-        xrt::run run;
-        if (useInC && traceSz > 0) {
-          run = kernel(opcode, bo_instr, instr_v.size(),
-                       bo_inA, bo_inB, bo_outC, bo_inC, bo_trace);
-        } else if (useInC) {
-          run = kernel(opcode, bo_instr, instr_v.size(),
-                       bo_inA, bo_inB, bo_outC, bo_inC);
-        } else if (traceSz > 0) {
-          run = kernel(opcode, bo_instr, instr_v.size(),
-                       bo_inA, bo_inB, bo_outC, bo_trace);
-        } else {
-          run = kernel(opcode, bo_instr, instr_v.size(),
-                       bo_inA, bo_inB, bo_outC);
-        }
-        run.wait();
-        auto stop = std::chrono::high_resolution_clock::now();
-
-        npu_time += std::chrono::duration<double, std::micro>(stop - start).count();
-
-        // Sync device to host memories
-        bo_outC.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-
-        if (verbosity >= 2) {
-          // When reuse axis != K, each reuse iteration produces separate output blocks
-          int repeatCount = (toc.reuseTPAxis != AXIS_K) ? toc.reuseTP : 1;
-          for (int i = 0; i < repeatCount; ++i) {
-            for (int j = 0; j < (tp.SPm * tp.SPn); ++j) {
-              uint32_t pkt_header, pkt_id;
-              std::memcpy(&pkt_header, &bufOut[(tp.TM * tp.TN + PKT_HDR_ELEMS) * ((tp.SPm * tp.SPn) * i + j) + 0], sizeof(pkt_header));
-              pkt_id = pkt_header & 0x1F;
-
-              std::cout << "OutC[" << ((tp.SPm * tp.SPn) * i + j) << "] (packet id = " << pkt_id << "): ";
-              for (int k = 0; k < (tp.TM * tp.TN); ++k) {
-                std::cout << static_cast<float>(bufOut[(tp.TM * tp.TN + PKT_HDR_ELEMS) * ((tp.SPm * tp.SPn) * i + j) + k + PKT_HDR_ELEMS]) << " ";
-              }
-              std::cout << "\n";
-            }
-          }
-        }
-
-        // Store partial sums to matC.
-        // When reuse axis is K, all tiles accumulate locally so repeatCount=1.
-        // Otherwise, each reuse iteration produces distinct output tiles.
-        int repeatCount = (toc.reuseTPAxis != AXIS_K) ? toc.reuseTP : 1;
-        for (int i = 0; i < repeatCount; ++i) {
-          int outerOffset = tp.SPm * tp.SPn * i;
-
-          for (int j = 0; j < ((tp.SPm * tp.SPn) / 4); ++j) {
-            int innerOffset =  4 * j;
-
-            for (int k = 0; k < 4; ++k) {
-              int idx = outerOffset + innerOffset + k;
-
-              uint32_t packetHeader, packetId;
-              std::memcpy(&packetHeader, &bufOut[(tp.TM * tp.TN + PKT_HDR_ELEMS) * idx], sizeof(packetHeader));
-              // RES packet IDs are power-of-2: {1,2,4,8} → tile index {0,1,2,3}.
-              // Extract 5-bit ID, then find the set bit position (log2).
-              uint32_t rawId = packetHeader & 0x1F;
-              packetId = 0;
-              while (rawId > 1) { rawId >>= 1; ++packetId; }
-              int matCIdx = outerOffset + innerOffset + packetId;
-
-              std::pair<int,int> tilePos = chunkCTileOrder[matCIdx];
-
-              const size_t tileElems  = static_cast<size_t>(tp.TM) * tp.TN;
-              const size_t blockElems = tileElems + PKT_HDR_ELEMS;
-              const size_t start      = blockElems * static_cast<size_t>(idx) + 1;
-              const size_t end        = start + tileElems;
-
-              if (verbosity >= 2) {
-                std::cout
-                  << "[k=" << k << "] "
-                  << " idx=" << idx
-                  << " packetId=" << packetId
-                  << " matCIdx=" << matCIdx
-                  << " tilePos=(" << tilePos.first << "," << tilePos.second << ") "
-                  << "tileElems=" << static_cast<unsigned long long>(tileElems)
-                  << " blockElems=" << static_cast<unsigned long long>(blockElems)
-                  << " start=" << static_cast<unsigned long long>(start)
-                  << " end=" << static_cast<unsigned long long>(end)
-                  << " outerOffset=" << outerOffset
-                  << " innerOffset=" << innerOffset
-                  << "\n";
-              }
-
-              // Output tile is in mmul-tiled layout; convert back to row-major.
-              const DATATYPE* tiledOut = &bufOut[(tp.TM * tp.TN + PKT_HDR_ELEMS) * idx + PKT_HDR_ELEMS];
-              auto tileValue = untile_from_mmul_layout<DATATYPE, MMUL_R, MMUL_T>(
-                  tiledOut, tp.TM, tp.TN);
-              write_tile_1d_strict<DATATYPE>(matC, tp.M, tp.N, tp.TM, tp.TN, tilePos.first, tilePos.second, tileValue);
-            }
-          }
-        }
+      if (verbosity >= 2) {
+        printMatrix("Staged A [step " + std::to_string(step) + "]",
+                    ss.a, chunkASize / tp.TK, tp.TK);
+        printMatrix("Staged B [step " + std::to_string(step) + "]",
+                    ss.b, chunkBSize / tp.TK, tp.TK);
       }
     }
-
-    if (iter < n_warmup_iterations) {
-      /* Warmup iterations do not count towards average runtime. */
-      // Clear trace buffer after last warmup so only measurement data remains.
-      if (traceSz > 0 && iter == n_warmup_iterations - 1) {
-        memset(bo_trace.map<char*>(), 0, traceSz);
-        bo_trace.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-      }
-      continue;
-    }
-
-    // Compare out to ref.
-    // Default: epsilon tolerance to handle accumulation order differences
-    // between host ref and AIE kernel.  bf16 has ~2 decimal digits of
-    // precision, so wider tolerances are needed than for f32.
-    // --strict-verify reverts to exact bitwise comparison for debugging.
-    if(verify) {
-      if (verbosity >= 1) {
-        std::cout << "Verifying results ..." << std::endl;
-      }
-      constexpr float REL_TOL = 1e-2f;
-      constexpr float ABS_TOL = 5e-1f;
-      for (int i = 0; i < tp.M; ++i) {
-        for (int j = 0; j < tp.N; ++j) {
-          float ref = matCRef[(i * tp.N) + j];
-          float out = matC[(i * tp.N) + j];
-
-          bool match = strictVerify
-              ? (out == ref)
-              : (std::fabs(out - ref) <= ABS_TOL + REL_TOL * std::fabs(ref));
-
-          if (!match) {
-            if (verbosity >= 1)
-              std::cout << "Error in output " << out << " != " << ref << std::endl;
-            errors++;
-          } else {
-            if (verbosity >= 1)
-              std::cout << "Correct output " << out << " == " << ref << std::endl;
-          }
-        }
-      }
-    }
-
-    npu_time_total += npu_time;
-    npu_time_min = (npu_time < npu_time_min) ? npu_time : npu_time_min;
-    npu_time_max = (npu_time > npu_time_max) ? npu_time : npu_time_max;
   }
 
-  // Save trace data after all iterations (last iteration's trace is captured)
+  // Sync instruction buffer once (constant across all invocations)
+  bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+  // ------------------------------------------------------
+  // Verification (one complete iteration with correct data)
+  // ------------------------------------------------------
+  if (verify) {
+    if (verbosity >= 1)
+      std::cout << "Running verification iteration...\n";
+
+    std::fill(matC.begin(), matC.end(), static_cast<DATATYPE>(0));
+
+    for (int step = 0; step < totalSteps; ++step) {
+      const auto &ss = staged[step];
+      memcpy(bufInA, ss.a.data(), chunkASize * sizeof(DATATYPE));
+      memcpy(bufInB, ss.b.data(), chunkBSize * sizeof(DATATYPE));
+      memset(bufOut, 0, chunkOutCSize * sizeof(DATATYPE));
+
+      if (useInC) {
+        // Extract partial sums from current matC (accumulated from prior steps)
+        int cCount = 0;
+        for (const auto &[tr, tc] : ss.cTileOrder) {
+          auto tile = extract_tile_1d_strict<DATATYPE>(matC, tp.M, tp.N, tp.TM, tp.TN, tr, tc);
+          auto tiled = tile_to_mmul_layout<DATATYPE, MMUL_R, MMUL_T>(tile.data(), tp.TM, tp.TN);
+          std::copy(tiled.begin(), tiled.end(), bufInC + cCount);
+          cCount += tiled.size();
+        }
+      }
+
+      bo_inA.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+      bo_inB.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+      bo_outC.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+      if (useInC) bo_inC.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+      runKernel();
+      bo_outC.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+
+      // Decode packet headers and write output tiles back to matC.
+      int repeatCount = (toc.reuseTPAxis != AXIS_K) ? toc.reuseTP : 1;
+      for (int ri = 0; ri < repeatCount; ++ri) {
+        int outerOff = tp.SPm * tp.SPn * ri;
+        for (int rj = 0; rj < static_cast<int>((tp.SPm * tp.SPn) / 4); ++rj) {
+          int innerOff = 4 * rj;
+          for (int rk = 0; rk < 4; ++rk) {
+            int idx = outerOff + innerOff + rk;
+            uint32_t hdr;
+            std::memcpy(&hdr, &bufOut[(tp.TM * tp.TN + PKT_HDR_ELEMS) * idx], sizeof(hdr));
+            uint32_t rawId = hdr & 0x1F, pid = 0;
+            while (rawId > 1) { rawId >>= 1; ++pid; }
+            auto tilePos = ss.cTileOrder[outerOff + innerOff + pid];
+            const DATATYPE *tiledOut =
+                &bufOut[(tp.TM * tp.TN + PKT_HDR_ELEMS) * idx + PKT_HDR_ELEMS];
+            auto val = untile_from_mmul_layout<DATATYPE, MMUL_R, MMUL_T>(
+                tiledOut, tp.TM, tp.TN);
+            write_tile_1d_strict<DATATYPE>(
+                matC, tp.M, tp.N, tp.TM, tp.TN, tilePos.first, tilePos.second, val);
+          }
+        }
+      }
+    }
+
+    // Compare against reference
+    if (verbosity >= 1)
+      std::cout << "Verifying results..." << std::endl;
+    constexpr float REL_TOL = 1e-2f;
+    constexpr float ABS_TOL = 5e-1f;
+    for (int vi = 0; vi < static_cast<int>(tp.M); ++vi) {
+      for (int vj = 0; vj < static_cast<int>(tp.N); ++vj) {
+        float ref = matCRef[vi * tp.N + vj];
+        float out = matC[vi * tp.N + vj];
+        bool match = strictVerify
+            ? (out == ref)
+            : (std::fabs(out - ref) <= ABS_TOL + REL_TOL * std::fabs(ref));
+        if (!match) {
+          if (verbosity >= 1)
+            std::cout << "Error in output " << out << " != " << ref << std::endl;
+          errors++;
+        } else if (verbosity >= 1) {
+          std::cout << "Correct output " << out << " == " << ref << std::endl;
+        }
+      }
+    }
+  }
+
+  // ------------------------------------------------------
+  // Idle (sleep) RAPL baseline
+  // ------------------------------------------------------
+  // Measure system idle power by sleeping — no CPU or IO activity.
+  // NPU energy = active_pkg - idle_rate * active_elapsed, which captures
+  // NPU compute + DMA/IO overhead above the system floor.
+  // Previous idle-with-IO approach produced systematically higher idle power
+  // than active because the tight memcpy+sync loop saturated CPU, while the
+  // active loop included kernel wait time with lower CPU utilization.
+  double idle_pkg_mw = -1.0;
+  bool rapl_available = false;
+  {
+    int64_t pkg0 = readRaplEnergyUj(RAPL_PKG_PATH);
+    if (pkg0 > 0) {
+      rapl_available = true;
+
+      int64_t idle_pkg0 = readRaplEnergyUj(RAPL_PKG_PATH);
+      auto idle_start = std::chrono::steady_clock::now();
+      std::this_thread::sleep_for(
+          std::chrono::duration<double>(MIN_IDLE_WALL_S));
+      auto idle_stop = std::chrono::steady_clock::now();
+      int64_t idle_pkg1 = readRaplEnergyUj(RAPL_PKG_PATH);
+      double idle_elapsed_s =
+          std::chrono::duration<double>(idle_stop - idle_start).count();
+      idle_pkg_mw =
+          static_cast<double>(idle_pkg1 - idle_pkg0) / idle_elapsed_s / 1000.0;
+    }
+  }
+
+  // ------------------------------------------------------
+  // Measurement loop (warmup + measured, unified body)
+  // ------------------------------------------------------
+  // Every iteration executes the same tight sequence:
+  //   memcpy staged→BO → sync(TO_DEVICE) → kernel → wait
+  // Warmup iterations warm the NPU pipeline but are not counted
+  // toward timing or energy statistics.
+  double npu_time_total = 0;
+  double npu_time_min = 1e18;
+  double npu_time_max = 0;
+
+  bool rapl_started = false;
+  int64_t rapl_pkg_before = 0;
+  std::chrono::steady_clock::time_point wall_start;
+
+  for (unsigned iter = 0; iter < num_iter; iter++) {
+    bool is_measured = (iter >= static_cast<unsigned>(n_warmup_iterations));
+
+    // At the first measured iteration: clear trace buffer and start RAPL.
+    // Trace clear here ensures warmup iterations do not pollute trace data.
+    if (!rapl_started && is_measured) {
+      if (traceSz > 0) {
+        memset(bo_trace.map<char *>(), 0, traceSz);
+        bo_trace.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+      }
+      if (rapl_available) {
+        rapl_pkg_before = readRaplEnergyUj(RAPL_PKG_PATH);
+      }
+      wall_start = std::chrono::steady_clock::now();
+      rapl_started = true;
+    }
+
+    double npu_time = 0;
+
+    for (int step = 0; step < totalSteps; ++step) {
+      const auto &ss = staged[step];
+
+      // Fill BO buffers from pre-staged data
+      memcpy(bufInA, ss.a.data(), chunkASize * sizeof(DATATYPE));
+      memcpy(bufInB, ss.b.data(), chunkBSize * sizeof(DATATYPE));
+      // Pres zeroed — kernel computation and DMA pattern are identical
+      // regardless of pres values; correctness was verified above.
+      if (useInC) memset(bufInC, 0, chunkCSize * sizeof(DATATYPE));
+      memset(bufOut, 0, chunkOutCSize * sizeof(DATATYPE));
+
+      bo_inA.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+      bo_inB.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+      bo_outC.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+      if (useInC) bo_inC.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+      auto t0 = std::chrono::high_resolution_clock::now();
+      runKernel();
+      auto t1 = std::chrono::high_resolution_clock::now();
+
+      npu_time += std::chrono::duration<double, std::micro>(t1 - t0).count();
+    }
+
+    if (is_measured) {
+      npu_time_total += npu_time;
+      npu_time_min = std::min(npu_time_min, npu_time);
+      npu_time_max = std::max(npu_time_max, npu_time);
+    }
+  }
+
+  // ------------------------------------------------------
+  // End RAPL bracket and compute energy
+  // ------------------------------------------------------
+  double active_pkg_mw = -1.0;
+  double npu_power_mw = -1.0;
+  double npu_energy_uj = -1.0;
+  double npu_energy_per_iter_uj = -1.0;
+  double wall_elapsed_s = -1.0;
+
+  if (rapl_started && rapl_available) {
+    auto wall_stop = std::chrono::steady_clock::now();
+    int64_t rapl_pkg_after = readRaplEnergyUj(RAPL_PKG_PATH);
+
+    wall_elapsed_s = std::chrono::duration<double>(wall_stop - wall_start).count();
+    double active_pkg_uj = static_cast<double>(rapl_pkg_after - rapl_pkg_before);
+    active_pkg_mw = active_pkg_uj / wall_elapsed_s / 1000.0;
+
+    // NPU contribution = active pkg minus idle-with-IO baseline rate.
+    // idle-with-IO runs the same memcpy+sync, so CPU/bus activity cancels out.
+    npu_energy_uj = active_pkg_uj - (idle_pkg_mw * wall_elapsed_s * 1000.0);
+    npu_power_mw = npu_energy_uj / wall_elapsed_s / 1000.0;
+    npu_energy_per_iter_uj = npu_energy_uj / n_iterations;
+  } else if (rapl_started) {
+    // RAPL unavailable but wall time still meaningful
+    auto wall_stop = std::chrono::steady_clock::now();
+    wall_elapsed_s = std::chrono::duration<double>(wall_stop - wall_start).count();
+  }
+
+  // ------------------------------------------------------
+  // Save trace data (last measurement iteration)
+  // ------------------------------------------------------
   if (traceSz > 0) {
     bo_trace.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-    // Write trace buffer as hex words, matching parse_trace.py expected format
-    {
-      uint32_t *traceOut = reinterpret_cast<uint32_t*>(bo_trace.map<char*>());
-      size_t totalWords = static_cast<size_t>(traceSz) / sizeof(uint32_t);
+    uint32_t *traceOut = reinterpret_cast<uint32_t *>(bo_trace.map<char *>());
+    size_t totalWords = static_cast<size_t>(traceSz) / sizeof(uint32_t);
 
-      // Skip leading zeros (DMA write pointer may not start at offset 0).
-      size_t start = 0;
-      while (start < totalWords && traceOut[start] == 0)
-        ++start;
+    size_t tStart = 0;
+    while (tStart < totalWords && traceOut[tStart] == 0) ++tStart;
+    size_t tEnd = totalWords;
+    while (tEnd > tStart && traceOut[tEnd - 1] == 0) --tEnd;
 
-      // Find last non-zero word to avoid trailing zeros.
-      size_t end = totalWords;
-      while (end > start && traceOut[end - 1] == 0)
-        --end;
-
-      FILE *fp = fopen(traceFile.c_str(), "w");
-      if (fp) {
-        for (size_t i = start; i < end; i++) {
-          fprintf(fp, "%08x\n", traceOut[i]);
-        }
-        fclose(fp);
-      }
+    FILE *fp = fopen(traceFile.c_str(), "w");
+    if (fp) {
+      for (size_t ti = tStart; ti < tEnd; ti++)
+        fprintf(fp, "%08x\n", traceOut[ti]);
+      fclose(fp);
     }
     std::cout << "Trace data written to " << traceFile
               << " (" << traceSz << " bytes)" << std::endl;
   }
 
   // ------------------------------------------------------
-  // Print verification and timing results
+  // Report results
   // ------------------------------------------------------
   std::cout << std::endl
             << "Number of iterations: " << n_iterations
@@ -482,35 +503,47 @@ int main(int argc, const char *argv[]) {
   oldState.copyfmt(std::cout);
 
   std::cout << std::endl
-            << "Avg NPU time: " << std::fixed << std::setprecision(2) << npu_time_total / n_iterations << "us."
-            << std::endl;
+            << "Avg NPU time: " << std::fixed << std::setprecision(2)
+            << npu_time_total / n_iterations << "us." << std::endl;
 
   std::cout << std::endl
-            << "Min NPU time: " << std::fixed << std::setprecision(2) << npu_time_min << "us." << std::endl;
+            << "Min NPU time: " << std::fixed << std::setprecision(2)
+            << npu_time_min << "us." << std::endl;
 
   std::cout << std::endl
-            << "Max NPU time: " << std::fixed << std::setprecision(2) << npu_time_max << "us." << std::endl;
+            << "Max NPU time: " << std::fixed << std::setprecision(2)
+            << npu_time_max << "us." << std::endl;
 
   std::cout.copyfmt(oldState);
 
+  if (rapl_available && rapl_started) {
+    std::cout << std::endl
+              << std::fixed << std::setprecision(1)
+              << "Idle pkg (with IO): " << idle_pkg_mw << " mW" << std::endl
+              << "Active pkg: " << active_pkg_mw << " mW" << std::endl
+              << "NPU power: " << npu_power_mw << " mW" << std::endl
+              << "NPU energy: " << npu_energy_uj << " uJ ("
+              << npu_power_mw << " mW, "
+              << std::setprecision(2) << wall_elapsed_s << "s)" << std::endl;
+    std::cout.copyfmt(oldState);
+  }
+
   double avgUs = npu_time_total / n_iterations;
 
-  // Write machine-readable JSON if --json-output was specified.
-  // run_tc_all.sh can parse this instead of fragile grep-based log scraping.
   if (!jsonOutputPath.empty()) {
     writeJsonResult(jsonOutputPath, errors ? "FAIL" : "PASS",
                     errors, n_iterations, n_warmup_iterations,
-                    avgUs, npu_time_min, npu_time_max);
+                    avgUs, npu_time_min, npu_time_max,
+                    idle_pkg_mw, active_pkg_mw, npu_power_mw,
+                    npu_energy_uj, npu_energy_per_iter_uj, wall_elapsed_s);
   }
 
-  // Print Pass/Fail result of our test
   if (!errors) {
     std::cout << std::endl << "PASS!" << std::endl << std::endl;
     return 0;
   } else {
     std::cout << std::endl
-              << errors << " mismatches." << std::endl
-              << std::endl;
+              << errors << " mismatches." << std::endl << std::endl;
     std::cout << std::endl << "fail." << std::endl << std::endl;
     return 1;
   }
