@@ -86,6 +86,7 @@ static inline tilingParam loadTilingParam(const std::string& path) {
 static inline void writeJsonResult(const std::string &path, const std::string &status,
                                    int errors, int iterations, int warmup,
                                    double avgUs, double minUs, double maxUs,
+                                   double stepAvgUs, double stepMinUs, double stepMaxUs,
                                    double idlePkgMw, double activePkgMw,
                                    double npuPowerMw, double npuEnergyUj,
                                    double npuEnergyPerIterUj, double wallElapsedS) {
@@ -97,6 +98,9 @@ static inline void writeJsonResult(const std::string &path, const std::string &s
   j["avg_us"] = avgUs;
   j["min_us"] = minUs;
   j["max_us"] = maxUs;
+  j["step_avg_us"] = stepAvgUs;
+  j["step_min_us"] = stepMinUs;
+  j["step_max_us"] = stepMaxUs;
   j["idle_pkg_mw"] = idlePkgMw;
   j["active_pkg_mw"] = activePkgMw;
   j["npu_power_mw"] = npuPowerMw;

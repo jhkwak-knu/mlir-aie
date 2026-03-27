@@ -112,8 +112,8 @@ else
 fi
 
 # CSV header (+upgrade if old header exists)
-NEW_HEADER="case_index,numSpm,SPm,SPn,TPm,TPk,TPn,TM,TK,TN,M,K,N,doubleBuffer,t_total_pred,status,errors,iters,warmup,avg_us,min_us,max_us,trace_dispatch_us,trace_kern_pct,trace_gflops,host_overhead_us,ss_iter_cy,ss_kernel_cy,idle_pkg_mw,active_pkg_mw,npu_power_mw,npu_energy_uj,npu_energy_per_iter_uj,wall_elapsed_s,host_steps,matmul_npu_us"
-NUM_COLUMNS=36
+NEW_HEADER="case_index,numSpm,SPm,SPn,TPm,TPk,TPn,TM,TK,TN,M,K,N,doubleBuffer,t_total_pred,status,errors,iters,warmup,avg_us,min_us,max_us,step_avg_us,step_min_us,step_max_us,trace_dispatch_us,trace_kern_pct,trace_gflops,host_overhead_us,ss_iter_cy,ss_kernel_cy,idle_pkg_mw,active_pkg_mw,npu_power_mw,npu_energy_uj,npu_energy_per_iter_uj,wall_elapsed_s,host_steps,matmul_npu_us"
+NUM_COLUMNS=39
 if [[ ! -f "$RESULT_CSV" ]]; then
   mkdir -p "$(dirname "$RESULT_CSV")"
   echo "$NEW_HEADER" > "$RESULT_CSV"
@@ -133,7 +133,7 @@ else
     else
       tail -n +2 "$RESULT_CSV" 2>/dev/null >> "$tmp_csv"
     fi
-    if [[ ${PIPESTATUS[1]} -ne 0 ]]; then
+    if [[ ${PIPESTATUS[1]:-0} -ne 0 ]]; then
       echo "error: awk failed during CSV header upgrade; aborting to preserve original" >&2
       rm -f "$tmp_csv"
       exit 1
@@ -221,8 +221,19 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
     TRACE_SZ=$(( 262144 * 4 * 2 * TRACE_NUM_COLS ))
     TRACE_MAKE_ARGS="TRACE_SZ=$TRACE_SZ TRACE_FILE=$TRACE_RAW"
   fi
-  echo "make -C \"$MAKE_DIR\" run JSON_OUTPUT=$JSON_RESULT $TRACE_MAKE_ARGS"
-  if ! make -C "$MAKE_DIR" run JSON_OUTPUT="$JSON_RESULT" $TRACE_MAKE_ARGS; then
+  # Read optional per-case HOST_ARGS from tc.json (e.g., n_iterations for RAPL)
+  CASE_HOST_ARGS=""
+  CASE_N_ITER=$(jq -r '.n_iterations // 0' "$OUTPUT_JSON")
+  CASE_N_WARMUP=$(jq -r '.n_warmup // 0' "$OUTPUT_JSON")
+  if [[ "$CASE_N_ITER" -gt 0 ]]; then
+    CASE_HOST_ARGS="$CASE_HOST_ARGS --n-iterations $CASE_N_ITER"
+  fi
+  if [[ "$CASE_N_WARMUP" -gt 0 ]]; then
+    CASE_HOST_ARGS="$CASE_HOST_ARGS --n-warmup $CASE_N_WARMUP"
+  fi
+
+  echo "make -C \"$MAKE_DIR\" run JSON_OUTPUT=$JSON_RESULT $TRACE_MAKE_ARGS HOST_ARGS=\"$CASE_HOST_ARGS\""
+  if ! make -C "$MAKE_DIR" run JSON_OUTPUT="$JSON_RESULT" $TRACE_MAKE_ARGS HOST_ARGS="$CASE_HOST_ARGS"; then
     echo "warn: make run failed"
     echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,$T_PRED,RUN_FAIL,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
     # if [[ -f "$CLEAN_SCRIPT" ]]; then bash "$CLEAN_SCRIPT" || true; fi
@@ -232,6 +243,7 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
   # 5) parse results — prefer JSON (deterministic) over grep (fragile)
   STATUS="FAIL"; ERRORS=-1
   ITERS=-1; WARMUP=-1; AVG_US=-1; MIN_US=-1; MAX_US=-1
+  STEP_AVG_US=-1; STEP_MIN_US=-1; STEP_MAX_US=-1
   IDLE_PKG_MW=-1; ACTIVE_PKG_MW=-1; NPU_POWER_MW=-1
   NPU_ENERGY_UJ=-1; NPU_ENERGY_PER_ITER_UJ=-1; WALL_ELAPSED_S=-1
 
@@ -244,6 +256,10 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
     AVG_US="$(jq -r '.avg_us // -1' "$JSON_RESULT")"
     MIN_US="$(jq -r '.min_us // -1' "$JSON_RESULT")"
     MAX_US="$(jq -r '.max_us // -1' "$JSON_RESULT")"
+    # Step time (memcpy + sync + dispatch) — matches energy measurement scope
+    STEP_AVG_US="$(jq -r '.step_avg_us // -1' "$JSON_RESULT")"
+    STEP_MIN_US="$(jq -r '.step_min_us // -1' "$JSON_RESULT")"
+    STEP_MAX_US="$(jq -r '.step_max_us // -1' "$JSON_RESULT")"
     # Energy fields (host RAPL measurement)
     IDLE_PKG_MW="$(jq -r '.idle_pkg_mw // -1' "$JSON_RESULT")"
     ACTIVE_PKG_MW="$(jq -r '.active_pkg_mw // -1' "$JSON_RESULT")"
@@ -329,7 +345,7 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
   fi
 
   # 7) append to CSV
-  echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,$T_PRED,$STATUS,$ERRORS,$ITERS,$WARMUP,$AVG_US,$MIN_US,$MAX_US,$TRACE_DISPATCH_US,$TRACE_KERN_PCT,$TRACE_GFLOPS,$HOST_OVERHEAD_US,$SS_ITER_CY,$SS_KERNEL_CY,$IDLE_PKG_MW,$ACTIVE_PKG_MW,$NPU_POWER_MW,$NPU_ENERGY_UJ,$NPU_ENERGY_PER_ITER_UJ,$WALL_ELAPSED_S,$HOST_STEPS,$MATMUL_NPU_US" >> "$RESULT_CSV"
+  echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,$T_PRED,$STATUS,$ERRORS,$ITERS,$WARMUP,$AVG_US,$MIN_US,$MAX_US,$STEP_AVG_US,$STEP_MIN_US,$STEP_MAX_US,$TRACE_DISPATCH_US,$TRACE_KERN_PCT,$TRACE_GFLOPS,$HOST_OVERHEAD_US,$SS_ITER_CY,$SS_KERNEL_CY,$IDLE_PKG_MW,$ACTIVE_PKG_MW,$NPU_POWER_MW,$NPU_ENERGY_UJ,$NPU_ENERGY_PER_ITER_UJ,$WALL_ELAPSED_S,$HOST_STEPS,$MATMUL_NPU_US" >> "$RESULT_CSV"
   echo "Result: case #$idx -> $STATUS (errors=$ERRORS, avg=${AVG_US}us, min=${MIN_US}us, max=${MAX_US}us) appended to $RESULT_CSV"
 
   # 7b) archive per-case artifacts before cleanup

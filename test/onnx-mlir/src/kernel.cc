@@ -62,9 +62,13 @@ void extern_kernel(bfloat16 *restrict A, bfloat16 *restrict B,
   }
 
   // 2x2 expansion: 2 M-tiles x 2 N-tiles per iteration (4 accumulators).
-  // 2×2 is the standard expansion for aie2p (matches upstream aie_kernels/aie2p/mm.cc).
+  // 2x2 is the standard expansion for aie2p (matches upstream aie_kernels/aie2p/mm.cc).
   // aie2p mmul<4,8,8>: size_A=32, size_B=64, size_C=32.
-  for (unsigned m = 0; m < rowA; m += 2) {
+  //
+  // chess_prepare_for_pipelining: enable loop pipelining for the M-loop.
+  // chess_loop_range: hint minimum trip count to the scheduler.
+  for (unsigned m = 0; m < rowA; m += 2)
+    chess_prepare_for_pipelining chess_loop_range(2, ) {
     for (unsigned n = 0; n < colB; n += 2) {
       unsigned c00_off = (m * colB + n) * MMUL::size_C;
       unsigned c01_off = (m * colB + n + 1) * MMUL::size_C;
@@ -76,7 +80,8 @@ void extern_kernel(bfloat16 *restrict A, bfloat16 *restrict B,
       MMUL C10(aie::load_v<MMUL::size_C>(&C[c10_off]));
       MMUL C11(aie::load_v<MMUL::size_C>(&C[c11_off]));
 
-      for (unsigned k = 0; k < colA; ++k) {
+      for (unsigned k = 0; k < colA; ++k)
+        chess_prepare_for_pipelining chess_loop_range(2, ) {
         auto a0 = aie::load_v<MMUL::size_A>(&A[(m * colA + k) * MMUL::size_A]);
         auto a1 = aie::load_v<MMUL::size_A>(&A[((m + 1) * colA + k) * MMUL::size_A]);
         auto b0 = aie::transpose(

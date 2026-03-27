@@ -8,6 +8,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -36,8 +37,10 @@
 static const char *RAPL_PKG_PATH =
     "/sys/class/powercap/intel-rapl:0/energy_uj";
 
-// Minimum wall-clock time (seconds) for RAPL measurement to ensure resolution.
-static constexpr double MIN_IDLE_WALL_S = 0.05;
+// Per-sample idle measurement window (seconds).
+static constexpr double IDLE_SAMPLE_WINDOW_S = 0.2;
+// Number of idle samples to collect; median is used as the idle baseline.
+static constexpr int N_IDLE_SAMPLES = 5;
 
 // Read a single RAPL energy counter.  Returns 0 on failure so callers
 // can detect unavailability without exceptions.
@@ -348,14 +351,11 @@ int main(int argc, const char *argv[]) {
   }
 
   // ------------------------------------------------------
-  // Idle (sleep) RAPL baseline
+  // Idle (sleep) RAPL baseline — multi-sample median
   // ------------------------------------------------------
-  // Measure system idle power by sleeping — no CPU or IO activity.
-  // NPU energy = active_pkg - idle_rate * active_elapsed, which captures
-  // NPU compute + DMA/IO overhead above the system floor.
-  // Previous idle-with-IO approach produced systematically higher idle power
-  // than active because the tight memcpy+sync loop saturated CPU, while the
-  // active loop included kernel wait time with lower CPU utilization.
+  // Take N_IDLE_SAMPLES measurements of IDLE_SAMPLE_WINDOW_S each.
+  // Use the median to reduce sensitivity to OS scheduling noise and
+  // transient system activity that plagued the single-sample approach.
   double idle_pkg_mw = -1.0;
   bool rapl_available = false;
   {
@@ -363,16 +363,21 @@ int main(int argc, const char *argv[]) {
     if (pkg0 > 0) {
       rapl_available = true;
 
-      int64_t idle_pkg0 = readRaplEnergyUj(RAPL_PKG_PATH);
-      auto idle_start = std::chrono::steady_clock::now();
-      std::this_thread::sleep_for(
-          std::chrono::duration<double>(MIN_IDLE_WALL_S));
-      auto idle_stop = std::chrono::steady_clock::now();
-      int64_t idle_pkg1 = readRaplEnergyUj(RAPL_PKG_PATH);
-      double idle_elapsed_s =
-          std::chrono::duration<double>(idle_stop - idle_start).count();
-      idle_pkg_mw =
-          static_cast<double>(idle_pkg1 - idle_pkg0) / idle_elapsed_s / 1000.0;
+      std::vector<double> idle_samples(N_IDLE_SAMPLES);
+      for (int s = 0; s < N_IDLE_SAMPLES; s++) {
+        int64_t s0 = readRaplEnergyUj(RAPL_PKG_PATH);
+        auto t0 = std::chrono::steady_clock::now();
+        std::this_thread::sleep_for(
+            std::chrono::duration<double>(IDLE_SAMPLE_WINDOW_S));
+        auto t1 = std::chrono::steady_clock::now();
+        int64_t s1 = readRaplEnergyUj(RAPL_PKG_PATH);
+        double elapsed =
+            std::chrono::duration<double>(t1 - t0).count();
+        idle_samples[s] =
+            static_cast<double>(s1 - s0) / elapsed / 1000.0;
+      }
+      std::sort(idle_samples.begin(), idle_samples.end());
+      idle_pkg_mw = idle_samples[N_IDLE_SAMPLES / 2];
     }
   }
 
@@ -386,10 +391,21 @@ int main(int argc, const char *argv[]) {
   double npu_time_total = 0;
   double npu_time_min = 1e18;
   double npu_time_max = 0;
+  // step_time: memcpy + sync + dispatch (matches energy measurement scope)
+  double step_time_total = 0;
+  double step_time_min = 1e18;
+  double step_time_max = 0;
 
   bool rapl_started = false;
   int64_t rapl_pkg_before = 0;
   std::chrono::steady_clock::time_point wall_start;
+
+  // Pre-zero pres buffer once before the loop — value is irrelevant for
+  // performance measurement (verified above), so skip per-step memset+sync.
+  if (useInC) {
+    memset(bufInC, 0, chunkCSize * sizeof(DATATYPE));
+    bo_inC.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  }
 
   for (unsigned iter = 0; iter < num_iter; iter++) {
     bool is_measured = (iter >= static_cast<unsigned>(n_warmup_iterations));
@@ -409,34 +425,39 @@ int main(int argc, const char *argv[]) {
     }
 
     double npu_time = 0;
+    double step_time = 0;
 
     for (int step = 0; step < totalSteps; ++step) {
       const auto &ss = staged[step];
 
+      // step_time bracket: includes memcpy + sync + dispatch
+      auto t_step_0 = std::chrono::high_resolution_clock::now();
+
       // Fill BO buffers from pre-staged data
       memcpy(bufInA, ss.a.data(), chunkASize * sizeof(DATATYPE));
       memcpy(bufInB, ss.b.data(), chunkBSize * sizeof(DATATYPE));
-      // Pres zeroed — kernel computation and DMA pattern are identical
-      // regardless of pres values; correctness was verified above.
-      if (useInC) memset(bufInC, 0, chunkCSize * sizeof(DATATYPE));
       memset(bufOut, 0, chunkOutCSize * sizeof(DATATYPE));
 
       bo_inA.sync(XCL_BO_SYNC_BO_TO_DEVICE);
       bo_inB.sync(XCL_BO_SYNC_BO_TO_DEVICE);
       bo_outC.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-      if (useInC) bo_inC.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
+      // npu_time bracket: dispatch + wait only
       auto t0 = std::chrono::high_resolution_clock::now();
       runKernel();
       auto t1 = std::chrono::high_resolution_clock::now();
 
       npu_time += std::chrono::duration<double, std::micro>(t1 - t0).count();
+      step_time += std::chrono::duration<double, std::micro>(t1 - t_step_0).count();
     }
 
     if (is_measured) {
       npu_time_total += npu_time;
       npu_time_min = std::min(npu_time_min, npu_time);
       npu_time_max = std::max(npu_time_max, npu_time);
+      step_time_total += step_time;
+      step_time_min = std::min(step_time_min, step_time);
+      step_time_max = std::max(step_time_max, step_time);
     }
   }
 
@@ -502,9 +523,12 @@ int main(int argc, const char *argv[]) {
   std::ios oldState(nullptr);
   oldState.copyfmt(std::cout);
 
+  double avgUs = npu_time_total / n_iterations;
+  double stepAvgUs = step_time_total / n_iterations;
+
   std::cout << std::endl
             << "Avg NPU time: " << std::fixed << std::setprecision(2)
-            << npu_time_total / n_iterations << "us." << std::endl;
+            << avgUs << "us." << std::endl;
 
   std::cout << std::endl
             << "Min NPU time: " << std::fixed << std::setprecision(2)
@@ -514,12 +538,18 @@ int main(int argc, const char *argv[]) {
             << "Max NPU time: " << std::fixed << std::setprecision(2)
             << npu_time_max << "us." << std::endl;
 
+  std::cout << std::endl
+            << "Step time (memcpy+sync+dispatch):" << std::endl
+            << "  Avg: " << std::fixed << std::setprecision(2) << stepAvgUs << "us"
+            << "  Min: " << step_time_min << "us"
+            << "  Max: " << step_time_max << "us" << std::endl;
+
   std::cout.copyfmt(oldState);
 
   if (rapl_available && rapl_started) {
     std::cout << std::endl
               << std::fixed << std::setprecision(1)
-              << "Idle pkg (with IO): " << idle_pkg_mw << " mW" << std::endl
+              << "Idle pkg (median): " << idle_pkg_mw << " mW" << std::endl
               << "Active pkg: " << active_pkg_mw << " mW" << std::endl
               << "NPU power: " << npu_power_mw << " mW" << std::endl
               << "NPU energy: " << npu_energy_uj << " uJ ("
@@ -528,12 +558,11 @@ int main(int argc, const char *argv[]) {
     std::cout.copyfmt(oldState);
   }
 
-  double avgUs = npu_time_total / n_iterations;
-
   if (!jsonOutputPath.empty()) {
     writeJsonResult(jsonOutputPath, errors ? "FAIL" : "PASS",
                     errors, n_iterations, n_warmup_iterations,
                     avgUs, npu_time_min, npu_time_max,
+                    stepAvgUs, step_time_min, step_time_max,
                     idle_pkg_mw, active_pkg_mw, npu_power_mw,
                     npu_energy_uj, npu_energy_per_iter_uj, wall_elapsed_s);
   }
