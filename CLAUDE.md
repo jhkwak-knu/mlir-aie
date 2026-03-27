@@ -19,35 +19,33 @@ Active branch: `energy-cost-model`
 
 ## Critical Rules
 
-### 1. Code Organization
+Code style, testing, security, and git workflow rules are inherited from
+the user-level CLAUDE.md. Below are **project-specific additions only**.
 
-- Many small files over few large files
-- High cohesion, low coupling
-- 200-400 lines typical, 800 max per file
-- Organize by feature/domain, not by type
+### Hardware Test Execution Protocol
 
-### 2. Code Style
+1. **Pre-test environment check** -- Before running any NPU test batch:
+   - Verify RAPL is accessible: `cat /sys/class/powercap/intel-rapl:0/energy_uj`
+   - Verify NPU driver timeout: `cat /sys/module/amdxdna/parameters/timeout`
+   - Verify no stale `out/tc.json` or `out/build/` from previous runs
+   - Close unnecessary applications (browser, IDE) to reduce measurement noise
 
-- No emojis in code, comments, or documentation
-- Prefer immutability -- avoid mutating objects or arrays when possible
-- Proper error handling -- check return values in C++, use exceptions/error codes appropriately
-- Write all code comments in English
-- Comments should explain *why*, not *what*
+2. **First-case validation** -- After the first test case completes:
+   - Check status is PASS (not RUN_FAIL or timeout)
+   - Verify `min_us` and `step_min_us` are reasonable (not -1 or extreme)
+   - Verify energy fields are populated (not all -1)
+   - If any issue, stop the batch and investigate before continuing
 
-### 3. Testing
+3. **Progress monitoring** -- During long batch runs:
+   - Periodically check `tail -5 <result_csv>` for recent statuses
+   - Watch for consecutive RUN_FAIL (may indicate driver/NPU hang)
+   - If >3 consecutive failures, stop and restart NPU driver or reboot
 
-- TDD: Write tests first (RED -> GREEN -> REFACTOR)
-- 80% minimum coverage
-- Unit tests for utilities
-- Integration tests for pass correctness (MLIR output comparison)
-- E2E tests for critical flows (hardware execution)
-
-### 4. Security
-
-- No hardcoded secrets
-- Environment variables for sensitive data
-- Validate all user inputs
-- Never commit files that may contain secrets (.env, credentials)
+4. **Result versioning** -- Every measurement batch must be traceable:
+   - Name result files with version/phase: `result_phase1.csv`, `result_v8.csv`
+   - Record the git commit hash at measurement time
+   - Record the tc_list file used (with config count)
+   - Archive previous results before overwriting (never delete raw data)
 
 ---
 
@@ -171,7 +169,11 @@ test/onnx-mlir/
 - `data/refs/tc_list_ver1/` -- reference tc_list.json per matrix size
 - `data/refs/result_ver1/` -- reference result.csv (correctness + timing baseline)
 
-Result CSV columns: `case_index, numSpm, SPm, SPn, TPm, TPk, TPn, TM, TK, TN, M, K, N, doubleBuffer, status, errors, iters, warmup, avg_us, min_us, max_us`
+Result CSV columns (39 total, since commit 7c984731):
+`case_index, numSpm, SPm, SPn, TPm, TPk, TPn, TM, TK, TN, M, K, N, doubleBuffer, t_total_pred, status, errors, iters, warmup, avg_us, min_us, max_us, step_avg_us, step_min_us, step_max_us, trace_dispatch_us, trace_kern_pct, trace_gflops, host_overhead_us, ss_iter_cy, ss_kernel_cy, idle_pkg_mw, active_pkg_mw, npu_power_mw, npu_energy_uj, npu_energy_per_iter_uj, wall_elapsed_s, host_steps, matmul_npu_us`
+
+- `min_us`: NPU dispatch+wait only (cost model calibration)
+- `step_min_us`: memcpy+sync+dispatch (matches energy measurement scope, use for EDP)
 
 ---
 
@@ -196,7 +198,8 @@ Result CSV columns: `case_index, numSpm, SPm, SPn, TPm, TPk, TPn, TM, TK, TN, M,
 
 ## Git Workflow
 
-- Conventional commits: `feat:`, `fix:`, `refactor:`, `docs:`, `test:`, `chore:`, `perf:`, `ci:`
-- Never commit to main directly
-- PRs require review
-- All tests must pass before merge
+Git conventions (conventional commits, PR workflow) are inherited from
+the user-level CLAUDE.md. Project-specific notes:
+
+- Active branch: `energy-cost-model` (will merge into `dev`)
+- Result CSV columns changed at commit 7c984731 (39 columns with step_time)
