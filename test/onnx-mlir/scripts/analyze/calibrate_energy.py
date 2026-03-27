@@ -123,6 +123,9 @@ class ECalibRow:
     avg_iter_us: float
     npu_per_iter_uj: float
     wall_elapsed_s: float
+    idle_pkg_mw: float = -1.0
+    active_pkg_mw: float = -1.0
+    n_iterations: int = 10
 
     @property
     def n_cores(self) -> int:
@@ -180,66 +183,210 @@ def load_energy_data(
     csv_path: Path,
     tc_path: Optional[Path] = None,
     min_wall_s: float = DEFAULT_MIN_WALL_S,
+    max_wall_s: float = 0.0,
+    gt_mode: str = "npu",
 ) -> Tuple[List[ECalibRow], List[SkippedRow]]:
     """Load energy CSV into calibration rows, filtering unreliable measurements.
 
+    gt_mode controls which energy value is used as ground truth:
+      "npu"        -- npu_per_iter_uj (idle-subtracted, original)
+      "active_pkg" -- active_pkg total energy per iter (no idle subtraction)
+      "corrected"  -- active_pkg minus global median idle, per iter
+
     Filters:
-      1. npu_per_iter_uj <= 0 (negative energy from RAPL noise)
+      1. GT energy <= 0 (negative energy from RAPL noise)
       2. wall_elapsed_s < min_wall_s (too short for reliable RAPL reading)
 
     Returns (valid_rows, skipped_rows).
     """
     tp_order_map = _load_tp_order_map(tc_path) if tc_path else {}
 
-    rows: List[ECalibRow] = []
-    skipped: List[SkippedRow] = []
-
+    # First pass: collect all rows to compute global idle median for 'corrected'
+    raw_rows: List[Dict[str, str]] = []
     with csv_path.open("r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            per_iter = float(_col(row, "npu_per_iter_uj",
+            raw_rows.append(dict(row))
+
+    # Compute global idle median for 'corrected' mode
+    idle_values = []
+    for row in raw_rows:
+        idle_mw = float(row.get("idle_pkg_mw", row.get("idle_uncore_mw", "-1")))
+        if idle_mw > 0:
+            idle_values.append(idle_mw)
+    idle_median_mw = sorted(idle_values)[len(idle_values) // 2] if idle_values else 0.0
+
+    rows: List[ECalibRow] = []
+    skipped: List[SkippedRow] = []
+
+    for row in raw_rows:
+        wall_s = float(row.get("wall_elapsed_s", "0"))
+        case_idx = int(row["case_index"])
+        M, K, N = int(row["M"]), int(row["K"]), int(row["N"])
+        size_key = f"{M}x{K}x{N}"
+        n_cores = int(_col(row, "num_cores", "numSpm"))
+        n_iters = int(row.get("iters", "10"))
+
+        # Read raw RAPL columns
+        idle_mw = float(row.get("idle_pkg_mw",
+                                row.get("idle_uncore_mw", "-1")))
+        active_mw = float(row.get("active_pkg_mw",
+                                  row.get("active_uncore_mw", "-1")))
+        npu_per_iter = float(_col(row, "npu_per_iter_uj",
                                   "npu_energy_per_iter_uj"))
-            wall_s = float(row.get("wall_elapsed_s", "0"))
-            case_idx = int(row["case_index"])
-            M, K, N = int(row["M"]), int(row["K"]), int(row["N"])
-            size_key = f"{M}x{K}x{N}"
-            n_cores = int(_col(row, "num_cores", "numSpm"))
 
-            # Filter 1: negative energy
-            if per_iter <= 0:
-                skipped.append(SkippedRow(
-                    case_idx, size_key, n_cores,
-                    f"negative energy ({per_iter:.1f} uJ)"))
-                continue
-
-            # Filter 2: short measurement window
-            if wall_s < min_wall_s:
-                skipped.append(SkippedRow(
-                    case_idx, size_key, n_cores,
-                    f"short window ({wall_s*1000:.1f}ms < {min_wall_s*1000:.0f}ms)"))
-                continue
-
-            # tp_order_inner: CSV column or tc_list.json lookup
-            if "tp_order_inner" in row:
-                tp_inner = int(row["tp_order_inner"])
-            elif case_idx in tp_order_map:
-                tp_inner = tp_order_map[case_idx]
+        # Compute GT energy per iteration based on mode
+        if gt_mode == "active_pkg":
+            if active_mw <= 0 or wall_s <= 0:
+                per_iter = -1.0
             else:
-                tp_inner = 2  # fallback: K-inner
+                # active_mw * wall_s * 1000 = total energy in uJ
+                per_iter = active_mw * wall_s * 1000.0 / n_iters
+        elif gt_mode == "corrected":
+            if active_mw <= 0 or wall_s <= 0:
+                per_iter = -1.0
+            else:
+                per_iter = (active_mw - idle_median_mw) * wall_s * 1000.0 / n_iters
+        else:  # "npu"
+            per_iter = npu_per_iter
 
-            rows.append(ECalibRow(
-                case_index=case_idx,
-                M=M, K=K, N=N,
-                SPm=int(row["SPm"]), SPn=int(row["SPn"]),
-                TPm=int(row["TPm"]), TPk=int(row["TPk"]), TPn=int(row["TPn"]),
-                TM=int(row["TM"]), TK=int(row["TK"]), TN=int(row["TN"]),
-                num_cores=n_cores,
-                tp_order_inner=tp_inner,
-                avg_iter_us=float(_col(row, "avg_iter_us", "avg_us")),
-                npu_per_iter_uj=per_iter,
-                wall_elapsed_s=wall_s,
-            ))
+        # Filter 1: negative or zero energy
+        if per_iter <= 0:
+            skipped.append(SkippedRow(
+                case_idx, size_key, n_cores,
+                f"non-positive energy ({per_iter:.1f} uJ, gt={gt_mode})"))
+            continue
+
+        # Filter 2: short measurement window
+        if wall_s < min_wall_s:
+            skipped.append(SkippedRow(
+                case_idx, size_key, n_cores,
+                f"short window ({wall_s*1000:.1f}ms < {min_wall_s*1000:.0f}ms)"))
+            continue
+
+        # Filter 3: long measurement window (idle error amplification)
+        if max_wall_s > 0 and wall_s > max_wall_s:
+            skipped.append(SkippedRow(
+                case_idx, size_key, n_cores,
+                f"long window ({wall_s:.2f}s > {max_wall_s:.2f}s)"))
+            continue
+
+        # tp_order_inner: CSV column or tc_list.json lookup
+        if "tp_order_inner" in row:
+            tp_inner = int(row["tp_order_inner"])
+        elif case_idx in tp_order_map:
+            tp_inner = tp_order_map[case_idx]
+        else:
+            tp_inner = 2  # fallback: K-inner
+
+        rows.append(ECalibRow(
+            case_index=case_idx,
+            M=M, K=K, N=N,
+            SPm=int(row["SPm"]), SPn=int(row["SPn"]),
+            TPm=int(row["TPm"]), TPk=int(row["TPk"]), TPn=int(row["TPn"]),
+            TM=int(row["TM"]), TK=int(row["TK"]), TN=int(row["TN"]),
+            num_cores=n_cores,
+            tp_order_inner=tp_inner,
+            avg_iter_us=float(_col(row, "avg_iter_us", "avg_us")),
+            npu_per_iter_uj=per_iter,
+            wall_elapsed_s=wall_s,
+            idle_pkg_mw=idle_mw,
+            active_pkg_mw=active_mw,
+            n_iterations=n_iters,
+        ))
+
+    if gt_mode != "npu":
+        print(f"[INFO] GT mode: {gt_mode}")
+        if gt_mode == "corrected":
+            print(f"[INFO] Global idle median: {idle_median_mw:.1f} mW "
+                  f"(from {len(idle_values)} samples)")
+
     return rows, skipped
+
+
+def print_idle_power_analysis(
+    rows: List[ECalibRow],
+    skipped: List[SkippedRow],
+) -> None:
+    """Print idle power stability analysis across all loaded data."""
+    sep = "-" * 70
+    print(f"\n{sep}")
+    print(f"  Idle Power Stability Analysis")
+    print(sep)
+
+    # Collect idle and active from valid + skipped (all raw data)
+    all_idle = [r.idle_pkg_mw for r in rows if r.idle_pkg_mw > 0]
+    all_active = [r.active_pkg_mw for r in rows if r.active_pkg_mw > 0]
+
+    if not all_idle:
+        print("  No idle_pkg_mw data available")
+        print(sep)
+        return
+
+    all_idle_sorted = sorted(all_idle)
+    n = len(all_idle_sorted)
+    idle_mean = sum(all_idle) / n
+    idle_std = (sum((x - idle_mean) ** 2 for x in all_idle) / n) ** 0.5
+    idle_cv = idle_std / idle_mean * 100 if idle_mean > 0 else 0
+    idle_median = all_idle_sorted[n // 2]
+    idle_q1 = all_idle_sorted[n // 4]
+    idle_q3 = all_idle_sorted[3 * n // 4]
+    idle_iqr = idle_q3 - idle_q1
+
+    print(f"  idle_pkg_mw (n={n}):")
+    print(f"    min={all_idle_sorted[0]:.0f}  q1={idle_q1:.0f}  "
+          f"median={idle_median:.0f}  q3={idle_q3:.0f}  "
+          f"max={all_idle_sorted[-1]:.0f}")
+    print(f"    mean={idle_mean:.0f}  std={idle_std:.0f}  CV={idle_cv:.1f}%")
+    print(f"    IQR={idle_iqr:.0f}  outlier_fence=[{idle_q1 - 1.5*idle_iqr:.0f}, "
+          f"{idle_q3 + 1.5*idle_iqr:.0f}]")
+
+    n_outliers = sum(1 for x in all_idle
+                     if x < idle_q1 - 1.5 * idle_iqr or x > idle_q3 + 1.5 * idle_iqr)
+    print(f"    outliers: {n_outliers}/{n} ({n_outliers/n*100:.0f}%)")
+
+    if all_active:
+        act_sorted = sorted(all_active)
+        na = len(act_sorted)
+        act_mean = sum(all_active) / na
+        act_std = (sum((x - act_mean) ** 2 for x in all_active) / na) ** 0.5
+        act_cv = act_std / act_mean * 100 if act_mean > 0 else 0
+        print(f"\n  active_pkg_mw (n={na}):")
+        print(f"    min={act_sorted[0]:.0f}  median={act_sorted[na//2]:.0f}  "
+              f"max={act_sorted[-1]:.0f}")
+        print(f"    mean={act_mean:.0f}  std={act_std:.0f}  CV={act_cv:.1f}%")
+
+    # Per-size breakdown
+    size_idle: Dict[str, List[float]] = defaultdict(list)
+    for r in rows:
+        if r.idle_pkg_mw > 0:
+            size_idle[r.size_key].append(r.idle_pkg_mw)
+
+    if size_idle:
+        print(f"\n  Per-size idle_pkg_mw:")
+        print(f"  {'Size':<16s}  {'N':>4s}  {'Mean':>8s}  {'Std':>8s}  {'CV%':>6s}  "
+              f"{'Median':>8s}")
+        for sk in sorted(size_idle.keys()):
+            vals = size_idle[sk]
+            ns = len(vals)
+            m = sum(vals) / ns
+            s = (sum((x - m) ** 2 for x in vals) / ns) ** 0.5 if ns > 1 else 0
+            cv = s / m * 100 if m > 0 else 0
+            med = sorted(vals)[ns // 2]
+            print(f"  {sk:<16s}  {ns:>4d}  {m:>8.0f}  {s:>8.0f}  {cv:>5.1f}%  "
+                  f"{med:>8.0f}")
+
+    # idle > active cases (causes negative energy)
+    neg_count = sum(1 for r in rows
+                    if r.idle_pkg_mw > 0 and r.active_pkg_mw > 0
+                    and r.idle_pkg_mw > r.active_pkg_mw)
+    total_with_both = sum(1 for r in rows
+                          if r.idle_pkg_mw > 0 and r.active_pkg_mw > 0)
+    if total_with_both > 0:
+        print(f"\n  idle > active (negative energy): {neg_count}/{total_with_both} "
+              f"({neg_count/total_with_both*100:.0f}%)")
+
+    print(sep)
 
 
 def print_validity_report(
@@ -247,11 +394,12 @@ def print_validity_report(
     skipped: List[SkippedRow],
     total_csv: int,
     min_wall_s: float,
+    gt_mode: str = "npu",
 ) -> None:
     """Print filter results: size x cores matrix and skipped case list."""
     sep = "=" * 70
     print(f"\n{sep}")
-    print(f"  Measurement Validity Report")
+    print(f"  Measurement Validity Report (gt_mode={gt_mode})")
     print(sep)
     print(f"  Total CSV rows:    {total_csv}")
     print(f"  Filtered out:      {len(skipped)}")
@@ -292,9 +440,10 @@ def print_validity_report(
     if skipped:
         reason_counts: Dict[str, int] = defaultdict(int)
         for s in skipped:
-            # Extract reason category
-            if "negative" in s.reason:
-                reason_counts["negative energy"] += 1
+            if "negative" in s.reason or "non-positive" in s.reason:
+                reason_counts["non-positive energy"] += 1
+            elif "long" in s.reason:
+                reason_counts["long window"] += 1
             else:
                 reason_counts["short window"] += 1
         print(f"\n  Skipped reasons:")
@@ -1320,15 +1469,14 @@ def update_calibration_json(
     best: EnergyFitResult,
     n_samples: int,
     min_wall_s: float,
+    gt_mode: str = "npu",
 ) -> None:
-    """Update calibration.json v3 with energy section."""
+    """Update calibration.json with energy section."""
     if existing_path.is_file():
         with existing_path.open("r", encoding="utf-8") as f:
             doc = json.load(f)
     else:
         doc = {}
-
-    doc["version"] = 3
 
     # Store only the model-essential parameters (not diagnostic ones)
     stored_params = {}
@@ -1340,15 +1488,22 @@ def update_calibration_json(
             continue
         stored_params[k] = v
 
+    gt_labels = {
+        "npu": "npu_per_iter_uj",
+        "active_pkg": "active_pkg_per_iter_uj",
+        "corrected": "corrected_npu_per_iter_uj",
+    }
+
     doc["energy"] = {
         "model": best.model,
         "params": stored_params,
+        "gt_mode": gt_mode,
         "fitted_from": {
             "n_samples": n_samples,
             "min_wall_s": min_wall_s,
             "spearman_rho": round(best.rho, 4),
             "mape_pct": round(best.mape, 1),
-            "ground_truth": "npu_per_iter_uj",
+            "ground_truth": gt_labels.get(gt_mode, gt_mode),
         },
     }
 
@@ -1371,6 +1526,13 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
                     help="Path to write updated calibration.json (default: same as --calib)")
     p.add_argument("--min-wall-s", type=float, default=DEFAULT_MIN_WALL_S,
                     help=f"Minimum wall_elapsed_s for valid measurement (default: {DEFAULT_MIN_WALL_S})")
+    p.add_argument("--max-wall-s", type=float, default=0.0,
+                    help="Maximum wall_elapsed_s (0=no limit). Long measurements "
+                         "amplify idle subtraction error.")
+    p.add_argument("--gt-mode", choices=["npu", "active_pkg", "corrected"],
+                    default="npu",
+                    help="Ground truth mode: npu (idle-subtracted), "
+                         "active_pkg (total package), corrected (global idle median)")
     return p.parse_args(argv)
 
 
@@ -1384,6 +1546,8 @@ def main(argv: List[str]) -> int:
     out_path = Path(args.output).resolve() if args.output else calib_path
     tc_path = Path(args.tc).resolve() if args.tc else None
     min_wall_s = args.min_wall_s
+    max_wall_s = args.max_wall_s
+    gt_mode = args.gt_mode
 
     # Load HW info for tiles-per-column
     try:
@@ -1393,11 +1557,15 @@ def main(argv: List[str]) -> int:
         pass  # keep default = 4
 
     # Load data with validity filter
-    rows, skipped = load_energy_data(energy_path, tc_path, min_wall_s)
+    rows, skipped = load_energy_data(energy_path, tc_path, min_wall_s,
+                                     max_wall_s=max_wall_s, gt_mode=gt_mode)
     total_csv = len(rows) + len(skipped)
 
+    # Step 0: Idle power stability analysis
+    print_idle_power_analysis(rows, skipped)
+
     # Step 1: Validity report
-    print_validity_report(rows, skipped, total_csv, min_wall_s)
+    print_validity_report(rows, skipped, total_csv, min_wall_s, gt_mode=gt_mode)
 
     if not rows:
         print("[ERROR] No valid energy data", file=sys.stderr)
@@ -1509,7 +1677,8 @@ def main(argv: List[str]) -> int:
     edp_core_optimal_analysis(rows, edp_models, features)
 
     # Write output
-    update_calibration_json(calib_path, out_path, overall_best, len(rows), min_wall_s)
+    update_calibration_json(calib_path, out_path, overall_best, len(rows),
+                            min_wall_s, gt_mode=gt_mode)
     print(f"\n[INFO] Wrote {out_path}")
 
     return 0

@@ -93,6 +93,14 @@ class CalibCoeffs:
     l_core_cy: float      # Per-core setup cost (cycles)
     l_startup_cy: float   # One-time NPU startup cost (cycles)
     calibrated: bool      # True if loaded from file, False if defaults
+    # Perf model scaling (v6+): T = alpha*T_comp + beta*T_comm + overhead
+    # alpha < 1 means compute is partially hidden behind DMA (pipelining).
+    perf_alpha: float = 1.0   # T_comp scaling factor (1.0 = no scaling)
+    perf_beta: float = 1.0    # T_comm scaling factor (1.0 = no scaling)
+    # v7 DMA-add: per-DMA-descriptor setup cost per temporal iteration.
+    # N_dma = SPm+SPn (K-inner), SPm+2N (M-inner), SPn+2N (N-inner).
+    # Balanced SP minimizes N_dma (AM-GM: SPm+SPn >= 2*sqrt(N_cores)).
+    l_dma_cy: float = 0.0     # Per-DMA-op per-iteration cost (0 = v6 compat)
     # Energy calibration (v3)
     energy_model: str = ""           # E-A, E-B, E-C, E-D (empty = not calibrated)
     energy_params: Dict[str, float] = None  # Model-specific fitted parameters
@@ -178,6 +186,9 @@ def load_calibration(path: Path = DEFAULT_CALIB_PATH) -> CalibCoeffs:
         l_core_cy=float(doc.get("l_core_cy", 0)),
         l_startup_cy=float(doc.get("l_startup_cy", 0)),
         calibrated=True,
+        perf_alpha=float(doc.get("perf_alpha", 1.0)),
+        perf_beta=float(doc.get("perf_beta", 1.0)),
+        l_dma_cy=float(doc.get("l_dma_cy", 0.0)),
         energy_model=energy_model,
         energy_params=energy_params,
         energy_calibrated=energy_calibrated,

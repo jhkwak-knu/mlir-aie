@@ -108,6 +108,8 @@ class EnergyRow:
     npu_avg_power_mw: float
     power_cv_pct: float
     wall_elapsed_s: float
+    idle_pkg_mw: float = -1.0
+    active_pkg_mw: float = -1.0
 
     @property
     def n_cores(self) -> int:
@@ -133,55 +135,105 @@ def load_energy_csv(
     csv_path: Path,
     tc_path: Optional[Path] = None,
     min_wall_s: float = DEFAULT_MIN_WALL_S,
+    max_wall_s: float = 0.0,
+    gt_mode: str = "npu",
 ) -> Tuple[List[EnergyRow], int, int]:
     """Load energy CSV with validity filter.
+
+    gt_mode: "npu" (idle-subtracted), "active_pkg" (total package),
+             "corrected" (global median idle subtracted).
 
     Returns (valid_rows, total_count, skipped_count).
     """
     tp_order_map = _load_tp_order_map(tc_path) if tc_path else {}
 
-    rows: List[EnergyRow] = []
-    total = 0
-    skipped = 0
-
+    # First pass: read all rows for global idle median
+    raw_rows: List[Dict[str, str]] = []
     with csv_path.open("r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            total += 1
-            case_idx = int(row["case_index"])
-            per_iter = float(_col(row, "npu_per_iter_uj",
-                                  "npu_energy_per_iter_uj"))
-            wall_s = float(row.get("wall_elapsed_s", "0"))
+            raw_rows.append(dict(row))
 
-            # Filter: negative energy or short measurement window
-            if per_iter <= 0 or wall_s < min_wall_s:
-                skipped += 1
-                continue
+    idle_values = []
+    for row in raw_rows:
+        idle_mw = float(row.get("idle_pkg_mw", row.get("idle_uncore_mw", "-1")))
+        if idle_mw > 0:
+            idle_values.append(idle_mw)
+    idle_median_mw = sorted(idle_values)[len(idle_values) // 2] if idle_values else 0.0
 
-            # tp_order_inner: CSV column or tc_list.json lookup
-            if "tp_order_inner" in row:
-                tp_inner = int(row["tp_order_inner"])
-            elif case_idx in tp_order_map:
-                tp_inner = tp_order_map[case_idx]
+    rows: List[EnergyRow] = []
+    total = len(raw_rows)
+    skipped = 0
+
+    for row in raw_rows:
+        case_idx = int(row["case_index"])
+        wall_s = float(row.get("wall_elapsed_s", "0"))
+        n_iters = int(row.get("iters", "10"))
+
+        idle_mw = float(row.get("idle_pkg_mw",
+                                row.get("idle_uncore_mw", "-1")))
+        active_mw = float(row.get("active_pkg_mw",
+                                  row.get("active_uncore_mw", "-1")))
+        npu_per_iter_raw = float(_col(row, "npu_per_iter_uj",
+                                      "npu_energy_per_iter_uj"))
+
+        # Compute GT energy based on mode
+        if gt_mode == "active_pkg":
+            if active_mw <= 0 or wall_s <= 0:
+                per_iter = -1.0
             else:
-                tp_inner = 2  # fallback: K-inner
+                per_iter = active_mw * wall_s * 1000.0 / n_iters
+        elif gt_mode == "corrected":
+            if active_mw <= 0 or wall_s <= 0:
+                per_iter = -1.0
+            else:
+                per_iter = (active_mw - idle_median_mw) * wall_s * 1000.0 / n_iters
+        else:
+            per_iter = npu_per_iter_raw
 
-            rows.append(EnergyRow(
-                case_index=case_idx,
-                M=int(row["M"]), K=int(row["K"]), N=int(row["N"]),
-                SPm=int(row["SPm"]), SPn=int(row["SPn"]),
-                TPm=int(row["TPm"]), TPk=int(row["TPk"]), TPn=int(row["TPn"]),
-                TM=int(row["TM"]), TK=int(row["TK"]), TN=int(row["TN"]),
-                num_cores=int(_col(row, "num_cores", "numSpm")),
-                tp_order_inner=tp_inner,
-                avg_iter_us=float(_col(row, "avg_iter_us", "avg_us")),
-                npu_energy_uj=float(_col(row, "npu_energy_uj")),
-                npu_per_iter_uj=per_iter,
-                npu_avg_power_mw=float(_col(row, "npu_avg_power_mw",
-                                            "npu_power_mw")),
-                power_cv_pct=float(row.get("power_cv_pct", "0.0")),
-                wall_elapsed_s=wall_s,
-            ))
+        # Filter: non-positive energy or short/long measurement window
+        if per_iter <= 0 or wall_s < min_wall_s:
+            skipped += 1
+            continue
+        if max_wall_s > 0 and wall_s > max_wall_s:
+            skipped += 1
+            continue
+
+        # tp_order_inner: CSV column or tc_list.json lookup
+        if "tp_order_inner" in row:
+            tp_inner = int(row["tp_order_inner"])
+        elif case_idx in tp_order_map:
+            tp_inner = tp_order_map[case_idx]
+        else:
+            tp_inner = 2  # fallback: K-inner
+
+        # Compute total energy from per_iter for consistency
+        npu_energy_total = per_iter * n_iters
+        npu_power = per_iter / (wall_s / n_iters * 1000.0) if wall_s > 0 else -1.0
+
+        rows.append(EnergyRow(
+            case_index=case_idx,
+            M=int(row["M"]), K=int(row["K"]), N=int(row["N"]),
+            SPm=int(row["SPm"]), SPn=int(row["SPn"]),
+            TPm=int(row["TPm"]), TPk=int(row["TPk"]), TPn=int(row["TPn"]),
+            TM=int(row["TM"]), TK=int(row["TK"]), TN=int(row["TN"]),
+            num_cores=int(_col(row, "num_cores", "numSpm")),
+            tp_order_inner=tp_inner,
+            avg_iter_us=float(_col(row, "avg_iter_us", "avg_us")),
+            npu_energy_uj=npu_energy_total,
+            npu_per_iter_uj=per_iter,
+            npu_avg_power_mw=npu_power,
+            power_cv_pct=float(row.get("power_cv_pct", "0.0")),
+            wall_elapsed_s=wall_s,
+            idle_pkg_mw=idle_mw,
+            active_pkg_mw=active_mw,
+        ))
+
+    if gt_mode != "npu":
+        print(f"[INFO] GT mode: {gt_mode}")
+        if gt_mode == "corrected":
+            print(f"[INFO] Idle median: {idle_median_mw:.1f} mW")
+
     return rows, total, skipped
 
 
@@ -673,6 +725,12 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
                     help="Path to calibration.json")
     p.add_argument("--min-wall-s", type=float, default=DEFAULT_MIN_WALL_S,
                     help=f"Minimum wall_elapsed_s for valid measurement (default: {DEFAULT_MIN_WALL_S})")
+    p.add_argument("--max-wall-s", type=float, default=0.0,
+                    help="Maximum wall_elapsed_s (0=no limit)")
+    p.add_argument("--gt-mode", choices=["npu", "active_pkg", "corrected"],
+                    default="npu",
+                    help="Ground truth mode: npu (idle-subtracted), "
+                         "active_pkg (total package), corrected (global idle median)")
     p.add_argument("--cross-validate", action="store_true",
                     help="Run 80/20 cross-validation")
     return p.parse_args(argv)
@@ -686,6 +744,8 @@ def main(argv: List[str]) -> int:
     energy_path = Path(args.energy).resolve()
     tc_path = Path(args.tc).resolve() if args.tc else None
     min_wall_s = args.min_wall_s
+    max_wall_s = args.max_wall_s
+    gt_mode = args.gt_mode
 
     # Load HW info for tiles-per-column
     try:
@@ -694,7 +754,9 @@ def main(argv: List[str]) -> int:
     except Exception:
         pass
 
-    rows, total, skipped = load_energy_csv(energy_path, tc_path, min_wall_s)
+    rows, total, skipped = load_energy_csv(energy_path, tc_path, min_wall_s,
+                                           max_wall_s=max_wall_s,
+                                           gt_mode=gt_mode)
     if not rows:
         print("[ERROR] No valid data in energy CSV", file=sys.stderr)
         return 1

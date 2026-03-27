@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import random
 import sys
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -260,26 +261,59 @@ def total_data_bytes(op: OpCase, c: Candidate, tp_order: int) -> int:
 def perf_compute(
     op: OpCase, c: Candidate, coeffs: Optional[CalibCoeffs] = None,
 ) -> float:
-    """T_comp: compute time assuming all cores run in parallel."""
+    """T_comp: compute time assuming all cores run in parallel.
+
+    When calibrated with perf_alpha < 1, compute time is scaled down
+    to reflect compute-DMA pipelining (compute hidden behind DMA).
+    """
     macs = coeffs.eff_macs if coeffs else PEAK_MACS
-    return (op.M * op.N * op.K) / (c.SPm * c.SPn * macs)
+    alpha = coeffs.perf_alpha if coeffs else 1.0
+    return alpha * (op.M * op.N * op.K) / (c.SPm * c.SPn * macs)
 
 
 def perf_comm(
     op: OpCase, c: Candidate, tp_order: int,
     coeffs: Optional[CalibCoeffs] = None,
 ) -> float:
-    """T_comm: data transfer time through shared DRAM bandwidth."""
+    """T_comm: data transfer time through shared DRAM bandwidth.
+
+    When calibrated with perf_beta != 1, applies scaling to account
+    for DMA overhead beyond raw transfer time.
+    """
     bw = coeffs.bw_eff_bpc if coeffs else BANDWIDTH_BPC
-    return total_data_bytes(op, c, tp_order) / bw
+    beta = coeffs.perf_beta if coeffs else 1.0
+    return beta * total_data_bytes(op, c, tp_order) / bw
+
+
+def _dma_ops_per_step(c: Candidate, tp_order: int) -> int:
+    """Number of unique DMA descriptor setups per temporal iteration.
+
+    Each unique data source/sink requires one DMA descriptor program.
+    Balanced SP (SPm ~= SPn) minimizes this count via AM-GM inequality:
+      SPm + SPn >= 2*sqrt(N_cores), equality at SPm = SPn.
+    """
+    if tp_order == TP_AXIS_M:
+        return c.SPm + 2 * c.num_cores
+    elif tp_order == TP_AXIS_N:
+        return c.SPn + 2 * c.num_cores
+    else:  # TP_AXIS_K
+        return c.SPm + c.SPn
 
 
 def perf_overhead(
     c: Candidate, coeffs: Optional[CalibCoeffs] = None,
+    tp_order: int = TP_AXIS_K,
 ) -> float:
-    """T_overhead: sync + per-core + startup cost (D+B model when calibrated)."""
+    """T_overhead: sync + DMA setup + per-core + startup cost.
+
+    v7 (DMA-add): adds L_DMA * N_dma_per_step * TP_total to capture
+    the per-DMA-descriptor setup cost that varies with SP shape.
+    v6 compat: l_dma_cy defaults to 0, giving the v6 formula.
+    """
     if coeffs and coeffs.calibrated:
+        dma_cost = coeffs.l_dma_cy * _dma_ops_per_step(c, tp_order) * c.tp_total
         return (coeffs.l_sync_cy * c.tp_total
+                + dma_cost
                 + coeffs.l_core_cy * c.num_cores
                 + coeffs.l_startup_cy)
     return ALPHA_CYCLES * (c.TPm * c.TPn * c.TPk)
@@ -444,7 +478,7 @@ def evaluate_candidate(
     """Evaluate a single candidate with a specific tpOrder."""
     tc = perf_compute(op, c, coeffs)
     tm = perf_comm(op, c, tp_order, coeffs)
-    to = perf_overhead(c, coeffs)
+    to = perf_overhead(c, coeffs, tp_order)
     tt = tc + tm + to
 
     if coeffs and coeffs.energy_calibrated:
@@ -565,11 +599,13 @@ def print_cost_summary(op: OpCase, ranked: List[CostResult]) -> None:
 # ============================================================
 # tc_list.json output (flat schema for the build/run pipeline)
 # ============================================================
-def cost_result_to_tc(op: OpCase, cr: CostResult) -> Dict[str, Any]:
+def cost_result_to_tc(
+    op: OpCase, cr: CostResult, edp_rank: int = 0,
+) -> Dict[str, Any]:
     """Convert a CostResult to a flat tc.json entry for the pipeline."""
     c = cr.candidate
     tp_order_full = build_tp_order(cr.tp_order)
-    return {
+    entry: Dict[str, Any] = {
         "M": op.M, "K": op.K, "N": op.N,
         "elemType": op.elem_type,
         "numCores": c.num_cores,
@@ -584,6 +620,11 @@ def cost_result_to_tc(op: OpCase, cr: CostResult) -> Dict[str, Any]:
             }
         ],
     }
+    if edp_rank > 0:
+        entry["edp_rank"] = edp_rank
+        entry["edp_pred"] = round(cr.edp, 2)
+        entry["e_total_pred"] = round(cr.e_total, 2)
+    return entry
 
 
 # ============================================================
@@ -591,12 +632,51 @@ def cost_result_to_tc(op: OpCase, cr: CostResult) -> Dict[str, Any]:
 # ============================================================
 def select_validation_candidates(
     ranked: List[CostResult],
+    top_n: int = 0,
+    per_core_top: int = 0,
+    random_sample: int = 0,
 ) -> List[CostResult]:
+    """Select validation candidates from EDP-ranked list.
+
+    If all sampling params are 0, returns all candidates (sorted by T_total).
+    Otherwise, builds a deduplicated set from:
+      1. EDP Top-N overall
+      2. EDP Top-K per core count
+      3. Random M from remaining (seed=42 for reproducibility)
+    Returns selected candidates sorted by EDP ascending.
     """
-    Return all candidates sorted by predicted T_total (ascending).
-    Used for full-spectrum validation against actual NPU measurements.
-    """
-    return sorted(ranked, key=lambda r: r.t_total)
+    if top_n <= 0 and per_core_top <= 0 and random_sample <= 0:
+        return sorted(ranked, key=lambda r: r.t_total)
+
+    selected_indices: set = set()
+
+    # 1. EDP Top-N overall (ranked is already sorted by EDP ascending)
+    if top_n > 0:
+        for i in range(min(top_n, len(ranked))):
+            selected_indices.add(i)
+
+    # 2. Per-core-count Top-K
+    if per_core_top > 0:
+        core_counts: Dict[int, List[int]] = {}
+        for i, r in enumerate(ranked):
+            nc = r.candidate.num_cores
+            if nc not in core_counts:
+                core_counts[nc] = []
+            core_counts[nc].append(i)
+        for nc in sorted(core_counts):
+            for i in core_counts[nc][:per_core_top]:
+                selected_indices.add(i)
+
+    # 3. Random sample from remaining
+    if random_sample > 0:
+        remaining = [i for i in range(len(ranked)) if i not in selected_indices]
+        rng = random.Random(42)
+        k = min(random_sample, len(remaining))
+        for i in rng.sample(remaining, k):
+            selected_indices.add(i)
+
+    result = [ranked[i] for i in sorted(selected_indices)]
+    return result
 
 
 def parse_args(argv: List[str]) -> argparse.Namespace:
@@ -614,6 +694,12 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
                    help="Run only this 0-based op index (-1 = all)")
     p.add_argument("--calib", default=str(DEFAULT_CALIB_PATH),
                    help="Path to calibration.json (empty string to skip)")
+    p.add_argument("--top-n", type=int, default=0,
+                   help="Validation: select EDP Top-N per size (0=all)")
+    p.add_argument("--per-core-top", type=int, default=0,
+                   help="Validation: select Top-K per core count per size")
+    p.add_argument("--random-sample", type=int, default=0,
+                   help="Validation: add N random candidates from remaining")
     return p.parse_args(argv)
 
 
@@ -719,11 +805,22 @@ def main(argv: List[str]) -> int:
         tc_cases: List[Dict[str, Any]] = []
         for idx, ranked in all_ranked.items():
             op = ops[idx]
-            selected = select_validation_candidates(ranked)
+            selected = select_validation_candidates(
+                ranked,
+                top_n=args.top_n,
+                per_core_top=args.per_core_top,
+                random_sample=args.random_sample,
+            )
             for cr in selected:
-                tc_cases.append(cost_result_to_tc(op, cr))
+                edp_rank = ranked.index(cr) + 1
+                tc_cases.append(cost_result_to_tc(op, cr, edp_rank=edp_rank))
+            sampling = ""
+            if args.top_n > 0 or args.per_core_top > 0 or args.random_sample > 0:
+                sampling = (f" (top-{args.top_n} + core-top-{args.per_core_top}"
+                            f" + rand-{args.random_sample}"
+                            f" from {len(ranked)} total)")
             print(f"\n[INFO] Op M{op.M}_K{op.K}_N{op.N}: "
-                  f"{len(selected)} validation candidates selected")
+                  f"{len(selected)} validation candidates selected{sampling}")
         write_tc_list(tc_cases, val_path)
         print(f"[INFO] Wrote {val_path} ({len(tc_cases)} cases)")
 
