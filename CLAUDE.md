@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+**At the start of every session, read `.claude/research-sync.md` for the
+Notion-based research synchronization workflow (page IDs, access rules,
+task status transitions).**
+
 ## Project Overview
 
 MLIR-AIE is an MLIR-based toolchain targeting AMD Ryzen AI NPUs (AI Engine tiles). This fork adds an **ONNX-to-AIE compilation pass** (`--convert-onnx-to-aie`) that lowers ONNX dialect operations to AIE/AIEX dialect with spatio-temporal tiling for matrix multiplication.
@@ -138,7 +142,11 @@ include/onnx/
 └── Target/XDNA2/xdna2_info.json # Hardware config (32 SPMs, 64KB each)
 
 lib/Conversion/ONNXToAIE/
-└── ONNXToAIE.cpp                # Main pass implementation (~700+ lines)
+├── ONNXToAIE.cpp                # Pass entry + registration
+├── TileParam.h / TileParam.cpp  # TileParam, SystemInfo, tc.json loading
+├── AiePlacement.h / AiePlacement.cpp  # Tile placement, buffer/DMA allocation
+├── AieEmitter.cpp               # MLIR op emission
+└── CMakeLists.txt
 
 lib/Dialect/ONNX/IR/
 ├── ONNXDialect.cpp              # Dialect registration
@@ -197,11 +205,11 @@ Result CSV columns (39 total, since commit 7c984731):
 
 ## Key Implementation Notes
 
-- The `tc.json` path in `ONNXToAIE.cpp:307` is hardcoded -- must be set correctly before `aie-opt` runs.
+- The `tc.json` path is loaded via `--tile-param-json` CLI option (`ONNXToAIE.cpp:47`), parsed in `TileParam.cpp`.
 - `aie-opt` is the modified version from this repo's `tools/aie-opt/`, not the installed system one. Ensure `$PATH` from `env_setup.sh` points to the local install.
 - `xdna2_info.json` target is XDNA2 (Ryzen AI Strix/Strix Halo/Krackan); `NPU2=1` is set in environment for these devices.
 - Double-buffering is defined in `TileParam` but currently disabled (`doubleBuffer=false`) in test case generation.
-- Kernel function signature: `void extern_kernel(float* A, float* B, float* C, uint32_t N_ROW, uint32_t N_COL, uint32_t N_DEP, bool acc)` -- B is transposed.
+- Kernel function signature: `void extern_kernel(bfloat16* A, bfloat16* B, bfloat16* C, uint32_t N_ROW, uint32_t N_COL, uint32_t N_DEP, bool acc)` -- B is transposed.
 
 ---
 
