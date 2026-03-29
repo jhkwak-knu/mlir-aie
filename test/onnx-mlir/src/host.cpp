@@ -436,11 +436,11 @@ int main(int argc, const char *argv[]) {
       // Fill BO buffers from pre-staged data
       memcpy(bufInA, ss.a.data(), chunkASize * sizeof(DATATYPE));
       memcpy(bufInB, ss.b.data(), chunkBSize * sizeof(DATATYPE));
-      memset(bufOut, 0, chunkOutCSize * sizeof(DATATYPE));
+      // Note: memset(bufOut) removed -- kernel zeros C internally when acc=false,
+      // and accumulates in device-local buffer when acc=true (no host→device sync needed).
 
       bo_inA.sync(XCL_BO_SYNC_BO_TO_DEVICE);
       bo_inB.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-      bo_outC.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
       // npu_time bracket: dispatch + wait only
       auto t0 = std::chrono::high_resolution_clock::now();

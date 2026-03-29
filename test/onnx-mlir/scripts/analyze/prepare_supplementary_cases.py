@@ -41,7 +41,7 @@ from cost_model import (  # noqa: E402
 )
 
 CLOCK_MHZ = 1500
-MIN_WALL_S = 0.010
+MIN_WALL_S = 0.050
 DEFAULT_WARMUP = 3
 
 

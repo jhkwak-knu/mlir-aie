@@ -40,8 +40,9 @@ from cost_model import (  # noqa: E402
 
 CLOCK_MHZ = 1500
 # Minimum wall time for reliable RAPL measurement (seconds).
-# 5ms is the minimum, but 10ms provides a comfortable margin.
-MIN_WALL_S = 0.010
+# 50ms provides sufficient margin for RAPL accuracy, especially after
+# kernel optimizations (chess pragmas) that reduce per-iteration time.
+MIN_WALL_S = 0.050
 # Default warmup iterations
 DEFAULT_WARMUP = 3
 

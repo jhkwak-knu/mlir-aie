@@ -5,7 +5,7 @@ AIETOOLS_DIR       ?= $(shell realpath $(dir $(shell which xchesscc))/../)
 AIE2_INCLUDE_DIR   ?= $(AIETOOLS_DIR)/data/aie2p/lib
 AIE_ARCH           ?= aie2p
 CHESSCC_FLAGS      ?= --aiearch $(AIE_ARCH) -f -p me -P $(AIE2_INCLUDE_DIR) -I $(AIETOOLS_DIR)/include
-AIECC_FLAGS        ?= --aie-generate-xclbin --no-compile-host --aie-generate-npu-insts --npu-insts-name=insts.bin
+AIECC_FLAGS        ?= --aie-generate-xclbin --no-compile-host --aie-generate-npu-insts --npu-insts-name=insts.bin -j 24
 
 # =========================
 # Paths (new tree layout)

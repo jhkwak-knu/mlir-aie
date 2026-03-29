@@ -220,7 +220,11 @@ def load_energy_data(
     skipped: List[SkippedRow] = []
 
     for row in raw_rows:
-        wall_s = float(row.get("wall_elapsed_s", "0"))
+        # Skip rows without wall_elapsed_s (e.g. RUN_FAIL with fewer columns)
+        wall_raw = row.get("wall_elapsed_s")
+        if wall_raw is None or wall_raw == "":
+            continue
+        wall_s = float(wall_raw)
         case_idx = int(row["case_index"])
         M, K, N = int(row["M"]), int(row["K"]), int(row["N"])
         size_key = f"{M}x{K}x{N}"

@@ -40,8 +40,26 @@ the user-level CLAUDE.md. Below are **project-specific additions only**.
    - Periodically check `tail -5 <result_csv>` for recent statuses
    - Watch for consecutive RUN_FAIL (may indicate driver/NPU hang)
    - If >3 consecutive failures, stop and restart NPU driver or reboot
+   - Compare `log.txt` modification time vs current time to detect hangs
+   - If `onnx_matmul` process is in `D` (disk sleep) state for >5 min, it is hung
 
-4. **Result versioning** -- Every measurement batch must be traceable:
+4. **Hang detection and recovery** -- NPU hangs manifest as `D` (disk sleep) state:
+   - Check: `pstree -p <batch_pid>` to find `onnx_matmul` PID
+   - Check: `cat /proc/<pid>/status | grep State` -- `D (disk sleep)` = hung
+   - NPU PCI device: `0000:c5:00.1` (PCI_ID=1022:17F0, driver=amdxdna)
+   - `D` state is uninterruptible -- `kill -9`, PCI reset, driver rmmod are all ineffective
+   - **Only reliable recovery is reboot**
+   - After reboot, resume with `run_tc_all.sh -s <next_case>` (preserves existing CSV)
+   - Prevention: ensure `timeout_in_sec` is set to 60 via `setup_env.sh` before batch start
+   - Note: timeout_in_sec=60 does NOT prevent all hangs -- some D states bypass driver timeout
+
+5. **Autonomous batch execution** -- When running batches via Claude Code:
+   - **Before start**: verify RAPL readable, NPU timeout set, no stale artifacts
+   - **First-case validation**: wait for case #1 to finish, check all fields per item 2
+   - **Periodic monitoring**: check progress every 10-15 min via background commands
+   - **Report**: alert user immediately on any FAIL, RUN_FAIL, or hang detection
+
+6. **Result versioning** -- Every measurement batch must be traceable:
    - Name result files with version/phase: `result_phase1.csv`, `result_v8.csv`
    - Record the git commit hash at measurement time
    - Record the tc_list file used (with config count)
