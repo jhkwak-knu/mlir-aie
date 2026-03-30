@@ -263,26 +263,23 @@ def perf_compute(
 ) -> float:
     """T_comp: compute time assuming all cores run in parallel.
 
-    When calibrated with perf_alpha < 1, compute time is scaled down
-    to reflect compute-DMA pipelining (compute hidden behind DMA).
+    Uses eff_macs (trace-calibrated effective MACs/cycle/tile).
     """
     macs = coeffs.eff_macs if coeffs else PEAK_MACS
-    alpha = coeffs.perf_alpha if coeffs else 1.0
-    return alpha * (op.M * op.N * op.K) / (c.SPm * c.SPn * macs)
+    return (op.M * op.N * op.K) / (c.SPm * c.SPn * macs)
 
 
 def perf_comm(
     op: OpCase, c: Candidate, tp_order: int,
     coeffs: Optional[CalibCoeffs] = None,
 ) -> float:
-    """T_comm: data transfer time through shared DRAM bandwidth.
+    """T_comm: data transfer time through calibrated effective bandwidth.
 
-    When calibrated with perf_beta != 1, applies scaling to account
-    for DMA overhead beyond raw transfer time.
+    bw_eff_bpc is calibrated to account for DMA efficiency, NoC
+    contention, and multicast effects.
     """
     bw = coeffs.bw_eff_bpc if coeffs else BANDWIDTH_BPC
-    beta = coeffs.perf_beta if coeffs else 1.0
-    return beta * total_data_bytes(op, c, tp_order) / bw
+    return total_data_bytes(op, c, tp_order) / bw
 
 
 def _dma_ops_per_step(c: Candidate, tp_order: int) -> int:
@@ -306,13 +303,15 @@ def perf_overhead(
 ) -> float:
     """T_overhead: sync + DMA setup + per-core + startup cost.
 
-    v7 (DMA-add): adds L_DMA * N_dma_per_step * TP_total to capture
-    the per-DMA-descriptor setup cost that varies with SP shape.
-    v6 compat: l_dma_cy defaults to 0, giving the v6 formula.
+    v9 (Core-Sync): sync cost scales with core count via L_SYNC2.
+      T_overhead = (L_SYNC + L_SYNC2*P)*TP + L_DMA*N_dma*TP + L_CORE*P + L_STARTUP
+    v8 compat: l_sync2_cy defaults to 0, giving the v8 formula.
     """
     if coeffs and coeffs.calibrated:
         dma_cost = coeffs.l_dma_cy * _dma_ops_per_step(c, tp_order) * c.tp_total
-        return (coeffs.l_sync_cy * c.tp_total
+        # v9 Core-Sync: barrier cost scales with participating cores
+        sync_per_iter = coeffs.l_sync_cy + coeffs.l_sync2_cy * c.num_cores
+        return (sync_per_iter * c.tp_total
                 + dma_cost
                 + coeffs.l_core_cy * c.num_cores
                 + coeffs.l_startup_cy)

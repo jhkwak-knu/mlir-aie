@@ -176,11 +176,15 @@ def compute_features(cases: List[MeasuredCase]) -> Dict[str, np.ndarray]:
         dma_per_step[i] = dps
         total_dma_ops[i] = dps * mc.cand.tp_total
 
+    # Core-Sync: P * TP_total interaction (barrier cost scales with cores)
+    core_x_tp = n_cores * tp_total
+
     return {
         "t_comp": t_comp, "t_comm": t_comm, "t_comm_raw": t_comm_raw,
         "tp_total": tp_total, "n_cores": n_cores,
         "gt_cy": gt_cy,
         "total_dma_ops": total_dma_ops, "dma_per_step": dma_per_step,
+        "core_x_tp": core_x_tp,
     }
 
 
@@ -318,6 +322,18 @@ MODELS = {
         "predict": predict_combined,
         "bounds": [(0.001, 10), (0.01, 10), (0, 1e3), (0, 5e5), (0, 5e5), (1.0, 2.0), (0, 5e5)],
         "param_names": ["alpha", "beta", "beta_core", "L_SYNC", "L_CORE", "gamma", "L_STARTUP"],
+    },
+    "Core-Sync": {
+        "predict": lambda f, p: (
+            p[0]*f["t_comp"] + p[1]*f["t_comm"]
+            + p[2]*f["tp_total"] + p[3]*f["core_x_tp"]
+            + p[4]*f["total_dma_ops"]
+            + p[5]*f["n_cores"] + p[6]
+        ),
+        "bounds": [(0.001, 10), (0.01, 10), (0, 5e5), (0, 1e5),
+                   (0, 5e5), (0, 5e5), (0, 5e5)],
+        "param_names": ["alpha", "beta", "L_SYNC", "L_SYNC2",
+                        "L_DMA", "L_CORE", "L_STARTUP"],
     },
 }
 
@@ -505,6 +521,15 @@ def write_calibration(calib_path, output_path, model_name, params, param_names, 
         calib["model"] = "D+B-NL"
         calib["l_sync_cy"] = pdict["L_SYNC"]
         calib["l_sync_alpha"] = pdict["alpha"]
+        calib["l_core_cy"] = pdict["L_CORE"]
+        calib["l_startup_cy"] = pdict["L_STARTUP"]
+    elif model_name == "Core-Sync":
+        calib["model"] = "Core-Sync"
+        calib["perf_alpha"] = pdict["alpha"]
+        calib["perf_beta"] = pdict["beta"]
+        calib["l_sync_cy"] = pdict["L_SYNC"]
+        calib["l_sync2_cy"] = pdict["L_SYNC2"]
+        calib["l_dma_cy"] = pdict["L_DMA"]
         calib["l_core_cy"] = pdict["L_CORE"]
         calib["l_startup_cy"] = pdict["L_STARTUP"]
     else:  # D+B baseline
