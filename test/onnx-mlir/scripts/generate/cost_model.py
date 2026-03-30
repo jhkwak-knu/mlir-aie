@@ -302,20 +302,30 @@ def perf_overhead(
     c: Candidate, coeffs: Optional[CalibCoeffs] = None,
     tp_order: int = TP_AXIS_K,
 ) -> float:
-    """T_overhead: sync + DMA setup + per-core + startup cost.
+    """T_overhead: sync + per-core sync + DMA setup + startup cost.
 
-    v9 (Core-Sync): sync cost scales with core count via L_SYNC2.
-      T_overhead = (L_SYNC + L_SYNC2*P)*TP + L_DMA*N_dma*TP + L_CORE*P + L_STARTUP
-    v8 compat: l_sync2_cy defaults to 0, giving the v8 formula.
+    v9: T_overhead = L_SYNC*TP + L_CORE*P*TP + L_DMA*N_dma*TP + L_STARTUP
+      L_SYNC: base per-iteration synchronization cost
+      L_CORE: per-core per-iteration barrier cost (O(P) contention)
+      L_DMA:  per-DMA-descriptor setup cost per iteration
+      L_STARTUP: one-time NPU dispatch overhead
+    v8 compat: l_core_cy applied as L_CORE*P (no TP scaling) when
+               l_sync2_cy == 0.
     """
     if coeffs and coeffs.calibrated:
         dma_cost = coeffs.l_dma_cy * _dma_ops_per_step(c, tp_order) * c.tp_total
-        # v9 Core-Sync: barrier cost scales with participating cores
-        sync_per_iter = coeffs.l_sync_cy + coeffs.l_sync2_cy * c.num_cores
-        return (sync_per_iter * c.tp_total
-                + dma_cost
-                + coeffs.l_core_cy * c.num_cores
-                + coeffs.l_startup_cy)
+        if coeffs.l_sync2_cy != 0:
+            # v9: L_CORE means per-core per-iteration (stored in l_sync2_cy)
+            return (coeffs.l_sync_cy * c.tp_total
+                    + coeffs.l_sync2_cy * c.num_cores * c.tp_total
+                    + dma_cost
+                    + coeffs.l_startup_cy)
+        else:
+            # v8 compat: L_CORE means per-core fixed (no TP scaling)
+            return (coeffs.l_sync_cy * c.tp_total
+                    + dma_cost
+                    + coeffs.l_core_cy * c.num_cores
+                    + coeffs.l_startup_cy)
     return ALPHA_CYCLES * (c.TPm * c.TPn * c.TPk)
 
 

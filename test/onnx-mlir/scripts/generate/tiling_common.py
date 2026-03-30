@@ -101,9 +101,10 @@ class CalibCoeffs:
     # N_dma = SPm+SPn (K-inner), SPm+2N (M-inner), SPn+2N (N-inner).
     # Balanced SP minimizes N_dma (AM-GM: SPm+SPn >= 2*sqrt(N_cores)).
     l_dma_cy: float = 0.0     # Per-DMA-op per-iteration cost (0 = v6 compat)
-    # v9 Core-Sync: per-core per-iteration sync cost.
-    # Barrier overhead scales with participating cores: L_SYNC_eff = L_SYNC + L_SYNC2*P.
-    l_sync2_cy: float = 0.0   # Per-core sync scaling (0 = v8 compat)
+    # v9 Core-Sync: per-core per-iteration barrier cost.
+    # T_overhead = L_SYNC*TP + L_CORE*P*TP + L_DMA*N_dma*TP + L_STARTUP
+    # Stored as l_sync2_cy for JSON compat; semantically = L_CORE in v9.
+    l_sync2_cy: float = 0.0   # Per-core per-iter sync cost (0 = v8 compat)
     # Energy calibration (v3)
     energy_model: str = ""           # E-A, E-B, E-C, E-D (empty = not calibrated)
     energy_params: Dict[str, float] = None  # Model-specific fitted parameters

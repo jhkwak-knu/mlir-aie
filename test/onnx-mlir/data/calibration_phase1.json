@@ -25,6 +25,7 @@
     "ground_truth": "min_us",
     "data_source": "result_phase1.csv (Phase 1 post-optimization)",
     "model_type": "Core-Sync (overhead-only, eff_macs/bw_eff fixed)",
+    "note": "l_sync2_cy = L_CORE in v9 formula: L_SYNC*TP + L_CORE*P*TP + L_DMA*N_dma*TP + L_STARTUP. l_core_cy=0 (absorbed into l_sync2_cy).",
     "cv_mape_pct": 22.0,
     "cv_core_acc_pct": 87,
     "mape_by_tp_bin": {
