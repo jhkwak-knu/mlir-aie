@@ -94,9 +94,9 @@ class CalibCoeffs:
     l_startup_cy: float   # One-time NPU startup cost (cycles)
     calibrated: bool      # True if loaded from file, False if defaults
     # Legacy v6-v8: alpha/beta scaling factors (kept for backward compat).
-    # v9+: alpha=1.0 (fixed), beta absorbed into bw_eff_bpc.
+    # v9+: alpha=1.0, beta=1.0 (both fixed; T_comp and T_comm use physical values).
     perf_alpha: float = 1.0   # Deprecated in v9 (always 1.0)
-    perf_beta: float = 1.0    # Deprecated in v9 (absorbed into bw_eff_bpc)
+    perf_beta: float = 1.0    # Deprecated in v9 (always 1.0)
     # v7 DMA-add: per-DMA-descriptor setup cost per temporal iteration.
     # N_dma = SPm+SPn (K-inner), SPm+2N (M-inner), SPn+2N (N-inner).
     # Balanced SP minimizes N_dma (AM-GM: SPm+SPn >= 2*sqrt(N_cores)).

@@ -273,10 +273,11 @@ def perf_comm(
     op: OpCase, c: Candidate, tp_order: int,
     coeffs: Optional[CalibCoeffs] = None,
 ) -> float:
-    """T_comm: data transfer time through calibrated effective bandwidth.
+    """T_comm: pure data transfer time at stream bandwidth.
 
-    bw_eff_bpc is calibrated to account for DMA efficiency, NoC
-    contention, and multicast effects.
+    bw_eff_bpc = 4.0 B/cy (single DMA stream bandwidth, fixed).
+    Additional DMA overhead (lock, starvation, descriptor setup) is
+    captured by T_overhead terms (L_SYNC, L_SYNC2, L_DMA).
     """
     bw = coeffs.bw_eff_bpc if coeffs else BANDWIDTH_BPC
     return total_data_bytes(op, c, tp_order) / bw
