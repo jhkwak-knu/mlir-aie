@@ -21,6 +21,10 @@ RAPL_CORE = "/sys/class/powercap/intel-rapl:0:0/energy_uj"
 # 100ms minimum ensures RAPL resolution is sufficient
 MIN_WALL_S = 0.10
 N_WARMUP = 5
+# Idle measurement: N samples, take median for noise robustness
+# (Matches NPU host.cpp: N_IDLE_SAMPLES=5, IDLE_SAMPLE_WINDOW_S=0.2)
+N_IDLE_SAMPLES = 5
+IDLE_SAMPLE_WINDOW_S = 0.2
 
 
 def read_rapl(path):
@@ -59,18 +63,24 @@ def measure_matmul(np, m, k, n, n_threads):
     # Need total wall time >= MIN_WALL_S * 2 (double margin for safety)
     n_iters = max(20, int(MIN_WALL_S * 2.0 / max(single_s, 1e-9)))
 
-    # Measure idle energy (sleep for 200ms for stable baseline)
-    idle_duration = 0.2
-    idle_pkg_before = read_rapl(RAPL_PKG)
-    idle_core_before = read_rapl(RAPL_CORE)
-    time.sleep(idle_duration)
-    idle_pkg_after = read_rapl(RAPL_PKG)
-    idle_core_after = read_rapl(RAPL_CORE)
-    idle_wall = idle_duration
-    idle_pkg_uj = idle_pkg_after - idle_pkg_before
-    idle_core_uj = idle_core_after - idle_core_before
-    idle_pkg_mw = idle_pkg_uj / (idle_wall * 1000) if idle_wall > 0 else 0
-    idle_core_mw = idle_core_uj / (idle_wall * 1000) if idle_wall > 0 else 0
+    # Measure idle power: N samples with median for noise robustness
+    # Matches NPU host.cpp methodology (N_IDLE_SAMPLES, median selection)
+    idle_pkg_samples = []
+    idle_core_samples = []
+    for _ in range(N_IDLE_SAMPLES):
+        pkg0 = read_rapl(RAPL_PKG)
+        core0 = read_rapl(RAPL_CORE)
+        time.sleep(IDLE_SAMPLE_WINDOW_S)
+        pkg1 = read_rapl(RAPL_PKG)
+        core1 = read_rapl(RAPL_CORE)
+        dt = IDLE_SAMPLE_WINDOW_S
+        idle_pkg_samples.append((pkg1 - pkg0) / (dt * 1000))   # mW
+        idle_core_samples.append((core1 - core0) / (dt * 1000))
+    idle_pkg_samples.sort()
+    idle_core_samples.sort()
+    idle_pkg_mw = idle_pkg_samples[N_IDLE_SAMPLES // 2]
+    idle_core_mw = idle_core_samples[N_IDLE_SAMPLES // 2]
+    idle_wall = IDLE_SAMPLE_WINDOW_S  # per-sample window for scaling
 
     # Measure active: run n_iters iterations, measure total time + energy
     times_us = []
@@ -96,9 +106,10 @@ def measure_matmul(np, m, k, n, n_threads):
     total_pkg_uj = pkg_after - pkg_before
     total_core_uj = core_after - core_before
 
-    # Subtract idle energy
-    active_pkg_uj = total_pkg_uj - idle_pkg_uj * (wall_s / idle_wall)
-    active_core_uj = total_core_uj - idle_core_uj * (wall_s / idle_wall)
+    # Subtract idle energy: idle_mw * wall_s * 1000 = idle energy in uJ
+    # (Matches NPU host.cpp: npu_energy_uj = active_pkg_uj - idle_pkg_mw * wall_s * 1000)
+    active_pkg_uj = total_pkg_uj - idle_pkg_mw * wall_s * 1000
+    active_core_uj = total_core_uj - idle_core_mw * wall_s * 1000
 
     # Per-iteration energy
     pkg_per_iter_uj = total_pkg_uj / n_iters

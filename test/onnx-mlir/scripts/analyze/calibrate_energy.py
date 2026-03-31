@@ -62,7 +62,7 @@ from tiling_common import (  # noqa: E402
     load_system_info, DEFAULT_SYS_PATH,
 )
 from cost_model import (  # noqa: E402
-    Candidate, total_data_bytes,
+    Candidate, total_data_bytes, _dma_ops_per_step,
     E_MAC_PJ, E_DRAM_PJ, P_STATIC_PJ,
 )
 
@@ -470,15 +470,27 @@ def compute_features(
         cand = r.make_cand()
 
         # Calibrated performance components (in cycles)
+        n_dma = _dma_ops_per_step(cand, r.tp_order_inner)
+        data_bytes = total_data_bytes(op, cand, r.tp_order_inner)
         if coeffs and coeffs.calibrated:
             t_comp_cy = (r.M * r.K * r.N) / (r.n_cores * coeffs.eff_macs)
-            t_dma_cy = total_data_bytes(op, cand, r.tp_order_inner) / coeffs.bw_eff_bpc
-            t_ovh_cy = (coeffs.l_sync_cy * r.tp_total
-                        + coeffs.l_core_cy * r.n_cores
-                        + coeffs.l_startup_cy)
+            t_dma_cy = data_bytes / coeffs.bw_eff_bpc
+            dma_cost = coeffs.l_dma_cy * n_dma * r.tp_total
+            if coeffs.l_sync2_cy != 0:
+                # v9 Core-Sync: per-core per-iteration barrier
+                t_ovh_cy = (coeffs.l_sync_cy * r.tp_total
+                            + coeffs.l_sync2_cy * r.n_cores * r.tp_total
+                            + dma_cost
+                            + coeffs.l_startup_cy)
+            else:
+                # v8 compat: per-core fixed cost (no TP scaling)
+                t_ovh_cy = (coeffs.l_sync_cy * r.tp_total
+                            + dma_cost
+                            + coeffs.l_core_cy * r.n_cores
+                            + coeffs.l_startup_cy)
         else:
             t_comp_cy = (r.M * r.K * r.N) / (r.n_cores * 256.0)
-            t_dma_cy = total_data_bytes(op, cand, r.tp_order_inner) / 4.0
+            t_dma_cy = data_bytes / 4.0
             t_ovh_cy = 20.0 * r.tp_total
 
         t_total_cy = t_comp_cy + t_dma_cy + t_ovh_cy
@@ -493,8 +505,10 @@ def compute_features(
             "n_cores": r.n_cores,
             "n_columns": r.n_columns,
             "macs": r.M * r.K * r.N,
-            "data_bytes": total_data_bytes(op, cand, r.tp_order_inner),
+            "data_bytes": data_bytes,
             "t_total_cy": t_total_cy,
+            "n_dma": n_dma,
+            "tp_total": r.tp_total,
         })
     return features
 
