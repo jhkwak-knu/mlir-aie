@@ -30,8 +30,9 @@ from tiling_common import (                       # noqa: E402
     OpCase, SystemInfo, CalibCoeffs, DEFAULT_COEFFS,
     divisors, factor_pairs, ws_bytes,
     load_op_list, load_system_info, load_calibration, write_tc_list,
-    build_tp_order,
+    build_tp_order, build_metadata,
 )
+import models as _models                          # noqa: E402
 
 # Hardware coefficients for XDNA2 (Ryzen AI 9 HX 370, Strix Point, TSMC N4P).
 # Sources: AMD XDNA2 spec (256 MACs/cycle BF16 per tile, 32 tiles, ~1.5 GHz),
@@ -227,33 +228,10 @@ def filter_candidates(
 # Stage 3: Cost model evaluation
 # ============================================================
 def total_data_bytes(op: OpCase, c: Candidate, tp_order: int) -> int:
-    """
-    Total data transfer volume (bytes) across all cores, with reuse applied.
-
-    The innermost temporal axis determines which operands stay in tile memory
-    (temporal reuse) and which are shared across spatial cores (spatial reuse).
-    Final transfer = raw transfer / (TR × SR) per operand.
-    """
-    M, K, N = op.M, op.K, op.N
-    eb = op.elem_bytes
-
-    if tp_order == TP_AXIS_M:
-        # M innermost: RHS reused across TPm iterations and SPm cores.
-        lhs = M * K * c.TPn
-        rhs = K * N
-        out = 2 * M * N * c.TPk
-    elif tp_order == TP_AXIS_N:
-        # N innermost: LHS reused across TPn iterations and SPn cores.
-        lhs = M * K
-        rhs = K * N * c.TPm
-        out = 2 * M * N * c.TPk
-    else:
-        # K innermost: OUT reused across TPk iterations (local accumulation).
-        lhs = M * K * c.TPn
-        rhs = K * N * c.TPm
-        out = 2 * M * N
-
-    return (lhs + rhs + out) * eb
+    """Total data transfer volume (bytes). Delegates to models.py."""
+    return _models.total_data_bytes(
+        op.M, op.K, op.N, op.elem_bytes,
+        c.SPm, c.SPn, c.TPm, c.TPk, c.TPn, tp_order)
 
 
 # --- Performance functions (unit: Cycles) ---
@@ -261,71 +239,39 @@ def total_data_bytes(op: OpCase, c: Candidate, tp_order: int) -> int:
 def perf_compute(
     op: OpCase, c: Candidate, coeffs: Optional[CalibCoeffs] = None,
 ) -> float:
-    """T_comp: compute time assuming all cores run in parallel.
-
-    Uses eff_macs (trace-calibrated effective MACs/cycle/tile).
-    """
-    macs = coeffs.eff_macs if coeffs else PEAK_MACS
-    return (op.M * op.N * op.K) / (c.SPm * c.SPn * macs)
+    """T_comp: compute time assuming all cores run in parallel."""
+    eff = coeffs.eff_macs if coeffs else PEAK_MACS
+    return (op.M * op.N * op.K) / (c.SPm * c.SPn * eff)
 
 
 def perf_comm(
     op: OpCase, c: Candidate, tp_order: int,
     coeffs: Optional[CalibCoeffs] = None,
 ) -> float:
-    """T_comm: pure data transfer time at stream bandwidth.
-
-    bw_eff_bpc = 4.0 B/cy (single DMA stream bandwidth, fixed).
-    Additional DMA overhead (lock, starvation, descriptor setup) is
-    captured by T_overhead terms (L_SYNC, L_SYNC2, L_DMA).
-    """
+    """T_comm: pure data transfer time at stream bandwidth."""
     bw = coeffs.bw_eff_bpc if coeffs else BANDWIDTH_BPC
     return total_data_bytes(op, c, tp_order) / bw
 
 
 def _dma_ops_per_step(c: Candidate, tp_order: int) -> int:
-    """Number of unique DMA descriptor setups per temporal iteration.
-
-    Each unique data source/sink requires one DMA descriptor program.
-    Balanced SP (SPm ~= SPn) minimizes this count via AM-GM inequality:
-      SPm + SPn >= 2*sqrt(N_cores), equality at SPm = SPn.
-    """
-    if tp_order == TP_AXIS_M:
-        return c.SPm + 2 * c.num_cores
-    elif tp_order == TP_AXIS_N:
-        return c.SPn + 2 * c.num_cores
-    else:  # TP_AXIS_K
-        return c.SPm + c.SPn
+    """Delegates to models.dma_ops_per_step()."""
+    return _models.dma_ops_per_step(c.SPm, c.SPn, c.num_cores, tp_order)
 
 
 def perf_overhead(
     c: Candidate, coeffs: Optional[CalibCoeffs] = None,
     tp_order: int = TP_AXIS_K,
 ) -> float:
-    """T_overhead: sync + per-core sync + DMA setup + startup cost.
-
-    v9: T_overhead = L_SYNC*TP + L_CORE*P*TP + L_DMA*N_dma*TP + L_STARTUP
-      L_SYNC: base per-iteration synchronization cost
-      L_CORE: per-core per-iteration barrier cost (O(P) contention)
-      L_DMA:  per-DMA-descriptor setup cost per iteration
-      L_STARTUP: one-time NPU dispatch overhead
-    v8 compat: l_core_cy applied as L_CORE*P (no TP scaling) when
-               l_sync2_cy == 0.
-    """
+    """T_overhead: delegates to models.PerfModel.components_v9()."""
     if coeffs and coeffs.calibrated:
-        dma_cost = coeffs.l_dma_cy * _dma_ops_per_step(c, tp_order) * c.tp_total
-        if coeffs.l_sync2_cy != 0:
-            # v9: L_CORE means per-core per-iteration (stored in l_sync2_cy)
-            return (coeffs.l_sync_cy * c.tp_total
-                    + coeffs.l_sync2_cy * c.num_cores * c.tp_total
-                    + dma_cost
-                    + coeffs.l_startup_cy)
-        else:
-            # v8 compat: L_CORE means per-core fixed (no TP scaling)
-            return (coeffs.l_sync_cy * c.tp_total
-                    + dma_cost
-                    + coeffs.l_core_cy * c.num_cores
-                    + coeffs.l_startup_cy)
+        n_dma = _dma_ops_per_step(c, tp_order)
+        _, _, t_ovh = _models.PerfModel.components_v9(
+            macs=0, data_bytes=0,  # only overhead needed
+            n_cores=c.num_cores, tp_total=c.tp_total, n_dma=n_dma,
+            eff_macs=coeffs.eff_macs, bw_bpc=coeffs.bw_eff_bpc,
+            l_sync=coeffs.l_sync_cy, l_sync2=coeffs.l_sync2_cy,
+            l_dma=coeffs.l_dma_cy, l_startup=coeffs.l_startup_cy)
+        return t_ovh
     return ALPHA_CYCLES * (c.TPm * c.TPn * c.TPk)
 
 
@@ -373,110 +319,33 @@ def energy_total_calibrated(
     t_comp: float, t_comm: float, t_overhead: float, t_total: float,
     coeffs: CalibCoeffs,
 ) -> Tuple[float, float, float, float]:
-    """Compute energy using fully calibrated model (E-A/E-B/E-C/E-D).
+    """Compute energy using calibrated model. Delegates to models.EnergyModel.
 
     Returns (e_comp_pj, e_comm_pj, e_static_pj, e_total_pj).
-    For models that don't decompose into components, e_comp/e_comm/e_static
-    are set to 0 and e_total contains the full prediction.
+    Component breakdown is approximate for models that don't decompose.
     """
-    CLOCK_MHZ = 1500
-    params = coeffs.energy_params
-    model = coeffs.energy_model
+    features = {
+        "macs": op.M * op.N * op.K,
+        "data_bytes": total_data_bytes(op, c, tp_order),
+        "n_cores": c.SPm * c.SPn,
+        "tp_total": c.tp_total,
+        "n_dma": _dma_ops_per_step(c, tp_order),
+        "t_total_cy": t_total,
+        "t_comp_cy": t_comp,
+        "t_comm_cy": t_comm,
+        "t_overhead_cy": t_overhead,
+    }
+    e_total = _models.EnergyModel.predict(
+        coeffs.energy_model, coeffs.energy_params, features)
 
-    if model == "E-A":
-        p_active_uw = params.get("p_active_uw", 0)
-        e_startup_uj = params.get("e_startup_uj", 0)
-        t_total_us = t_total / CLOCK_MHZ
-        e_total_pj = (p_active_uw * t_total_us / 1e6 + e_startup_uj) * 1e6
-        return 0.0, 0.0, 0.0, e_total_pj
-
-    elif model == "E-B":
-        p_comp = params.get("p_comp_uw", 0)
-        p_dma = params.get("p_dma_uw", 0)
-        p_idle = params.get("p_idle_uw", 0)
-        e_startup = params.get("e_startup_uj", 0)
-        e_comp = p_comp * (t_comp / CLOCK_MHZ) / 1e6 * 1e6   # uW*us/1e6=uJ, *1e6=pJ
-        e_comm = p_dma * (t_comm / CLOCK_MHZ) / 1e6 * 1e6
-        e_static = p_idle * (t_overhead / CLOCK_MHZ) / 1e6 * 1e6
-        e_total_pj = e_comp + e_comm + e_static + e_startup * 1e6
-        return e_comp, e_comm, e_static, e_total_pj
-
-    elif model == "E-C":
-        # Component-based: same structure as theoretical, just different constants
-        e_mac = params.get("e_mac_pj", E_MAC_PJ)
-        e_byte = params.get("e_byte_pj", E_DRAM_PJ)
-        p_static = params.get("p_static_pj", P_STATIC_PJ)
-        e_startup = params.get("e_startup_uj", 0)
-        e_comp = op.M * op.N * op.K * e_mac
-        e_comm = total_data_bytes(op, c, tp_order) * e_byte
-        e_st = (c.SPm * c.SPn) * p_static * t_total
-        e_total_pj = e_comp + e_comm + e_st + e_startup * 1e6
-        return e_comp, e_comm, e_st, e_total_pj
-
-    elif model == "E-D":
-        p_core_uw = params.get("p_core_uw", 0)
-        e_startup = params.get("e_startup_uj", 0)
-        t_total_us = t_total / CLOCK_MHZ
-        n_cores = c.SPm * c.SPn
-        e_total_pj = (p_core_uw * n_cores * t_total_us / 1e6 + e_startup) * 1e6
-        return 0.0, 0.0, 0.0, e_total_pj
-
-    elif model == "E-F":
-        p_base_uw = params.get("p_base_uw", 0)
-        p_core_uw = params.get("p_core_uw", 0)
-        e_startup = params.get("e_startup_uj", 0)
-        t_total_us = t_total / CLOCK_MHZ
-        n_cores = c.SPm * c.SPn
-        e_total_pj = ((p_base_uw + p_core_uw * n_cores) * t_total_us / 1e6
-                      + e_startup) * 1e6
-        return 0.0, 0.0, 0.0, e_total_pj
-
-    elif model == "T-A":
-        # Calibrated theoretical: E = E_mac*MACs + E_dram*bytes + P_static*N*T
-        e_mac = params.get("e_mac_pj", E_MAC_PJ)
-        e_dram = params.get("e_dram_pj", E_DRAM_PJ)
-        p_static = params.get("p_static_pj", P_STATIC_PJ)
-        n_cores = c.SPm * c.SPn
-        e_comp = op.M * op.N * op.K * e_mac
-        e_comm = total_data_bytes(op, c, tp_order) * e_dram
-        e_st = n_cores * p_static * t_total
-        return e_comp, e_comm, e_st, e_comp + e_comm + e_st
-
-    elif model == "T-B":
-        # Base + per-core power: E = E_mac*MACs + E_dram*bytes + (P_base + P_core*N)*T
-        e_mac = params.get("e_mac_pj", E_MAC_PJ)
-        e_dram = params.get("e_dram_pj", E_DRAM_PJ)
-        p_base_uw = params.get("p_base_uw", 0)
-        p_core_uw = params.get("p_core_uw", 0)
-        n_cores = c.SPm * c.SPn
-        t_total_us = t_total / CLOCK_MHZ
-        e_comp = op.M * op.N * op.K * e_mac
-        e_comm = total_data_bytes(op, c, tp_order) * e_dram
-        # P(uW) * t(us) = uW*us = pJ
-        e_st = (p_base_uw + p_core_uw * n_cores) * t_total_us
-        return e_comp, e_comm, e_st, e_comp + e_comm + e_st
-
-    elif model == "T-C":
-        # Base + per-core + startup: same as T-B + E_startup
-        e_mac = params.get("e_mac_pj", E_MAC_PJ)
-        e_dram = params.get("e_dram_pj", E_DRAM_PJ)
-        p_base_uw = params.get("p_base_uw", 0)
-        p_core_uw = params.get("p_core_uw", 0)
-        e_startup = params.get("e_startup_uj", 0)
-        n_cores = c.SPm * c.SPn
-        t_total_us = t_total / CLOCK_MHZ
-        e_comp = op.M * op.N * op.K * e_mac
-        e_comm = total_data_bytes(op, c, tp_order) * e_dram
-        e_st = (p_base_uw + p_core_uw * n_cores) * t_total_us
-        e_total_pj = e_comp + e_comm + e_st + e_startup * 1e6
-        return e_comp, e_comm, e_st, e_total_pj
-
-    else:
-        # Unknown model — fall back to theoretical constants
-        edc = op.M * op.N * op.K * E_MAC_PJ
-        edm = total_data_bytes(op, c, tp_order) * E_DRAM_PJ
-        es = (c.SPm * c.SPn) * P_STATIC_PJ * t_total
-        return edc, edm, es, edc + edm + es
+    # Approximate component breakdown for reporting
+    e_mac_pj = coeffs.energy_params.get("e_mac_pj", E_MAC_PJ)
+    e_dram_pj = coeffs.energy_params.get("e_dram_pj",
+                coeffs.energy_params.get("e_byte_pj", E_DRAM_PJ))
+    e_comp = features["macs"] * e_mac_pj
+    e_comm = features["data_bytes"] * e_dram_pj
+    e_static = max(0.0, e_total - e_comp - e_comm)
+    return e_comp, e_comm, e_static, e_total
 
 
 # --- Combined evaluation ---
@@ -831,7 +700,8 @@ def main(argv: List[str]) -> int:
                             f" from {len(ranked)} total)")
             print(f"\n[INFO] Op M{op.M}_K{op.K}_N{op.N}: "
                   f"{len(selected)} validation candidates selected{sampling}")
-        write_tc_list(tc_cases, val_path)
+        meta = build_metadata(calib_path=Path(args.calib), coeffs=coeffs)
+        write_tc_list(tc_cases, val_path, metadata=meta)
         print(f"[INFO] Wrote {val_path} ({len(tc_cases)} cases)")
 
     return 0

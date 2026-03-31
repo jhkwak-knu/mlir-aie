@@ -36,6 +36,7 @@ from cost_model import (  # noqa: E402
 from tiling_common import (  # noqa: E402
     CalibCoeffs, OpCase, load_calibration,
     TP_AXIS_M, TP_AXIS_N, TP_AXIS_K,
+    CommentFilterFile,
 )
 
 # Import spearman from analyze_ranking (same directory)
@@ -144,14 +145,14 @@ def load_validation_data(
     case_indices = None
     if tc_archive_path:
         with csv_path.open("r", encoding="utf-8") as f:
-            case_indices = [int(r["case_index"]) for r in csv.DictReader(f)
+            case_indices = [int(r["case_index"]) for r in csv.DictReader(CommentFilterFile(f))
                            if r.get("status") == "PASS"]
     tp_map = load_tp_order_map(tc_path, tc_archive_path, case_indices)
 
     rows: List[ValidationRow] = []
     skipped = 0
     with csv_path.open("r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
+        reader = csv.DictReader(CommentFilterFile(f))
         for row in reader:
             if row.get("status") != "PASS":
                 continue
@@ -190,7 +191,7 @@ def load_validation_data(
 
             t_comp = perf_compute(op, cand, coeffs)
             t_comm = perf_comm(op, cand, tp_order, coeffs)
-            t_over = perf_overhead(cand, coeffs)
+            t_over = perf_overhead(cand, coeffs, tp_order)
             t_total_cy = t_comp + t_comm + t_over
             t_total_us = t_total_cy / CLOCK_MHZ
 

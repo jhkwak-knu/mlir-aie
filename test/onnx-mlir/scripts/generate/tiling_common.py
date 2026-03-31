@@ -13,8 +13,10 @@ from __future__ import annotations
 import json
 import math
 import shutil
+import subprocess
 import tempfile
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -200,6 +202,38 @@ def load_calibration(path: Path = DEFAULT_CALIB_PATH) -> CalibCoeffs:
     )
 
 
+class CommentFilterFile:
+    """Wraps a file object to skip lines starting with '#'.
+
+    Use with csv.DictReader to transparently handle metadata comments:
+        with open(path) as f:
+            reader = csv.DictReader(CommentFilterFile(f))
+    """
+
+    def __init__(self, f):
+        self._f = f
+        self.metadata: List[str] = []
+
+    def __iter__(self):
+        for line in self._f:
+            if line.startswith("#"):
+                self.metadata.append(line.rstrip())
+            else:
+                yield line
+
+    def __next__(self):
+        for line in self._f:
+            if line.startswith("#"):
+                self.metadata.append(line.rstrip())
+                continue
+            return line
+        raise StopIteration
+
+    def readline(self):
+        """Support csv.reader which calls readline()."""
+        return next(self, "")
+
+
 def atomic_write_json(obj: Any, out_path: Path) -> None:
     """Write JSON atomically to prevent partial writes on crash."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -238,9 +272,46 @@ def atomic_write_text(text: str, out_path: Path) -> None:
         raise
 
 
-def write_tc_list(tc_cases: List[Dict[str, Any]], out_path: Path) -> None:
-    """Write tc_list.json atomically for the build/run pipeline."""
-    atomic_write_json({"cases": tc_cases}, out_path)
+def _git_commit_short() -> str:
+    """Get current git commit hash (short), or 'unknown'."""
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(REPO_ROOT), stderr=subprocess.DEVNULL,
+        ).decode().strip()
+    except Exception:
+        return "unknown"
+
+
+def build_metadata(
+    calib_path: Optional[Path] = None,
+    coeffs: Optional["CalibCoeffs"] = None,
+) -> Dict[str, Any]:
+    """Build metadata dict for tc_list.json and result CSV traceability."""
+    meta: Dict[str, Any] = {
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "git_commit": _git_commit_short(),
+    }
+    if calib_path:
+        meta["calibration_file"] = str(calib_path.name)
+    if coeffs:
+        meta["perf_model"] = coeffs.__class__.__name__
+        meta["perf_version"] = 9
+        meta["bw_eff_bpc"] = coeffs.bw_eff_bpc
+        meta["energy_model"] = coeffs.energy_model or "none"
+    return meta
+
+
+def write_tc_list(
+    tc_cases: List[Dict[str, Any]], out_path: Path,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Write tc_list.json atomically with optional metadata."""
+    doc: Dict[str, Any] = {}
+    if metadata:
+        doc["metadata"] = metadata
+    doc["cases"] = tc_cases
+    atomic_write_json(doc, out_path)
 
 
 # ============================================================

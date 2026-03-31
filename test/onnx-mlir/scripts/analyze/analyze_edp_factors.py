@@ -39,7 +39,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "generate"))
 from tiling_common import (  # noqa: E402
     CalibCoeffs, load_calibration, DEFAULT_CALIB_PATH,
 )
-from cost_model import total_data_bytes, Candidate, OpCase  # noqa: E402
+from cost_model import total_data_bytes, Candidate, OpCase, _dma_ops_per_step  # noqa: E402
+import models as _models  # noqa: E402
 
 CLOCK_MHZ = 1500
 COMP_TILES_PER_COL = 4
@@ -238,20 +239,19 @@ def analyze_lsync_scaling(cases: List[FactorCase], coeffs: CalibCoeffs) -> None:
         print("  [WARN] No calibration loaded, skipping")
         return
 
-    eff_macs = coeffs.eff_macs
-    bw = coeffs.bw_eff_bpc
-    l_sync = coeffs.l_sync_cy
-    l_core = coeffs.l_core_cy
-    l_startup = coeffs.l_startup_cy
-
     # Compute measured overhead for each case
     data_points = []
     for c in cases:
         op = c.make_op()
         cand = c.make_cand()
-        t_comp_cy = (c.M * c.K * c.N) / (c.num_cores * eff_macs)
-        t_comm_cy = total_data_bytes(op, cand, c.tp_order_inner) / bw
-        t_pred_ovh_cy = l_sync * c.tp_total + l_core * c.num_cores + l_startup
+        n_dma = _dma_ops_per_step(cand, c.tp_order_inner)
+        data_bytes = total_data_bytes(op, cand, c.tp_order_inner)
+        t_comp_cy, t_comm_cy, t_pred_ovh_cy = _models.PerfModel.components_v9(
+            macs=c.M * c.K * c.N, data_bytes=data_bytes,
+            n_cores=c.num_cores, tp_total=c.tp_total, n_dma=n_dma,
+            eff_macs=coeffs.eff_macs, bw_bpc=coeffs.bw_eff_bpc,
+            l_sync=coeffs.l_sync_cy, l_sync2=coeffs.l_sync2_cy,
+            l_dma=coeffs.l_dma_cy, l_startup=coeffs.l_startup_cy)
 
         t_meas_cy = c.min_us * CLOCK_MHZ
         t_meas_ovh_cy = t_meas_cy - t_comp_cy - t_comm_cy

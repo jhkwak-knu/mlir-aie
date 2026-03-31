@@ -116,7 +116,20 @@ NEW_HEADER="case_index,numSpm,SPm,SPn,TPm,TPk,TPn,TM,TK,TN,M,K,N,doubleBuffer,t_
 NUM_COLUMNS=39
 if [[ ! -f "$RESULT_CSV" ]]; then
   mkdir -p "$(dirname "$RESULT_CSV")"
-  echo "$NEW_HEADER" > "$RESULT_CSV"
+  # Write metadata comment lines for traceability
+  {
+    echo "# tc_list: $(basename "$INPUT_JSON")"
+    echo "# git_commit: $(git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    echo "# created_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    # Extract calibration info from tc_list metadata if available
+    _calib_file=$(jq -r '.metadata.calibration_file // empty' "$INPUT_JSON" 2>/dev/null || true)
+    _energy_model=$(jq -r '.metadata.energy_model // empty' "$INPUT_JSON" 2>/dev/null || true)
+    _bw_eff=$(jq -r '.metadata.bw_eff_bpc // empty' "$INPUT_JSON" 2>/dev/null || true)
+    [[ -n "$_calib_file" ]] && echo "# calibration: $_calib_file"
+    [[ -n "$_energy_model" ]] && echo "# energy_model: $_energy_model"
+    [[ -n "$_bw_eff" ]] && echo "# bw_eff_bpc: $_bw_eff"
+    echo "$NEW_HEADER"
+  } > "$RESULT_CSV"
 else
   CUR_HEADER="$(head -n1 "$RESULT_CSV" || true)"
   if ! echo "$CUR_HEADER" | grep -q 'trace_dispatch_us'; then

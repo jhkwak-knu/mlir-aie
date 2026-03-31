@@ -31,6 +31,7 @@ from analyze_ranking import spearman_rank_correlation  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "generate"))
 from tiling_common import OpCase, TP_AXIS_K  # noqa: E402
 from cost_model import Candidate, total_data_bytes  # noqa: E402
+import models as _models  # noqa: E402
 
 # Fixed constants (from v8 calibration)
 EFF_MACS = 24.28
@@ -103,13 +104,8 @@ def load_data(result_path: str, tc_path: str) -> list:
 
 
 def _dma_ops_per_step(d: dict) -> int:
-    """N_dma per step based on tpOrder."""
-    if d["tp_order"] == 0:   # M inner
-        return d["SPm"] + 2 * d["nc"]
-    elif d["tp_order"] == 1: # N inner
-        return d["SPn"] + 2 * d["nc"]
-    else:                    # K inner
-        return d["SPm"] + d["SPn"]
+    """Delegates to models.dma_ops_per_step()."""
+    return _models.dma_ops_per_step(d["SPm"], d["SPn"], d["nc"], d["tp_order"])
 
 
 def _total_data_bytes(d: dict) -> float:
@@ -130,13 +126,6 @@ def _total_data_bytes(d: dict) -> float:
 
 def analyze_contributions(data: list, calib: dict) -> dict:
     """Compute contribution ratios for each component."""
-    alpha = calib["perf_alpha"]
-    beta = calib["perf_beta"]
-    l_sync = calib["l_sync_cy"]
-    l_dma = calib["l_dma_cy"]
-    l_core = calib["l_core_cy"]
-    l_startup = calib["l_startup_cy"]
-
     # TP_total bins
     bins = {
         "[1-4]": (1, 4),
@@ -151,18 +140,24 @@ def analyze_contributions(data: list, calib: dict) -> dict:
     all_contribs = {"comp": [], "comm": [], "overhead": []}
 
     for d in data:
-        t_comp = (d["M"] * d["K"] * d["N"]) / (d["nc"] * EFF_MACS)
-        t_comm = _total_data_bytes(d) / BW_BPC
-        dma_cost = l_dma * _dma_ops_per_step(d) * d["tp_total"]
-        t_overhead = (l_sync * d["tp_total"] + dma_cost
-                      + l_core * d["nc"] + l_startup)
+        macs = d["M"] * d["K"] * d["N"]
+        data_bytes = _total_data_bytes(d)
+        n_dma = _dma_ops_per_step(d)
+        t_comp, t_comm, t_overhead = _models.PerfModel.components_v9(
+            macs=macs, data_bytes=data_bytes,
+            n_cores=d["nc"], tp_total=d["tp_total"], n_dma=n_dma,
+            eff_macs=EFF_MACS, bw_bpc=BW_BPC,
+            l_sync=calib["l_sync_cy"],
+            l_sync2=calib.get("l_sync2_cy", 0),
+            l_dma=calib["l_dma_cy"],
+            l_startup=calib["l_startup_cy"])
 
-        t_total = alpha * t_comp + beta * t_comm + t_overhead
+        t_total = t_comp + t_comm + t_overhead
         if t_total <= 0:
             continue
 
-        comp_pct = alpha * t_comp / t_total * 100
-        comm_pct = beta * t_comm / t_total * 100
+        comp_pct = t_comp / t_total * 100
+        comm_pct = t_comm / t_total * 100
         ovhd_pct = t_overhead / t_total * 100
 
         all_contribs["comp"].append(comp_pct)

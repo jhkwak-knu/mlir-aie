@@ -60,11 +60,13 @@ from tiling_common import (  # noqa: E402
     OpCase, CalibCoeffs,
     load_calibration, atomic_write_json, DEFAULT_CALIB_PATH,
     load_system_info, DEFAULT_SYS_PATH,
+    CommentFilterFile,
 )
 from cost_model import (  # noqa: E402
     Candidate, total_data_bytes, _dma_ops_per_step,
     E_MAC_PJ, E_DRAM_PJ, P_STATIC_PJ,
 )
+import models as _models  # noqa: E402
 
 CLOCK_MHZ = 1500
 # Loaded at startup from xdna2_info.json; fallback = 4
@@ -204,7 +206,7 @@ def load_energy_data(
     # First pass: collect all rows to compute global idle median for 'corrected'
     raw_rows: List[Dict[str, str]] = []
     with csv_path.open("r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
+        reader = csv.DictReader(CommentFilterFile(f))
         for row in reader:
             raw_rows.append(dict(row))
 
@@ -463,33 +465,28 @@ def print_validity_report(
 def compute_features(
     rows: List[ECalibRow], coeffs: Optional[CalibCoeffs],
 ) -> List[Dict[str, float]]:
-    """Compute model features for each row using calibrated perf model."""
+    """Compute model features for each row using calibrated perf model.
+
+    Delegates performance computation to models.PerfModel.components_v9().
+    """
     features = []
     for r in rows:
         op = r.make_op()
         cand = r.make_cand()
 
-        # Calibrated performance components (in cycles)
         n_dma = _dma_ops_per_step(cand, r.tp_order_inner)
         data_bytes = total_data_bytes(op, cand, r.tp_order_inner)
+        macs = r.M * r.K * r.N
+
         if coeffs and coeffs.calibrated:
-            t_comp_cy = (r.M * r.K * r.N) / (r.n_cores * coeffs.eff_macs)
-            t_dma_cy = data_bytes / coeffs.bw_eff_bpc
-            dma_cost = coeffs.l_dma_cy * n_dma * r.tp_total
-            if coeffs.l_sync2_cy != 0:
-                # v9 Core-Sync: per-core per-iteration barrier
-                t_ovh_cy = (coeffs.l_sync_cy * r.tp_total
-                            + coeffs.l_sync2_cy * r.n_cores * r.tp_total
-                            + dma_cost
-                            + coeffs.l_startup_cy)
-            else:
-                # v8 compat: per-core fixed cost (no TP scaling)
-                t_ovh_cy = (coeffs.l_sync_cy * r.tp_total
-                            + dma_cost
-                            + coeffs.l_core_cy * r.n_cores
-                            + coeffs.l_startup_cy)
+            t_comp_cy, t_dma_cy, t_ovh_cy = _models.PerfModel.components_v9(
+                macs=macs, data_bytes=data_bytes,
+                n_cores=r.n_cores, tp_total=r.tp_total, n_dma=n_dma,
+                eff_macs=coeffs.eff_macs, bw_bpc=coeffs.bw_eff_bpc,
+                l_sync=coeffs.l_sync_cy, l_sync2=coeffs.l_sync2_cy,
+                l_dma=coeffs.l_dma_cy, l_startup=coeffs.l_startup_cy)
         else:
-            t_comp_cy = (r.M * r.K * r.N) / (r.n_cores * 256.0)
+            t_comp_cy = macs / (r.n_cores * 256.0)
             t_dma_cy = data_bytes / 4.0
             t_ovh_cy = 20.0 * r.tp_total
 
@@ -504,7 +501,7 @@ def compute_features(
             "t_measured_us": r.avg_iter_us,
             "n_cores": r.n_cores,
             "n_columns": r.n_columns,
-            "macs": r.M * r.K * r.N,
+            "macs": macs,
             "data_bytes": data_bytes,
             "t_total_cy": t_total_cy,
             "n_dma": n_dma,
@@ -893,11 +890,14 @@ def _active_fraction(r: ECalibRow, coeffs: Optional[CalibCoeffs]) -> float:
     op = r.make_op()
     cand = r.make_cand()
     if coeffs and coeffs.calibrated:
-        t_comp = (r.M * r.K * r.N) / (r.n_cores * coeffs.eff_macs)
-        t_dma = total_data_bytes(op, cand, r.tp_order_inner) / coeffs.bw_eff_bpc
-        t_ovh = (coeffs.l_sync_cy * r.tp_total
-                 + coeffs.l_core_cy * r.n_cores
-                 + coeffs.l_startup_cy)
+        n_dma = _dma_ops_per_step(cand, r.tp_order_inner)
+        t_comp, t_dma, t_ovh = _models.PerfModel.components_v9(
+            macs=r.M * r.K * r.N,
+            data_bytes=total_data_bytes(op, cand, r.tp_order_inner),
+            n_cores=r.n_cores, tp_total=r.tp_total, n_dma=n_dma,
+            eff_macs=coeffs.eff_macs, bw_bpc=coeffs.bw_eff_bpc,
+            l_sync=coeffs.l_sync_cy, l_sync2=coeffs.l_sync2_cy,
+            l_dma=coeffs.l_dma_cy, l_startup=coeffs.l_startup_cy)
     else:
         t_comp = (r.M * r.K * r.N) / (r.n_cores * 256.0)
         t_dma = total_data_bytes(op, cand, r.tp_order_inner) / 4.0
@@ -1027,27 +1027,26 @@ def fit_model_wlog_t(
 # Theory-calibrated models (T-A, T-B, T-C) — scipy nonlinear optimization
 # ---------------------------------------------------------------------------
 def _predict_ta(params, macs_arr, bytes_arr, nt_arr):
-    """T-A: E = e_mac * MACs + e_dram * bytes + p_static * N * T"""
-    e_mac, e_dram, p_static = params
-    return [e_mac * macs_arr[i] + e_dram * bytes_arr[i] + p_static * nt_arr[i]
-            for i in range(len(macs_arr))]
+    """T-A via models.EnergyModel.predict_ta_optim()."""
+    return _models.EnergyModel.predict_ta_optim(params, {
+        "macs": macs_arr, "data_bytes": bytes_arr, "nt": nt_arr,
+    })
 
 
 def _predict_tb(params, macs_arr, bytes_arr, t_arr, nt_arr):
-    """T-B: E = e_mac * MACs + e_dram * bytes + (p_base + p_core * N) * T
-           = e_mac * MACs + e_dram * bytes + p_base * T + p_core * N * T"""
-    e_mac, e_dram, p_base, p_core = params
-    return [e_mac * macs_arr[i] + e_dram * bytes_arr[i]
-            + p_base * t_arr[i] + p_core * nt_arr[i]
-            for i in range(len(macs_arr))]
+    """T-B via models.EnergyModel.predict_tb_optim()."""
+    return _models.EnergyModel.predict_tb_optim(params, {
+        "macs": macs_arr, "data_bytes": bytes_arr,
+        "t_total_cy": t_arr, "nt": nt_arr,
+    })
 
 
 def _predict_tc(params, macs_arr, bytes_arr, t_arr, nt_arr):
-    """T-C: E = e_mac * MACs + e_dram * bytes + (p_base + p_core * N) * T + e_startup"""
-    e_mac, e_dram, p_base, p_core, e_startup = params
-    return [e_mac * macs_arr[i] + e_dram * bytes_arr[i]
-            + p_base * t_arr[i] + p_core * nt_arr[i] + e_startup
-            for i in range(len(macs_arr))]
+    """T-C via models.EnergyModel.predict_tc_optim()."""
+    return _models.EnergyModel.predict_tc_optim(params, {
+        "macs": macs_arr, "data_bytes": bytes_arr,
+        "t_total_cy": t_arr, "nt": nt_arr,
+    })
 
 
 def _log_space_mse(preds, actuals):

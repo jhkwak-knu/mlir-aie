@@ -39,6 +39,11 @@ from cost_model import (  # noqa: E402
     Candidate, total_data_bytes, _dma_ops_per_step,
     E_MAC_PJ, E_DRAM_PJ, P_STATIC_PJ,
 )
+# NOTE: Canonical model formulas live in models.py (EnergyModel).
+# The _predict_* functions below use optimization-internal units (uJ/cy)
+# which differ from models.py's deployment units (pJ/uW/us).
+# Results are unit-converted when stored in calibration.json.
+import models as _models  # noqa: E402
 
 from calibrate_energy import (  # noqa: E402
     ECalibRow, load_energy_data, compute_features, compute_mape,
@@ -322,43 +327,30 @@ def step1b_error_structure(
 # ============================================================================
 
 def _predict_td(params, macs_arr, bytes_arr, ndma_tp_arr, t_arr, nt_arr):
-    """T-D: T-B + DMA descriptor energy term.
-    E = e_mac*MACs + e_dram*bytes + e_dma*N_dma*TP + (p_base+p_core*P)*T
-    """
-    e_mac, e_dram, e_dma, p_base, p_core = params
-    return [e_mac * macs_arr[i] + e_dram * bytes_arr[i]
-            + e_dma * ndma_tp_arr[i]
-            + p_base * t_arr[i] + p_core * nt_arr[i]
-            for i in range(len(macs_arr))]
+    """T-D via models.EnergyModel.predict_td_optim()."""
+    return _models.EnergyModel.predict_td_optim(params, {
+        "macs": macs_arr, "data_bytes": bytes_arr,
+        "ndma_tp": ndma_tp_arr, "t_total_cy": t_arr, "nt": nt_arr,
+    })
 
 
 def _predict_te(params, macs_arr, bytes_arr, ndma_tp_arr, tp_arr, t_arr, nt_arr):
-    """T-E: T-D + sync energy term.
-    E = e_mac*MACs + e_dram*bytes + e_dma*N_dma*TP + e_sync*TP
-        + (p_base+p_core*P)*T
-    """
-    e_mac, e_dram, e_dma, e_sync, p_base, p_core = params
-    return [e_mac * macs_arr[i] + e_dram * bytes_arr[i]
-            + e_dma * ndma_tp_arr[i] + e_sync * tp_arr[i]
-            + p_base * t_arr[i] + p_core * nt_arr[i]
-            for i in range(len(macs_arr))]
+    """T-E via models.EnergyModel.predict_te_optim()."""
+    return _models.EnergyModel.predict_te_optim(params, {
+        "macs": macs_arr, "data_bytes": bytes_arr,
+        "ndma_tp": ndma_tp_arr, "tp_total": tp_arr,
+        "t_total_cy": t_arr, "nt": nt_arr,
+    })
 
 
 def _predict_tf(params, macs_arr, bytes_arr, ndma_tp_arr, tp_arr,
                 t_comp_arr, t_comm_arr, nt_arr):
-    """T-F: Separate compute/comm power + DMA + sync.
-    E = p_comp * P * t_comp + p_comm * t_comm + e_dma * N_dma * TP
-        + e_sync * TP + p_core * P * t_total
-    where t_total is implicit (p_comp*P*t_comp + p_comm*t_comm already covers it).
-    Actually: E = p_comp * t_comp_cy + p_comm * t_comm_cy + e_dma * N_dma * TP
-                  + e_sync * TP + p_idle * N * t_total_cy
-    p_comp captures per-core compute power (t_comp is already per-core).
-    """
-    p_comp, p_comm, e_dma, e_sync, p_idle = params
-    return [p_comp * t_comp_arr[i] + p_comm * t_comm_arr[i]
-            + e_dma * ndma_tp_arr[i] + e_sync * tp_arr[i]
-            + p_idle * nt_arr[i]
-            for i in range(len(macs_arr))]
+    """T-F via models.EnergyModel.predict_tf_optim()."""
+    return _models.EnergyModel.predict_tf_optim(params, {
+        "macs": macs_arr, "data_bytes": bytes_arr,
+        "ndma_tp": ndma_tp_arr, "tp_total": tp_arr,
+        "t_comp_cy": t_comp_arr, "t_comm_cy": t_comm_arr, "nt": nt_arr,
+    })
 
 
 def step2_calibrate(

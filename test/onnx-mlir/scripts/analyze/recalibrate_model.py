@@ -42,10 +42,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from analyze_ranking import spearman_rank_correlation  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "generate"))
-from tiling_common import OpCase  # noqa: E402
+from tiling_common import OpCase, CommentFilterFile  # noqa: E402
 from cost_model import (  # noqa: E402
     Candidate, total_data_bytes, TP_AXIS_K,
 )
+import models as _models  # noqa: E402
 
 # Fixed trace-verified constants
 EFF_MACS = 24.28   # MACs/cycle (trace ss_kernel_cy median)
@@ -87,7 +88,7 @@ def load_data(
     # Collect all PASS rows, group by unique config
     raw: Dict[tuple, List[float]] = defaultdict(list)
     with open(result_path) as f:
-        for row in csv.DictReader(f):
+        for row in csv.DictReader(CommentFilterFile(f)):
             if row["status"] != "PASS":
                 continue
             gt_val = float(row[gt_field])
@@ -133,23 +134,9 @@ def load_data(
 # ============================================================
 
 def _dma_ops_per_step(mc: MeasuredCase) -> int:
-    """Number of unique DMA transfers per temporal iteration.
-
-    Depends on spatial partitioning and tpOrder:
-      K-inner: SPm (LHS rows) + SPn (RHS cols)
-      M-inner: SPm (LHS rows) + 2*N_cores (pres+res per core)
-      N-inner: SPn (RHS cols) + 2*N_cores (pres+res per core)
-
-    General principle: each unique data source/sink requires one DMA
-    descriptor setup. Balanced SP minimizes SPm+SPn (AM-GM inequality).
-    """
+    """Delegates to models.dma_ops_per_step()."""
     c = mc.cand
-    if mc.tp_order == 0:   # M inner
-        return c.SPm + 2 * c.num_cores
-    elif mc.tp_order == 1: # N inner
-        return c.SPn + 2 * c.num_cores
-    else:                  # K inner
-        return c.SPm + c.SPn
+    return _models.dma_ops_per_step(c.SPm, c.SPn, c.num_cores, mc.tp_order)
 
 
 def compute_features(cases: List[MeasuredCase]) -> Dict[str, np.ndarray]:

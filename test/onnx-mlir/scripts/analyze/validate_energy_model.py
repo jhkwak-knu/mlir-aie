@@ -45,12 +45,15 @@ from tiling_common import (  # noqa: E402
     OpCase, CalibCoeffs,
     load_calibration, DEFAULT_CALIB_PATH,
     load_system_info, DEFAULT_SYS_PATH,
+    CommentFilterFile,
 )
 from cost_model import (  # noqa: E402
     Candidate, evaluate_candidate, total_data_bytes,
     E_MAC_PJ, E_DRAM_PJ, P_STATIC_PJ,
     PEAK_MACS, BANDWIDTH_BPC, ALPHA_CYCLES,
+    _dma_ops_per_step,
 )
+import models as _models  # noqa: E402
 
 CLOCK_MHZ = 1500
 DEFAULT_MIN_WALL_S = 0.005
@@ -150,7 +153,7 @@ def load_energy_csv(
     # First pass: read all rows for global idle median
     raw_rows: List[Dict[str, str]] = []
     with csv_path.open("r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
+        reader = csv.DictReader(CommentFilterFile(f))
         for row in reader:
             raw_rows.append(dict(row))
 
@@ -167,7 +170,7 @@ def load_energy_csv(
 
     for row in raw_rows:
         case_idx = int(row["case_index"])
-        wall_s = float(row.get("wall_elapsed_s", "0"))
+        wall_s = float(row.get("wall_elapsed_s") or "0")
         n_iters = int(row.get("iters", "10"))
 
         idle_mw = float(row.get("idle_pkg_mw",
@@ -252,19 +255,23 @@ def _make_op_cand(row: EnergyRow) -> Tuple[OpCase, Candidate]:
 
 
 def _perf_components(row: EnergyRow, coeffs: Optional[CalibCoeffs]):
-    """Compute performance components (cycles)."""
+    """Compute performance components (cycles). Delegates to models.py."""
     op, cand = _make_op_cand(row)
     if coeffs and coeffs.calibrated:
-        t_comp = (op.M * op.N * op.K) / (row.n_cores * coeffs.eff_macs)
-        t_dma = total_data_bytes(op, cand, row.tp_order_inner) / coeffs.bw_eff_bpc
-        t_ovh = (coeffs.l_sync_cy * cand.tp_total
-                 + coeffs.l_core_cy * row.n_cores
-                 + coeffs.l_startup_cy)
+        macs = op.M * op.N * op.K
+        data_bytes = total_data_bytes(op, cand, row.tp_order_inner)
+        n_dma = _dma_ops_per_step(cand, row.tp_order_inner)
+        return _models.PerfModel.components_v9(
+            macs=macs, data_bytes=data_bytes,
+            n_cores=row.n_cores, tp_total=cand.tp_total, n_dma=n_dma,
+            eff_macs=coeffs.eff_macs, bw_bpc=coeffs.bw_eff_bpc,
+            l_sync=coeffs.l_sync_cy, l_sync2=coeffs.l_sync2_cy,
+            l_dma=coeffs.l_dma_cy, l_startup=coeffs.l_startup_cy)
     else:
         t_comp = (op.M * op.N * op.K) / (row.n_cores * PEAK_MACS)
         t_dma = total_data_bytes(op, cand, row.tp_order_inner) / BANDWIDTH_BPC
         t_ovh = ALPHA_CYCLES * cand.tp_total
-    return t_comp, t_dma, t_ovh
+        return t_comp, t_dma, t_ovh
 
 
 def predict_energy_theoretical(row: EnergyRow) -> Dict[str, float]:
@@ -310,108 +317,33 @@ def predict_energy_calibrated(
 def predict_energy_with_energy_calib(
     row: EnergyRow, coeffs: CalibCoeffs,
 ) -> Dict[str, float]:
-    """Predict energy using fully calibrated model (both perf and energy)."""
+    """Predict energy using fully calibrated model. Delegates to models.py."""
     if not coeffs.energy_calibrated:
         return predict_energy_calibrated(row, coeffs)
 
     op, cand = _make_op_cand(row)
-    params = coeffs.energy_params
-    model = coeffs.energy_model
     t_comp, t_dma, t_ovh = _perf_components(row, coeffs)
     t_total_cy = t_comp + t_dma + t_ovh
-    t_total_us = t_total_cy / CLOCK_MHZ
 
-    if model == "E-A":
-        p_active_uw = params.get("p_active_uw", 0)
-        e_startup_uj = params.get("e_startup_uj", 0)
-        e_total_uj = p_active_uw * t_total_us / 1e6 + e_startup_uj
-
-    elif model == "E-B":
-        p_comp = params.get("p_comp_uw", 0)
-        p_dma = params.get("p_dma_uw", 0)
-        p_idle = params.get("p_idle_uw", 0)
-        e_startup = params.get("e_startup_uj", 0)
-        e_total_uj = (p_comp * t_comp / CLOCK_MHZ / 1e6
-                      + p_dma * t_dma / CLOCK_MHZ / 1e6
-                      + p_idle * t_ovh / CLOCK_MHZ / 1e6
-                      + e_startup)
-
-    elif model == "E-C":
-        e_mac = params.get("e_mac_pj", E_MAC_PJ)
-        e_byte = params.get("e_byte_pj", E_DRAM_PJ)
-        p_static = params.get("p_static_pj", P_STATIC_PJ)
-        e_startup = params.get("e_startup_uj", 0)
-        macs = row.M * row.K * row.N
-        data_bytes = total_data_bytes(op, cand, row.tp_order_inner)
-        e_total_pj = (e_mac * macs + e_byte * data_bytes
-                      + p_static * row.n_cores * t_total_cy)
-        e_total_uj = e_total_pj / 1e6 + e_startup
-
-    elif model == "E-D":
-        p_core_uw = params.get("p_core_uw", 0)
-        e_startup = params.get("e_startup_uj", 0)
-        e_total_uj = p_core_uw * row.n_cores * t_total_us / 1e6 + e_startup
-
-    elif model == "E-F":
-        p_base_uw = params.get("p_base_uw", 0)
-        p_core_uw = params.get("p_core_uw", 0)
-        e_startup = params.get("e_startup_uj", 0)
-        e_total_uj = (p_base_uw + p_core_uw * row.n_cores) * t_total_us / 1e6 + e_startup
-
-    elif model == "T-A":
-        e_mac_pj = params.get("e_mac_pj", E_MAC_PJ)
-        e_dram_pj = params.get("e_dram_pj", E_DRAM_PJ)
-        p_static_pj = params.get("p_static_pj", P_STATIC_PJ)
-        macs = row.M * row.K * row.N
-        data_bytes = total_data_bytes(op, cand, row.tp_order_inner)
-        e_total_pj = (e_mac_pj * macs + e_dram_pj * data_bytes
-                      + p_static_pj * row.n_cores * t_total_cy)
-        e_total_uj = e_total_pj / 1e6
-
-    elif model == "T-B":
-        e_mac_pj = params.get("e_mac_pj", E_MAC_PJ)
-        e_dram_pj = params.get("e_dram_pj", E_DRAM_PJ)
-        p_base_uw = params.get("p_base_uw", 0)
-        p_core_uw = params.get("p_core_uw", 0)
-        macs = row.M * row.K * row.N
-        data_bytes = total_data_bytes(op, cand, row.tp_order_inner)
-        # p_base_uw and p_core_uw are in uW; t_total_us in us
-        # P * t = uW * us = 1e-6 W * 1e-6 s = 1e-12 J = pJ -> /1e6 = uJ
-        e_total_pj = e_mac_pj * macs + e_dram_pj * data_bytes
-        e_total_uj = e_total_pj / 1e6 + (p_base_uw + p_core_uw * row.n_cores) * t_total_us / 1e6
-
-    elif model == "T-C":
-        e_mac_pj = params.get("e_mac_pj", E_MAC_PJ)
-        e_dram_pj = params.get("e_dram_pj", E_DRAM_PJ)
-        p_base_uw = params.get("p_base_uw", 0)
-        p_core_uw = params.get("p_core_uw", 0)
-        e_startup = params.get("e_startup_uj", 0)
-        macs = row.M * row.K * row.N
-        data_bytes = total_data_bytes(op, cand, row.tp_order_inner)
-        e_total_pj = e_mac_pj * macs + e_dram_pj * data_bytes
-        e_total_uj = (e_total_pj / 1e6
-                      + (p_base_uw + p_core_uw * row.n_cores) * t_total_us / 1e6
-                      + e_startup)
-
-    elif model.startswith("L-"):
-        a_time = params.get("a_time", 1.0)
-        C = params.get("C", 1.0)
-        log_e = math.log(C) + a_time * math.log(max(t_total_us, 1e-6))
-        if "c_cores" in params:
-            log_e += params["c_cores"] * math.log(row.n_cores)
-        if "c_cols" in params and "c_cores" not in params:
-            log_e += params["c_cols"] * math.log(row.n_columns)
-        e_total_uj = math.exp(log_e)
-
-    else:
-        pred = predict_energy_theoretical(row)
-        return pred
+    features = {
+        "macs": row.M * row.K * row.N,
+        "data_bytes": total_data_bytes(op, cand, row.tp_order_inner),
+        "n_cores": row.n_cores,
+        "tp_total": row.tp_total,
+        "n_dma": _dma_ops_per_step(cand, row.tp_order_inner),
+        "t_total_cy": t_total_cy,
+        "t_comp_cy": t_comp,
+        "t_comm_cy": t_dma,
+        "t_overhead_cy": t_ovh,
+    }
+    e_total_pj = _models.EnergyModel.predict(
+        coeffs.energy_model, coeffs.energy_params, features)
 
     return {
         "t_total_cy": t_total_cy,
         "e_comp_pj": 0, "e_comm_pj": 0, "e_static_pj": 0,
-        "e_total_pj": e_total_uj * 1e6,
-        "e_total_uj": e_total_uj,
+        "e_total_pj": float(e_total_pj),
+        "e_total_uj": float(e_total_pj) / 1e6,
     }
 
 

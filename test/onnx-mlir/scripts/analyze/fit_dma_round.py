@@ -42,6 +42,7 @@ from tiling_common import (  # noqa: E402
 from cost_model import (  # noqa: E402
     total_data_bytes, Candidate, OpCase,
 )
+import models as _models  # noqa: E402
 
 CLOCK_MHZ = 1500
 COMP_TILES_PER_COL = 4
