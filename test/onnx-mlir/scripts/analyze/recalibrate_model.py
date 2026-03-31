@@ -42,16 +42,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from analyze_ranking import spearman_rank_correlation  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "generate"))
-from tiling_common import OpCase, CommentFilterFile  # noqa: E402
+from tiling_common import OpCase, CommentFilterFile, load_calibration  # noqa: E402
 from cost_model import (  # noqa: E402
     Candidate, total_data_bytes, TP_AXIS_K,
 )
 import models as _models  # noqa: E402
 
-# Fixed trace-verified constants
+# Defaults (overridden by calibration.json at runtime)
 EFF_MACS = 24.28   # MACs/cycle (trace ss_kernel_cy median)
 BW_BPC = 4.0       # Bytes/cycle
 CLOCK_MHZ = 1500
+
+
+def _load_hw_constants(calib_path: str) -> None:
+    """Load EFF_MACS/BW_BPC from calibration.json to stay in sync."""
+    global EFF_MACS, BW_BPC
+    coeffs = load_calibration(Path(calib_path))
+    if coeffs.calibrated:
+        EFF_MACS = coeffs.eff_macs
+        BW_BPC = coeffs.bw_eff_bpc
 
 
 # ============================================================
@@ -562,7 +571,9 @@ def main():
     ap.add_argument("--cv", action="store_true")
     args = ap.parse_args()
 
+    _load_hw_constants(args.calib)
     print(f"Loading data: {args.result}")
+    print(f"  EFF_MACS={EFF_MACS}, BW_BPC={BW_BPC} (from {args.calib})")
     cases = load_data(args.result, args.tc, args.gt)
 
     feat = compute_features(cases)

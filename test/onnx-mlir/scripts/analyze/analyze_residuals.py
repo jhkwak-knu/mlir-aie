@@ -33,6 +33,7 @@ from tiling_common import OpCase, TP_AXIS_K  # noqa: E402
 from cost_model import Candidate, total_data_bytes  # noqa: E402
 import models as _models  # noqa: E402
 
+# Defaults (overridden by calibration.json at runtime)
 EFF_MACS = 24.28
 BW_BPC = 4.0
 CLOCK_MHZ = 1500
@@ -320,6 +321,10 @@ def main():
 
     with open(args.calib) as f:
         calib = json.load(f)
+
+    global EFF_MACS, BW_BPC
+    EFF_MACS = calib.get("eff_macs", EFF_MACS)
+    BW_BPC = calib.get("bw_eff_bpc", BW_BPC)
 
     print("Loading data...")
     data = load_data(args.result, args.tc)
