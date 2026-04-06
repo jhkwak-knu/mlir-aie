@@ -83,13 +83,29 @@ static inline tilingParam loadTilingParam(const std::string& path) {
 
 // Write structured JSON result to a file for machine-readable log parsing.
 // Energy fields are set to -1 when RAPL measurement is unavailable.
+// Extended diagnostics struct to avoid long parameter lists.
+struct ExtendedDiag {
+  double idle_post_mw = -1.0;
+  double bracket_idle_mean_mw = -1.0;
+  double batch_energy_cv_pct = -1.0;
+  double batch_step_cv_pct = -1.0;
+  double batch_best_wall_s = -1.0;
+  double batch_best_active_uj = -1.0;
+  double core_energy_per_iter_uj = -1.0;
+};
+
 static inline void writeJsonResult(const std::string &path, const std::string &status,
                                    int errors, int iterations, int warmup,
                                    double avgUs, double minUs, double maxUs,
                                    double stepAvgUs, double stepMinUs, double stepMaxUs,
                                    double idlePkgMw, double activePkgMw,
                                    double npuPowerMw, double npuEnergyUj,
-                                   double npuEnergyPerIterUj, double wallElapsedS) {
+                                   double npuEnergyPerIterUj, double wallElapsedS,
+                                   int nBatches = 0, int nInner = 0,
+                                   double batchMinAvgUs = -1.0,
+                                   double batchMinStepAvgUs = -1.0,
+                                   double batchMinEnergyPerIterUj = -1.0,
+                                   const ExtendedDiag &diag = {}) {
   json j;
   j["status"] = status;
   j["errors"] = errors;
@@ -107,6 +123,19 @@ static inline void writeJsonResult(const std::string &path, const std::string &s
   j["npu_energy_uj"] = npuEnergyUj;
   j["npu_energy_per_iter_uj"] = npuEnergyPerIterUj;
   j["wall_elapsed_s"] = wallElapsedS;
+  j["n_batches"] = nBatches;
+  j["n_inner"] = nInner;
+  j["batch_min_avg_us"] = batchMinAvgUs;
+  j["batch_min_step_avg_us"] = batchMinStepAvgUs;
+  j["batch_min_energy_per_iter_uj"] = batchMinEnergyPerIterUj;
+  // Extended diagnostics
+  j["idle_post_mw"] = diag.idle_post_mw;
+  j["bracket_idle_mean_mw"] = diag.bracket_idle_mean_mw;
+  j["batch_energy_cv_pct"] = diag.batch_energy_cv_pct;
+  j["batch_step_cv_pct"] = diag.batch_step_cv_pct;
+  j["batch_best_wall_s"] = diag.batch_best_wall_s;
+  j["batch_best_active_uj"] = diag.batch_best_active_uj;
+  j["core_energy_per_iter_uj"] = diag.core_energy_per_iter_uj;
 
   std::ofstream ofs(path);
   if (!ofs) {

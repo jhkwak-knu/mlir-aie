@@ -78,8 +78,10 @@ $(BUILD_DIR)/$(TARGET): $(SRC_DIR)/host.cpp CMakeLists.txt | $(BUILD_DIR)
 	cp $(HOST_BUILD_DIR)/$(TARGET) $(BUILD_DIR)/$(TARGET)
 
 # 5) Run (logs at out/logs/log.txt)
+# CPU pinning: reduce scheduling noise during measurement.
+TASKSET ?= taskset -c 0
 run: host all | $(LOGS_DIR)
-	$(BUILD_DIR)/$(TARGET) \
+	$(TASKSET) $(BUILD_DIR)/$(TARGET) \
 		-x $(BUILD_DIR)/final.xclbin \
 		-i $(BUILD_DIR)/insts.bin \
 		-k MLIR_AIE -v 2 \

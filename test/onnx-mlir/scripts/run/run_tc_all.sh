@@ -3,12 +3,13 @@
 #                 append results to result.csv, then clean before next case.
 #
 # Usage:
-#   ./run_tc_all.sh [-i INPUT_JSON] [-o OUTPUT_JSON] [-r RESULT_CSV] [-n INDEX] [-s START] [-t] [-a DIR]
+#   ./run_tc_all.sh [-i INPUT_JSON] [-o OUTPUT_JSON] [-r RESULT_CSV] [-n INDEX] [-s START] [-e END] [-t] [-a DIR] [-w N]
 #     -i: input file   (default: out/tc_list.json)
 #     -o: tc.json path (default: out/tc.json)
 #     -r: result csv   (default: out/reports/result.csv)
 #     -n: 1-based case index to run only that single case
 #     -s: 1-based start index to resume from (skips earlier cases)
+#     -e: 1-based end index (inclusive) for partial batch runs
 #     -t: enable NPU trace collection
 #     -a: archive per-case artifacts to DIR/case_NNN/
 
@@ -25,6 +26,7 @@ OUTPUT_JSON="$OUT_DIR/tc.json"         # out/tc.json
 RESULT_CSV="$REPORTS_DIR/result.csv"   # out/reports/result.csv
 SINGLE_IDX=""                          # optional: run only this 1-based index
 START_FROM=""                          # optional: resume from this 1-based index
+END_AT=""                              # optional: end at this 1-based index
 TRACE_ENABLED=""                       # optional: enable NPU trace collection
 TRACE_SZ_DEFAULT=1048576               # 1MB trace buffer
 ARCHIVE_DIR=""                         # optional: archive per-case artifacts
@@ -39,6 +41,7 @@ Options:
   -r FILE   Result CSV path (default: $RESULT_CSV)
   -n INDEX  Run only the INDEX-th case (1-based)
   -s START  Resume from the START-th case (1-based, appends to existing CSV)
+  -e END    Stop after the END-th case (1-based, inclusive; for partial batch runs)
   -t        Enable NPU trace collection and analysis
   -a DIR    Archive per-case artifacts to DIR/case_NNN/ (preserves all trace data)
   -h        Help
@@ -46,13 +49,14 @@ EOF
   exit 1
 }
 
-while getopts ":i:o:r:n:s:a:th" opt; do
+while getopts ":i:o:r:n:s:e:a:th" opt; do
   case "$opt" in
     i) INPUT_JSON="$OPTARG" ;;
     o) OUTPUT_JSON="$OPTARG" ;;
     r) RESULT_CSV="$OPTARG" ;;
     n) SINGLE_IDX="$OPTARG" ;;
     s) START_FROM="$OPTARG" ;;
+    e) END_AT="$OPTARG" ;;
     a) ARCHIVE_DIR="$OPTARG" ;;
     t) TRACE_ENABLED=1 ;;
     h) usage ;;
@@ -111,9 +115,19 @@ else
   echo "Found $TOTAL_CASES cases in $INPUT_JSON"
 fi
 
+# Apply -e END_AT if provided (overrides END_IDX)
+if [[ -n "${END_AT:-}" ]]; then
+  if ! [[ "$END_AT" =~ ^[0-9]+$ ]] || [[ "$END_AT" -lt 1 ]] || [[ "$END_AT" -gt "$TOTAL_CASES" ]]; then
+    echo "error: invalid -e index: $END_AT (valid range: 1..$TOTAL_CASES)" >&2
+    exit 4
+  fi
+  END_IDX="$END_AT"
+  echo "  End index set to #$END_AT"
+fi
+
 # CSV header (+upgrade if old header exists)
-NEW_HEADER="case_index,numSpm,SPm,SPn,TPm,TPk,TPn,TM,TK,TN,M,K,N,doubleBuffer,t_total_pred,status,errors,iters,warmup,avg_us,min_us,max_us,step_avg_us,step_min_us,step_max_us,trace_dispatch_us,trace_kern_pct,trace_gflops,host_overhead_us,ss_iter_cy,ss_kernel_cy,idle_pkg_mw,active_pkg_mw,npu_power_mw,npu_energy_uj,npu_energy_per_iter_uj,wall_elapsed_s,host_steps,matmul_npu_us"
-NUM_COLUMNS=39
+NEW_HEADER="case_index,numSpm,SPm,SPn,TPm,TPk,TPn,TM,TK,TN,M,K,N,doubleBuffer,t_total_pred,status,errors,iters,warmup,avg_us,min_us,max_us,step_avg_us,step_min_us,step_max_us,trace_dispatch_us,trace_kern_pct,trace_gflops,host_overhead_us,ss_iter_cy,ss_kernel_cy,idle_pkg_mw,active_pkg_mw,npu_power_mw,npu_energy_uj,npu_energy_per_iter_uj,wall_elapsed_s,host_steps,matmul_npu_us,n_batches,n_inner,batch_min_avg_us,batch_min_energy_per_iter_uj,idle_post_mw,bracket_idle_mean_mw,batch_energy_cv_pct,batch_step_cv_pct,batch_best_wall_s,batch_best_active_uj,core_energy_per_iter_uj"
+NUM_COLUMNS=50
 if [[ ! -f "$RESULT_CSV" ]]; then
   mkdir -p "$(dirname "$RESULT_CSV")"
   # Write metadata comment lines for traceability
@@ -218,7 +232,7 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
     fi
   else
     echo "warn: generator script not found: $GEN_SCRIPT"
-    echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,$T_PRED,GEN_MISSING,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
+    echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,$T_PRED,GEN_MISSING,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
     if [[ -f "$CLEAN_SCRIPT" ]]; then bash "$CLEAN_SCRIPT" || true; fi
     continue
   fi
@@ -244,11 +258,19 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
   if [[ "$CASE_N_WARMUP" -gt 0 ]]; then
     CASE_HOST_ARGS="$CASE_HOST_ARGS --n-warmup $CASE_N_WARMUP"
   fi
+  CASE_N_BATCHES=$(jq -r '.n_batches // 0' "$OUTPUT_JSON")
+  if [[ "$CASE_N_BATCHES" -gt 0 ]]; then
+    CASE_HOST_ARGS="$CASE_HOST_ARGS --n-batches $CASE_N_BATCHES"
+  fi
+  if [[ -n "${DIAG_OUT_DIR:-}" ]]; then
+    mkdir -p "$DIAG_OUT_DIR"
+    CASE_HOST_ARGS="$CASE_HOST_ARGS --diag-json $DIAG_OUT_DIR/case_$(printf '%04d' "$idx").json"
+  fi
 
   echo "make -C \"$MAKE_DIR\" run JSON_OUTPUT=$JSON_RESULT $TRACE_MAKE_ARGS HOST_ARGS=\"$CASE_HOST_ARGS\""
   if ! make -C "$MAKE_DIR" run JSON_OUTPUT="$JSON_RESULT" $TRACE_MAKE_ARGS HOST_ARGS="$CASE_HOST_ARGS"; then
     echo "warn: make run failed"
-    echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,$T_PRED,RUN_FAIL,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
+    echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,$T_PRED,RUN_FAIL,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" >> "$RESULT_CSV"
     # if [[ -f "$CLEAN_SCRIPT" ]]; then bash "$CLEAN_SCRIPT" || true; fi
     continue
   fi
@@ -259,6 +281,11 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
   STEP_AVG_US=-1; STEP_MIN_US=-1; STEP_MAX_US=-1
   IDLE_PKG_MW=-1; ACTIVE_PKG_MW=-1; NPU_POWER_MW=-1
   NPU_ENERGY_UJ=-1; NPU_ENERGY_PER_ITER_UJ=-1; WALL_ELAPSED_S=-1
+  BATCH_N_BATCHES=-1; BATCH_N_INNER=-1; BATCH_MIN_AVG_US=-1; BATCH_MIN_ENERGY=-1
+  # Extended diagnostics
+  IDLE_POST_MW=-1; BRACKET_IDLE_MEAN_MW=-1
+  BATCH_ENERGY_CV_PCT=-1; BATCH_STEP_CV_PCT=-1
+  BATCH_BEST_WALL_S=-1; BATCH_BEST_ACTIVE_UJ=-1; CORE_ENERGY_PER_ITER_UJ=-1
 
   if [[ -f "$JSON_RESULT" ]]; then
     # Structured JSON written by host --json-output; no regex needed.
@@ -280,6 +307,19 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
     NPU_ENERGY_UJ="$(jq -r '.npu_energy_uj // -1' "$JSON_RESULT")"
     NPU_ENERGY_PER_ITER_UJ="$(jq -r '.npu_energy_per_iter_uj // -1' "$JSON_RESULT")"
     WALL_ELAPSED_S="$(jq -r '.wall_elapsed_s // -1' "$JSON_RESULT")"
+    # Batch-mode fields
+    BATCH_N_BATCHES="$(jq -r '.n_batches // -1' "$JSON_RESULT")"
+    BATCH_N_INNER="$(jq -r '.n_inner // -1' "$JSON_RESULT")"
+    BATCH_MIN_AVG_US="$(jq -r '.batch_min_avg_us // -1' "$JSON_RESULT")"
+    BATCH_MIN_ENERGY="$(jq -r '.batch_min_energy_per_iter_uj // -1' "$JSON_RESULT")"
+    # Extended diagnostics
+    IDLE_POST_MW="$(jq -r '.idle_post_mw // -1' "$JSON_RESULT")"
+    BRACKET_IDLE_MEAN_MW="$(jq -r '.bracket_idle_mean_mw // -1' "$JSON_RESULT")"
+    BATCH_ENERGY_CV_PCT="$(jq -r '.batch_energy_cv_pct // -1' "$JSON_RESULT")"
+    BATCH_STEP_CV_PCT="$(jq -r '.batch_step_cv_pct // -1' "$JSON_RESULT")"
+    BATCH_BEST_WALL_S="$(jq -r '.batch_best_wall_s // -1' "$JSON_RESULT")"
+    BATCH_BEST_ACTIVE_UJ="$(jq -r '.batch_best_active_uj // -1' "$JSON_RESULT")"
+    CORE_ENERGY_PER_ITER_UJ="$(jq -r '.core_energy_per_iter_uj // -1' "$JSON_RESULT")"
   elif [[ -f "$LOG_FILE" ]]; then
     # Fallback: grep-based log parsing for backward compatibility.
     if grep -q 'PASS!' "$LOG_FILE"; then
@@ -358,7 +398,7 @@ for (( idx=START_IDX; idx<=END_IDX; idx++ )); do
   fi
 
   # 7) append to CSV
-  echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,$T_PRED,$STATUS,$ERRORS,$ITERS,$WARMUP,$AVG_US,$MIN_US,$MAX_US,$STEP_AVG_US,$STEP_MIN_US,$STEP_MAX_US,$TRACE_DISPATCH_US,$TRACE_KERN_PCT,$TRACE_GFLOPS,$HOST_OVERHEAD_US,$SS_ITER_CY,$SS_KERNEL_CY,$IDLE_PKG_MW,$ACTIVE_PKG_MW,$NPU_POWER_MW,$NPU_ENERGY_UJ,$NPU_ENERGY_PER_ITER_UJ,$WALL_ELAPSED_S,$HOST_STEPS,$MATMUL_NPU_US" >> "$RESULT_CSV"
+  echo "$idx,$numSpm,$SPm,$SPn,$TPm,$TPk,$TPn,$TM,$TK,$TN,$M,$K,$N,$DB_STR,$T_PRED,$STATUS,$ERRORS,$ITERS,$WARMUP,$AVG_US,$MIN_US,$MAX_US,$STEP_AVG_US,$STEP_MIN_US,$STEP_MAX_US,$TRACE_DISPATCH_US,$TRACE_KERN_PCT,$TRACE_GFLOPS,$HOST_OVERHEAD_US,$SS_ITER_CY,$SS_KERNEL_CY,$IDLE_PKG_MW,$ACTIVE_PKG_MW,$NPU_POWER_MW,$NPU_ENERGY_UJ,$NPU_ENERGY_PER_ITER_UJ,$WALL_ELAPSED_S,$HOST_STEPS,$MATMUL_NPU_US,$BATCH_N_BATCHES,$BATCH_N_INNER,$BATCH_MIN_AVG_US,$BATCH_MIN_ENERGY,$IDLE_POST_MW,$BRACKET_IDLE_MEAN_MW,$BATCH_ENERGY_CV_PCT,$BATCH_STEP_CV_PCT,$BATCH_BEST_WALL_S,$BATCH_BEST_ACTIVE_UJ,$CORE_ENERGY_PER_ITER_UJ" >> "$RESULT_CSV"
   echo "Result: case #$idx -> $STATUS (errors=$ERRORS, avg=${AVG_US}us, min=${MIN_US}us, max=${MAX_US}us) appended to $RESULT_CSV"
 
   # 7b) archive per-case artifacts before cleanup
