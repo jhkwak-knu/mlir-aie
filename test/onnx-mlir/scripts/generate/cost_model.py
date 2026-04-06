@@ -383,19 +383,85 @@ def evaluate_candidate(
 def select_optimal(
     valid: List[Candidate], op: OpCase,
     coeffs: Optional[CalibCoeffs] = None,
+    keep_all_tporders: bool = False,
 ) -> List[CostResult]:
     """
     For each candidate, evaluate all 3 tpOrders, keep the one with lowest EDP.
     Return the full list sorted by EDP ascending.
+
+    If keep_all_tporders=True, also returns a dict mapping candidate index
+    to all 3 CostResults (for tpOrder verification).
     """
     best_per_candidate: List[CostResult] = []
-    for c in valid:
+    all_tporder_results: Dict[int, List[CostResult]] = {}
+    for i, c in enumerate(valid):
         results = [evaluate_candidate(op, c, tpo, coeffs) for tpo in (0, 1, 2)]
         best = min(results, key=lambda r: r.edp)
         best_per_candidate.append(best)
+        if keep_all_tporders:
+            all_tporder_results[i] = results
 
     best_per_candidate.sort(key=lambda r: r.edp)
+    if keep_all_tporders:
+        return best_per_candidate, all_tporder_results
     return best_per_candidate
+
+
+def select_tporder_verify_cases(
+    all_ranked: Dict[int, List[CostResult]],
+    all_tporder_data: Dict[int, Dict[int, List[CostResult]]],
+    ops: list,
+    n_verify: int = 19,
+) -> List[Dict[str, Any]]:
+    """Select tpOrder verification cases: 1 per workload, pick the candidate
+    with the largest EDP ratio across 3 tpOrders. Return extra tc entries
+    for the non-best tpOrders (2 per selected candidate).
+    """
+    verify_tcs: List[Dict[str, Any]] = []
+    n_verify = min(n_verify, len(all_ranked))
+
+    # For each workload, find the candidate with max tpOrder EDP spread
+    workload_picks = []
+    for op_idx, ranked in all_ranked.items():
+        tpo_data = all_tporder_data.get(op_idx, {})
+        if not tpo_data:
+            continue
+        # Build a map from candidate identity to tporder results
+        # ranked contains best-per-candidate; we need to find which
+        # valid-index each ranked entry maps to
+        best_ratio = 0.0
+        best_cand_results = None
+        best_cr = None
+        for valid_idx, results in tpo_data.items():
+            edps = [r.edp for r in results]
+            if min(edps) <= 0:
+                continue
+            ratio = max(edps) / min(edps)
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_cand_results = results
+                best_cr = min(results, key=lambda r: r.edp)
+
+        if best_cand_results and best_cr:
+            workload_picks.append((op_idx, best_ratio, best_cr, best_cand_results))
+
+    # Sort by ratio descending, take top n_verify
+    workload_picks.sort(key=lambda x: x[1], reverse=True)
+    selected = workload_picks[:n_verify]
+
+    for op_idx, ratio, best_cr, all_results in selected:
+        op = ops[op_idx]
+        best_tpo = best_cr.tp_order
+        for r in all_results:
+            if r.tp_order != best_tpo:
+                tc = cost_result_to_tc(op, r)
+                tc["tporder_verify"] = True
+                verify_tcs.append(tc)
+        print(f"  tpOrder verify: M{op.M}_K{op.K}_N{op.N} "
+              f"SP=({best_cr.candidate.SPm},{best_cr.candidate.SPn}) "
+              f"ratio={ratio:.2f}")
+
+    return verify_tcs
 
 
 # ============================================================
@@ -579,17 +645,24 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
                    help="Validation: select Top-K per core count per size")
     p.add_argument("--random-sample", type=int, default=0,
                    help="Validation: add N random candidates from remaining")
+    p.add_argument("--tporder-verify", type=int, default=0,
+                   help="Add tpOrder verification cases: N workloads x 2 extra tpOrders")
     return p.parse_args(argv)
 
 
 def process_op(
     op: OpCase, sys_info: SystemInfo,
     coeffs: Optional[CalibCoeffs] = None,
-) -> List[CostResult]:
+    keep_all_tporders: bool = False,
+):
     """Run Stage 1 through Stage 4 for a single op case."""
     all_candidates = enumerate_candidates(op, sys_info)
     valid, filter_results = filter_candidates(all_candidates, op, sys_info)
     print_search_summary(op, len(all_candidates), valid, filter_results)
+    if keep_all_tporders:
+        ranked, tpo_data = select_optimal(valid, op, coeffs, keep_all_tporders=True)
+        print_cost_summary(op, ranked)
+        return ranked, tpo_data
     ranked = select_optimal(valid, op, coeffs)
     print_cost_summary(op, ranked)
     return ranked
@@ -641,9 +714,15 @@ def main(argv: List[str]) -> int:
     else:
         targets = list(enumerate(ops))
 
+    need_tporder = args.tporder_verify > 0
     all_ranked: Dict[int, List[CostResult]] = {}
+    all_tporder_data: Dict[int, Dict[int, List[CostResult]]] = {}
     for idx, op in targets:
-        ranked = process_op(op, sys_info, coeffs)
+        if need_tporder:
+            ranked, tpo_data = process_op(op, sys_info, coeffs, keep_all_tporders=True)
+            all_tporder_data[idx] = tpo_data
+        else:
+            ranked = process_op(op, sys_info, coeffs)
         all_ranked[idx] = ranked
 
     # Write output if requested
@@ -700,9 +779,19 @@ def main(argv: List[str]) -> int:
                             f" from {len(ranked)} total)")
             print(f"\n[INFO] Op M{op.M}_K{op.K}_N{op.N}: "
                   f"{len(selected)} validation candidates selected{sampling}")
+        # Add tpOrder verification cases
+        if args.tporder_verify > 0 and all_tporder_data:
+            print(f"\n[INFO] Selecting tpOrder verification cases...")
+            verify_tcs = select_tporder_verify_cases(
+                all_ranked, all_tporder_data, ops,
+                n_verify=args.tporder_verify,
+            )
+            tc_cases.extend(verify_tcs)
+            print(f"[INFO] Added {len(verify_tcs)} tpOrder verification cases")
+
         meta = build_metadata(calib_path=Path(args.calib), coeffs=coeffs)
         write_tc_list(tc_cases, val_path, metadata=meta)
-        print(f"[INFO] Wrote {val_path} ({len(tc_cases)} cases)")
+        print(f"[INFO] Wrote {val_path} ({len(tc_cases)} cases total)")
 
     return 0
 

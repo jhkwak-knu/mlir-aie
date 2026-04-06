@@ -22,9 +22,14 @@ RAPL_CORE = "/sys/class/powercap/intel-rapl:0:0/energy_uj"
 MIN_WALL_S = 0.10
 N_WARMUP = 5
 # Idle measurement: N samples, take median for noise robustness
-# (Matches NPU host.cpp: N_IDLE_SAMPLES=5, IDLE_SAMPLE_WINDOW_S=0.2)
-N_IDLE_SAMPLES = 5
+# (Matches NPU host.cpp: N_IDLE_SAMPLES=10, IDLE_SAMPLE_WINDOW_S=0.2)
+N_IDLE_SAMPLES = 10
 IDLE_SAMPLE_WINDOW_S = 0.2
+
+# Double-loop min parameters (matches NPU host.cpp methodology)
+N_BATCHES = 5
+TARGET_BATCH_WALL_S = 0.5
+MIN_INNER = 10
 
 
 def read_rapl(path):
@@ -34,11 +39,13 @@ def read_rapl(path):
 
 
 def measure_matmul(np, m, k, n, n_threads):
-    """Measure matmul time and energy for given size and thread count.
+    """Measure matmul time and energy using double-loop min methodology.
 
-    Automatically adjusts iteration count so total wall time >= MIN_WALL_S.
+    Matches NPU host.cpp: warmup outside outer loop, N dynamically determined,
+    time and energy min selected independently across K batches.
     """
-    # Set thread count before any computation
+    import math
+
     os.environ["OMP_NUM_THREADS"] = str(n_threads)
     os.environ["OPENBLAS_NUM_THREADS"] = str(n_threads)
     os.environ["MKL_NUM_THREADS"] = str(n_threads)
@@ -46,25 +53,21 @@ def measure_matmul(np, m, k, n, n_threads):
     a = np.random.randn(m, k).astype(np.float32)
     b = np.random.randn(k, n).astype(np.float32)
 
-    # Warmup
-    for _ in range(N_WARMUP):
-        _ = a @ b
-
-    # Estimate single iteration time (average of 3 runs for stability)
-    est_times = []
-    for _ in range(3):
+    # Warmup (3 iterations, measure first for N determination)
+    single_s = 0.0
+    for w in range(N_WARMUP):
         t0 = time.perf_counter()
-        _ = a @ b
+        c = a @ b
         t1 = time.perf_counter()
-        est_times.append(t1 - t0)
-    single_s = min(est_times)
+        if w == 0:
+            single_s = t1 - t0
+    if single_s <= 0:
+        single_s = 1e-9
 
-    # Calculate iterations needed for reliable RAPL measurement
-    # Need total wall time >= MIN_WALL_S * 2 (double margin for safety)
-    n_iters = max(20, int(MIN_WALL_S * 2.0 / max(single_s, 1e-9)))
+    # Dynamically determine inner iteration count
+    n_inner = max(MIN_INNER, math.ceil(TARGET_BATCH_WALL_S / single_s))
 
-    # Measure idle power: N samples with median for noise robustness
-    # Matches NPU host.cpp methodology (N_IDLE_SAMPLES, median selection)
+    # Measure idle power: 10 samples with median
     idle_pkg_samples = []
     idle_core_samples = []
     for _ in range(N_IDLE_SAMPLES):
@@ -80,69 +83,74 @@ def measure_matmul(np, m, k, n, n_threads):
     idle_core_samples.sort()
     idle_pkg_mw = idle_pkg_samples[N_IDLE_SAMPLES // 2]
     idle_core_mw = idle_core_samples[N_IDLE_SAMPLES // 2]
-    idle_wall = IDLE_SAMPLE_WINDOW_S  # per-sample window for scaling
 
-    # Measure active: run n_iters iterations, measure total time + energy
-    times_us = []
+    # Double-loop min: K batches x N inner iterations
+    best_batch_time_us = 1e18
+    best_batch_energy_pkg_uj = 1e18
+    best_batch_energy_core_uj = 1e18
+    all_iter_times = []
 
-    pkg_before = read_rapl(RAPL_PKG)
-    core_before = read_rapl(RAPL_CORE)
-    wall_start = time.perf_counter()
+    for batch in range(N_BATCHES):
+        pkg_before = read_rapl(RAPL_PKG)
+        core_before = read_rapl(RAPL_CORE)
+        batch_wall_start = time.perf_counter()
 
-    for _ in range(n_iters):
-        t0 = time.perf_counter()
-        c = a @ b
-        t1 = time.perf_counter()
-        times_us.append((t1 - t0) * 1e6)
+        batch_time_total = 0.0
+        for _ in range(n_inner):
+            t0 = time.perf_counter()
+            c = a @ b
+            t1 = time.perf_counter()
+            iter_us = (t1 - t0) * 1e6
+            batch_time_total += iter_us
+            all_iter_times.append(iter_us)
 
-    wall_end = time.perf_counter()
-    pkg_after = read_rapl(RAPL_PKG)
-    core_after = read_rapl(RAPL_CORE)
+        batch_wall_end = time.perf_counter()
+        pkg_after = read_rapl(RAPL_PKG)
+        core_after = read_rapl(RAPL_CORE)
+
+        batch_wall_s = batch_wall_end - batch_wall_start
+        batch_avg_us = batch_time_total / n_inner
+
+        # Batch energy per iteration (idle-subtracted)
+        batch_pkg_uj = (pkg_after - pkg_before) - idle_pkg_mw * batch_wall_s * 1000
+        batch_core_uj = (core_after - core_before) - idle_core_mw * batch_wall_s * 1000
+        batch_pkg_per_iter = batch_pkg_uj / n_inner
+        batch_core_per_iter = batch_core_uj / n_inner
+
+        # Independent min selection
+        if batch_avg_us < best_batch_time_us:
+            best_batch_time_us = batch_avg_us
+        if batch_pkg_per_iter < best_batch_energy_pkg_uj:
+            best_batch_energy_pkg_uj = batch_pkg_per_iter
+        if batch_core_per_iter < best_batch_energy_core_uj:
+            best_batch_energy_core_uj = batch_core_per_iter
 
     # Prevent optimization
     _ = c[0, 0]
 
-    wall_s = wall_end - wall_start
-    total_pkg_uj = pkg_after - pkg_before
-    total_core_uj = core_after - core_before
-
-    # Subtract idle energy: idle_mw * wall_s * 1000 = idle energy in uJ
-    # (Matches NPU host.cpp: npu_energy_uj = active_pkg_uj - idle_pkg_mw * wall_s * 1000)
-    active_pkg_uj = total_pkg_uj - idle_pkg_mw * wall_s * 1000
-    active_core_uj = total_core_uj - idle_core_mw * wall_s * 1000
-
-    # Per-iteration energy
-    pkg_per_iter_uj = total_pkg_uj / n_iters
-    core_per_iter_uj = total_core_uj / n_iters
-    active_pkg_per_iter_uj = max(0, active_pkg_uj / n_iters)
-    active_core_per_iter_uj = max(0, active_core_uj / n_iters)
-
     macs = 2 * m * k * n
-    min_us = min(times_us)
-    avg_us = sum(times_us) / len(times_us)
-    gflops = macs / min_us / 1e3 if min_us > 0 else 0.0
-
-    # Power during active period
-    active_pkg_mw = total_pkg_uj / (wall_s * 1000) if wall_s > 0 else 0
-    active_core_mw = total_core_uj / (wall_s * 1000) if wall_s > 0 else 0
+    total_iters = N_BATCHES * n_inner
+    min_us = min(all_iter_times)
+    avg_us = sum(all_iter_times) / len(all_iter_times)
+    gflops = macs / best_batch_time_us / 1e3 if best_batch_time_us > 0 else 0.0
 
     return {
         "M": m, "K": k, "N": n,
         "MACs": macs,
         "threads": n_threads,
-        "n_iters": n_iters,
-        "min_us": round(min_us, 2),
+        "n_iters": total_iters,
+        "min_us": round(best_batch_time_us, 2),
         "avg_us": round(avg_us, 2),
         "gflops": round(gflops, 1),
-        "wall_s": round(wall_s, 6),
+        "wall_s": -1.0,
         "idle_pkg_mw": round(idle_pkg_mw, 1),
         "idle_core_mw": round(idle_core_mw, 1),
-        "active_pkg_mw": round(active_pkg_mw, 1),
-        "active_core_mw": round(active_core_mw, 1),
-        "pkg_per_iter_uj": round(pkg_per_iter_uj, 2),
-        "core_per_iter_uj": round(core_per_iter_uj, 2),
-        "active_pkg_per_iter_uj": round(active_pkg_per_iter_uj, 2),
-        "active_core_per_iter_uj": round(active_core_per_iter_uj, 2),
+        "active_pkg_mw": -1.0,
+        "active_core_mw": -1.0,
+        "pkg_per_iter_uj": round(max(0, best_batch_energy_pkg_uj), 2),
+        "core_per_iter_uj": round(max(0, best_batch_energy_core_uj), 2),
+        "active_pkg_per_iter_uj": round(max(0, best_batch_energy_pkg_uj), 2),
+        "active_core_per_iter_uj": round(max(0, best_batch_energy_core_uj), 2),
     }
 
 
