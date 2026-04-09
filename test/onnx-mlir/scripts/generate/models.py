@@ -214,6 +214,8 @@ class EnergyModel:
             "T-B": EnergyModel._predict_tb,
             "T-C": EnergyModel._predict_tc,
             "T-E": EnergyModel._predict_te,
+            "T-3": EnergyModel._predict_t3,
+            "T-3S": EnergyModel._predict_t3s,
             "L-B": EnergyModel._predict_lb,
         }
         fn = dispatch.get(model_name)
@@ -269,6 +271,61 @@ class EnergyModel:
         e_power = (p_base + p_core * features["n_cores"]) * t_total_us
         return e_comp + e_comm + e_power
 
+    # --- T-3: 3-parameter compact model ---
+
+    @staticmethod
+    def predict_compact(
+        features: Dict[str, Numeric],
+        p_sys: float, p_core: float, e_dma: float,
+    ) -> Numeric:
+        """T-3: 3-parameter compact energy model.
+
+        E = P_sys*T + P_core*P*T + E_DMA*D_total
+
+        Physical interpretation:
+          - P_sys*T: system power independent of active core count
+            (CPU, DRAM refresh, uncore, NPU leakage).
+            Absorbs P_BASE*T, E_SYNC*TP (TP~T corr=0.959).
+          - P_core*P*T: per-core active power (power gating).
+            Absorbs P_CORE*P*T, E_MAC*MACs (~P*T), E_DRAM*bytes (~T).
+          - E_DMA*D_total: per-DMA-descriptor energy (time-independent).
+
+        Units: p_sys/p_core in uW, e_dma in uJ, T in us -> pJ output.
+        """
+        t_us = features["t_total_cy"] / CLOCK_MHZ
+        n_cores = features["n_cores"]
+        d_tot = features["d_total"]
+
+        e_sys = p_sys * t_us                    # uW * us = pJ
+        e_core = p_core * n_cores * t_us        # uW * us = pJ
+        e_dma_term = e_dma * d_tot * 1e6        # uJ -> pJ
+
+        return e_sys + e_core + e_dma_term
+
+    @staticmethod
+    def predict_compact_sync(
+        features: Dict[str, Numeric],
+        p_sys: float, p_core: float, e_dma: float, e_sync: float,
+    ) -> Numeric:
+        """T-3S: 4-parameter variant with E_SYNC separated.
+
+        E = P_sys*T + P_core*P*T + E_DMA*D_total + E_SYNC*TP_total
+
+        Rationale: TP-T correlation is high (0.959) but not perfect;
+        separating sync energy may improve P_core identifiability.
+        """
+        t_us = features["t_total_cy"] / CLOCK_MHZ
+        n_cores = features["n_cores"]
+        d_tot = features["d_total"]
+        tp_total = features["tp_total"]
+
+        e_sys = p_sys * t_us
+        e_core = p_core * n_cores * t_us
+        e_dma_term = e_dma * d_tot * 1e6
+        e_sync_term = e_sync * tp_total * 1e6   # uJ -> pJ
+
+        return e_sys + e_core + e_dma_term + e_sync_term
+
     # --- Dispatcher helpers (params dict -> keyword args) ---
 
     @staticmethod
@@ -291,6 +348,25 @@ class EnergyModel:
             e_dram=params.get("e_dram_pj", 0),
             p_base=params.get("p_base_uw", 0),
             p_core=params.get("p_core_uw", 0),
+        )
+
+    @staticmethod
+    def _predict_t3(params: Dict[str, float], features: Dict[str, Numeric]) -> Numeric:
+        return EnergyModel.predict_compact(
+            features,
+            p_sys=params.get("p_sys_uw", 0),
+            p_core=params.get("p_core_uw", 0),
+            e_dma=params.get("e_dma_uj", 0),
+        )
+
+    @staticmethod
+    def _predict_t3s(params: Dict[str, float], features: Dict[str, Numeric]) -> Numeric:
+        return EnergyModel.predict_compact_sync(
+            features,
+            p_sys=params.get("p_sys_uw", 0),
+            p_core=params.get("p_core_uw", 0),
+            e_dma=params.get("e_dma_uj", 0),
+            e_sync=params.get("e_sync_uj", 0),
         )
 
     @staticmethod
@@ -454,6 +530,33 @@ class EnergyModel:
                 + e_startup)
 
     @staticmethod
+    def predict_t3_optim(
+        params: Tuple, features: Dict[str, Numeric],
+    ) -> Numeric:
+        """T-3 in optimization units (uJ).
+
+        params = (p_sys, p_core, e_dma) in uJ-cycle / uJ units.
+        output in uJ.
+        """
+        p_sys, p_core, e_dma = params
+        _a = EnergyModel._to_arr
+        return (p_sys * _a(features["t_total_cy"])
+                + p_core * _a(features["nt"])
+                + e_dma * _a(features["d_total"]))
+
+    @staticmethod
+    def predict_t3s_optim(
+        params: Tuple, features: Dict[str, Numeric],
+    ) -> Numeric:
+        """T-3S in optimization units (uJ). T-3 + sync."""
+        p_sys, p_core, e_dma, e_sync = params
+        _a = EnergyModel._to_arr
+        return (p_sys * _a(features["t_total_cy"])
+                + p_core * _a(features["nt"])
+                + e_dma * _a(features["d_total"])
+                + e_sync * _a(features["tp_total"]))
+
+    @staticmethod
     def predict_tf_optim(
         params: Tuple, features: Dict[str, Numeric],
     ) -> Numeric:
@@ -512,6 +615,21 @@ class EnergyModel:
                 "p_base_uw": p_base * CLOCK_MHZ * 1e6,
                 "p_core_uw": p_core * CLOCK_MHZ * 1e6,
                 "e_startup_uj": e_startup,
+            }
+        elif model_name == "T-3":
+            p_sys, p_core, e_dma = params
+            return {
+                "p_sys_uw": p_sys * CLOCK_MHZ * 1e6,
+                "p_core_uw": p_core * CLOCK_MHZ * 1e6,
+                "e_dma_uj": e_dma,
+            }
+        elif model_name == "T-3S":
+            p_sys, p_core, e_dma, e_sync = params
+            return {
+                "p_sys_uw": p_sys * CLOCK_MHZ * 1e6,
+                "p_core_uw": p_core * CLOCK_MHZ * 1e6,
+                "e_dma_uj": e_dma,
+                "e_sync_uj": e_sync,
             }
         else:
             return {}
