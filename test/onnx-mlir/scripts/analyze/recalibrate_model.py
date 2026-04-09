@@ -331,6 +331,16 @@ MODELS = {
         "param_names": ["alpha", "beta", "L_SYNC", "L_SYNC2",
                         "L_DMA", "L_CORE", "L_STARTUP"],
     },
+    "Core-Sync-Fixed": {
+        "predict": lambda f, p: (
+            f["t_comp"] + f["t_comm"]
+            + p[0]*f["tp_total"] + p[1]*f["core_x_tp"]
+            + p[2]*f["total_dma_ops"]
+            + p[3]
+        ),
+        "bounds": [(0, 5e5), (0, 1e5), (0, 5e5), (0, 5e5)],
+        "param_names": ["L_SYNC", "L_CORE", "L_DMA", "L_STARTUP"],
+    },
 }
 
 
