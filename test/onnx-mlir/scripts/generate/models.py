@@ -49,6 +49,60 @@ def dma_ops_per_step(
         return spm + spn
 
 
+def dma_ops_decomposed(
+    spm: Numeric, spn: Numeric, num_cores: Numeric, tp_order: int,
+) -> Tuple[Numeric, Numeric]:
+    """Decompose DMA ops into 'every iteration' and 'reused' categories.
+
+    Returns (N_dma_every, N_dma_reused) where:
+      - N_dma_every: DMA descriptors needed every temporal iteration
+      - N_dma_reused: DMA descriptors that benefit from inner-loop reuse
+        (only reloaded when outer loop advances: TP_total / TP_inner times)
+
+    D_total = N_dma_every * TP_total + N_dma_reused * (TP_total / TP_inner)
+
+    Physical basis: inner-loop temporal reuse means some operands stay in
+    tile memory across consecutive iterations of the innermost temporal axis.
+    """
+    if tp_order == TP_AXIS_M:
+        # M-inner: LHS + OUT reload every iter; RHS reused across TPm
+        return spm + 2 * num_cores, spn
+    elif tp_order == TP_AXIS_N:
+        # N-inner: RHS + OUT reload every iter; LHS reused across TPn
+        return spn + 2 * num_cores, spm
+    else:  # TP_AXIS_K
+        # K-inner: LHS + RHS reload every iter; OUT reused (local accum)
+        return spm + spn, 2 * num_cores
+
+
+def tp_inner_value(
+    tpm: Numeric, tpk: Numeric, tpn: Numeric, tp_order: int,
+) -> Numeric:
+    """Return the TP value for the innermost temporal axis."""
+    if tp_order == TP_AXIS_M:
+        return tpm
+    elif tp_order == TP_AXIS_N:
+        return tpn
+    else:
+        return tpk
+
+
+def d_total(
+    spm: Numeric, spn: Numeric, num_cores: Numeric,
+    tpm: Numeric, tpk: Numeric, tpn: Numeric,
+    tp_total: Numeric, tp_order: int,
+) -> Numeric:
+    """Refined total DMA descriptor setups across all temporal iterations.
+
+    D_total = N_dma_every * TP_total + N_dma_reused * (TP_total / TP_inner)
+
+    Degeneracy: when TP_inner == 1, D_total == N_dma * TP_total (baseline).
+    """
+    n_every, n_reused = dma_ops_decomposed(spm, spn, num_cores, tp_order)
+    tp_inn = tp_inner_value(tpm, tpk, tpn, tp_order)
+    return n_every * tp_total + n_reused * (tp_total / tp_inn)
+
+
 def total_data_bytes(
     M: Numeric, K: Numeric, N: Numeric, elem_bytes: Numeric,
     spm: Numeric, spn: Numeric,
