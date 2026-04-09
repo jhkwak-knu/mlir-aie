@@ -631,5 +631,23 @@ class EnergyModel:
                 "e_dma_uj": e_dma,
                 "e_sync_uj": e_sync,
             }
+        elif model_name == "E1":
+            # E1: E = P_sys*T + E_core*P + E_DMA*D_total
+            # e_core is per-core fixed energy (uJ), not power
+            p_sys, e_core, e_dma = params
+            return {
+                "p_sys_uw": p_sys * CLOCK_MHZ * 1e6,
+                "e_core_uj": e_core,
+                "e_dma_uj": e_dma,
+            }
+        elif model_name == "E2":
+            # E2: E = P_sys*T + P_core*P*T + E_core*P + E_DMA*D_total
+            p_sys, p_core, e_core, e_dma = params
+            return {
+                "p_sys_uw": p_sys * CLOCK_MHZ * 1e6,
+                "p_core_uw": p_core * CLOCK_MHZ * 1e6,
+                "e_core_uj": e_core,
+                "e_dma_uj": e_dma,
+            }
         else:
             return {}
