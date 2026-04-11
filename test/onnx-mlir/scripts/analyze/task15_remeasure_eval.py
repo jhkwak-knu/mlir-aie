@@ -60,16 +60,115 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from analyze_ranking import spearman_rank_correlation  # noqa: E402
-from task13_compact_energy import (  # noqa: E402
-    EnergyRow,
-    load_energy_rows,
-    compute_features,
-)
+from task13_compact_energy import EnergyRow  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "generate"))
-from tiling_common import load_calibration, CommentFilterFile  # noqa: E402
+from tiling_common import load_calibration, CommentFilterFile, OpCase  # noqa: E402
+from cost_model import Candidate, total_data_bytes  # noqa: E402
+import models as _models  # noqa: E402
 
 CLOCK_MHZ = 1500
+
+# Ground-truth measurement columns used by Task 15 EDP evaluation.
+# Matches the Draft v3 analysis done by Claude.ai (Notion task).
+# batch_min_avg_us: minimum across outer-batches of per-batch iteration avg
+# batch_min_energy_per_iter_uj: matching energy per iteration
+GT_TIME_COL = "batch_min_avg_us"
+GT_ENERGY_COL = "batch_min_energy_per_iter_uj"
+
+
+def load_task15_rows(csv_path, tc_path, min_wall_s=0.005):
+    """Load rows using Task 15 / Draft v3 GT conventions.
+
+    GT time  = batch_min_avg_us
+    GT energy = batch_min_energy_per_iter_uj
+    """
+    with open(tc_path) as f:
+        tc_data = json.load(f)
+    cases_list = tc_data["cases"] if isinstance(tc_data, dict) else tc_data
+    tp_order_map = {}
+    for i, tc in enumerate(cases_list, start=1):
+        tp_order_map[i] = tc["levels"][0].get("tpOrder", [2, 0, 1])[0]
+
+    rows = []
+    import csv as _csv
+    with open(csv_path) as f:
+        for row in _csv.DictReader(CommentFilterFile(f)):
+            if row["status"] != "PASS":
+                continue
+            gt_e = float(row.get(GT_ENERGY_COL, 0) or 0)
+            gt_t = float(row.get(GT_TIME_COL, 0) or 0)
+            if gt_e <= 0 or gt_t <= 0:
+                continue
+            wall_s = float(row.get("wall_elapsed_s", -1))
+            if wall_s <= 0:
+                wall_s = float(row.get("batch_best_wall_s", -1))
+            if wall_s < min_wall_s:
+                continue
+            case_idx = int(row["case_index"])
+            r = EnergyRow(
+                case_index=case_idx,
+                M=int(row["M"]), K=int(row["K"]), N=int(row["N"]),
+                SPm=int(row["SPm"]), SPn=int(row["SPn"]),
+                TPm=int(row["TPm"]), TPk=int(row["TPk"]), TPn=int(row["TPn"]),
+                TM=int(row["TM"]), TK=int(row["TK"]), TN=int(row["TN"]),
+                num_cores=int(row["numSpm"]),
+                tp_order_inner=tp_order_map.get(case_idx, 2),
+                min_us=gt_t,   # Task 15: GT time = batch_min_avg_us (stored here)
+                avg_iter_us=float(row.get("avg_us", 0)),
+                npu_per_iter_uj=gt_e,  # Task 15: GT energy = batch_min_energy_per_iter_uj
+                wall_s=wall_s,
+            )
+            rows.append(r)
+    return rows
+
+
+def compute_task15_features(rows, coeffs):
+    """Compute features for Task 15 EDP evaluation.
+
+    Predicts T with Candidate A DMA-Refined and returns feature dict
+    containing both predicted time and GT energy (batch_min_*).
+    """
+    n = len(rows)
+    macs = np.zeros(n)
+    data_bytes = np.zeros(n)
+    t_total_cy = np.zeros(n)
+    n_cores_arr = np.zeros(n)
+    tp_total_arr = np.zeros(n)
+    d_total_arr = np.zeros(n)
+    gt_uj = np.zeros(n)
+
+    for i, r in enumerate(rows):
+        op = r.make_op()
+        cand = r.make_cand()
+        nc = r.n_cores
+        macs[i] = r.M * r.K * r.N
+        db = total_data_bytes(op, cand, r.tp_order_inner)
+        data_bytes[i] = db
+        n_cores_arr[i] = nc
+        tp_total_arr[i] = r.tp_total
+        gt_uj[i] = r.npu_per_iter_uj
+
+        n_ev, n_re = _models.dma_ops_decomposed(
+            r.SPm, r.SPn, nc, r.tp_order_inner)
+        tp_inn = _models.tp_inner_value(r.TPm, r.TPk, r.TPn, r.tp_order_inner)
+        d_total_arr[i] = n_ev * r.tp_total + n_re * (r.tp_total / tp_inn)
+
+        # Predicted T (Candidate A DMA-Refined)
+        t_comp = macs[i] / (nc * coeffs.eff_macs)
+        t_comm = db / coeffs.bw_eff_bpc
+        t_ovh = (coeffs.l_sync_cy * r.tp_total
+                 + coeffs.l_sync2_cy * nc * r.tp_total
+                 + coeffs.l_dma_cy * d_total_arr[i]
+                 + coeffs.l_startup_cy)
+        t_total_cy[i] = t_comp + t_comm + t_ovh
+
+    return {
+        "macs": macs, "data_bytes": data_bytes,
+        "t_total_cy": t_total_cy, "n_cores": n_cores_arr,
+        "tp_total": tp_total_arr, "d_total": d_total_arr,
+        "gt_uj": gt_uj,
+    }
 
 # ============================================================
 # Notion-specified model coefficients (Task 15 -- DO NOT CHANGE)
@@ -437,23 +536,28 @@ def compute_edp_per_workload(rows, feat, gt_uj):
 
 
 def run_phase2(v12_path, v13_path, tc_path, calib_path):
-    """Phase 2: EDP comparison between v12 and v13."""
+    """Phase 2: EDP comparison between v12 and v13.
+
+    Uses batch_min_avg_us + batch_min_energy_per_iter_uj as GT
+    (matches Draft v3 Claude.ai analysis convention for Task 15).
+    """
     print("\n" + "=" * 70)
     print("PHASE 2: EDP RE-EVALUATION (V12 vs V13)")
+    print(f"  GT convention: T={GT_TIME_COL}, E={GT_ENERGY_COL}")
     print("=" * 70)
 
     coeffs = load_calibration(Path(calib_path))
 
     # Load both datasets
     print(f"\n  Loading v12: {v12_path}")
-    rows_v12 = load_energy_rows(v12_path, tc_path)
-    feat_v12 = compute_features(rows_v12, coeffs)
+    rows_v12 = load_task15_rows(v12_path, tc_path)
+    feat_v12 = compute_task15_features(rows_v12, coeffs)
     gt_uj_v12 = feat_v12["gt_uj"]
     print(f"    {len(rows_v12)} valid samples")
 
     print(f"  Loading v13: {v13_path}")
-    rows_v13 = load_energy_rows(v13_path, tc_path)
-    feat_v13 = compute_features(rows_v13, coeffs)
+    rows_v13 = load_task15_rows(v13_path, tc_path)
+    feat_v13 = compute_task15_features(rows_v13, coeffs)
     gt_uj_v13 = feat_v13["gt_uj"]
     print(f"    {len(rows_v13)} valid samples")
 
