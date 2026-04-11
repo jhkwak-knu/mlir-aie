@@ -107,6 +107,9 @@ class CalibCoeffs:
     # T_overhead = L_SYNC*TP + L_CORE*P*TP + L_DMA*N_dma*TP + L_STARTUP
     # Stored as l_sync2_cy for JSON compat; semantically = L_CORE in v9.
     l_sync2_cy: float = 0.0   # Per-core per-iter sync cost (0 = v8 compat)
+    # Performance model variant (DMA count structure).
+    # "Core-Sync" = N_dma*TP (v9 baseline). "DMA-Refined" = D_total (v13+).
+    perf_model: str = "Core-Sync"
     # Energy calibration (v3)
     energy_model: str = ""           # E-A, E-B, E-C, E-D (empty = not calibrated)
     energy_params: Dict[str, float] = None  # Model-specific fitted parameters
@@ -196,6 +199,7 @@ def load_calibration(path: Path = DEFAULT_CALIB_PATH) -> CalibCoeffs:
         perf_beta=float(doc.get("perf_beta", 1.0)),
         l_dma_cy=float(doc.get("l_dma_cy", 0.0)),
         l_sync2_cy=float(doc.get("l_sync2_cy", 0.0)),
+        perf_model=str(doc.get("model", "Core-Sync")),
         energy_model=energy_model,
         energy_params=energy_params,
         energy_calibrated=energy_calibrated,

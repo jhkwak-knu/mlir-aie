@@ -1,5 +1,5 @@
 {
-  "version": 13,
+  "version": 14,
   "target": "xdna2",
   "model": "DMA-Refined",
   "eff_macs": 24.28,
@@ -34,57 +34,44 @@
     "cv_core_acc_pct": 93,
     "fit_method": "scipy differential_evolution (log-space MSE, seed=42, maxiter=2000)",
     "measurement_commit": "d4ea3a55",
-    "task": "Task 12 (d975926a)",
-    "prev_version": {
-      "version": 12,
-      "n_samples": 1226,
-      "mape_pct": 26.3,
-      "spearman_rho": 0.9736,
-      "core_accuracy": "14/19 (74%)",
-      "regret_mean_pct": 5.0,
-      "regret_max_pct": 22.5,
-      "l_sync_cy": 3893,
-      "l_sync2_cy": 1187,
-      "l_dma_cy": 2693,
-      "l_startup_cy": 98337,
-      "model_type": "Core-Sync (N_dma*TP)"
-    }
+    "task": "Task 12 (d975926a)"
   },
   "energy": {
-    "model": "T-E-DMA-Refined",
+    "model": "1-G",
     "params": {
-      "e_mac_pj": 2.0463,
-      "e_dram_pj": 72.7462,
-      "e_dma_uj": 23.115563,
-      "e_sync_uj": 8.9414,
-      "p_base_uw": 14295069,
-      "p_core_uw": 50000
+      "p_base_uw": 15000000,
+      "p_core_uw": 40000,
+      "e_dma_uj": 22.44
     },
     "gt_mode": "npu",
     "fitted_from": {
       "n_samples": 1246,
-      "spearman_rho": 0.9961,
-      "ws_rho": 0.9815,
-      "mape_pct": 17.2,
-      "ground_truth": "npu_per_iter_uj (bracket-idle subtracted)",
-      "data_source": "result_v12.csv (bracket-idle measurement, 19 shapes)",
-      "formula": "E_MAC*MACs + E_DRAM*bytes + E_DMA*D_total + E_SYNC*TP + (P_BASE+P_CORE*P)*T_total",
-      "fit_method": "scipy differential_evolution (log-space MSE, seed=42, constrained: E_MAC/E_DRAM/E_DMA/E_SYNC >= 10% v9, P_CORE >= 50mW)",
-      "note": "D_total replaces N_dma*TP (same as perf model). P_CORE=50mW is a lower bound constraint due to identifiability limitation in performance-mode measurement (see Task 12 P_CORE analysis). E_MAC/E_DRAM/E_SYNC at 10% lower bound.",
-      "component_contribution": "E_MAC*MACs 0.5%, E_DRAM*bytes 0.5%, E_DMA*D_total 26.8%, E_SYNC*TP 0.9%, P_BASE*T 67.8%, P_CORE*P*T 3.4%",
-      "task": "Task 12 (d975926a)",
+      "formula": "E = (P_BASE + P_CORE*P) * T_total + E_DMA * D_total",
+      "data_source": "result_v12.csv (bracket-idle measurement, 19 shapes) + Task 15 selective re-measurement",
+      "parameter_origin": {
+        "P_BASE": "Calibrated (Task 13 Phase 4B sweep, interpolated at P_CORE=40mW)",
+        "P_CORE": "Fixed by architecture specification (40 mW/core)",
+        "E_DMA": "Calibrated (Task 13 Phase 4B sweep, interpolated at P_CORE=40mW)"
+      },
+      "note": "3-parameter compact model. P_CORE fixed at 40mW (architecture spec), P_BASE and E_DMA calibrated. Same formula structure as T-3 but with semantic naming (p_base_uw vs p_sys_uw).",
+      "task": "Task 15",
+      "edp_core_accuracy": "16/19",
+      "edp_regret_mean_pct": 6.8,
+      "edp_regret_max_pct": 47.5,
+      "edp_regret_le10": "16/19",
       "prev_version": {
-        "version": 12,
-        "n_samples": 1226,
-        "spearman_rho": 0.9896,
-        "mape_pct": 23.7,
-        "e_mac_pj": 2.046,
-        "e_dram_pj": 72.746,
-        "e_dma_uj": 0.0447,
-        "e_sync_uj": 78.27,
-        "p_base_uw": 17960124,
-        "p_core_uw": 91581,
-        "model_type": "T-E (N_dma*TP)"
+        "version": 13,
+        "model": "T-E-DMA-Refined",
+        "params": {
+          "e_mac_pj": 2.0463,
+          "e_dram_pj": 72.7462,
+          "e_dma_uj": 23.115563,
+          "e_sync_uj": 8.9414,
+          "p_base_uw": 14295069,
+          "p_core_uw": 50000
+        },
+        "n_params": 7,
+        "replaced_by": "1-G (3-param) as of Task 15"
       }
     }
   }

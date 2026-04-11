@@ -253,6 +253,13 @@ def perf_comm(
     return total_data_bytes(op, c, tp_order) / bw
 
 
+def _d_total(c: Candidate, tp_order: int) -> float:
+    """Refined total DMA descriptor setups (D_total) for Candidate c."""
+    return _models.d_total(
+        c.SPm, c.SPn, c.num_cores,
+        c.TPm, c.TPk, c.TPn, c.tp_total, tp_order)
+
+
 def _dma_ops_per_step(c: Candidate, tp_order: int) -> int:
     """Delegates to models.dma_ops_per_step()."""
     return _models.dma_ops_per_step(c.SPm, c.SPn, c.num_cores, tp_order)
@@ -262,15 +269,28 @@ def perf_overhead(
     c: Candidate, coeffs: Optional[CalibCoeffs] = None,
     tp_order: int = TP_AXIS_K,
 ) -> float:
-    """T_overhead: delegates to models.PerfModel.components_v9()."""
+    """T_overhead: delegates to the appropriate PerfModel variant.
+
+    DMA-Refined (v13+): L_DMA * D_total
+    Core-Sync (v9):     L_DMA * N_dma * TP_total
+    """
     if coeffs and coeffs.calibrated:
-        n_dma = _dma_ops_per_step(c, tp_order)
-        _, _, t_ovh = _models.PerfModel.components_v9(
-            macs=0, data_bytes=0,  # only overhead needed
-            n_cores=c.num_cores, tp_total=c.tp_total, n_dma=n_dma,
-            eff_macs=coeffs.eff_macs, bw_bpc=coeffs.bw_eff_bpc,
-            l_sync=coeffs.l_sync_cy, l_sync2=coeffs.l_sync2_cy,
-            l_dma=coeffs.l_dma_cy, l_startup=coeffs.l_startup_cy)
+        if coeffs.perf_model == "DMA-Refined":
+            d_tot = _d_total(c, tp_order)
+            _, _, t_ovh = _models.PerfModel.components_dma_refined(
+                macs=0, data_bytes=0,
+                n_cores=c.num_cores, tp_total=c.tp_total, d_total_val=d_tot,
+                eff_macs=coeffs.eff_macs, bw_bpc=coeffs.bw_eff_bpc,
+                l_sync=coeffs.l_sync_cy, l_sync2=coeffs.l_sync2_cy,
+                l_dma=coeffs.l_dma_cy, l_startup=coeffs.l_startup_cy)
+        else:
+            n_dma = _dma_ops_per_step(c, tp_order)
+            _, _, t_ovh = _models.PerfModel.components_v9(
+                macs=0, data_bytes=0,
+                n_cores=c.num_cores, tp_total=c.tp_total, n_dma=n_dma,
+                eff_macs=coeffs.eff_macs, bw_bpc=coeffs.bw_eff_bpc,
+                l_sync=coeffs.l_sync_cy, l_sync2=coeffs.l_sync2_cy,
+                l_dma=coeffs.l_dma_cy, l_startup=coeffs.l_startup_cy)
         return t_ovh
     return ALPHA_CYCLES * (c.TPm * c.TPn * c.TPk)
 
@@ -330,6 +350,7 @@ def energy_total_calibrated(
         "n_cores": c.SPm * c.SPn,
         "tp_total": c.tp_total,
         "n_dma": _dma_ops_per_step(c, tp_order),
+        "d_total": _d_total(c, tp_order),
         "t_total_cy": t_total,
         "t_comp_cy": t_comp,
         "t_comm_cy": t_comm,

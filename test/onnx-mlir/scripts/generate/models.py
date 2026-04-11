@@ -141,6 +141,30 @@ class PerfModel:
     """Performance prediction formulas for XDNA2 NPU."""
 
     @staticmethod
+    def components_dma_refined(
+        macs: Numeric, data_bytes: Numeric,
+        n_cores: Numeric, tp_total: Numeric, d_total_val: Numeric,
+        eff_macs: float, bw_bpc: float,
+        l_sync: float, l_sync2: float, l_dma: float,
+        l_startup: float,
+    ) -> Tuple[Numeric, Numeric, Numeric]:
+        """Candidate A / DMA-Refined: returns (T_comp, T_comm, T_overhead) in cycles.
+
+        T_comp = MACs / (N_cores * eff_macs)
+        T_comm = data_bytes / bw_bpc
+        T_overhead = L_SYNC*TP + L_SYNC2*P*TP + L_DMA*D_total + L_STARTUP
+
+        where D_total = N_dma_every*TP + N_dma_reused*(TP/TP_inner).
+        """
+        t_comp = macs / (n_cores * eff_macs)
+        t_comm = data_bytes / bw_bpc
+        t_overhead = (l_sync * tp_total
+                      + l_sync2 * n_cores * tp_total
+                      + l_dma * d_total_val
+                      + l_startup)
+        return t_comp, t_comm, t_overhead
+
+    @staticmethod
     def components_v9(
         macs: Numeric, data_bytes: Numeric,
         n_cores: Numeric, tp_total: Numeric, n_dma: Numeric,
@@ -216,6 +240,7 @@ class EnergyModel:
             "T-E": EnergyModel._predict_te,
             "T-3": EnergyModel._predict_t3,
             "T-3S": EnergyModel._predict_t3s,
+            "1-G": EnergyModel._predict_1g,
             "L-B": EnergyModel._predict_lb,
         }
         fn = dispatch.get(model_name)
@@ -367,6 +392,20 @@ class EnergyModel:
             p_core=params.get("p_core_uw", 0),
             e_dma=params.get("e_dma_uj", 0),
             e_sync=params.get("e_sync_uj", 0),
+        )
+
+    @staticmethod
+    def _predict_1g(params: Dict[str, float], features: Dict[str, Numeric]) -> Numeric:
+        """1-G (3-parameter): E = (P_BASE + P_CORE*P)*T + E_DMA*D_total.
+
+        Structurally identical to T-3 but uses p_base_uw/p_core_uw naming and
+        P_CORE is typically fixed (architecture spec, e.g., 40mW).
+        """
+        return EnergyModel.predict_compact(
+            features,
+            p_sys=params.get("p_base_uw", params.get("p_sys_uw", 0)),
+            p_core=params.get("p_core_uw", 0),
+            e_dma=params.get("e_dma_uj", 0),
         )
 
     @staticmethod
