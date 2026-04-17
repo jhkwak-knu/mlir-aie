@@ -171,26 +171,26 @@ def compute_task15_features(rows, coeffs):
     }
 
 # ============================================================
-# Notion-specified model coefficients (Task 15 -- DO NOT CHANGE)
+# Model coefficients (calibration.json v15, fitted on result_v14_clean.csv)
 # ============================================================
 
-# Performance model: Candidate A, DMA-Refined (matches calibration.json v13)
+# Performance model: DMA-Refined (matches calibration.json v15)
 NOTION_PERF = {
     "eff_macs": 24.28,
     "eff_bw": 4.0,
-    "L_SYNC": 1676,
-    "L_CORE": 174,      # = l_core_cy
-    "L_DMA": 3424,
-    "L_STARTUP": 26660,
+    "L_SYNC": 6622,
+    "L_CORE": 1272,
+    "L_DMA": 1788,
+    "L_STARTUP": 53599,
     "clock_mhz": 1500,
 }
 
-# Energy model: 1-G, 3-parameter (T-3 with P_CORE=40mW fixed)
-# E = (P_BASE + P_CORE*P) * T_total + E_DMA * D_total
+# Energy model: 1-G, 3-parameter (P_CORE=40mW fixed)
+# E = (P_BASE + P_CORE*P) * T_pred + E_DMA * D_total
 NOTION_ENERGY = {
     "P_CORE_mW": 40.0,        # fixed (architecture specification)
-    "E_DMA_uJ": 22.44,        # calibrated
-    "P_BASE_W": 15.00,        # calibrated
+    "E_DMA_uJ": 18.07,        # calibrated on v14
+    "P_BASE_W": 8.64,         # calibrated on v14
 }
 
 # Target workloads for re-measurement (Regret > 10%)

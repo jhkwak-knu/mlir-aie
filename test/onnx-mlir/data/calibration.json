@@ -1,76 +1,75 @@
 {
-  "version": 14,
+  "version": 15,
   "target": "xdna2",
   "model": "DMA-Refined",
   "eff_macs": 24.28,
   "bw_eff_bpc": 4.0,
   "perf_alpha": 1.0,
   "perf_beta": 1.0,
-  "l_sync_cy": 1676,
-  "l_core_cy": 174,
-  "l_dma_cy": 3424,
-  "l_startup_cy": 26660,
+  "l_sync_cy": 6622,
+  "l_core_cy": 1272,
+  "l_dma_cy": 1788,
+  "l_startup_cy": 53599,
   "l_config_cy": 0,
   "clock_mhz": 1500,
   "fitted_from": {
-    "n_samples": 1226,
-    "spearman_rho": 0.9876,
-    "global_rho": 0.9926,
-    "mape_pct": 22.1,
-    "mape_p90_pct": 41.3,
-    "mape_max_pct": 165.1,
-    "core_accuracy": "18/19 (95%)",
-    "regret_mean_pct": 2.6,
-    "regret_max_pct": 11.9,
-    "regret_le5_pct": "14/19",
-    "regret_le10_pct": "18/19",
-    "rank_inversions": "517/10108 (5.1%)",
+    "n_samples": 1290,
     "ground_truth": "batch_min_avg_us",
-    "data_source": "result_v12.csv (bracket-idle measurement, 19 shapes)",
-    "model_type": "DMA-Refined (T = T_comp + T_comm + L_SYNC*TP + L_CORE*P*TP + L_DMA*D_total + L_STARTUP, D_total = N_dma_every*TP + N_dma_reused*(TP/TP_inner))",
-    "note": "Task 12 Candidate A. l_core_cy = L_CORE (per-core per-TP barrier). L_DMA applies to D_total (refined DMA count with temporal reuse), not N_dma*TP.",
-    "cv_mape_pct": 22.4,
-    "cv_core_acc_pct": 93,
+    "data_source": "result_v14_clean.csv (chunk-measured, 18 shapes, best-CV selected)",
+    "model_type": "DMA-Refined (T = T_comp + T_comm + L_SYNC*TP + L_CORE*P*TP + L_DMA*D_total + L_STARTUP)",
     "fit_method": "scipy differential_evolution (log-space MSE, seed=42, maxiter=2000)",
-    "measurement_commit": "d4ea3a55",
-    "task": "Task 12 (d975926a)"
+    "t_rho": 0.9910,
+    "t_mape_pct": 22.0,
+    "t_mape_p90_pct": 40.0,
+    "prev_version": {
+      "version": 14,
+      "l_sync_cy": 1676,
+      "l_core_cy": 174,
+      "l_dma_cy": 3424,
+      "l_startup_cy": 26660,
+      "data_source": "result_v12.csv",
+      "t_rho": 0.9903,
+      "t_mape_pct": 22.9
+    }
   },
   "energy": {
     "model": "1-G",
     "params": {
-      "p_base_uw": 15000000,
+      "p_base_uw": 8640000,
       "p_core_uw": 40000,
-      "e_dma_uj": 22.44
+      "e_dma_uj": 18.07
     },
     "gt_mode": "npu",
+    "gt_columns": {
+      "time": "batch_min_avg_us",
+      "energy": "batch_min_energy_per_iter_uj"
+    },
     "fitted_from": {
-      "n_samples": 1246,
-      "formula": "E = (P_BASE + P_CORE*P) * T_total + E_DMA * D_total",
-      "data_source": "result_v12.csv (bracket-idle measurement, 19 shapes) + Task 15 selective re-measurement",
+      "n_samples": 1290,
+      "formula": "E = (P_BASE + P_CORE*P) * T_pred + E_DMA * D_total",
+      "data_source": "result_v14_clean.csv (chunk-measured, 18 shapes, best-CV selected)",
+      "fit_method": "scipy differential_evolution (log-space MSE, seed=42, maxiter=2000)",
       "parameter_origin": {
-        "P_BASE": "Calibrated (Task 13 Phase 4B sweep, interpolated at P_CORE=40mW)",
+        "P_BASE": "Calibrated on v14 clean data (8.64 W)",
         "P_CORE": "Fixed by architecture specification (40 mW/core)",
-        "E_DMA": "Calibrated (Task 13 Phase 4B sweep, interpolated at P_CORE=40mW)"
+        "E_DMA": "Calibrated on v14 clean data (18.07 uJ)"
       },
-      "note": "3-parameter compact model. P_CORE fixed at 40mW (architecture spec), P_BASE and E_DMA calibrated. Same formula structure as T-3 but with semantic naming (p_base_uw vs p_sys_uw).",
-      "task": "Task 15",
-      "edp_core_accuracy": "16/19",
-      "edp_regret_mean_pct": 6.8,
-      "edp_regret_max_pct": 47.5,
-      "edp_regret_le10": "16/19",
+      "e_rho": 0.9950,
+      "e_mape_pct": 12.6,
+      "e_mape_p90_pct": 28.2,
+      "edp_core_accuracy": "17/18",
+      "edp_regret_mean_pct": 8.3,
+      "edp_regret_max_pct": 39.1,
+      "edp_regret_le10": "13/18",
       "prev_version": {
-        "version": 13,
-        "model": "T-E-DMA-Refined",
+        "version": 14,
         "params": {
-          "e_mac_pj": 2.0463,
-          "e_dram_pj": 72.7462,
-          "e_dma_uj": 23.115563,
-          "e_sync_uj": 8.9414,
-          "p_base_uw": 14295069,
-          "p_core_uw": 50000
+          "p_base_uw": 15000000,
+          "p_core_uw": 40000,
+          "e_dma_uj": 22.44
         },
-        "n_params": 7,
-        "replaced_by": "1-G (3-param) as of Task 15"
+        "data_source": "result_v12.csv + Task 15 re-measurement",
+        "e_mape_pct": 56.2
       }
     }
   }

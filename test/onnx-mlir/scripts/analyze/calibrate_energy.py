@@ -222,11 +222,14 @@ def load_energy_data(
     skipped: List[SkippedRow] = []
 
     for row in raw_rows:
-        # Skip rows without wall_elapsed_s (e.g. RUN_FAIL with fewer columns)
+        # Skip rows without wall time (e.g. RUN_FAIL with fewer columns).
+        # Prefer wall_elapsed_s; fall back to batch_best_wall_s for v14+ CSVs.
         wall_raw = row.get("wall_elapsed_s")
         if wall_raw is None or wall_raw == "":
             continue
         wall_s = float(wall_raw)
+        if wall_s <= 0:
+            wall_s = float(row.get("batch_best_wall_s", -1))
         case_idx = int(row["case_index"])
         M, K, N = int(row["M"]), int(row["K"]), int(row["N"])
         size_key = f"{M}x{K}x{N}"
