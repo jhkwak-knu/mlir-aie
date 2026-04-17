@@ -60,6 +60,12 @@ def load_npu_results(path: str) -> Dict[Tuple[int, int, int], MeasuredResult]:
         for row in csv.DictReader(_skip_comments(f)):
             if row.get("status") != "PASS":
                 continue
+            # Skip CPU rows when a combined CSV is passed (CPU rows have SPm=-1).
+            try:
+                if int(row.get("SPm", -1)) <= 0:
+                    continue
+            except (TypeError, ValueError):
+                continue
             t_us = float(row.get("batch_min_avg_us", -1))
             e_uj = float(row.get("batch_min_energy_per_iter_uj", -1))
             if t_us <= 0 or e_uj <= 0:
@@ -100,6 +106,12 @@ def load_cpu_results(path: str) -> Tuple[
         for row in csv.DictReader(_skip_comments(f)):
             if row.get("status") != "PASS":
                 continue
+            # Skip NPU rows when a combined CSV is passed (NPU rows have SPm>=1).
+            try:
+                if int(row.get("SPm", -1)) >= 1:
+                    continue
+            except (TypeError, ValueError):
+                pass
             threads = int(row["numSpm"])
             key = (int(row["M"]), int(row["K"]), int(row["N"]))
             t_us = float(row.get("batch_min_avg_us", -1))

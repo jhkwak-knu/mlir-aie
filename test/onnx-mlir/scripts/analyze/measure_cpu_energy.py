@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Measure CPU matmul baseline with RAPL energy measurement.
+"""Measure CPU bf16 matmul baseline with RAPL energy measurement.
 
-Measures both single-thread and multi-thread execution time and energy
-for each matrix size. Uses RAPL (package-0 and core domains) for
-energy measurement.
+Uses PyTorch bfloat16 matmul on CPU (hardware-accelerated via AVX-512
+BF16/VNNI on Zen4+) to match the NPU data type. Measures both
+single-thread and multi-thread execution time and energy for each matrix
+size. Uses RAPL (package-0 and core domains) for energy measurement.
 
 Output CSV uses the same 50-column format as NPU result CSV
 (run_tc_all.sh) for direct comparison. NPU-specific columns are
@@ -91,19 +92,30 @@ def _measure_bracket_idle(window_s, n_samples):
     return _measure_idle_median(window_s, n_samples)
 
 
-def measure_matmul(np, m, k, n, n_threads):
-    """Measure matmul time and energy using double-loop min methodology.
+def measure_matmul(torch, m, k, n, n_threads):
+    """Measure bf16 matmul time and energy using double-loop min methodology.
 
-    Matches NPU host.cpp v12: warmup outside outer loop with min-based
-    n_inner sizing, per-batch bracket idle (before+after), target wall 1.0s,
-    post-measurement idle drift detection, CV metrics.
+    Uses PyTorch bfloat16 matmul on CPU (hardware-accelerated via
+    AVX-512 BF16/VNNI on Zen4+). Matches NPU host.cpp v12: warmup outside
+    outer loop with min-based n_inner sizing, per-batch bracket idle
+    (before+after), target wall 1.0s, post-measurement idle drift detection,
+    CV metrics.
     """
     os.environ["OMP_NUM_THREADS"] = str(n_threads)
     os.environ["OPENBLAS_NUM_THREADS"] = str(n_threads)
     os.environ["MKL_NUM_THREADS"] = str(n_threads)
+    torch.set_num_threads(n_threads)
 
-    a = np.random.randn(m, k).astype(np.float32)
-    b = np.random.randn(k, n).astype(np.float32)
+    a = torch.randn(m, k, dtype=torch.bfloat16).contiguous()
+    b = torch.randn(k, n, dtype=torch.bfloat16).contiguous()
+    # Mode control via env var: CPU_BASELINE_MODE
+    #   "bf16" (default): native bf16 matmul (uses AVX-512 BF16 VNNI when available)
+    #   "upcast_fp32": cast bf16 inputs to fp32 and run fp32 matmul
+    #       (models "CPU without BF16 VNNI": bf16-precision data but fp32 compute)
+    mode = os.environ.get("CPU_BASELINE_MODE", "bf16")
+    if mode == "upcast_fp32":
+        a = a.float().contiguous()
+        b = b.float().contiguous()
 
     # Session-level idle (median of N samples)
     idle_pkg_mw, idle_core_mw = _measure_idle_median(
@@ -113,7 +125,7 @@ def measure_matmul(np, m, k, n, n_threads):
     single_s_min = 1e18
     for _ in range(N_WARMUP):
         t0 = time.perf_counter()
-        c = a @ b
+        c = torch.matmul(a, b)
         t1 = time.perf_counter()
         elapsed = t1 - t0
         if elapsed < single_s_min:
@@ -153,7 +165,7 @@ def measure_matmul(np, m, k, n, n_threads):
         batch_time_total = 0.0
         for _ in range(n_inner):
             t0 = time.perf_counter()
-            c = a @ b
+            c = torch.matmul(a, b)
             t1 = time.perf_counter()
             iter_us = (t1 - t0) * 1e6
             batch_time_total += iter_us
@@ -201,7 +213,7 @@ def measure_matmul(np, m, k, n, n_threads):
             best_batch_energy_core_uj = batch_core_per_iter
 
     # Prevent optimization
-    _ = c[0, 0]
+    _ = c[0, 0].item()
 
     # Post-measurement idle for drift detection (matches NPU host.cpp)
     idle_post_pkg, _ = _measure_idle_median(
@@ -338,11 +350,11 @@ def _to_npu_csv_row(case_index, result):
 
 def run_single_thread_batch(cases, start_index=1):
     """Run measurements in-process (threads already set before import)."""
-    import numpy as np
+    import torch
     results = []
     for i, case in enumerate(cases):
         m, k, n_val = case["M"], case["K"], case["N"]
-        result = measure_matmul(np, m, k, n_val, 1)
+        result = measure_matmul(torch, m, k, n_val, 1)
         row = _to_npu_csv_row(start_index + i, result)
         results.append(row)
         sz = f"{m}x{k}x{n_val}"
@@ -404,7 +416,7 @@ def main():
 
     # Worker mode: run a single thread config and write CSV
     if args._worker > 0:
-        import numpy as np
+        import torch
         with open(args.op) as f:
             cases = json.load(f)["cases"]
 
@@ -417,7 +429,7 @@ def main():
         rows = []
         for i, case in enumerate(cases):
             m, k, n_val = case["M"], case["K"], case["N"]
-            result = measure_matmul(np, m, k, n_val, args._worker)
+            result = measure_matmul(torch, m, k, n_val, args._worker)
             row = _to_npu_csv_row(args._start_index + i, result)
             rows.append(row)
             sz = f"{m}x{k}x{n_val}"
@@ -437,24 +449,33 @@ def main():
         return
 
     # Main mode
-    # Set 1T before importing numpy
+    # Set 1T before importing torch
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
-    import numpy as np
+    import torch
+    torch.set_num_threads(1)
 
     with open(args.op) as f:
         op_data = json.load(f)
     cases = op_data["cases"]
 
-    print(f"NumPy version: {np.__version__}")
+    print(f"PyTorch version: {torch.__version__}")
+    print(f"  torch.get_num_threads()={torch.get_num_threads()}")
+    print(f"  mkldnn_available={torch.backends.mkldnn.is_available()}")
     try:
-        config = np.show_config(mode="dicts")
-        if isinstance(config, dict):
-            blas = config.get("Build Dependencies", {}).get("blas", {})
-            print(f"BLAS: {blas.get('name', 'unknown')} {blas.get('version', '')}")
+        bf16_ok = torch.cpu._is_avx512_bf16_supported()
+        print(f"  AVX512_BF16 supported: {bf16_ok}")
     except Exception:
         pass
+
+    # bf16 matmul sanity check (relative error < 5% vs fp32 reference)
+    _a = torch.randn(64, 64, dtype=torch.bfloat16)
+    _b = torch.randn(64, 64, dtype=torch.bfloat16)
+    _c_bf = torch.matmul(_a, _b).float()
+    _c_fp = torch.matmul(_a.float(), _b.float())
+    _rel = ((_c_bf - _c_fp).abs() / (_c_fp.abs() + 1e-6)).mean().item()
+    print(f"  bf16 sanity: mean relative error vs fp32 = {_rel*100:.3f}%")
 
     # Check RAPL access
     try:
