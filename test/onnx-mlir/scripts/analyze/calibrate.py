@@ -728,8 +728,8 @@ def main(argv: List[str]) -> int:
                           help="Path to archive directory (per-case tc.json)")
     parser.add_argument("--output", default="data/calibration.json",
                         help="Path to write calibration.json")
-    parser.add_argument("--ground-truth", default="min_us",
-                        help="CSV column for ground truth (default: min_us)")
+    parser.add_argument("--ground-truth", default="batch_min_avg_us",
+                        help="CSV column for ground truth (default: batch_min_avg_us)")
     parser.add_argument("--min-quality", type=float, default=0.0,
                         help="Minimum data_quality threshold (default: 0.0)")
     parser.add_argument("--model", default="",

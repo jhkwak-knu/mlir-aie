@@ -132,7 +132,7 @@ def predict_v8(data: list, calib: dict) -> np.ndarray:
             n_cores=d["nc"], tp_total=d["tp_total"], n_dma=n_dma,
             eff_macs=EFF_MACS, bw_bpc=BW_BPC,
             l_sync=calib["l_sync_cy"],
-            l_sync2=calib.get("l_sync2_cy", 0),
+            l_core=calib.get("l_core_cy", 0),
             l_dma=calib["l_dma_cy"],
             l_startup=calib["l_startup_cy"])
     return preds

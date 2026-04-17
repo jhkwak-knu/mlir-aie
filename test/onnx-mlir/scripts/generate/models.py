@@ -145,21 +145,21 @@ class PerfModel:
         macs: Numeric, data_bytes: Numeric,
         n_cores: Numeric, tp_total: Numeric, d_total_val: Numeric,
         eff_macs: float, bw_bpc: float,
-        l_sync: float, l_sync2: float, l_dma: float,
+        l_sync: float, l_core: float, l_dma: float,
         l_startup: float,
     ) -> Tuple[Numeric, Numeric, Numeric]:
         """Candidate A / DMA-Refined: returns (T_comp, T_comm, T_overhead) in cycles.
 
         T_comp = MACs / (N_cores * eff_macs)
         T_comm = data_bytes / bw_bpc
-        T_overhead = L_SYNC*TP + L_SYNC2*P*TP + L_DMA*D_total + L_STARTUP
+        T_overhead = L_SYNC*TP + L_CORE*P*TP + L_DMA*D_total + L_STARTUP
 
         where D_total = N_dma_every*TP + N_dma_reused*(TP/TP_inner).
         """
         t_comp = macs / (n_cores * eff_macs)
         t_comm = data_bytes / bw_bpc
         t_overhead = (l_sync * tp_total
-                      + l_sync2 * n_cores * tp_total
+                      + l_core * n_cores * tp_total
                       + l_dma * d_total_val
                       + l_startup)
         return t_comp, t_comm, t_overhead
@@ -169,22 +169,22 @@ class PerfModel:
         macs: Numeric, data_bytes: Numeric,
         n_cores: Numeric, tp_total: Numeric, n_dma: Numeric,
         eff_macs: float, bw_bpc: float,
-        l_sync: float, l_sync2: float, l_dma: float,
+        l_sync: float, l_core: float, l_dma: float,
         l_startup: float,
     ) -> Tuple[Numeric, Numeric, Numeric]:
         """v9 Core-Sync model: returns (T_comp, T_comm, T_overhead) in cycles.
 
         T_comp = MACs / (N_cores * eff_macs)
         T_comm = data_bytes / bw_bpc
-        T_overhead = L_SYNC*TP + L_SYNC2*P*TP + L_DMA*N_dma*TP + L_STARTUP
+        T_overhead = L_SYNC*TP + L_CORE*P*TP + L_DMA*N_dma*TP + L_STARTUP
         """
         t_comp = macs / (n_cores * eff_macs)
         t_comm = data_bytes / bw_bpc
 
-        if l_sync2 != 0:
+        if l_core != 0:
             # v9: per-core per-iteration barrier cost
             t_overhead = (l_sync * tp_total
-                          + l_sync2 * n_cores * tp_total
+                          + l_core * n_cores * tp_total
                           + l_dma * n_dma * tp_total
                           + l_startup)
         else:
@@ -200,13 +200,13 @@ class PerfModel:
         macs: Numeric, data_bytes: Numeric,
         n_cores: Numeric, tp_total: Numeric, n_dma: Numeric,
         eff_macs: float, bw_bpc: float,
-        l_sync: float, l_sync2: float, l_dma: float,
+        l_sync: float, l_core: float, l_dma: float,
         l_startup: float,
     ) -> Numeric:
         """v9 Core-Sync model: returns T_total in cycles."""
         t_comp, t_comm, t_overhead = PerfModel.components_v9(
             macs, data_bytes, n_cores, tp_total, n_dma,
-            eff_macs, bw_bpc, l_sync, l_sync2, l_dma, l_startup)
+            eff_macs, bw_bpc, l_sync, l_core, l_dma, l_startup)
         return t_comp + t_comm + t_overhead
 
 

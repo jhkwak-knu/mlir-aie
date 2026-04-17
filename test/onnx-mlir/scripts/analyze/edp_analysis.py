@@ -25,12 +25,12 @@ CLOCK_MHZ = 1500.0
 ELEM_BYTES = 2
 
 
-def predict_perf_v9(L_SYNC, L_SYNC2, L_DMA, L_STARTUP,
+def predict_perf_v9(L_SYNC, L_CORE, L_DMA, L_STARTUP,
                     t_comp, t_comm, tp_total, core_x_tp, dma_ops):
     """Returns predicted cycles."""
     return (t_comp + t_comm
             + L_SYNC * tp_total
-            + L_SYNC2 * core_x_tp
+            + L_CORE * core_x_tp
             + L_DMA * dma_ops
             + L_STARTUP)
 
@@ -124,7 +124,7 @@ def main():
     ap.add_argument("--tc", required=True)
     ap.add_argument("--calib", default="data/calibration.json")
     ap.add_argument("--new-perf", nargs=4, type=float, required=True,
-                    metavar=("L_SYNC", "L_SYNC2", "L_DMA", "L_STARTUP"),
+                    metavar=("L_SYNC", "L_CORE", "L_DMA", "L_STARTUP"),
                     help="NEW perf coefficients")
     ap.add_argument("--new-energy", nargs=6, type=float, required=True,
                     metavar=("e_mac_pj", "e_dram_pj", "e_dma_uj", "e_sync_uj",
@@ -179,7 +179,7 @@ def main():
     with open(args.calib) as f:
         calib = json.load(f)
 
-    old_perf = [float(calib["l_sync_cy"]), float(calib["l_sync2_cy"]),
+    old_perf = [float(calib["l_sync_cy"]), float(calib["l_core_cy"]),
                 float(calib["l_dma_cy"]), float(calib["l_startup_cy"])]
     old_energy_p = calib.get("energy", {}).get("params", {})
     old_energy = [

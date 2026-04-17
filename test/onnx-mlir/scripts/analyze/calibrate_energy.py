@@ -238,7 +238,7 @@ def load_energy_data(
                                 row.get("idle_uncore_mw", "-1")))
         active_mw = float(row.get("active_pkg_mw",
                                   row.get("active_uncore_mw", "-1")))
-        npu_per_iter = float(_col(row, "npu_per_iter_uj",
+        npu_per_iter = float(_col(row, "batch_min_energy_per_iter_uj",
                                   "npu_energy_per_iter_uj"))
 
         # Compute GT energy per iteration based on mode
@@ -483,7 +483,7 @@ def compute_features(
                 macs=macs, data_bytes=data_bytes,
                 n_cores=r.n_cores, tp_total=r.tp_total, n_dma=n_dma,
                 eff_macs=coeffs.eff_macs, bw_bpc=coeffs.bw_eff_bpc,
-                l_sync=coeffs.l_sync_cy, l_sync2=coeffs.l_sync2_cy,
+                l_sync=coeffs.l_sync_cy, l_core=coeffs.l_core_cy,
                 l_dma=coeffs.l_dma_cy, l_startup=coeffs.l_startup_cy)
         else:
             t_comp_cy = macs / (r.n_cores * 256.0)
@@ -896,7 +896,7 @@ def _active_fraction(r: ECalibRow, coeffs: Optional[CalibCoeffs]) -> float:
             data_bytes=total_data_bytes(op, cand, r.tp_order_inner),
             n_cores=r.n_cores, tp_total=r.tp_total, n_dma=n_dma,
             eff_macs=coeffs.eff_macs, bw_bpc=coeffs.bw_eff_bpc,
-            l_sync=coeffs.l_sync_cy, l_sync2=coeffs.l_sync2_cy,
+            l_sync=coeffs.l_sync_cy, l_core=coeffs.l_core_cy,
             l_dma=coeffs.l_dma_cy, l_startup=coeffs.l_startup_cy)
     else:
         t_comp = (r.M * r.K * r.N) / (r.n_cores * 256.0)

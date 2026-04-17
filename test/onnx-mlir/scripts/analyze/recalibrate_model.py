@@ -328,7 +328,7 @@ MODELS = {
         ),
         "bounds": [(0.001, 10), (0.01, 10), (0, 5e5), (0, 1e5),
                    (0, 5e5), (0, 5e5), (0, 5e5)],
-        "param_names": ["alpha", "beta", "L_SYNC", "L_SYNC2",
+        "param_names": ["alpha", "beta", "L_SYNC", "L_CORE",
                         "L_DMA", "L_CORE", "L_STARTUP"],
     },
     "Core-Sync-Fixed": {
@@ -534,7 +534,7 @@ def write_calibration(calib_path, output_path, model_name, params, param_names, 
         calib["perf_alpha"] = pdict["alpha"]
         calib["perf_beta"] = pdict["beta"]
         calib["l_sync_cy"] = pdict["L_SYNC"]
-        calib["l_sync2_cy"] = pdict["L_SYNC2"]
+        calib["l_core_cy"] = pdict["L_CORE"]
         calib["l_dma_cy"] = pdict["L_DMA"]
         calib["l_core_cy"] = pdict["L_CORE"]
         calib["l_startup_cy"] = pdict["L_STARTUP"]

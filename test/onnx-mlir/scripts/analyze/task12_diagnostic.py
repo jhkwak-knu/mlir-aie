@@ -202,53 +202,53 @@ def compute_features(
 
 def predict_baseline(f, p):
     """Core-Sync-Fixed (v12 Baseline, 4 overhead params).
-    T = T_comp + T_comm + L_SYNC*TP + L_SYNC2*P*TP + L_DMA*N_dma*TP + L_STARTUP
+    T = T_comp + T_comm + L_SYNC*TP + L_CORE*P*TP + L_DMA*N_dma*TP + L_STARTUP
     """
-    l_sync, l_sync2, l_dma, l_startup = p
+    l_sync, l_core, l_dma, l_startup = p
     return (f["t_comp"] + f["t_comm"]
             + l_sync * f["tp_total"]
-            + l_sync2 * f["core_x_tp"]
+            + l_core * f["core_x_tp"]
             + l_dma * f["total_dma_ops"]
             + l_startup)
 
 
 def predict_candidate_a(f, p):
     """Candidate A: DMA-Refined (4 overhead params, same count as baseline).
-    T = T_comp + T_comm + L_SYNC*TP + L_SYNC2*P*TP + L_DMA*D_total + L_STARTUP
+    T = T_comp + T_comm + L_SYNC*TP + L_CORE*P*TP + L_DMA*D_total + L_STARTUP
     where D_total = N_dma_every*TP + N_dma_reused*(TP/TP_inner)
     """
-    l_sync, l_sync2, l_dma, l_startup = p
+    l_sync, l_core, l_dma, l_startup = p
     return (f["t_comp"] + f["t_comm"]
             + l_sync * f["tp_total"]
-            + l_sync2 * f["core_x_tp"]
+            + l_core * f["core_x_tp"]
             + l_dma * f["d_total"]
             + l_startup)
 
 
 def predict_candidate_b(f, p):
     """Candidate B: Free eff_macs/bw_eff (6 params, diagnostic only).
-    T = MACs/(P*eff_cal) + bytes/bw_cal + L_SYNC*TP + L_SYNC2*P*TP + L_DMA*N_dma*TP + L_STARTUP
+    T = MACs/(P*eff_cal) + bytes/bw_cal + L_SYNC*TP + L_CORE*P*TP + L_DMA*N_dma*TP + L_STARTUP
     """
-    eff_cal, bw_cal, l_sync, l_sync2, l_dma, l_startup = p
+    eff_cal, bw_cal, l_sync, l_core, l_dma, l_startup = p
     t_comp_new = f["macs"] / (f["n_cores"] * eff_cal)
     t_comm_new = f["data_bytes"] / bw_cal
     return (t_comp_new + t_comm_new
             + l_sync * f["tp_total"]
-            + l_sync2 * f["core_x_tp"]
+            + l_core * f["core_x_tp"]
             + l_dma * f["total_dma_ops"]
             + l_startup)
 
 
 def predict_candidate_ab(f, p):
     """Candidate A+B: DMA-Refined + Free params (6 params, diagnostic only).
-    T = MACs/(P*eff_cal) + bytes/bw_cal + L_SYNC*TP + L_SYNC2*P*TP + L_DMA*D_total + L_STARTUP
+    T = MACs/(P*eff_cal) + bytes/bw_cal + L_SYNC*TP + L_CORE*P*TP + L_DMA*D_total + L_STARTUP
     """
-    eff_cal, bw_cal, l_sync, l_sync2, l_dma, l_startup = p
+    eff_cal, bw_cal, l_sync, l_core, l_dma, l_startup = p
     t_comp_new = f["macs"] / (f["n_cores"] * eff_cal)
     t_comm_new = f["data_bytes"] / bw_cal
     return (t_comp_new + t_comm_new
             + l_sync * f["tp_total"]
-            + l_sync2 * f["core_x_tp"]
+            + l_core * f["core_x_tp"]
             + l_dma * f["d_total"]
             + l_startup)
 
@@ -257,14 +257,14 @@ CANDIDATES = {
     "Baseline": {
         "predict": predict_baseline,
         "bounds": [(0, 5e5), (0, 1e5), (0, 5e5), (0, 5e5)],
-        "param_names": ["L_SYNC", "L_SYNC2", "L_DMA", "L_STARTUP"],
+        "param_names": ["L_SYNC", "L_CORE", "L_DMA", "L_STARTUP"],
         "adoptable": True,
         "description": "Core-Sync-Fixed (v12)",
     },
     "Candidate-A": {
         "predict": predict_candidate_a,
         "bounds": [(0, 5e5), (0, 1e5), (0, 5e5), (0, 5e5)],
-        "param_names": ["L_SYNC", "L_SYNC2", "L_DMA", "L_STARTUP"],
+        "param_names": ["L_SYNC", "L_CORE", "L_DMA", "L_STARTUP"],
         "adoptable": True,
         "description": "DMA-Refined (D_total replaces N_dma*TP)",
     },
@@ -273,7 +273,7 @@ CANDIDATES = {
         "bounds": [(5, 60), (1, 16),
                    (0, 5e5), (0, 1e5), (0, 5e5), (0, 5e5)],
         "param_names": ["eff_macs_cal", "bw_eff_cal",
-                        "L_SYNC", "L_SYNC2", "L_DMA", "L_STARTUP"],
+                        "L_SYNC", "L_CORE", "L_DMA", "L_STARTUP"],
         "adoptable": False,
         "description": "Free eff_macs/bw_eff (diagnostic only)",
     },
@@ -282,7 +282,7 @@ CANDIDATES = {
         "bounds": [(5, 60), (1, 16),
                    (0, 5e5), (0, 1e5), (0, 5e5), (0, 5e5)],
         "param_names": ["eff_macs_cal", "bw_eff_cal",
-                        "L_SYNC", "L_SYNC2", "L_DMA", "L_STARTUP"],
+                        "L_SYNC", "L_CORE", "L_DMA", "L_STARTUP"],
         "adoptable": False,
         "description": "DMA-Refined + Free params (diagnostic only)",
     },
@@ -457,12 +457,12 @@ def phase0_verify_baseline(cases, feat, calib_path):
     print("=" * 70)
 
     coeffs = load_calibration(Path(calib_path))
-    v12_params = [coeffs.l_sync_cy, coeffs.l_sync2_cy,
+    v12_params = [coeffs.l_sync_cy, coeffs.l_core_cy,
                   coeffs.l_dma_cy, coeffs.l_startup_cy]
 
     print(f"  v12 coefficients:")
     print(f"    eff_macs={coeffs.eff_macs}, bw_eff={coeffs.bw_eff_bpc}")
-    print(f"    L_SYNC={coeffs.l_sync_cy}, L_SYNC2={coeffs.l_sync2_cy}, "
+    print(f"    L_SYNC={coeffs.l_sync_cy}, L_CORE={coeffs.l_core_cy}, "
           f"L_DMA={coeffs.l_dma_cy}, L_STARTUP={coeffs.l_startup_cy}")
 
     metrics = evaluate(cases, feat, predict_baseline, v12_params)

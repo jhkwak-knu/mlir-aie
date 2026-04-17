@@ -121,11 +121,11 @@ def main():
         calib = json.load(f)
 
     # v9 Core-Sync: alpha=beta=1 fixed, L_CORE=0 fixed (4 params fitted)
-    #   T = t_comp + t_comm + L_SYNC*TP + L_SYNC2*P*TP
+    #   T = t_comp + t_comm + L_SYNC*TP + L_CORE*P*TP
     #       + L_DMA*N_dma + L_STARTUP
     old_perf = np.array([
         float(calib["l_sync_cy"]),
-        float(calib["l_sync2_cy"]),
+        float(calib["l_core_cy"]),
         float(calib["l_dma_cy"]),
         float(calib["l_startup_cy"]),
     ])
@@ -155,7 +155,7 @@ def main():
     print("\n" + "=" * 72)
     print("PERFORMANCE MODEL (Core-Sync, 7 parameters)")
     print("=" * 72)
-    names = ["L_SYNC", "L_SYNC2", "L_DMA", "L_STARTUP"]
+    names = ["L_SYNC", "L_CORE", "L_DMA", "L_STARTUP"]
     print(f"\n{'Coeff':<11} {'OLD (400-case)':>16} {'NEW (clean refit)':>20}")
     print("-" * 52)
     for nm, o, n in zip(names, old_perf, new_perf):

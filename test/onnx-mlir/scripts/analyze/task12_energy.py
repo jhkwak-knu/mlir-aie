@@ -187,7 +187,7 @@ def compute_energy_features(
                 macs=m, data_bytes=db,
                 n_cores=nc, tp_total=r.tp_total, n_dma=n_dma,
                 eff_macs=coeffs.eff_macs, bw_bpc=coeffs.bw_eff_bpc,
-                l_sync=coeffs.l_sync_cy, l_sync2=coeffs.l_sync2_cy,
+                l_sync=coeffs.l_sync_cy, l_core=coeffs.l_core_cy,
                 l_dma=coeffs.l_dma_cy, l_startup=coeffs.l_startup_cy)
             t_total_cy[i] = t_comp + t_comm + t_ovh
         else:

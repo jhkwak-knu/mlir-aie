@@ -250,7 +250,7 @@ def analyze_lsync_scaling(cases: List[FactorCase], coeffs: CalibCoeffs) -> None:
             macs=c.M * c.K * c.N, data_bytes=data_bytes,
             n_cores=c.num_cores, tp_total=c.tp_total, n_dma=n_dma,
             eff_macs=coeffs.eff_macs, bw_bpc=coeffs.bw_eff_bpc,
-            l_sync=coeffs.l_sync_cy, l_sync2=coeffs.l_sync2_cy,
+            l_sync=coeffs.l_sync_cy, l_core=coeffs.l_core_cy,
             l_dma=coeffs.l_dma_cy, l_startup=coeffs.l_startup_cy)
 
         t_meas_cy = c.min_us * CLOCK_MHZ

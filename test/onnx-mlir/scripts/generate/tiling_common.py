@@ -105,8 +105,6 @@ class CalibCoeffs:
     l_dma_cy: float = 0.0     # Per-DMA-op per-iteration cost (0 = v6 compat)
     # v9 Core-Sync: per-core per-iteration barrier cost.
     # T_overhead = L_SYNC*TP + L_CORE*P*TP + L_DMA*N_dma*TP + L_STARTUP
-    # Stored as l_sync2_cy for JSON compat; semantically = L_CORE in v9.
-    l_sync2_cy: float = 0.0   # Per-core per-iter sync cost (0 = v8 compat)
     # Performance model variant (DMA count structure).
     # "Core-Sync" = N_dma*TP (v9 baseline). "DMA-Refined" = D_total (v13+).
     perf_model: str = "Core-Sync"
@@ -192,13 +190,12 @@ def load_calibration(path: Path = DEFAULT_CALIB_PATH) -> CalibCoeffs:
         eff_macs=float(doc["eff_macs"]),
         bw_eff_bpc=float(doc["bw_eff_bpc"]),
         l_sync_cy=float(doc["l_sync_cy"]),
-        l_core_cy=float(doc.get("l_core_cy", 0)),
+        l_core_cy=float(doc.get("l_core_cy", doc.get("l_sync2_cy", 0.0))),
         l_startup_cy=float(doc.get("l_startup_cy", 0)),
         calibrated=True,
         perf_alpha=float(doc.get("perf_alpha", 1.0)),
         perf_beta=float(doc.get("perf_beta", 1.0)),
         l_dma_cy=float(doc.get("l_dma_cy", 0.0)),
-        l_sync2_cy=float(doc.get("l_sync2_cy", 0.0)),
         perf_model=str(doc.get("model", "Core-Sync")),
         energy_model=energy_model,
         energy_params=energy_params,

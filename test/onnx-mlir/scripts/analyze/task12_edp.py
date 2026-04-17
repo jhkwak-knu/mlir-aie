@@ -121,7 +121,7 @@ def compute_predictions(cases, coeffs, phase2_path, phase3_path):
         p2 = json.load(f)
     cand_a_params = p2["candidates"]["Candidate-A"]["params"]
     l_sync_a = cand_a_params["L_SYNC"]
-    l_sync2_a = cand_a_params["L_SYNC2"]
+    l_core_a = cand_a_params["L_CORE"]
     l_dma_a = cand_a_params["L_DMA"]
     l_startup_a = cand_a_params["L_STARTUP"]
 
@@ -160,7 +160,7 @@ def compute_predictions(cases, coeffs, phase2_path, phase3_path):
         t_comm = db / coeffs.bw_eff_bpc
         t_bl = (t_comp + t_comm
                 + coeffs.l_sync_cy * tp_tot
-                + coeffs.l_sync2_cy * nc * tp_tot
+                + coeffs.l_core_cy * nc * tp_tot
                 + coeffs.l_dma_cy * n_dma * tp_tot
                 + coeffs.l_startup_cy)
         t_baseline_cy[i] = t_bl
@@ -168,7 +168,7 @@ def compute_predictions(cases, coeffs, phase2_path, phase3_path):
         # Improved T (Candidate A)
         t_imp = (t_comp + t_comm
                  + l_sync_a * tp_tot
-                 + l_sync2_a * nc * tp_tot
+                 + l_core_a * nc * tp_tot
                  + l_dma_a * d_tot
                  + l_startup_a)
         t_improved_cy[i] = t_imp

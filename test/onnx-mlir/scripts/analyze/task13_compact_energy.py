@@ -176,7 +176,7 @@ def compute_features(rows, coeffs):
         t_comp = m / (nc * coeffs.eff_macs)
         t_comm = db / coeffs.bw_eff_bpc
         t_ovh = (coeffs.l_sync_cy * r.tp_total
-                 + coeffs.l_sync2_cy * nc * r.tp_total
+                 + coeffs.l_core_cy * nc * r.tp_total
                  + coeffs.l_dma_cy * d_total_arr[i]
                  + coeffs.l_startup_cy)
         t_total_cy[i] = t_comp + t_comm + t_ovh

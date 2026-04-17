@@ -733,8 +733,8 @@ def main():
     args = parser.parse_args()
 
     coeffs = load_calibration(args.calib)
-    print(f"Loaded calibration v{coeffs.l_sync2_cy != 0 and 9 or 8}: "
-          f"l_sync2={coeffs.l_sync2_cy}, l_dma={coeffs.l_dma_cy}")
+    print(f"Loaded calibration v{coeffs.l_core_cy != 0 and 9 or 8}: "
+          f"l_core={coeffs.l_core_cy}, l_dma={coeffs.l_dma_cy}")
 
     # Step 1-A: Energy basis analysis
     rows = step1a_energy_basis(args.csv, args.tc, args.min_wall_s)

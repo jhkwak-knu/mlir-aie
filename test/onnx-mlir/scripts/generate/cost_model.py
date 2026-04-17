@@ -92,7 +92,10 @@ class CostResult:
 # ============================================================
 # Stage 1: Exhaustive enumeration
 # ============================================================
-def enumerate_candidates(op: OpCase, sys_info: SystemInfo) -> List[Candidate]:
+def enumerate_candidates(
+    op: OpCase, sys_info: SystemInfo,
+    exclude_cores: Optional[set] = None,
+) -> List[Candidate]:
     """
     Enumerate ALL (num_cores, SPm, SPn, TPm, TPk, TPn) combinations.
 
@@ -127,6 +130,8 @@ def enumerate_candidates(op: OpCase, sys_info: SystemInfo) -> List[Candidate]:
     divs_N = divisors(op.N)
 
     for num_cores in range(1, sys_info.total_cores + 1):
+        if exclude_cores and num_cores in exclude_cores:
+            continue
         for SPm, SPn in factor_pairs(num_cores):
             for TPm in divs_M:
                 for TPk in divs_K:
@@ -281,7 +286,7 @@ def perf_overhead(
                 macs=0, data_bytes=0,
                 n_cores=c.num_cores, tp_total=c.tp_total, d_total_val=d_tot,
                 eff_macs=coeffs.eff_macs, bw_bpc=coeffs.bw_eff_bpc,
-                l_sync=coeffs.l_sync_cy, l_sync2=coeffs.l_sync2_cy,
+                l_sync=coeffs.l_sync_cy, l_core=coeffs.l_core_cy,
                 l_dma=coeffs.l_dma_cy, l_startup=coeffs.l_startup_cy)
         else:
             n_dma = _dma_ops_per_step(c, tp_order)
@@ -289,7 +294,7 @@ def perf_overhead(
                 macs=0, data_bytes=0,
                 n_cores=c.num_cores, tp_total=c.tp_total, n_dma=n_dma,
                 eff_macs=coeffs.eff_macs, bw_bpc=coeffs.bw_eff_bpc,
-                l_sync=coeffs.l_sync_cy, l_sync2=coeffs.l_sync2_cy,
+                l_sync=coeffs.l_sync_cy, l_core=coeffs.l_core_cy,
                 l_dma=coeffs.l_dma_cy, l_startup=coeffs.l_startup_cy)
         return t_ovh
     return ALPHA_CYCLES * (c.TPm * c.TPn * c.TPk)
@@ -668,6 +673,9 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
                    help="Validation: add N random candidates from remaining")
     p.add_argument("--tporder-verify", type=int, default=0,
                    help="Add tpOrder verification cases: N workloads x 2 extra tpOrders")
+    p.add_argument("--exclude-cores", default="",
+                   help="Comma-separated numCores values to exclude from enumeration "
+                        "(e.g., '24' to skip all 24-core configs)")
     return p.parse_args(argv)
 
 
@@ -675,9 +683,10 @@ def process_op(
     op: OpCase, sys_info: SystemInfo,
     coeffs: Optional[CalibCoeffs] = None,
     keep_all_tporders: bool = False,
+    exclude_cores: Optional[set] = None,
 ):
     """Run Stage 1 through Stage 4 for a single op case."""
-    all_candidates = enumerate_candidates(op, sys_info)
+    all_candidates = enumerate_candidates(op, sys_info, exclude_cores=exclude_cores)
     valid, filter_results = filter_candidates(all_candidates, op, sys_info)
     print_search_summary(op, len(all_candidates), valid, filter_results)
     if keep_all_tporders:
@@ -736,14 +745,19 @@ def main(argv: List[str]) -> int:
         targets = list(enumerate(ops))
 
     need_tporder = args.tporder_verify > 0
+    exclude_cores_set = set()
+    if args.exclude_cores:
+        exclude_cores_set = {int(x) for x in args.exclude_cores.split(",") if x.strip()}
+        print(f"[info] excluding numCores: {sorted(exclude_cores_set)}")
     all_ranked: Dict[int, List[CostResult]] = {}
     all_tporder_data: Dict[int, Dict[int, List[CostResult]]] = {}
     for idx, op in targets:
         if need_tporder:
-            ranked, tpo_data = process_op(op, sys_info, coeffs, keep_all_tporders=True)
+            ranked, tpo_data = process_op(op, sys_info, coeffs, keep_all_tporders=True,
+                                          exclude_cores=exclude_cores_set)
             all_tporder_data[idx] = tpo_data
         else:
-            ranked = process_op(op, sys_info, coeffs)
+            ranked = process_op(op, sys_info, coeffs, exclude_cores=exclude_cores_set)
         all_ranked[idx] = ranked
 
     # Write output if requested

@@ -158,7 +158,7 @@ def compute_task15_features(rows, coeffs):
         t_comp = macs[i] / (nc * coeffs.eff_macs)
         t_comm = db / coeffs.bw_eff_bpc
         t_ovh = (coeffs.l_sync_cy * r.tp_total
-                 + coeffs.l_sync2_cy * nc * r.tp_total
+                 + coeffs.l_core_cy * nc * r.tp_total
                  + coeffs.l_dma_cy * d_total_arr[i]
                  + coeffs.l_startup_cy)
         t_total_cy[i] = t_comp + t_comm + t_ovh
@@ -179,7 +179,7 @@ NOTION_PERF = {
     "eff_macs": 24.28,
     "eff_bw": 4.0,
     "L_SYNC": 1676,
-    "L_CORE": 174,      # = l_sync2_cy
+    "L_CORE": 174,      # = l_core_cy
     "L_DMA": 3424,
     "L_STARTUP": 26660,
     "clock_mhz": 1500,
@@ -245,7 +245,7 @@ def run_phase0(calib_path):
         ("eff_macs", NOTION_PERF["eff_macs"], coeffs.eff_macs),
         ("eff_bw (bw_eff_bpc)", NOTION_PERF["eff_bw"], coeffs.bw_eff_bpc),
         ("L_SYNC (l_sync_cy)", NOTION_PERF["L_SYNC"], coeffs.l_sync_cy),
-        ("L_CORE (l_sync2_cy)", NOTION_PERF["L_CORE"], coeffs.l_sync2_cy),
+        ("L_CORE (l_core_cy)", NOTION_PERF["L_CORE"], coeffs.l_core_cy),
         ("L_DMA (l_dma_cy)", NOTION_PERF["L_DMA"], coeffs.l_dma_cy),
         ("L_STARTUP (l_startup_cy)", NOTION_PERF["L_STARTUP"], coeffs.l_startup_cy),
     ]
