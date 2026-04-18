@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-compare_npu_cpu_v16.py -- Compare NPU (model-selected) vs CPU 1T/24T.
+compare_npu_cpu_v16.py -- Compare NPU (model-selected) vs CPU 1T/24T (+ GPU).
 
 Unlike compare_npu_cpu.py which selects the measured EDP-optimal config, this
 script selects the NPU configuration predicted as EDP-optimal by the v16 cost
@@ -14,6 +14,10 @@ Resolution modes:
   - fallback: predicted config absent -> pick same-core-count measurement
               with closest model-predicted EDP
 
+With --gpu, iGPU (Radeon 890M, fp32) measurements are appended to each row.
+Note: NPU uses bf16, CPU uses bf16, GPU uses fp32 (Kompute 0.9.0 binding
+limitation); MACs are identical across.
+
 Usage:
     python3 scripts/analyze/compare_npu_cpu_v16.py \\
         --op data/op_list.json \\
@@ -21,6 +25,7 @@ Usage:
         --npu out/reports/result_v14_clean.csv \\
         --tc-list out/tc_list_v14.json \\
         --cpu out/reports/cpu_baseline_v14.csv \\
+        [--gpu out/reports/gpu_baseline_v14.csv] \\
         --out-csv out/reports/cpu_npu_combined_v14.csv
 """
 
@@ -102,6 +107,22 @@ class CpuMeasurement:
 
 
 @dataclass
+class GpuMeasurement:
+    """Measured iGPU row (numSpm == -2)."""
+    M: int
+    K: int
+    N: int
+    batch_min_avg_us: float
+    batch_min_energy_per_iter_uj: float  # RAPL package bracket-idle subtracted
+    ppt_energy_per_iter_uj: float  # amdgpu PPT-based (secondary)
+    ppt_active_mw: float  # amdgpu PPT active power (secondary)
+
+    @property
+    def edp(self) -> float:
+        return self.batch_min_avg_us * self.batch_min_energy_per_iter_uj
+
+
+@dataclass
 class ComparisonRow:
     """One row of the output CSV: per-workload NPU(model) vs CPU comparison."""
     workload_idx: int
@@ -133,6 +154,12 @@ class ComparisonRow:
     cpu_24t_t_us: float
     cpu_24t_e_uj: float
     cpu_24t_edp: float
+    # GPU (iGPU fp32)
+    gpu_t_us: float
+    gpu_e_uj: float  # RAPL package energy per iter (idle subtracted)
+    gpu_edp: float
+    gpu_ppt_e_uj: float  # PPT-based energy (secondary)
+    gpu_ppt_mw: float  # PPT active power (secondary)
     # Ratios (CPU/NPU, >1 = NPU wins)
     speedup_1t: float
     speedup_24t: float
@@ -140,6 +167,10 @@ class ComparisonRow:
     energy_ratio_24t: float
     edp_ratio_1t: float
     edp_ratio_24t: float
+    # GPU ratios (GPU/NPU, >1 = NPU wins)
+    speedup_gpu: float
+    energy_ratio_gpu: float
+    edp_ratio_gpu: float
 
 
 # ------------------------------------------------------------
@@ -249,6 +280,42 @@ def load_cpu_measurements(
     return cpu_1t, cpu_24t
 
 
+def load_gpu_measurements(
+    csv_path: Path,
+) -> Dict[Tuple[int, int, int], GpuMeasurement]:
+    """Load GPU CSV rows where numSpm == -2 (GPU identifier)."""
+    by_size: Dict[Tuple[int, int, int], GpuMeasurement] = {}
+    with csv_path.open() as f:
+        reader = csv.DictReader(CommentFilterFile(f))
+        for row in reader:
+            if row.get("status") != "PASS":
+                continue
+            try:
+                num_spm = int(row.get("numSpm", 0))
+            except (TypeError, ValueError):
+                continue
+            if num_spm != -2:
+                continue
+            try:
+                key = (int(row["M"]), int(row["K"]), int(row["N"]))
+            except (TypeError, ValueError, KeyError):
+                continue
+            t_us = float(row.get("batch_min_avg_us", -1))
+            e_uj = float(row.get("batch_min_energy_per_iter_uj", -1))
+            ppt_e = float(row.get("npu_energy_per_iter_uj", -1))
+            ppt_mw = float(row.get("npu_power_mw", -1))
+            if t_us <= 0 or e_uj <= 0:
+                continue
+            by_size[key] = GpuMeasurement(
+                M=key[0], K=key[1], N=key[2],
+                batch_min_avg_us=t_us,
+                batch_min_energy_per_iter_uj=e_uj,
+                ppt_energy_per_iter_uj=ppt_e,
+                ppt_active_mw=ppt_mw,
+            )
+    return by_size
+
+
 # ------------------------------------------------------------
 # Model-based optimal selection + measurement lookup
 # ------------------------------------------------------------
@@ -337,6 +404,7 @@ def build_row(
     resolution: str,
     cpu_1t: Optional[CpuMeasurement],
     cpu_24t: Optional[CpuMeasurement],
+    gpu: Optional[GpuMeasurement] = None,
 ) -> ComparisonRow:
     c = best.candidate
     # Model-predicted (cycles -> us, pJ -> uJ)
@@ -361,6 +429,13 @@ def build_row(
     c24t_e = cpu_24t.batch_min_energy_per_iter_uj if cpu_24t else -1.0
     c24t_edp = cpu_24t.edp if cpu_24t else -1.0
 
+    # GPU
+    gpu_t = gpu.batch_min_avg_us if gpu else -1.0
+    gpu_e = gpu.batch_min_energy_per_iter_uj if gpu else -1.0
+    gpu_edp = gpu.edp if gpu else -1.0
+    gpu_ppt_e = gpu.ppt_energy_per_iter_uj if gpu else -1.0
+    gpu_ppt_mw = gpu.ppt_active_mw if gpu else -1.0
+
     return ComparisonRow(
         workload_idx=idx,
         M=op.M, K=op.K, N=op.N,
@@ -381,12 +456,20 @@ def build_row(
         cpu_24t_t_us=c24t_t,
         cpu_24t_e_uj=c24t_e,
         cpu_24t_edp=c24t_edp,
+        gpu_t_us=gpu_t,
+        gpu_e_uj=gpu_e,
+        gpu_edp=gpu_edp,
+        gpu_ppt_e_uj=gpu_ppt_e,
+        gpu_ppt_mw=gpu_ppt_mw,
         speedup_1t=_ratio(c1t_t, t_meas),
         speedup_24t=_ratio(c24t_t, t_meas),
         energy_ratio_1t=_ratio(c1t_e, e_meas),
         energy_ratio_24t=_ratio(c24t_e, e_meas),
         edp_ratio_1t=_ratio(c1t_edp, edp_meas),
         edp_ratio_24t=_ratio(c24t_edp, edp_meas),
+        speedup_gpu=_ratio(gpu_t, t_meas),
+        energy_ratio_gpu=_ratio(gpu_e, e_meas),
+        edp_ratio_gpu=_ratio(gpu_edp, edp_meas),
     )
 
 
@@ -403,9 +486,12 @@ CSV_FIELDNAMES = [
     "npu_resolution",
     "cpu_1t_t_us", "cpu_1t_e_uj", "cpu_1t_edp",
     "cpu_24t_t_us", "cpu_24t_e_uj", "cpu_24t_edp",
+    "gpu_t_us", "gpu_e_uj", "gpu_edp",
+    "gpu_ppt_e_uj", "gpu_ppt_mw",
     "speedup_1t", "speedup_24t",
     "energy_ratio_1t", "energy_ratio_24t",
     "edp_ratio_1t", "edp_ratio_24t",
+    "speedup_gpu", "energy_ratio_gpu", "edp_ratio_gpu",
 ]
 
 
@@ -446,95 +532,120 @@ def _geo_mean(vals: List[float]) -> float:
     return math.exp(sum(math.log(v) for v in vals) / len(vals))
 
 
-def print_report(rows: List[ComparisonRow]) -> None:
+def print_report(rows: List[ComparisonRow], include_gpu: bool = False) -> None:
     if not rows:
         print("No rows to report.")
         return
-    sep = "-" * 135
+    sep = "-" * 155
+    hdr_extra_1 = f" {'GPU(us)':>10} {'GPU/NPU':>8}" if include_gpu else ""
+    hdr_extra_e = f" {'GPU(uJ)':>10} {'GPU/NPU':>8}" if include_gpu else ""
+    hdr_extra_edp = f" {'GPU EDP':>12} {'GPU/NPU':>8}" if include_gpu else ""
     print()
-    print("=" * 135)
-    print("  NPU (v16 model-selected) vs CPU 1T/24T Comparison")
-    print("=" * 135)
+    print("=" * 155)
+    label_xpu = "CPU 1T/24T" + (" + GPU" if include_gpu else "")
+    print(f"  NPU (v16 model-selected) vs {label_xpu} Comparison")
+    print("=" * 155)
 
     # [1] Performance
     print()
     print("  [1] Performance (batch_min_avg_us, lower is better)")
     print(sep)
     print(f"{'Size':>18} {'NPU(us)':>10} {'Cores':>5} {'Res':>9} "
-          f"{'CPU-1T':>10} {'CPU-24T':>10} "
+          f"{'CPU-1T':>10} {'CPU-24T':>10}{hdr_extra_1} "
           f"{'1T/NPU':>8} {'24T/NPU':>8} {'Winner':>8}")
     print(sep)
-    wins = {"NPU": 0, "CPU-1T": 0, "CPU-24T": 0}
+    winner_set = {"NPU": 0, "CPU-1T": 0, "CPU-24T": 0}
+    if include_gpu:
+        winner_set["GPU"] = 0
     for r in rows:
         sz = f"{r.M}x{r.K}x{r.N}"
         cand = [("NPU", r.npu_t_meas_us), ("CPU-1T", r.cpu_1t_t_us),
                 ("CPU-24T", r.cpu_24t_t_us)]
+        if include_gpu:
+            cand.append(("GPU", r.gpu_t_us))
         cand = [c for c in cand if c[1] > 0]
         winner = min(cand, key=lambda c: c[1])[0] if cand else "N/A"
-        if winner in wins:
-            wins[winner] += 1
+        if winner in winner_set:
+            winner_set[winner] += 1
+        extra = (f" {_fmt(r.gpu_t_us):>10} {_fmt_ratio(r.speedup_gpu):>8}"
+                 if include_gpu else "")
         print(f"{sz:>18} {_fmt(r.npu_t_meas_us):>10} {r.npu_num_cores:>5} "
               f"{r.npu_resolution:>9} "
-              f"{_fmt(r.cpu_1t_t_us):>10} {_fmt(r.cpu_24t_t_us):>10} "
+              f"{_fmt(r.cpu_1t_t_us):>10} {_fmt(r.cpu_24t_t_us):>10}"
+              f"{extra} "
               f"{_fmt_ratio(r.speedup_1t):>8} {_fmt_ratio(r.speedup_24t):>8} "
               f"{winner:>8}")
     print(sep)
-    print(f"  Wins: NPU={wins['NPU']}, CPU-1T={wins['CPU-1T']}, "
-          f"CPU-24T={wins['CPU-24T']} (of {len(rows)})")
+    wins_str = ", ".join(f"{k}={v}" for k, v in winner_set.items())
+    print(f"  Wins: {wins_str} (of {len(rows)})")
 
     # [2] Energy
     print()
     print("  [2] Energy (batch_min_energy_per_iter_uj, lower is better)")
     print(sep)
     print(f"{'Size':>18} {'NPU(uJ)':>10} {'Cores':>5} {'Res':>9} "
-          f"{'CPU-1T':>10} {'CPU-24T':>10} "
+          f"{'CPU-1T':>10} {'CPU-24T':>10}{hdr_extra_e} "
           f"{'1T/NPU':>8} {'24T/NPU':>8} {'Winner':>8}")
     print(sep)
     ewins = {"NPU": 0, "CPU-1T": 0, "CPU-24T": 0}
+    if include_gpu:
+        ewins["GPU"] = 0
     for r in rows:
         sz = f"{r.M}x{r.K}x{r.N}"
         cand = [("NPU", r.npu_e_meas_uj), ("CPU-1T", r.cpu_1t_e_uj),
                 ("CPU-24T", r.cpu_24t_e_uj)]
+        if include_gpu:
+            cand.append(("GPU", r.gpu_e_uj))
         cand = [c for c in cand if c[1] > 0]
         winner = min(cand, key=lambda c: c[1])[0] if cand else "N/A"
         if winner in ewins:
             ewins[winner] += 1
+        extra = (f" {_fmt(r.gpu_e_uj):>10} {_fmt_ratio(r.energy_ratio_gpu):>8}"
+                 if include_gpu else "")
         print(f"{sz:>18} {_fmt(r.npu_e_meas_uj):>10} {r.npu_num_cores:>5} "
               f"{r.npu_resolution:>9} "
-              f"{_fmt(r.cpu_1t_e_uj):>10} {_fmt(r.cpu_24t_e_uj):>10} "
+              f"{_fmt(r.cpu_1t_e_uj):>10} {_fmt(r.cpu_24t_e_uj):>10}"
+              f"{extra} "
               f"{_fmt_ratio(r.energy_ratio_1t):>8} "
               f"{_fmt_ratio(r.energy_ratio_24t):>8} "
               f"{winner:>8}")
     print(sep)
-    print(f"  Wins: NPU={ewins['NPU']}, CPU-1T={ewins['CPU-1T']}, "
-          f"CPU-24T={ewins['CPU-24T']} (of {len(rows)})")
+    wins_str = ", ".join(f"{k}={v}" for k, v in ewins.items())
+    print(f"  Wins: {wins_str} (of {len(rows)})")
 
     # [3] EDP
     print()
     print("  [3] EDP (T_us * E_uJ, lower is better)")
     print(sep)
     print(f"{'Size':>18} {'NPU EDP':>12} {'Cores':>5} {'Res':>9} "
-          f"{'CPU-1T EDP':>12} {'CPU-24T EDP':>12} "
+          f"{'CPU-1T EDP':>12} {'CPU-24T EDP':>12}{hdr_extra_edp} "
           f"{'1T/NPU':>8} {'24T/NPU':>8} {'Winner':>8}")
     print(sep)
     edpwins = {"NPU": 0, "CPU-1T": 0, "CPU-24T": 0}
+    if include_gpu:
+        edpwins["GPU"] = 0
     for r in rows:
         sz = f"{r.M}x{r.K}x{r.N}"
         cand = [("NPU", r.npu_edp_meas), ("CPU-1T", r.cpu_1t_edp),
                 ("CPU-24T", r.cpu_24t_edp)]
+        if include_gpu:
+            cand.append(("GPU", r.gpu_edp))
         cand = [c for c in cand if c[1] > 0]
         winner = min(cand, key=lambda c: c[1])[0] if cand else "N/A"
         if winner in edpwins:
             edpwins[winner] += 1
+        extra = (f" {_fmt(r.gpu_edp):>12} {_fmt_ratio(r.edp_ratio_gpu):>8}"
+                 if include_gpu else "")
         print(f"{sz:>18} {_fmt(r.npu_edp_meas):>12} {r.npu_num_cores:>5} "
               f"{r.npu_resolution:>9} "
-              f"{_fmt(r.cpu_1t_edp):>12} {_fmt(r.cpu_24t_edp):>12} "
+              f"{_fmt(r.cpu_1t_edp):>12} {_fmt(r.cpu_24t_edp):>12}"
+              f"{extra} "
               f"{_fmt_ratio(r.edp_ratio_1t):>8} "
               f"{_fmt_ratio(r.edp_ratio_24t):>8} "
               f"{winner:>8}")
     print(sep)
-    print(f"  Wins: NPU={edpwins['NPU']}, CPU-1T={edpwins['CPU-1T']}, "
-          f"CPU-24T={edpwins['CPU-24T']} (of {len(rows)})")
+    wins_str = ", ".join(f"{k}={v}" for k, v in edpwins.items())
+    print(f"  Wins: {wins_str} (of {len(rows)})")
 
     # [4] Model accuracy
     print()
@@ -577,18 +688,22 @@ def print_report(rows: List[ComparisonRow]) -> None:
           f"fallback_xcore={fb_xcore_n}, "
           f"unmatched={none_n}")
 
-    print(f"  Geometric mean ratios (CPU/NPU, >1 = NPU wins):")
-    for label, tkey, ekey, edpkey in [
+    print(f"  Geometric mean ratios (other/NPU, >1 = NPU wins):")
+    geo_entries = [
         ("1T ", "speedup_1t", "energy_ratio_1t", "edp_ratio_1t"),
         ("24T", "speedup_24t", "energy_ratio_24t", "edp_ratio_24t"),
-    ]:
+    ]
+    if any(r.gpu_t_us > 0 for r in rows):
+        geo_entries.append(
+            ("GPU", "speedup_gpu", "energy_ratio_gpu", "edp_ratio_gpu"))
+    for label, tkey, ekey, edpkey in geo_entries:
         t_geo = _geo_mean([getattr(r, tkey) for r in rows])
         e_geo = _geo_mean([getattr(r, ekey) for r in rows])
         edp_geo = _geo_mean([getattr(r, edpkey) for r in rows])
         print(f"    {label}: speedup={t_geo:.2f}x  "
               f"energy={e_geo:.2f}x  EDP={edp_geo:.2f}x")
 
-    # Crossover: first size where NPU wins over CPU-24T
+    # Crossover: first size where NPU wins over each baseline
     sorted_rows = sorted(rows, key=lambda r: r.M * r.K * r.N)
     cross_t = next((r for r in sorted_rows if r.speedup_24t > 1), None)
     cross_edp = next((r for r in sorted_rows if r.edp_ratio_24t > 1), None)
@@ -598,6 +713,14 @@ def print_report(rows: List[ComparisonRow]) -> None:
     if cross_edp:
         print(f"  EDP crossover  (NPU > CPU-24T): "
               f"{cross_edp.M}x{cross_edp.K}x{cross_edp.N}")
+    cross_t_gpu = next((r for r in sorted_rows if r.speedup_gpu > 1), None)
+    cross_edp_gpu = next((r for r in sorted_rows if r.edp_ratio_gpu > 1), None)
+    if cross_t_gpu:
+        print(f"  Perf crossover (NPU > GPU):     "
+              f"{cross_t_gpu.M}x{cross_t_gpu.K}x{cross_t_gpu.N}")
+    if cross_edp_gpu:
+        print(f"  EDP crossover  (NPU > GPU):     "
+              f"{cross_edp_gpu.M}x{cross_edp_gpu.K}x{cross_edp_gpu.N}")
     print()
 
 
@@ -620,6 +743,9 @@ def main() -> int:
                         help="tc_list_v14.json (case_index -> tpOrder)")
     parser.add_argument("--cpu", type=Path, required=True,
                         help="CPU baseline CSV (e.g. cpu_baseline_v14.csv)")
+    parser.add_argument("--gpu", type=Path, default=None,
+                        help="Optional iGPU baseline CSV "
+                             "(e.g. gpu_baseline_v14.csv)")
     parser.add_argument("--out-csv", type=Path, required=True,
                         help="Output combined CSV")
     parser.add_argument("--op-index", type=int, default=-1,
@@ -632,10 +758,17 @@ def main() -> int:
     tc_map = load_tc_list(args.tc_list)
     npu_by_size = load_npu_measurements(args.npu, tc_map)
     cpu_1t, cpu_24t = load_cpu_measurements(args.cpu)
+    gpu_by_size: Dict[Tuple[int, int, int], GpuMeasurement] = {}
+    if args.gpu is not None:
+        gpu_by_size = load_gpu_measurements(args.gpu)
 
-    print(f"Loaded: {len(ops)} workloads, "
-          f"calibration={coeffs.perf_model}/{coeffs.energy_model}, "
-          f"NPU sizes={len(npu_by_size)}, CPU 1T/24T={len(cpu_1t)}/{len(cpu_24t)}")
+    summary = (f"Loaded: {len(ops)} workloads, "
+               f"calibration={coeffs.perf_model}/{coeffs.energy_model}, "
+               f"NPU sizes={len(npu_by_size)}, "
+               f"CPU 1T/24T={len(cpu_1t)}/{len(cpu_24t)}")
+    if args.gpu is not None:
+        summary += f", GPU={len(gpu_by_size)}"
+    print(summary)
 
     rows: List[ComparisonRow] = []
     for i, op in enumerate(ops):
@@ -656,13 +789,14 @@ def main() -> int:
             idx=i, op=op,
             best=best, npu_meas=npu_meas, resolution=resolution,
             cpu_1t=cpu_1t.get(key), cpu_24t=cpu_24t.get(key),
+            gpu=gpu_by_size.get(key),
         )
         rows.append(row)
 
     write_csv(rows, args.out_csv)
     print(f"CSV written: {args.out_csv}")
 
-    print_report(rows)
+    print_report(rows, include_gpu=bool(gpu_by_size))
     return 0
 
 
