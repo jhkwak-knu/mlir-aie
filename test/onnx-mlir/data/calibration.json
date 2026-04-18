@@ -1,43 +1,50 @@
 {
-  "version": 15,
+  "version": 16,
   "target": "xdna2",
-  "model": "DMA-Refined",
+  "model": "DMA-Bottleneck",
   "eff_macs": 24.28,
   "bw_eff_bpc": 4.0,
   "perf_alpha": 1.0,
   "perf_beta": 1.0,
-  "l_sync_cy": 6622,
-  "l_core_cy": 1272,
-  "l_dma_cy": 1788,
-  "l_startup_cy": 53599,
+  "l_sync_cy": 4200,
+  "l_core_cy": 1896,
+  "l_setup_cy": 3109,
+  "l_dma_cy": 3109,
+  "l_startup_cy": 45086,
   "l_config_cy": 0,
   "clock_mhz": 1500,
   "fitted_from": {
     "n_samples": 1290,
     "ground_truth": "batch_min_avg_us",
     "data_source": "result_v14_clean.csv (chunk-measured, 18 shapes, best-CV selected)",
-    "model_type": "DMA-Refined (T = T_comp + T_comm + L_SYNC*TP + L_CORE*P*TP + L_DMA*D_total + L_STARTUP)",
-    "fit_method": "scipy differential_evolution (log-space MSE, seed=42, maxiter=2000)",
-    "t_rho": 0.9910,
-    "t_mape_pct": 22.0,
-    "t_mape_p90_pct": 40.0,
+    "model_type": "DMA-Bottleneck (T = T_comp + D*max(L_SETUP, db/(D*BW)) + L_SYNC*TP + L_CORE*P*TP + L_STARTUP)",
+    "fit_method": "scipy differential_evolution (log-space MSE, seed=42, maxiter=3000)",
+    "changes_from_v15": [
+      "K-inner total_data_bytes output term: 2*M*N -> 1*M*N (output readback only, no pres for K-inner)",
+      "DMA term: T_comm + L_DMA*D (additive) -> D*max(L_SETUP, avg_tile/BW) (pipelined bottleneck)"
+    ],
+    "t_rho": 0.9947,
+    "t_mape_pct": 13.6,
+    "t_mape_p90_pct": 27.2,
+    "t_bias_pct": 2.5,
     "prev_version": {
-      "version": 14,
-      "l_sync_cy": 1676,
-      "l_core_cy": 174,
-      "l_dma_cy": 3424,
-      "l_startup_cy": 26660,
-      "data_source": "result_v12.csv",
-      "t_rho": 0.9903,
-      "t_mape_pct": 22.9
+      "version": 15,
+      "model": "DMA-Refined",
+      "l_sync_cy": 6622,
+      "l_core_cy": 1272,
+      "l_dma_cy": 1788,
+      "l_startup_cy": 53599,
+      "t_rho": 0.9910,
+      "t_mape_pct": 22.0
     }
   },
   "energy": {
-    "model": "1-G",
+    "model": "Power-Time-Byte",
     "params": {
-      "p_base_uw": 8640000,
-      "p_core_uw": 40000,
-      "e_dma_uj": 18.07
+      "p_base_uw": 10850000,
+      "p_core_uw": 17900,
+      "e_byte_uj_per_byte": 0.0012,
+      "e_startup_uj": 278.7
     },
     "gt_mode": "npu",
     "gt_columns": {
@@ -46,30 +53,38 @@
     },
     "fitted_from": {
       "n_samples": 1290,
-      "formula": "E = (P_BASE + P_CORE*P) * T_pred + E_DMA * D_total",
+      "formula": "E = (P_BASE + P_CORE*P) * T_pred + E_BYTE * db + E_STARTUP",
       "data_source": "result_v14_clean.csv (chunk-measured, 18 shapes, best-CV selected)",
       "fit_method": "scipy differential_evolution (log-space MSE, seed=42, maxiter=2000)",
       "parameter_origin": {
-        "P_BASE": "Calibrated on v14 clean data (8.64 W)",
-        "P_CORE": "Fixed by architecture specification (40 mW/core)",
-        "E_DMA": "Calibrated on v14 clean data (18.07 uJ)"
+        "P_BASE": "Calibrated (10.85 W)",
+        "P_CORE": "Calibrated (17.9 mW/core)",
+        "E_BYTE": "Calibrated (1.2 nJ/byte, equiv transfer power 5.4W at 4 B/cy)",
+        "E_STARTUP": "Calibrated (278.7 uJ)"
       },
+      "changes_from_v15": [
+        "E_DMA*D (per-descriptor) -> E_BYTE*db (per-byte) + E_STARTUP",
+        "P_CORE: fixed 40mW -> calibrated 17.9mW",
+        "Performance-energy symmetry: perf uses max (time overlap), energy uses sum (both consume energy)"
+      ],
       "e_rho": 0.9950,
-      "e_mape_pct": 12.6,
-      "e_mape_p90_pct": 28.2,
-      "edp_core_accuracy": "17/18",
-      "edp_regret_mean_pct": 8.3,
+      "e_mape_pct": 11.9,
+      "e_mape_p90_pct": 26.5,
+      "e_bias_pct": 1.3,
+      "edp_mape_pct": 23.8,
+      "edp_regret_mean_pct": 9.6,
       "edp_regret_max_pct": 39.1,
-      "edp_regret_le10": "13/18",
+      "edp_regret_le10": "12/18",
       "prev_version": {
-        "version": 14,
+        "version": 15,
+        "model": "1-G",
         "params": {
-          "p_base_uw": 15000000,
+          "p_base_uw": 8640000,
           "p_core_uw": 40000,
-          "e_dma_uj": 22.44
+          "e_dma_uj": 18.07
         },
-        "data_source": "result_v12.csv + Task 15 re-measurement",
-        "e_mape_pct": 56.2
+        "e_rho": 0.9950,
+        "e_mape_pct": 12.6
       }
     }
   }

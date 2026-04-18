@@ -125,10 +125,12 @@ def total_data_bytes(
         rhs = K * N * tpm
         out = 2 * M * N * tpk
     else:
-        # K innermost: OUT reused across TPk iterations (local accumulation).
+        # K innermost: OUT stays in tile for local accumulation across TPk
+        # iterations.  Only the final result is read back once (1x), not
+        # read+write per iteration (2x).
         lhs = M * K * tpn
         rhs = K * N * tpm
-        out = 2 * M * N
+        out = 1 * M * N
 
     return (lhs + rhs + out) * elem_bytes
 
@@ -209,6 +211,33 @@ class PerfModel:
             eff_macs, bw_bpc, l_sync, l_core, l_dma, l_startup)
         return t_comp + t_comm + t_overhead
 
+    @staticmethod
+    def components_dma_bottleneck(
+        macs: Numeric, data_bytes: Numeric,
+        n_cores: Numeric, tp_total: Numeric, d_total_val: Numeric,
+        eff_macs: float, bw_bpc: float,
+        l_sync: float, l_core: float, l_setup: float,
+        l_startup: float,
+    ) -> Tuple[Numeric, Numeric, Numeric]:
+        """v16 DMA-Bottleneck: returns (T_comp, T_dma, T_overhead) in cycles.
+
+        T_comp = MACs / (N_cores * eff_macs)
+        T_dma  = D_total * max(L_SETUP, avg_bytes_per_desc / BW)
+        T_overhead = L_SYNC*TP + L_CORE*P*TP + L_STARTUP
+
+        Key difference from DMA-Refined (v15): uses max() instead of
+        additive T_comm + L_DMA*D.  In pipelined DMA architectures the
+        per-descriptor cost is bounded by the bottleneck (setup vs transfer),
+        analogous to the Roofline model.
+        """
+        t_comp = macs / (n_cores * eff_macs)
+        avg_bytes = data_bytes / np.maximum(d_total_val, 1)
+        t_dma = d_total_val * np.maximum(l_setup, avg_bytes / bw_bpc)
+        t_overhead = (l_sync * tp_total
+                      + l_core * n_cores * tp_total
+                      + l_startup)
+        return t_comp, t_dma, t_overhead
+
 
 # ============================================================
 # Energy Model
@@ -241,6 +270,7 @@ class EnergyModel:
             "T-3": EnergyModel._predict_t3,
             "T-3S": EnergyModel._predict_t3s,
             "1-G": EnergyModel._predict_1g,
+            "Power-Time-Byte": EnergyModel._predict_ptb,
             "L-B": EnergyModel._predict_lb,
         }
         fn = dispatch.get(model_name)
@@ -407,6 +437,29 @@ class EnergyModel:
             p_core=params.get("p_core_uw", 0),
             e_dma=params.get("e_dma_uj", 0),
         )
+
+    @staticmethod
+    def _predict_ptb(params: Dict[str, float], features: Dict[str, Numeric]) -> Numeric:
+        """Power-Time-Byte (v16): E = (P_BASE + P_CORE*P)*T + E_BYTE*db + E_STARTUP.
+
+        Time-proportional power dissipation (base + per-core leakage/active)
+        plus volume-proportional data transfer energy (NoC switching).
+        Performance model uses max(setup, transfer) for DMA time overlap;
+        energy model uses additive terms because energy is consumed by both.
+        """
+        p_base = params.get("p_base_uw", 0)
+        p_core = params.get("p_core_uw", 0)
+        e_byte = params.get("e_byte_uj_per_byte", 0)
+        e_startup = params.get("e_startup_uj", 0)
+        t_us = features["t_total_cy"] / CLOCK_MHZ
+        n_cores = features["n_cores"]
+        data_bytes = features["data_bytes"]
+
+        # (uW * us) = pJ
+        e_power = (p_base + p_core * n_cores) * t_us
+        e_data = e_byte * data_bytes * 1e6    # uJ -> pJ
+        e_start = e_startup * 1e6             # uJ -> pJ
+        return e_power + e_data + e_start
 
     @staticmethod
     def _predict_ta(params: Dict[str, float], features: Dict[str, Numeric]) -> Numeric:

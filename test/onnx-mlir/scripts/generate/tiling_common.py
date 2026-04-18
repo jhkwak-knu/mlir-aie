@@ -103,10 +103,13 @@ class CalibCoeffs:
     # N_dma = SPm+SPn (K-inner), SPm+2N (M-inner), SPn+2N (N-inner).
     # Balanced SP minimizes N_dma (AM-GM: SPm+SPn >= 2*sqrt(N_cores)).
     l_dma_cy: float = 0.0     # Per-DMA-op per-iteration cost (0 = v6 compat)
+    # v16 DMA-Bottleneck: per-descriptor setup cost (used in max(L_SETUP, avg_tile/BW)).
+    l_setup_cy: float = 0.0   # Per-descriptor DMA setup overhead (cycles)
     # v9 Core-Sync: per-core per-iteration barrier cost.
     # T_overhead = L_SYNC*TP + L_CORE*P*TP + L_DMA*N_dma*TP + L_STARTUP
     # Performance model variant (DMA count structure).
     # "Core-Sync" = N_dma*TP (v9 baseline). "DMA-Refined" = D_total (v13+).
+    # "DMA-Bottleneck" = D*max(L_SETUP, avg_tile/BW) (v16).
     perf_model: str = "Core-Sync"
     # Energy calibration (v3)
     energy_model: str = ""           # E-A, E-B, E-C, E-D (empty = not calibrated)
@@ -196,6 +199,7 @@ def load_calibration(path: Path = DEFAULT_CALIB_PATH) -> CalibCoeffs:
         perf_alpha=float(doc.get("perf_alpha", 1.0)),
         perf_beta=float(doc.get("perf_beta", 1.0)),
         l_dma_cy=float(doc.get("l_dma_cy", 0.0)),
+        l_setup_cy=float(doc.get("l_setup_cy", 0.0)),
         perf_model=str(doc.get("model", "Core-Sync")),
         energy_model=energy_model,
         energy_params=energy_params,

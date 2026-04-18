@@ -276,11 +276,25 @@ def perf_overhead(
 ) -> float:
     """T_overhead: delegates to the appropriate PerfModel variant.
 
-    DMA-Refined (v13+): L_DMA * D_total
-    Core-Sync (v9):     L_DMA * N_dma * TP_total
+    DMA-Bottleneck (v16): D * max(L_SETUP, avg_tile/BW) + sync overhead
+    DMA-Refined (v13+):   L_DMA * D_total + sync overhead
+    Core-Sync (v9):       L_DMA * N_dma * TP_total + sync overhead
     """
     if coeffs and coeffs.calibrated:
-        if coeffs.perf_model == "DMA-Refined":
+        if coeffs.perf_model == "DMA-Bottleneck":
+            d_tot = _d_total(c, tp_order)
+            op_dummy = OpCase(M=1, K=1, N=1, elem_type="bf16")
+            # Need actual data_bytes for avg_tile calculation
+            # Caller passes data_bytes=0; compute here for the overhead
+            l_setup = coeffs.l_setup_cy if hasattr(coeffs, 'l_setup_cy') else coeffs.l_dma_cy
+            _, t_dma, t_sync = _models.PerfModel.components_dma_bottleneck(
+                macs=0, data_bytes=0,
+                n_cores=c.num_cores, tp_total=c.tp_total, d_total_val=d_tot,
+                eff_macs=coeffs.eff_macs, bw_bpc=coeffs.bw_eff_bpc,
+                l_sync=coeffs.l_sync_cy, l_core=coeffs.l_core_cy,
+                l_setup=l_setup, l_startup=coeffs.l_startup_cy)
+            return t_dma + t_sync
+        elif coeffs.perf_model == "DMA-Refined":
             d_tot = _d_total(c, tp_order)
             _, _, t_ovh = _models.PerfModel.components_dma_refined(
                 macs=0, data_bytes=0,
@@ -288,6 +302,7 @@ def perf_overhead(
                 eff_macs=coeffs.eff_macs, bw_bpc=coeffs.bw_eff_bpc,
                 l_sync=coeffs.l_sync_cy, l_core=coeffs.l_core_cy,
                 l_dma=coeffs.l_dma_cy, l_startup=coeffs.l_startup_cy)
+            return t_ovh
         else:
             n_dma = _dma_ops_per_step(c, tp_order)
             _, _, t_ovh = _models.PerfModel.components_v9(
@@ -296,7 +311,7 @@ def perf_overhead(
                 eff_macs=coeffs.eff_macs, bw_bpc=coeffs.bw_eff_bpc,
                 l_sync=coeffs.l_sync_cy, l_core=coeffs.l_core_cy,
                 l_dma=coeffs.l_dma_cy, l_startup=coeffs.l_startup_cy)
-        return t_ovh
+            return t_ovh
     return ALPHA_CYCLES * (c.TPm * c.TPn * c.TPk)
 
 
@@ -381,10 +396,28 @@ def evaluate_candidate(
     coeffs: Optional[CalibCoeffs] = None,
 ) -> CostResult:
     """Evaluate a single candidate with a specific tpOrder."""
-    tc = perf_compute(op, c, coeffs)
-    tm = perf_comm(op, c, tp_order, coeffs)
-    to = perf_overhead(c, coeffs, tp_order)
-    tt = tc + tm + to
+    if coeffs and coeffs.calibrated and coeffs.perf_model == "DMA-Bottleneck":
+        # v16: T = T_comp + D*max(L_SETUP, avg_tile/BW) + sync + startup
+        # T_comm is integrated into the DMA bottleneck term (no separate T_comm)
+        l_setup = coeffs.l_setup_cy if hasattr(coeffs, 'l_setup_cy') else coeffs.l_dma_cy
+        data_bytes = total_data_bytes(op, c, tp_order)
+        d_tot = _d_total(c, tp_order)
+        tc_cy, td_cy, to_cy = _models.PerfModel.components_dma_bottleneck(
+            macs=op.M * op.N * op.K,
+            data_bytes=data_bytes,
+            n_cores=c.num_cores, tp_total=c.tp_total, d_total_val=d_tot,
+            eff_macs=coeffs.eff_macs, bw_bpc=coeffs.bw_eff_bpc,
+            l_sync=coeffs.l_sync_cy, l_core=coeffs.l_core_cy,
+            l_setup=l_setup, l_startup=coeffs.l_startup_cy)
+        tc = tc_cy  # T_comp in cycles
+        tm = td_cy  # T_dma in cycles (replaces T_comm)
+        to = to_cy  # T_sync + T_startup in cycles
+        tt = tc + tm + to
+    else:
+        tc = perf_compute(op, c, coeffs)
+        tm = perf_comm(op, c, tp_order, coeffs)
+        to = perf_overhead(c, coeffs, tp_order)
+        tt = tc + tm + to
 
     if coeffs and coeffs.energy_calibrated:
         edc, edm, es, et = energy_total_calibrated(
