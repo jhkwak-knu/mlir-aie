@@ -1,0 +1,27 @@
+{
+  "model": {
+    "type": "mlp",
+    "layer_sizes": [784, 512, 512, 10],
+    "activations": ["relu", "relu"],
+    "weight_init": "random"
+  },
+  "dataset": {
+    "name": "mnist",
+    "batch_size": 32,
+    "num_inference_samples": 100
+  },
+  "measurement": {
+    "warmup_iterations": 10,
+    "outer_batches": 5,
+    "inner_target_seconds": 0.5,
+    "rapl_domains": ["package", "core"],
+    "bracket_idle_seconds": 0.3,
+    "bracket_idle_count": 5
+  },
+  "setters": ["star_map", "max_p", "charm_cdse", "timeloop"],
+  "output": {
+    "results_dir": "./experiments/results/mlp_512_512_bs32/",
+    "figure_format": "png",
+    "log_level": "info"
+  }
+}
