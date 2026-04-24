@@ -1,9 +1,10 @@
 {
   "model": {
     "type": "mlp",
-    "layer_sizes": [784, 512, 512, 10],
+    "layer_sizes": [784, 512, 512, 16],
     "activations": ["relu", "relu"],
-    "weight_init": "random"
+    "weight_init": "random",
+    "note_output_padding": "Output N padded from MNIST 10 classes to 16 to satisfy the XDNA2 mmul<4,8,8> 2x2 expansion constraint (TN % 16 == 0). The mlp_runner slices the first 10 logits before softmax."
   },
   "dataset": {
     "name": "mnist",

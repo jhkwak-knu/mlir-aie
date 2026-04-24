@@ -25,9 +25,10 @@ def canonical_config() -> dict:
     return {
         "model": {
             "type": "mlp",
-            "layer_sizes": [784, 512, 512, 10],
+            "layer_sizes": [784, 512, 512, 16],
             "activations": ["relu", "relu"],
             "weight_init": "random",
+            "note_output_padding": "padded 10 -> 16 for NPU TN constraint",
         },
         "dataset": {"name": "mnist", "batch_size": 32, "num_inference_samples": 100},
         "measurement": {
@@ -56,7 +57,7 @@ def test_derive_shapes_canonical_mlp(canonical_config):
     assert out["shapes"] == [
         {"layer": "fc1", "M": 32, "K": 784, "N": 512, "calls_per_inference": 1},
         {"layer": "fc2", "M": 32, "K": 512, "N": 512, "calls_per_inference": 1},
-        {"layer": "fc3", "M": 32, "K": 512, "N": 10, "calls_per_inference": 1},
+        {"layer": "fc3", "M": 32, "K": 512, "N": 16, "calls_per_inference": 1},
     ]
 
 
