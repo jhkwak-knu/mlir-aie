@@ -120,6 +120,29 @@ def annotate_metrics(rows: List[Dict[str, Any]]) -> None:
             r["edp_measured"] = None
 
 
+def enrich_rows_from_tc_list(
+    rows: List[Dict[str, Any]], cases: List[Dict[str, Any]],
+) -> None:
+    """Attach tpOrder_inner / edp_rank / edp_pred / e_total_pred from the
+    tc_list that generated this result.csv.
+
+    Matches by 1-based case_index (run_tc_all.sh writes case_index starting
+    at 1; tc_list.json cases are in that same order). Missing keys on a row
+    are left alone -- the caller can fall back to other match logic.
+    """
+    for r in rows:
+        ci = r.get("case_index")
+        if not isinstance(ci, int) or ci < 1 or ci > len(cases):
+            continue
+        case = cases[ci - 1]
+        lvl = case.get("levels", [{}])[0]
+        tp = lvl.get("tpOrder") or [0, 0, 0]
+        r.setdefault("tpOrder_inner", int(tp[0]))
+        for k in ("edp_rank", "edp_pred", "e_total_pred"):
+            if k in case and k not in r:
+                r[k] = case[k]
+
+
 def group_by_workload(
     rows: List[Dict[str, Any]],
 ) -> Dict[WorkloadKey, List[Dict[str, Any]]]:
@@ -193,6 +216,13 @@ def _baseline_dict(
         "TPk": int(row.get("TPk", 0)),
         "TPn": int(row.get("TPn", 0)),
         "tpOrder_inner": int(row.get("tpOrder_inner", 0)),
+        # Predicted values from the cost model (result.csv carries
+        # t_total_pred; e_total_pred / edp_pred only if the row was
+        # enriched from tc_list.json).
+        "t_total_pred": row.get("t_total_pred"),
+        "e_total_pred": row.get("e_total_pred"),
+        "edp_pred": row.get("edp_pred"),
+        "edp_rank": row.get("edp_rank"),
         "time_us": row.get("time_us"),
         "energy_uj": row.get("energy_uj"),
         "edp_measured": row.get("edp_measured"),
@@ -292,11 +322,25 @@ def main(argv: List[str]) -> int:
         print(f"[ERROR] failed to read {args.csv}: {e}", file=sys.stderr)
         return 1
     annotate_metrics(rows)
+
+    # When --tc-list is provided, use it to enrich result.csv rows with
+    # fields that run_tc_all.sh strips (tpOrder_inner) or never saw
+    # (edp_rank / edp_pred / e_total_pred). Enrichment happens BEFORE
+    # grouping so GT / P_max-GT also see predicted columns.
+    tc_cases: List[Dict[str, Any]] = []
+    if args.tc_list:
+        with args.tc_list.open("r", encoding="utf-8") as f:
+            doc = json.load(f)
+        tc_cases = doc.get("cases", [])
+        enrich_rows_from_tc_list(rows, tc_cases)
+
     groups = group_by_workload(rows)
 
     workloads = _load_workloads_from_op_list(args.op)
     print(f"[INFO] {len(rows)} rows, {len(groups)} workloads in CSV; "
           f"{len(workloads)} workloads in op_list")
+    if tc_cases:
+        print(f"[INFO] enriched rows from tc_list ({len(tc_cases)} cases)")
 
     output: List[Dict[str, Any]] = []
     for wl in workloads:
@@ -311,11 +355,8 @@ def main(argv: List[str]) -> int:
         if pmax:
             output.append(pmax)
 
-    if args.tc_list:
-        with args.tc_list.open("r", encoding="utf-8") as f:
-            doc = json.load(f)
-        cases = doc.get("cases", [])
-        matched = match_predicted_to_measured(cases, groups)
+    if tc_cases:
+        matched = match_predicted_to_measured(tc_cases, groups)
         for m in matched:
             # flatten the single-level SP/TP into the output row
             lvl = m["levels"][0]
@@ -326,6 +367,11 @@ def main(argv: List[str]) -> int:
                 "SPm": lvl["SPm"], "SPn": lvl["SPn"],
                 "TPm": lvl["TPm"], "TPk": lvl["TPk"], "TPn": lvl["TPn"],
                 "tpOrder_inner": lvl["tpOrder"][0],
+                # Cost-model predictions carried from tc_list.json.
+                "t_total_pred": m.get("t_total_pred"),
+                "e_total_pred": m.get("e_total_pred"),
+                "edp_pred": m.get("edp_pred"),
+                "edp_rank": m.get("edp_rank"),
                 "time_us": m.get("measured_time_us"),
                 "energy_uj": m.get("measured_energy_uj"),
                 "edp_measured": m.get("measured_edp"),
