@@ -27,6 +27,8 @@ set(MLP_RUNNER_CORE_SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/gemm_cpu.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/mlp.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/npu_dispatch.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/rapl.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/measurement.cpp
 )
 
 add_library(mlp_runner_core STATIC ${MLP_RUNNER_CORE_SOURCES})

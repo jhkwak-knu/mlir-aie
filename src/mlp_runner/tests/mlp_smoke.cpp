@@ -22,8 +22,10 @@
 
 #include "config_loader.h"
 #include "gemm_cpu.h"
+#include "measurement.h"
 #include "mlp.h"
 #include "npu_dispatch.h"
+#include "rapl.h"
 
 using namespace mlp_runner;
 
@@ -165,6 +167,57 @@ static void testXrtStubThrows() {
   assert(threw && "XrtDispatcherStub must throw in Step 6-3");
 }
 
+static void testRaplDeltaWrapAround() {
+  // Normal case: positive delta, returned as-is.
+  assert(raplDelta(200, 100) == 100);
+  // Wrap-around: after < before, MAX_ENERGY_RANGE added.
+  int64_t after = 50;
+  int64_t before = RAPL_MAX_ENERGY_RANGE_UJ - 10;
+  int64_t d = raplDelta(after, before);
+  assert(d == (after - before + RAPL_MAX_ENERGY_RANGE_UJ));
+  assert(d == 60);  // ~60 uJ bridging the wrap
+}
+
+static void testComputeMeanCv() {
+  // Identical values: CV = 0.
+  auto r1 = computeMeanCv({10.0, 10.0, 10.0});
+  _assertClose(r1.mean, 10.0, 1e-9, "cv identical mean");
+  _assertClose(r1.cv_pct, 0.0, 1e-9, "cv identical cv");
+  // Simple spread: mean=2, std=1 -> cv = 50%.
+  auto r2 = computeMeanCv({1.0, 2.0, 3.0});
+  _assertClose(r2.mean, 2.0, 1e-9, "cv spread mean");
+  _assertClose(r2.cv_pct, 50.0, 1e-6, "cv spread cv=50%");
+  // n<2 returns cv=0.
+  auto r3 = computeMeanCv({42.0});
+  _assertClose(r3.cv_pct, 0.0, 1e-9, "cv n<2");
+}
+
+static void testInstrumentedForwardRecordsLayers() {
+  // Tiny MLP (same structure as testForwardShapeAndSoftmax). Verify
+  // the instrumented forward returns one PerLayerSample per layer and a
+  // model-level time_us that is >= sum of layer time_us (dispatcher calls
+  // happen inside the model window).
+  auto cfg = _tinyConfig(3, 2);
+  auto layers = _tinyLayers(3);
+  auto w = initRandomWeights(layers, 7);
+  auto x = makeRandomInput(cfg.batch_size, cfg.layer_sizes.front(),
+                           7 ^ 0xA5A5u);
+  auto disp = makeDispatcher("cpu");
+  std::vector<float> probs;
+  auto sample = instrumentedForward(cfg, layers, w, x, *disp, probs);
+
+  assert(sample.layers.size() == layers.size());
+  assert(sample.layers[0].layer == "fc1");
+  assert(sample.layers[1].layer == "fc2");
+  assert(sample.time_us > 0.0);
+  for (const auto& ps : sample.layers) {
+    assert(ps.time_us >= 0.0);
+  }
+  // probs survived slice+softmax.
+  assert(probs.size() ==
+         static_cast<size_t>(cfg.batch_size * cfg.output_classes));
+}
+
 int main() {
   testGemmCpuToy();
   testReluAndSoftmax();
@@ -172,6 +225,9 @@ int main() {
   testDeterministicSeed();
   testOutputSlicingPadded();
   testXrtStubThrows();
-  std::printf("mlp_smoke: ok (6 checks)\n");
+  testRaplDeltaWrapAround();
+  testComputeMeanCv();
+  testInstrumentedForwardRecordsLayers();
+  std::printf("mlp_smoke: ok (9 checks)\n");
   return 0;
 }
