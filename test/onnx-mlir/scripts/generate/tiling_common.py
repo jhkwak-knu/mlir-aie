@@ -352,3 +352,37 @@ def build_tp_order(winner_axis: int) -> List[int]:
     """
     default_order = [TP_AXIS_K, TP_AXIS_M, TP_AXIS_N]
     return [winner_axis] + [ax for ax in default_order if ax != winner_axis]
+
+
+# ============================================================
+# Statistics utilities
+# ============================================================
+def spearman_rank_correlation(x: List[float], y: List[float]) -> float:
+    """Spearman rank correlation coefficient, averaging ranks for ties."""
+    n = len(x)
+    if n < 2:
+        return float("nan")
+
+    def _rank(vals: List[float]) -> List[float]:
+        indexed = sorted(range(n), key=lambda i: vals[i])
+        ranks = [0.0] * n
+        i = 0
+        while i < n:
+            j = i
+            while j < n - 1 and vals[indexed[j + 1]] == vals[indexed[j]]:
+                j += 1
+            avg_rank = (i + j) / 2.0 + 1.0
+            for k in range(i, j + 1):
+                ranks[indexed[k]] = avg_rank
+            i = j + 1
+        return ranks
+
+    rx, ry = _rank(x), _rank(y)
+    mean_rx = sum(rx) / n
+    mean_ry = sum(ry) / n
+    num = sum((a - mean_rx) * (b - mean_ry) for a, b in zip(rx, ry))
+    den_x = sum((a - mean_rx) ** 2 for a in rx) ** 0.5
+    den_y = sum((b - mean_ry) ** 2 for b in ry) ** 0.5
+    if den_x == 0 or den_y == 0:
+        return float("nan")
+    return num / (den_x * den_y)

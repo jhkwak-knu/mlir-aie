@@ -27,13 +27,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from analyze_ranking import spearman_rank_correlation  # noqa: E402
-
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "generate"))
 from tiling_common import (  # noqa: E402
     OpCase, CalibCoeffs,
     load_calibration, DEFAULT_CALIB_PATH,
+    spearman_rank_correlation,
 )
 from cost_model import (  # noqa: E402
     Candidate, total_data_bytes, _dma_ops_per_step,
