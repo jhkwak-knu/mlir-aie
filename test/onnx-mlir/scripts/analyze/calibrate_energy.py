@@ -26,8 +26,8 @@ Models:
 
   --- Theory-calibrated family (scipy nonlinear opt, log-space MSE) ---
   T-A: E = E_MAC_cal * MACs + E_DRAM_cal * bytes + P_STATIC_cal * N * T    (3p)
-  T-B: E = E_MAC_cal * MACs + E_DRAM_cal * bytes + (P_BASE + P_CORE * N) * T  (4p)
-  T-C: E = E_MAC_cal * MACs + E_DRAM_cal * bytes + (P_BASE + P_CORE * N) * T + E_STARTUP  (5p)
+  T-B: E = E_MAC_cal * MACs + E_DRAM_cal * bytes + (P_BASE + P_PE * N) * T  (4p)
+  T-C: E = E_MAC_cal * MACs + E_DRAM_cal * bytes + (P_BASE + P_PE * N) * T + E_STARTUP  (5p)
 
 Writes calibration.json v3 with energy section.
 
@@ -484,7 +484,7 @@ def compute_features(
                 macs=macs, data_bytes=data_bytes,
                 n_cores=r.n_cores, tp_total=r.tp_total, n_dma=n_dma,
                 eff_macs=coeffs.eff_macs, bw_bpc=coeffs.bw_eff_bpc,
-                l_sync=coeffs.l_sync_cy, l_core=coeffs.l_core_cy,
+                l_sync=coeffs.l_sync_cy, l_pe=coeffs.l_pe_cy,
                 l_dma=coeffs.l_dma_cy, l_startup=coeffs.l_startup_cy)
         else:
             t_comp_cy = macs / (r.n_cores * 256.0)
@@ -688,7 +688,7 @@ def fit_model_ed(
     mape = compute_mape(preds, y)
     return EnergyFitResult(
         model="E-D",
-        params={"p_core_uw": round(a*1e6, 1),
+        params={"p_pe_uw": round(a*1e6, 1),
                 "e_startup_uj": round(b, 2)},
         n_params=2, rho=rho, mape=mape, predictions_uj=preds,
     )
@@ -713,7 +713,7 @@ def fit_model_ef(
     return EnergyFitResult(
         model="E-F",
         params={"p_base_uw": round(coefs[0]*1e6, 1),
-                "p_core_uw": round(coefs[1]*1e6, 1),
+                "p_pe_uw": round(coefs[1]*1e6, 1),
                 "e_startup_uj": round(coefs[2], 2)},
         n_params=3, rho=rho, mape=mape, predictions_uj=preds,
     )
@@ -786,7 +786,7 @@ def fit_model_ei(
         model="E-I",
         params={"p_base_uw": round(coefs[0]*1e6, 1),
                 "p_col_uw": round(coefs[1]*1e6, 1),
-                "p_core_uw": round(coefs[2]*1e6, 1),
+                "p_pe_uw": round(coefs[2]*1e6, 1),
                 "e_startup_uj": round(coefs[3], 2)},
         n_params=4, rho=rho, mape=mape, predictions_uj=preds,
     )
@@ -897,7 +897,7 @@ def _active_fraction(r: ECalibRow, coeffs: Optional[CalibCoeffs]) -> float:
             data_bytes=total_data_bytes(op, cand, r.tp_order_inner),
             n_cores=r.n_cores, tp_total=r.tp_total, n_dma=n_dma,
             eff_macs=coeffs.eff_macs, bw_bpc=coeffs.bw_eff_bpc,
-            l_sync=coeffs.l_sync_cy, l_core=coeffs.l_core_cy,
+            l_sync=coeffs.l_sync_cy, l_pe=coeffs.l_pe_cy,
             l_dma=coeffs.l_dma_cy, l_startup=coeffs.l_startup_cy)
     else:
         t_comp = (r.M * r.K * r.N) / (r.n_cores * 256.0)
@@ -1118,8 +1118,8 @@ def fit_model_tb(
 ) -> EnergyFitResult:
     """T-B: Base power + per-core power theoretical model (4 constants).
 
-    E(uJ) = e_mac * MACs + e_dram * bytes + (p_base + p_core * N) * T
-           = e_mac * MACs + e_dram * bytes + p_base * T + p_core * N * T
+    E(uJ) = e_mac * MACs + e_dram * bytes + (p_base + p_pe * N) * T
+           = e_mac * MACs + e_dram * bytes + p_base * T + p_pe * N * T
     """
     try:
         from scipy.optimize import minimize
@@ -1142,7 +1142,7 @@ def fit_model_tb(
     bounds = [(1e-12, None), (1e-12, None), (1e-12, None), (1e-12, None)]
 
     result = minimize(objective, x0, method='L-BFGS-B', bounds=bounds)
-    e_mac, e_dram, p_base, p_core = result.x
+    e_mac, e_dram, p_base, p_pe = result.x
 
     preds = _predict_tb(result.x, macs_arr, bytes_arr, t_arr, nt_arr)
     rho = spearman_rank_correlation(preds, y)
@@ -1151,7 +1151,7 @@ def fit_model_tb(
     # Unit conversion: p_base (uJ/cy) → uW
     # uJ/cy * cy/us = uJ/us = W; * 1e6 = uW
     p_base_uw = p_base * CLOCK_MHZ * 1e6
-    p_core_uw = p_core * CLOCK_MHZ * 1e6
+    p_pe_uw = p_pe * CLOCK_MHZ * 1e6
 
     return EnergyFitResult(
         model="T-B",
@@ -1159,7 +1159,7 @@ def fit_model_tb(
             "e_mac_pj": round(e_mac * 1e6, 4),
             "e_dram_pj": round(e_dram * 1e6, 4),
             "p_base_uw": round(p_base_uw, 1),
-            "p_core_uw": round(p_core_uw, 1),
+            "p_pe_uw": round(p_pe_uw, 1),
         },
         n_params=4, rho=rho, mape=mape, predictions_uj=preds,
     )
@@ -1170,7 +1170,7 @@ def fit_model_tc(
 ) -> EnergyFitResult:
     """T-C: Base power + per-core power + startup energy (5 constants).
 
-    E(uJ) = e_mac * MACs + e_dram * bytes + (p_base + p_core * N) * T + e_startup
+    E(uJ) = e_mac * MACs + e_dram * bytes + (p_base + p_pe * N) * T + e_startup
     """
     try:
         from scipy.optimize import minimize
@@ -1193,14 +1193,14 @@ def fit_model_tc(
     bounds = [(1e-12, None), (1e-12, None), (1e-12, None), (1e-12, None), (0.0, None)]
 
     result = minimize(objective, x0, method='L-BFGS-B', bounds=bounds)
-    e_mac, e_dram, p_base, p_core, e_startup = result.x
+    e_mac, e_dram, p_base, p_pe, e_startup = result.x
 
     preds = _predict_tc(result.x, macs_arr, bytes_arr, t_arr, nt_arr)
     rho = spearman_rank_correlation(preds, y)
     mape = compute_mape(preds, y)
 
     p_base_uw = p_base * CLOCK_MHZ * 1e6
-    p_core_uw = p_core * CLOCK_MHZ * 1e6
+    p_pe_uw = p_pe * CLOCK_MHZ * 1e6
 
     return EnergyFitResult(
         model="T-C",
@@ -1208,7 +1208,7 @@ def fit_model_tc(
             "e_mac_pj": round(e_mac * 1e6, 4),
             "e_dram_pj": round(e_dram * 1e6, 4),
             "p_base_uw": round(p_base_uw, 1),
-            "p_core_uw": round(p_core_uw, 1),
+            "p_pe_uw": round(p_pe_uw, 1),
             "e_startup_uj": round(e_startup, 2),
         },
         n_params=5, rho=rho, mape=mape, predictions_uj=preds,
@@ -1272,7 +1272,7 @@ def diagnose_theoretical_model(
 # ---------------------------------------------------------------------------
 # EDP core-count optimal analysis
 # ---------------------------------------------------------------------------
-def edp_core_optimal_analysis(
+def edp_pe_optimal_analysis(
     rows: List[ECalibRow],
     all_fits: List[EnergyFitResult],
     features: List[Dict],
@@ -1692,7 +1692,7 @@ def main(argv: List[str]) -> int:
         for ft in fits_theory_valid:
             if ft.model != overall_best.model:
                 edp_models.append(ft)
-    edp_core_optimal_analysis(rows, edp_models, features)
+    edp_pe_optimal_analysis(rows, edp_models, features)
 
     # Write output
     update_calibration_json(calib_path, out_path, overall_best, len(rows),

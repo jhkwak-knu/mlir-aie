@@ -263,7 +263,7 @@ def _perf_components(row: EnergyRow, coeffs: Optional[CalibCoeffs]):
             macs=macs, data_bytes=data_bytes,
             n_cores=row.n_cores, tp_total=cand.tp_total, n_dma=n_dma,
             eff_macs=coeffs.eff_macs, bw_bpc=coeffs.bw_eff_bpc,
-            l_sync=coeffs.l_sync_cy, l_core=coeffs.l_core_cy,
+            l_sync=coeffs.l_sync_cy, l_pe=coeffs.l_pe_cy,
             l_dma=coeffs.l_dma_cy, l_startup=coeffs.l_startup_cy)
     else:
         t_comp = (op.M * op.N * op.K) / (row.n_cores * PEAK_MACS)

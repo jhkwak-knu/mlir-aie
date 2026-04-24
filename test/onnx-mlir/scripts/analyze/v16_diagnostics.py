@@ -147,7 +147,7 @@ def predict_perf(r: DiagRow, calib: dict) -> Tuple[float, float, float]:
         macs=macs, data_bytes=data_bytes,
         n_cores=r.n_cores, tp_total=r.tp_total, d_total_val=d_tot,
         eff_macs=calib["eff_macs"], bw_bpc=calib["bw_eff_bpc"],
-        l_sync=calib["l_sync_cy"], l_core=calib["l_core_cy"],
+        l_sync=calib["l_sync_cy"], l_pe=calib["l_pe_cy"],
         l_dma=calib["l_dma_cy"], l_startup=calib["l_startup_cy"],
     )
     return t_comp, t_comm, t_overhead
@@ -160,12 +160,12 @@ def predict_energy(r: DiagRow, t_pred_us: float, calib: dict) -> float:
         r.TPm, r.TPk, r.TPn, r.tp_total, r.tp_order[0])
     e_params = calib["energy"]["params"]
     p_base = e_params["p_base_uw"]   # uW
-    p_core = e_params["p_core_uw"]   # uW
+    p_pe = e_params["p_pe_uw"]       # uW
     e_dma = e_params["e_dma_uj"]     # uJ
 
-    # E = (P_BASE + P_CORE*P) * T(us) + E_DMA * D_total
+    # E = (P_BASE + P_PE*P) * T(us) + E_DMA * D_total
     # uW * us = pJ -> convert to uJ
-    e_pj = (p_base + p_core * r.n_cores) * t_pred_us
+    e_pj = (p_base + p_pe * r.n_cores) * t_pred_us
     e_uj = e_pj / 1e6 + e_dma * d_tot
     return e_uj
 

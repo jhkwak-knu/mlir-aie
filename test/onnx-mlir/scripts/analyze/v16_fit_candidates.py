@@ -190,67 +190,67 @@ class FeatureArrays:
 # ---------------------------------------------------------------------------
 
 def predict_baseline(params: np.ndarray, fa: FeatureArrays) -> np.ndarray:
-    """Baseline (v15): T = T_comp + T_comm + L_SYNC*TP + L_CORE*P*TP + L_DMA*D + L_STARTUP
-    params: [l_sync, l_core, l_dma, l_startup]
+    """Baseline (v15): T = T_comp + T_comm + L_SYNC*TP + L_PE*P*TP + L_DMA*D + L_STARTUP
+    params: [l_sync, l_pe, l_dma, l_startup]
     """
-    l_sync, l_core, l_dma, l_startup = params
+    l_sync, l_pe, l_dma, l_startup = params
     overhead = (l_sync * fa.tp_total
-                + l_core * fa.n_cores * fa.tp_total
+                + l_pe * fa.n_cores * fa.tp_total
                 + l_dma * fa.d_total
                 + l_startup)
     return fa.t_comp + fa.t_comm_base + overhead
 
 
 def predict_p1_free_bw(params: np.ndarray, fa: FeatureArrays) -> np.ndarray:
-    """P1: Free BW. params: [bw_fit, l_sync, l_core, l_dma, l_startup]"""
-    bw_fit, l_sync, l_core, l_dma, l_startup = params
+    """P1: Free BW. params: [bw_fit, l_sync, l_pe, l_dma, l_startup]"""
+    bw_fit, l_sync, l_pe, l_dma, l_startup = params
     t_comm = fa.data_bytes / bw_fit
     overhead = (l_sync * fa.tp_total
-                + l_core * fa.n_cores * fa.tp_total
+                + l_pe * fa.n_cores * fa.tp_total
                 + l_dma * fa.d_total
                 + l_startup)
     return fa.t_comp + t_comm + overhead
 
 
 def predict_p2_p_squared(params: np.ndarray, fa: FeatureArrays) -> np.ndarray:
-    """P2: Superlinear sync. params: [l_sync, l_core, l_core_sq, l_dma, l_startup]"""
-    l_sync, l_core, l_core_sq, l_dma, l_startup = params
+    """P2: Superlinear sync. params: [l_sync, l_pe, l_pe_sq, l_dma, l_startup]"""
+    l_sync, l_pe, l_pe_sq, l_dma, l_startup = params
     overhead = (l_sync * fa.tp_total
-                + l_core * fa.n_cores * fa.tp_total
-                + l_core_sq * fa.n_cores_sq * fa.tp_total
+                + l_pe * fa.n_cores * fa.tp_total
+                + l_pe_sq * fa.n_cores_sq * fa.tp_total
                 + l_dma * fa.d_total
                 + l_startup)
     return fa.t_comp + fa.t_comm_base + overhead
 
 
 def predict_p3_bw_contention(params: np.ndarray, fa: FeatureArrays) -> np.ndarray:
-    """P3: BW Contention. params: [bw_inv_base, bw_cont, l_sync, l_core, l_dma, l_startup]"""
-    bw_inv_base, bw_cont, l_sync, l_core, l_dma, l_startup = params
+    """P3: BW Contention. params: [bw_inv_base, bw_cont, l_sync, l_pe, l_dma, l_startup]"""
+    bw_inv_base, bw_cont, l_sync, l_pe, l_dma, l_startup = params
     t_comm = fa.data_bytes * (bw_inv_base + bw_cont * fa.n_cores)
     overhead = (l_sync * fa.tp_total
-                + l_core * fa.n_cores * fa.tp_total
+                + l_pe * fa.n_cores * fa.tp_total
                 + l_dma * fa.d_total
                 + l_startup)
     return fa.t_comp + t_comm + overhead
 
 
 def predict_p4_per_order_dma(params: np.ndarray, fa: FeatureArrays) -> np.ndarray:
-    """P4: Per-tpOrder DMA. params: [l_sync, l_core, l_dma_m, l_dma_n, l_dma_k, l_startup]"""
-    l_sync, l_core, l_dma_m, l_dma_n, l_dma_k, l_startup = params
+    """P4: Per-tpOrder DMA. params: [l_sync, l_pe, l_dma_m, l_dma_n, l_dma_k, l_startup]"""
+    l_sync, l_pe, l_dma_m, l_dma_n, l_dma_k, l_startup = params
     # Apply per-axis L_DMA
     l_dma_arr = np.where(fa.mask_m, l_dma_m, np.where(fa.mask_n, l_dma_n, l_dma_k))
     overhead = (l_sync * fa.tp_total
-                + l_core * fa.n_cores * fa.tp_total
+                + l_pe * fa.n_cores * fa.tp_total
                 + l_dma_arr * fa.d_total
                 + l_startup)
     return fa.t_comp + fa.t_comm_base + overhead
 
 
 def predict_p5_column(params: np.ndarray, fa: FeatureArrays) -> np.ndarray:
-    """P5: Column-aware. params: [l_sync, l_core, l_col, l_dma, l_startup]"""
-    l_sync, l_core, l_col, l_dma, l_startup = params
+    """P5: Column-aware. params: [l_sync, l_pe, l_col, l_dma, l_startup]"""
+    l_sync, l_pe, l_col, l_dma, l_startup = params
     overhead = (l_sync * fa.tp_total
-                + l_core * fa.n_cores * fa.tp_total
+                + l_pe * fa.n_cores * fa.tp_total
                 + l_col * fa.num_cols * fa.tp_total
                 + l_dma * fa.d_total
                 + l_startup)
@@ -264,25 +264,25 @@ def predict_p5_column(params: np.ndarray, fa: FeatureArrays) -> np.ndarray:
 
 def predict_e_baseline(params: np.ndarray, fa: FeatureArrays,
                        t_pred_us: np.ndarray) -> np.ndarray:
-    """Baseline 1-G: E = (P_BASE + P_CORE*P)*T + E_DMA*D_total
-    P_CORE = 40mW = 40000 uW fixed.
+    """Baseline 1-G: E = (P_BASE + P_PE*P)*T + E_DMA*D_total
+    P_PE = 40mW = 40000 uW fixed.
     params: [p_base_w, e_dma_uj]  (p_base in W for easier bounds)
     """
     p_base_w, e_dma = params
     p_base_uw = p_base_w * 1e6
-    p_core_uw = 40000.0
+    p_pe_uw = 40000.0
     # (uW * us) = pJ -> convert to uJ by /1e6
-    e_power_uj = (p_base_uw + p_core_uw * fa.n_cores) * t_pred_us / 1e6
+    e_power_uj = (p_base_uw + p_pe_uw * fa.n_cores) * t_pred_us / 1e6
     return e_power_uj + e_dma * fa.d_total
 
 
 def predict_e1_free_pcore(params: np.ndarray, fa: FeatureArrays,
                           t_pred_us: np.ndarray) -> np.ndarray:
-    """E1: Free P_CORE. params: [p_base_w, p_core_mw, e_dma_uj]"""
-    p_base_w, p_core_mw, e_dma = params
+    """E1: Free P_PE. params: [p_base_w, p_pe_mw, e_dma_uj]"""
+    p_base_w, p_pe_mw, e_dma = params
     p_base_uw = p_base_w * 1e6
-    p_core_uw = p_core_mw * 1e3
-    e_power_uj = (p_base_uw + p_core_uw * fa.n_cores) * t_pred_us / 1e6
+    p_pe_uw = p_pe_mw * 1e3
+    e_power_uj = (p_base_uw + p_pe_uw * fa.n_cores) * t_pred_us / 1e6
     return e_power_uj + e_dma * fa.d_total
 
 
@@ -291,8 +291,8 @@ def predict_e3_startup(params: np.ndarray, fa: FeatureArrays,
     """E3: Startup energy. params: [p_base_w, e_dma_uj, e_startup_uj]"""
     p_base_w, e_dma, e_startup = params
     p_base_uw = p_base_w * 1e6
-    p_core_uw = 40000.0
-    e_power_uj = (p_base_uw + p_core_uw * fa.n_cores) * t_pred_us / 1e6
+    p_pe_uw = 40000.0
+    e_power_uj = (p_base_uw + p_pe_uw * fa.n_cores) * t_pred_us / 1e6
     return e_power_uj + e_dma * fa.d_total + e_startup
 
 
@@ -380,7 +380,7 @@ def get_perf_candidates() -> List[CandidateSpec]:
         CandidateSpec(
             name="Baseline",
             category="perf",
-            param_names=["l_sync", "l_core", "l_dma", "l_startup"],
+            param_names=["l_sync", "l_pe", "l_dma", "l_startup"],
             bounds=[(100, 20000), (100, 5000), (100, 5000), (1000, 200000)],
             predict_fn=predict_baseline,
             description="v15 DMA-Refined (bw=4.0 fixed)",
@@ -388,7 +388,7 @@ def get_perf_candidates() -> List[CandidateSpec]:
         CandidateSpec(
             name="P1_FreeBW",
             category="perf",
-            param_names=["bw_fit", "l_sync", "l_core", "l_dma", "l_startup"],
+            param_names=["bw_fit", "l_sync", "l_pe", "l_dma", "l_startup"],
             bounds=[(1.0, 8.0), (100, 20000), (100, 5000), (100, 5000), (1000, 200000)],
             predict_fn=predict_p1_free_bw,
             description="Free bandwidth fitting",
@@ -396,7 +396,7 @@ def get_perf_candidates() -> List[CandidateSpec]:
         CandidateSpec(
             name="P2_P2Sync",
             category="perf",
-            param_names=["l_sync", "l_core", "l_core_sq", "l_dma", "l_startup"],
+            param_names=["l_sync", "l_pe", "l_pe_sq", "l_dma", "l_startup"],
             bounds=[(100, 20000), (0, 5000), (0, 200), (100, 5000), (1000, 200000)],
             predict_fn=predict_p2_p_squared,
             description="Superlinear sync (P^2*TP term)",
@@ -404,7 +404,7 @@ def get_perf_candidates() -> List[CandidateSpec]:
         CandidateSpec(
             name="P3_BWCont",
             category="perf",
-            param_names=["bw_inv_base", "bw_cont", "l_sync", "l_core", "l_dma", "l_startup"],
+            param_names=["bw_inv_base", "bw_cont", "l_sync", "l_pe", "l_dma", "l_startup"],
             bounds=[(0.05, 1.0), (0.0, 0.05), (100, 20000), (100, 5000), (100, 5000), (1000, 200000)],
             predict_fn=predict_p3_bw_contention,
             description="P-dependent BW contention",
@@ -412,7 +412,7 @@ def get_perf_candidates() -> List[CandidateSpec]:
         CandidateSpec(
             name="P4_OrderDMA",
             category="perf",
-            param_names=["l_sync", "l_core", "l_dma_m", "l_dma_n", "l_dma_k", "l_startup"],
+            param_names=["l_sync", "l_pe", "l_dma_m", "l_dma_n", "l_dma_k", "l_startup"],
             bounds=[(100, 20000), (100, 5000), (100, 10000), (100, 10000), (100, 10000), (1000, 200000)],
             predict_fn=predict_p4_per_order_dma,
             description="Per-tpOrder DMA cost split",
@@ -420,7 +420,7 @@ def get_perf_candidates() -> List[CandidateSpec]:
         CandidateSpec(
             name="P5_Column",
             category="perf",
-            param_names=["l_sync", "l_core", "l_col", "l_dma", "l_startup"],
+            param_names=["l_sync", "l_pe", "l_col", "l_dma", "l_startup"],
             bounds=[(100, 20000), (0, 5000), (0, 10000), (100, 5000), (1000, 200000)],
             predict_fn=predict_p5_column,
             description="Column-aware overhead",
@@ -436,15 +436,15 @@ def get_energy_candidates() -> List[CandidateSpec]:
             param_names=["p_base_w", "e_dma_uj"],
             bounds=[(1.0, 30.0), (0.1, 100.0)],
             predict_fn=predict_e_baseline,
-            description="1-G (P_CORE=40mW fixed)",
+            description="1-G (P_PE=40mW fixed)",
         ),
         CandidateSpec(
             name="E1_FreePCORE",
             category="energy",
-            param_names=["p_base_w", "p_core_mw", "e_dma_uj"],
+            param_names=["p_base_w", "p_pe_mw", "e_dma_uj"],
             bounds=[(1.0, 30.0), (1.0, 500.0), (0.1, 100.0)],
             predict_fn=predict_e1_free_pcore,
-            description="Free P_CORE fitting",
+            description="Free P_PE fitting",
         ),
         CandidateSpec(
             name="E3_Startup",

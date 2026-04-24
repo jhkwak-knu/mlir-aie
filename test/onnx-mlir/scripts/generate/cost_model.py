@@ -291,7 +291,7 @@ def perf_overhead(
                 macs=0, data_bytes=0,
                 n_cores=c.num_cores, tp_total=c.tp_total, d_total_val=d_tot,
                 eff_macs=coeffs.eff_macs, bw_bpc=coeffs.bw_eff_bpc,
-                l_sync=coeffs.l_sync_cy, l_core=coeffs.l_core_cy,
+                l_sync=coeffs.l_sync_cy, l_pe=coeffs.l_pe_cy,
                 l_setup=l_setup, l_startup=coeffs.l_startup_cy)
             return t_dma + t_sync
         elif coeffs.perf_model == "DMA-Refined":
@@ -300,7 +300,7 @@ def perf_overhead(
                 macs=0, data_bytes=0,
                 n_cores=c.num_cores, tp_total=c.tp_total, d_total_val=d_tot,
                 eff_macs=coeffs.eff_macs, bw_bpc=coeffs.bw_eff_bpc,
-                l_sync=coeffs.l_sync_cy, l_core=coeffs.l_core_cy,
+                l_sync=coeffs.l_sync_cy, l_pe=coeffs.l_pe_cy,
                 l_dma=coeffs.l_dma_cy, l_startup=coeffs.l_startup_cy)
             return t_ovh
         else:
@@ -309,7 +309,7 @@ def perf_overhead(
                 macs=0, data_bytes=0,
                 n_cores=c.num_cores, tp_total=c.tp_total, n_dma=n_dma,
                 eff_macs=coeffs.eff_macs, bw_bpc=coeffs.bw_eff_bpc,
-                l_sync=coeffs.l_sync_cy, l_core=coeffs.l_core_cy,
+                l_sync=coeffs.l_sync_cy, l_pe=coeffs.l_pe_cy,
                 l_dma=coeffs.l_dma_cy, l_startup=coeffs.l_startup_cy)
             return t_ovh
     return ALPHA_CYCLES * (c.TPm * c.TPn * c.TPk)
@@ -407,7 +407,7 @@ def evaluate_candidate(
             data_bytes=data_bytes,
             n_cores=c.num_cores, tp_total=c.tp_total, d_total_val=d_tot,
             eff_macs=coeffs.eff_macs, bw_bpc=coeffs.bw_eff_bpc,
-            l_sync=coeffs.l_sync_cy, l_core=coeffs.l_core_cy,
+            l_sync=coeffs.l_sync_cy, l_pe=coeffs.l_pe_cy,
             l_setup=l_setup, l_startup=coeffs.l_startup_cy)
         tc = tc_cy  # T_comp in cycles
         tm = td_cy  # T_dma in cycles (replaces T_comm)
@@ -763,7 +763,7 @@ def main(argv: List[str]) -> int:
     if coeffs.calibrated:
         print(f"[INFO] Calibration: eff_macs={coeffs.eff_macs}, "
               f"l_sync={coeffs.l_sync_cy:.0f}, "
-              f"l_core={coeffs.l_core_cy:.0f}, "
+              f"l_pe={coeffs.l_pe_cy:.0f}, "
               f"l_startup={coeffs.l_startup_cy:.0f}")
     else:
         print(f"[INFO] Calibration: not loaded (using defaults)")

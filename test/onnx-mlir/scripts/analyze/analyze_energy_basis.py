@@ -75,7 +75,7 @@ def _spearman(xs: List[float], ys: List[float]) -> float:
     return spearman_rank_correlation(xs, ys)
 
 
-def _edp_core_accuracy_and_regret(
+def _edp_pe_accuracy_and_regret(
     rows: List[ECalibRow],
     energy_pred_fn,
     time_pred_fn,
@@ -253,12 +253,12 @@ def step1b_error_structure(
         return _log_space_mse(preds, y)
 
     # Bounds based on prior T-B results: e_mac~16pJ, e_dram~1370pJ,
-    # p_base~2.9MW (1.9e-3 uJ/cy), p_core~107kW (7e-5 uJ/cy)
+    # p_base~2.9MW (1.9e-3 uJ/cy), p_pe~107kW (7e-5 uJ/cy)
     bounds = [
         (1e-18, 1e-3),   # e_mac (uJ/MAC), up to ~1000 pJ
         (1e-18, 1e-1),   # e_dram (uJ/byte), up to ~100,000 pJ
         (1e-18, 1e0),    # p_base (uJ/cy)
-        (1e-18, 1e0),    # p_core (uJ/cy)
+        (1e-18, 1e0),    # p_pe (uJ/cy)
     ]
     result = differential_evolution(objective, bounds, seed=42, polish=True,
                                     maxiter=3000, tol=1e-14, popsize=30)
@@ -266,12 +266,12 @@ def step1b_error_structure(
     rho = _spearman(preds, y)
     mape = compute_mape(preds, y)
 
-    e_mac, e_dram, p_base, p_core = result.x
+    e_mac, e_dram, p_base, p_pe = result.x
     print(f"\nT-B (re-fitted with DE, v9 T_total):")
     print(f"  e_mac  = {e_mac*1e6:.2f} pJ/MAC")
     print(f"  e_dram = {e_dram*1e6:.2f} pJ/byte")
     print(f"  p_base = {p_base * CLOCK_MHZ * 1e6:.0f} uW ({p_base * CLOCK_MHZ:.3f} W)")
-    print(f"  p_core = {p_core * CLOCK_MHZ * 1e6:.0f} uW ({p_core * CLOCK_MHZ * 1e3:.1f} mW)")
+    print(f"  p_pe = {p_pe * CLOCK_MHZ * 1e6:.0f} uW ({p_pe * CLOCK_MHZ * 1e3:.1f} mW)")
     print(f"  rho={rho:.4f}, MAPE={mape:.1f}%")
 
     # Residuals
@@ -390,23 +390,23 @@ def step2_calibrate(
         (1e-18, 1e-3),   # e_mac (uJ/MAC)
         (1e-18, 1e-1),   # e_dram (uJ/byte)
         (1e-18, 1e0),    # p_base (uJ/cy)
-        (1e-18, 1e0),    # p_core (uJ/cy)
+        (1e-18, 1e0),    # p_pe (uJ/cy)
     ]
     res_tb = differential_evolution(obj_tb, bounds_tb, seed=42, polish=True,
                                     maxiter=3000, tol=1e-14, popsize=30)
     preds_tb = _predict_tb(res_tb.x, macs_arr, bytes_arr, t_arr, nt_arr)
     rho_tb = _spearman(preds_tb, y)
     mape_tb = compute_mape(preds_tb, y)
-    e_mac, e_dram, p_base, p_core = res_tb.x
+    e_mac, e_dram, p_base, p_pe = res_tb.x
     fit_tb = EnergyFitResult(
         "T-B",
         {"e_mac_pj": round(e_mac * 1e6, 4), "e_dram_pj": round(e_dram * 1e6, 4),
          "p_base_uw": round(p_base * CLOCK_MHZ * 1e6, 1),
-         "p_core_uw": round(p_core * CLOCK_MHZ * 1e6, 1)},
+         "p_pe_uw": round(p_pe * CLOCK_MHZ * 1e6, 1)},
         4, rho_tb, mape_tb, preds_tb)
     results["T-B"] = (res_tb.x, fit_tb)
     print(f"  e_mac={e_mac*1e6:.2f} pJ, e_dram={e_dram*1e6:.2f} pJ, "
-          f"p_base={p_base*CLOCK_MHZ*1e6:.0f} uW, p_core={p_core*CLOCK_MHZ*1e6:.0f} uW")
+          f"p_base={p_base*CLOCK_MHZ*1e6:.0f} uW, p_pe={p_pe*CLOCK_MHZ*1e6:.0f} uW")
     print(f"  rho={rho_tb:.4f}, MAPE={mape_tb:.1f}%")
 
     # --- T-D: 5 params (T-B + DMA descriptor) ---
@@ -420,25 +420,25 @@ def step2_calibrate(
         (1e-18, 1e-1),   # e_dram
         (1e-18, 1e3),    # e_dma (uJ per DMA*TP)
         (1e-18, 1e0),    # p_base
-        (1e-18, 1e0),    # p_core
+        (1e-18, 1e0),    # p_pe
     ]
     res_td = differential_evolution(obj_td, bounds_td, seed=42, polish=True,
                                     maxiter=3000, tol=1e-14, popsize=30)
     preds_td = _predict_td(res_td.x, macs_arr, bytes_arr, ndma_tp_arr, t_arr, nt_arr)
     rho_td = _spearman(preds_td, y)
     mape_td = compute_mape(preds_td, y)
-    e_mac, e_dram, e_dma, p_base, p_core = res_td.x
+    e_mac, e_dram, e_dma, p_base, p_pe = res_td.x
     fit_td = EnergyFitResult(
         "T-D",
         {"e_mac_pj": round(e_mac * 1e6, 4), "e_dram_pj": round(e_dram * 1e6, 4),
          "e_dma_uj": round(e_dma, 6),
          "p_base_uw": round(p_base * CLOCK_MHZ * 1e6, 1),
-         "p_core_uw": round(p_core * CLOCK_MHZ * 1e6, 1)},
+         "p_pe_uw": round(p_pe * CLOCK_MHZ * 1e6, 1)},
         5, rho_td, mape_td, preds_td)
     results["T-D"] = (res_td.x, fit_td)
     print(f"  e_mac={e_mac*1e6:.2f} pJ, e_dram={e_dram*1e6:.2f} pJ, "
           f"e_dma={e_dma:.4f} uJ/DMA*TP")
-    print(f"  p_base={p_base*CLOCK_MHZ*1e6:.0f} uW, p_core={p_core*CLOCK_MHZ*1e6:.0f} uW")
+    print(f"  p_base={p_base*CLOCK_MHZ*1e6:.0f} uW, p_pe={p_pe*CLOCK_MHZ*1e6:.0f} uW")
     print(f"  rho={rho_td:.4f}, MAPE={mape_td:.1f}%")
 
     # --- T-E: 6 params (T-D + sync) ---
@@ -453,25 +453,25 @@ def step2_calibrate(
         (1e-18, 1e3),    # e_dma
         (1e-18, 1e4),    # e_sync (uJ per TP iteration)
         (1e-18, 1e0),    # p_base
-        (1e-18, 1e0),    # p_core
+        (1e-18, 1e0),    # p_pe
     ]
     res_te = differential_evolution(obj_te, bounds_te, seed=42, polish=True,
                                     maxiter=3000, tol=1e-14, popsize=30)
     preds_te = _predict_te(res_te.x, macs_arr, bytes_arr, ndma_tp_arr, tp_arr, t_arr, nt_arr)
     rho_te = _spearman(preds_te, y)
     mape_te = compute_mape(preds_te, y)
-    e_mac, e_dram, e_dma, e_sync, p_base, p_core = res_te.x
+    e_mac, e_dram, e_dma, e_sync, p_base, p_pe = res_te.x
     fit_te = EnergyFitResult(
         "T-E",
         {"e_mac_pj": round(e_mac * 1e6, 4), "e_dram_pj": round(e_dram * 1e6, 4),
          "e_dma_uj": round(e_dma, 6), "e_sync_uj": round(e_sync, 4),
          "p_base_uw": round(p_base * CLOCK_MHZ * 1e6, 1),
-         "p_core_uw": round(p_core * CLOCK_MHZ * 1e6, 1)},
+         "p_pe_uw": round(p_pe * CLOCK_MHZ * 1e6, 1)},
         6, rho_te, mape_te, preds_te)
     results["T-E"] = (res_te.x, fit_te)
     print(f"  e_mac={e_mac*1e6:.2f} pJ, e_dram={e_dram*1e6:.2f} pJ, "
           f"e_dma={e_dma:.4f} uJ/DMA*TP, e_sync={e_sync:.2f} uJ/TP")
-    print(f"  p_base={p_base*CLOCK_MHZ*1e6:.0f} uW, p_core={p_core*CLOCK_MHZ*1e6:.0f} uW")
+    print(f"  p_base={p_base*CLOCK_MHZ*1e6:.0f} uW, p_pe={p_pe*CLOCK_MHZ*1e6:.0f} uW")
     print(f"  rho={rho_te:.4f}, MAPE={mape_te:.1f}%")
 
     # --- L-B: 3 params (power-law baseline) ---
@@ -628,7 +628,7 @@ def step3_compare(
         params, fit = model_results[model_name]
 
         e_fn = _make_fast_energy_fn(model_name, params)
-        n_correct, n_sizes, mean_regret, max_regret = _edp_core_accuracy_and_regret(
+        n_correct, n_sizes, mean_regret, max_regret = _edp_pe_accuracy_and_regret(
             rows, e_fn, _fast_time_fn)
 
         acc_str = f"{n_correct}/{n_sizes} ({n_correct/n_sizes*100:.0f}%)" if n_sizes > 0 else "N/A"
@@ -731,8 +731,8 @@ def main():
     args = parser.parse_args()
 
     coeffs = load_calibration(args.calib)
-    print(f"Loaded calibration v{coeffs.l_core_cy != 0 and 9 or 8}: "
-          f"l_core={coeffs.l_core_cy}, l_dma={coeffs.l_dma_cy}")
+    print(f"Loaded calibration v{coeffs.l_pe_cy != 0 and 9 or 8}: "
+          f"l_pe={coeffs.l_pe_cy}, l_dma={coeffs.l_dma_cy}")
 
     # Step 1-A: Energy basis analysis
     rows = step1a_energy_basis(args.csv, args.tc, args.min_wall_s)

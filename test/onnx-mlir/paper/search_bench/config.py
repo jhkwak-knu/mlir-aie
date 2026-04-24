@@ -41,7 +41,7 @@ class PerfCoeffs:
     eff_macs: float = 24.28      # MACs/cycle/tile (measured)
     bw_eff_bpc: float = 4.0      # bytes/cycle effective bandwidth
     L_SYNC: float = 0.0          # per-iteration sync cost (cycles)
-    L_CORE: float = 0.0          # per-core per-iteration barrier (cycles)
+    L_PE: float = 0.0          # per-PE per-iteration barrier (cycles)
     L_DMA: float = 0.0           # per-DMA-descriptor setup (cycles)
     L_STARTUP: float = 0.0       # one-time dispatch overhead (cycles)
 
@@ -49,7 +49,7 @@ class PerfCoeffs:
 @dataclass
 class EnergyCoeffs:
     """v16 4-term energy model coefficients."""
-    P_CORE: float = 0.0      # aggregate per-core active power (mW)
+    P_PE: float = 0.0      # aggregate per-PE active power (mW)
     E_BYTE: float = 0.0      # per-byte data-movement energy (µJ/B)
     E_STARTUP: float = 0.0   # one-time dispatch / startup energy (µJ)
     P_BASE: float = 0.0      # system base power, core-count independent (W)
@@ -126,13 +126,13 @@ def _map_flat_v16(raw: dict) -> Tuple[PerfCoeffs, EnergyCoeffs]:
         eff_macs=float(raw["eff_macs"]),
         bw_eff_bpc=float(raw["bw_eff_bpc"]),
         L_SYNC=float(raw["l_sync_cy"]),
-        L_CORE=float(raw["l_core_cy"]),
+        L_PE=float(raw["l_pe_cy"]),
         L_DMA=float(raw["l_dma_cy"]),
         L_STARTUP=float(raw["l_startup_cy"]),
     )
     ep = raw["energy"]["params"]
     energy = EnergyCoeffs(
-        P_CORE=float(ep["p_core_uw"]) / 1.0e3,    # uW -> mW
+        P_PE=float(ep["p_pe_uw"]) / 1.0e3,    # uW -> mW
         E_BYTE=float(ep["e_byte_uj_per_byte"]),   # uJ/B (already)
         E_STARTUP=float(ep["e_startup_uj"]),      # uJ
         P_BASE=float(ep["p_base_uw"]) / 1.0e6,    # uW -> W

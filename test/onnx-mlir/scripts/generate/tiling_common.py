@@ -92,7 +92,7 @@ class CalibCoeffs:
     eff_macs: float       # Effective MACs/cycle/tile
     bw_eff_bpc: float     # Effective DMA bandwidth (bytes/cycle)
     l_sync_cy: float      # Per-temporal-step sync cost (cycles)
-    l_core_cy: float      # Per-core setup cost (cycles)
+    l_pe_cy: float        # Per-PE (per-tile) per-iteration barrier cost (cycles)
     l_startup_cy: float   # One-time NPU startup cost (cycles)
     calibrated: bool      # True if loaded from file, False if defaults
     # Legacy v6-v8: alpha/beta scaling factors (kept for backward compat).
@@ -105,8 +105,8 @@ class CalibCoeffs:
     l_dma_cy: float = 0.0     # Per-DMA-op per-iteration cost (0 = v6 compat)
     # v16 DMA-Bottleneck: per-descriptor setup cost (used in max(L_SETUP, avg_tile/BW)).
     l_setup_cy: float = 0.0   # Per-descriptor DMA setup overhead (cycles)
-    # v9 Core-Sync: per-core per-iteration barrier cost.
-    # T_overhead = L_SYNC*TP + L_CORE*P*TP + L_DMA*N_dma*TP + L_STARTUP
+    # v9 Core-Sync: per-PE per-iteration barrier cost.
+    # T_overhead = L_SYNC*TP + L_PE*P*TP + L_DMA*N_dma*TP + L_STARTUP
     # Performance model variant (DMA count structure).
     # "Core-Sync" = N_dma*TP (v9 baseline). "DMA-Refined" = D_total (v13+).
     # "DMA-Bottleneck" = D*max(L_SETUP, avg_tile/BW) (v16).
@@ -126,7 +126,7 @@ DEFAULT_COEFFS = CalibCoeffs(
     eff_macs=256.0,       # PEAK_MACS
     bw_eff_bpc=4.0,       # BANDWIDTH_BPC
     l_sync_cy=20.0,       # ALPHA_CYCLES
-    l_core_cy=0.0,
+    l_pe_cy=0.0,
     l_startup_cy=0.0,
     calibrated=False,
 )
@@ -193,7 +193,7 @@ def load_calibration(path: Path = DEFAULT_CALIB_PATH) -> CalibCoeffs:
         eff_macs=float(doc["eff_macs"]),
         bw_eff_bpc=float(doc["bw_eff_bpc"]),
         l_sync_cy=float(doc["l_sync_cy"]),
-        l_core_cy=float(doc.get("l_core_cy", doc.get("l_sync2_cy", 0.0))),
+        l_pe_cy=float(doc.get("l_pe_cy", doc.get("l_core_cy", doc.get("l_sync2_cy", 0.0)))),
         l_startup_cy=float(doc.get("l_startup_cy", 0)),
         calibrated=True,
         perf_alpha=float(doc.get("perf_alpha", 1.0)),

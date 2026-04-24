@@ -147,21 +147,21 @@ class PerfModel:
         macs: Numeric, data_bytes: Numeric,
         n_cores: Numeric, tp_total: Numeric, d_total_val: Numeric,
         eff_macs: float, bw_bpc: float,
-        l_sync: float, l_core: float, l_dma: float,
+        l_sync: float, l_pe: float, l_dma: float,
         l_startup: float,
     ) -> Tuple[Numeric, Numeric, Numeric]:
         """Candidate A / DMA-Refined: returns (T_comp, T_comm, T_overhead) in cycles.
 
         T_comp = MACs / (N_cores * eff_macs)
         T_comm = data_bytes / bw_bpc
-        T_overhead = L_SYNC*TP + L_CORE*P*TP + L_DMA*D_total + L_STARTUP
+        T_overhead = L_SYNC*TP + L_PE*P*TP + L_DMA*D_total + L_STARTUP
 
         where D_total = N_dma_every*TP + N_dma_reused*(TP/TP_inner).
         """
         t_comp = macs / (n_cores * eff_macs)
         t_comm = data_bytes / bw_bpc
         t_overhead = (l_sync * tp_total
-                      + l_core * n_cores * tp_total
+                      + l_pe * n_cores * tp_total
                       + l_dma * d_total_val
                       + l_startup)
         return t_comp, t_comm, t_overhead
@@ -171,26 +171,26 @@ class PerfModel:
         macs: Numeric, data_bytes: Numeric,
         n_cores: Numeric, tp_total: Numeric, n_dma: Numeric,
         eff_macs: float, bw_bpc: float,
-        l_sync: float, l_core: float, l_dma: float,
+        l_sync: float, l_pe: float, l_dma: float,
         l_startup: float,
     ) -> Tuple[Numeric, Numeric, Numeric]:
         """v9 Core-Sync model: returns (T_comp, T_comm, T_overhead) in cycles.
 
         T_comp = MACs / (N_cores * eff_macs)
         T_comm = data_bytes / bw_bpc
-        T_overhead = L_SYNC*TP + L_CORE*P*TP + L_DMA*N_dma*TP + L_STARTUP
+        T_overhead = L_SYNC*TP + L_PE*P*TP + L_DMA*N_dma*TP + L_STARTUP
         """
         t_comp = macs / (n_cores * eff_macs)
         t_comm = data_bytes / bw_bpc
 
-        if l_core != 0:
+        if l_pe != 0:
             # v9: per-core per-iteration barrier cost
             t_overhead = (l_sync * tp_total
-                          + l_core * n_cores * tp_total
+                          + l_pe * n_cores * tp_total
                           + l_dma * n_dma * tp_total
                           + l_startup)
         else:
-            # v8 compat: l_core as per-core fixed cost (no TP scaling)
+            # v8 compat: l_pe as per-core fixed cost (no TP scaling)
             t_overhead = (l_sync * tp_total
                           + l_dma * n_dma * tp_total
                           + l_startup)
@@ -202,13 +202,13 @@ class PerfModel:
         macs: Numeric, data_bytes: Numeric,
         n_cores: Numeric, tp_total: Numeric, n_dma: Numeric,
         eff_macs: float, bw_bpc: float,
-        l_sync: float, l_core: float, l_dma: float,
+        l_sync: float, l_pe: float, l_dma: float,
         l_startup: float,
     ) -> Numeric:
         """v9 Core-Sync model: returns T_total in cycles."""
         t_comp, t_comm, t_overhead = PerfModel.components_v9(
             macs, data_bytes, n_cores, tp_total, n_dma,
-            eff_macs, bw_bpc, l_sync, l_core, l_dma, l_startup)
+            eff_macs, bw_bpc, l_sync, l_pe, l_dma, l_startup)
         return t_comp + t_comm + t_overhead
 
     @staticmethod
@@ -216,14 +216,14 @@ class PerfModel:
         macs: Numeric, data_bytes: Numeric,
         n_cores: Numeric, tp_total: Numeric, d_total_val: Numeric,
         eff_macs: float, bw_bpc: float,
-        l_sync: float, l_core: float, l_setup: float,
+        l_sync: float, l_pe: float, l_setup: float,
         l_startup: float,
     ) -> Tuple[Numeric, Numeric, Numeric]:
         """v16 DMA-Bottleneck: returns (T_comp, T_dma, T_overhead) in cycles.
 
         T_comp = MACs / (N_cores * eff_macs)
         T_dma  = D_total * max(L_SETUP, avg_bytes_per_desc / BW)
-        T_overhead = L_SYNC*TP + L_CORE*P*TP + L_STARTUP
+        T_overhead = L_SYNC*TP + L_PE*P*TP + L_STARTUP
 
         Key difference from DMA-Refined (v15): uses max() instead of
         additive T_comm + L_DMA*D.  In pipelined DMA architectures the
@@ -234,7 +234,7 @@ class PerfModel:
         avg_bytes = data_bytes / np.maximum(d_total_val, 1)
         t_dma = d_total_val * np.maximum(l_setup, avg_bytes / bw_bpc)
         t_overhead = (l_sync * tp_total
-                      + l_core * n_cores * tp_total
+                      + l_pe * n_cores * tp_total
                       + l_startup)
         return t_comp, t_dma, t_overhead
 
@@ -285,15 +285,15 @@ class EnergyModel:
         features: Dict[str, Numeric],
         e_mac: float, e_dram: float,
         e_dma: float, e_sync: float,
-        p_base: float, p_core: float,
+        p_base: float, p_pe: float,
     ) -> Numeric:
         """T-E: 6-param theoretical + DMA/sync + power model.
 
         E = e_mac*MACs + e_dram*bytes + e_dma*N_dma*TP + e_sync*TP
-            + (p_base + p_core*P) * T_total_us
+            + (p_base + p_pe*P) * T_total_us
 
         Units: e_mac/e_dram in pJ, e_dma/e_sync in uJ,
-               p_base/p_core in uW, T in us -> uW*us = pJ
+               p_base/p_pe in uW, T in us -> uW*us = pJ
         """
         macs = features["macs"]
         data_bytes = features["data_bytes"]
@@ -306,7 +306,7 @@ class EnergyModel:
         e_comm = e_dram * data_bytes
         e_dma_term = e_dma * n_dma * tp_total * 1e6    # uJ -> pJ
         e_sync_term = e_sync * tp_total * 1e6           # uJ -> pJ
-        e_power = (p_base + p_core * n_cores) * t_total_us  # uW*us = pJ
+        e_power = (p_base + p_pe * n_cores) * t_total_us  # uW*us = pJ
 
         return e_comp + e_comm + e_dma_term + e_sync_term + e_power
 
@@ -314,16 +314,16 @@ class EnergyModel:
     def predict_tb(
         features: Dict[str, Numeric],
         e_mac: float, e_dram: float,
-        p_base: float, p_core: float,
+        p_base: float, p_pe: float,
     ) -> Numeric:
         """T-B: 4-param base + per-core power model.
 
-        E = e_mac*MACs + e_dram*bytes + (p_base + p_core*P) * T_total_us
+        E = e_mac*MACs + e_dram*bytes + (p_base + p_pe*P) * T_total_us
         """
         e_comp = e_mac * features["macs"]
         e_comm = e_dram * features["data_bytes"]
         t_total_us = features["t_total_cy"] / CLOCK_MHZ
-        e_power = (p_base + p_core * features["n_cores"]) * t_total_us
+        e_power = (p_base + p_pe * features["n_cores"]) * t_total_us
         return e_comp + e_comm + e_power
 
     # --- T-3: 3-parameter compact model ---
@@ -331,43 +331,43 @@ class EnergyModel:
     @staticmethod
     def predict_compact(
         features: Dict[str, Numeric],
-        p_sys: float, p_core: float, e_dma: float,
+        p_sys: float, p_pe: float, e_dma: float,
     ) -> Numeric:
         """T-3: 3-parameter compact energy model.
 
-        E = P_sys*T + P_core*P*T + E_DMA*D_total
+        E = P_sys*T + P_PE*P*T + E_DMA*D_total
 
         Physical interpretation:
           - P_sys*T: system power independent of active core count
             (CPU, DRAM refresh, uncore, NPU leakage).
             Absorbs P_BASE*T, E_SYNC*TP (TP~T corr=0.959).
-          - P_core*P*T: per-core active power (power gating).
-            Absorbs P_CORE*P*T, E_MAC*MACs (~P*T), E_DRAM*bytes (~T).
+          - P_PE*P*T: per-core active power (power gating).
+            Absorbs P_PE*P*T, E_MAC*MACs (~P*T), E_DRAM*bytes (~T).
           - E_DMA*D_total: per-DMA-descriptor energy (time-independent).
 
-        Units: p_sys/p_core in uW, e_dma in uJ, T in us -> pJ output.
+        Units: p_sys/p_pe in uW, e_dma in uJ, T in us -> pJ output.
         """
         t_us = features["t_total_cy"] / CLOCK_MHZ
         n_cores = features["n_cores"]
         d_tot = features["d_total"]
 
         e_sys = p_sys * t_us                    # uW * us = pJ
-        e_core = p_core * n_cores * t_us        # uW * us = pJ
+        e_pe = p_pe * n_cores * t_us            # uW * us = pJ
         e_dma_term = e_dma * d_tot * 1e6        # uJ -> pJ
 
-        return e_sys + e_core + e_dma_term
+        return e_sys + e_pe + e_dma_term
 
     @staticmethod
     def predict_compact_sync(
         features: Dict[str, Numeric],
-        p_sys: float, p_core: float, e_dma: float, e_sync: float,
+        p_sys: float, p_pe: float, e_dma: float, e_sync: float,
     ) -> Numeric:
         """T-3S: 4-parameter variant with E_SYNC separated.
 
-        E = P_sys*T + P_core*P*T + E_DMA*D_total + E_SYNC*TP_total
+        E = P_sys*T + P_PE*P*T + E_DMA*D_total + E_SYNC*TP_total
 
         Rationale: TP-T correlation is high (0.959) but not perfect;
-        separating sync energy may improve P_core identifiability.
+        separating sync energy may improve P_PE identifiability.
         """
         t_us = features["t_total_cy"] / CLOCK_MHZ
         n_cores = features["n_cores"]
@@ -375,11 +375,11 @@ class EnergyModel:
         tp_total = features["tp_total"]
 
         e_sys = p_sys * t_us
-        e_core = p_core * n_cores * t_us
+        e_pe = p_pe * n_cores * t_us
         e_dma_term = e_dma * d_tot * 1e6
         e_sync_term = e_sync * tp_total * 1e6   # uJ -> pJ
 
-        return e_sys + e_core + e_dma_term + e_sync_term
+        return e_sys + e_pe + e_dma_term + e_sync_term
 
     # --- Dispatcher helpers (params dict -> keyword args) ---
 
@@ -392,7 +392,7 @@ class EnergyModel:
             e_dma=params.get("e_dma_uj", 0),
             e_sync=params.get("e_sync_uj", 0),
             p_base=params.get("p_base_uw", 0),
-            p_core=params.get("p_core_uw", 0),
+            p_pe=params.get("p_pe_uw", 0),
         )
 
     @staticmethod
@@ -402,7 +402,7 @@ class EnergyModel:
             e_mac=params.get("e_mac_pj", 0),
             e_dram=params.get("e_dram_pj", 0),
             p_base=params.get("p_base_uw", 0),
-            p_core=params.get("p_core_uw", 0),
+            p_pe=params.get("p_pe_uw", 0),
         )
 
     @staticmethod
@@ -410,7 +410,7 @@ class EnergyModel:
         return EnergyModel.predict_compact(
             features,
             p_sys=params.get("p_sys_uw", 0),
-            p_core=params.get("p_core_uw", 0),
+            p_pe=params.get("p_pe_uw", 0),
             e_dma=params.get("e_dma_uj", 0),
         )
 
@@ -419,28 +419,28 @@ class EnergyModel:
         return EnergyModel.predict_compact_sync(
             features,
             p_sys=params.get("p_sys_uw", 0),
-            p_core=params.get("p_core_uw", 0),
+            p_pe=params.get("p_pe_uw", 0),
             e_dma=params.get("e_dma_uj", 0),
             e_sync=params.get("e_sync_uj", 0),
         )
 
     @staticmethod
     def _predict_1g(params: Dict[str, float], features: Dict[str, Numeric]) -> Numeric:
-        """1-G (3-parameter): E = (P_BASE + P_CORE*P)*T + E_DMA*D_total.
+        """1-G (3-parameter): E = (P_BASE + P_PE*P)*T + E_DMA*D_total.
 
-        Structurally identical to T-3 but uses p_base_uw/p_core_uw naming and
-        P_CORE is typically fixed (architecture spec, e.g., 40mW).
+        Structurally identical to T-3 but uses p_base_uw/p_pe_uw naming and
+        P_PE is typically fixed (architecture spec, e.g., 40mW).
         """
         return EnergyModel.predict_compact(
             features,
             p_sys=params.get("p_base_uw", params.get("p_sys_uw", 0)),
-            p_core=params.get("p_core_uw", 0),
+            p_pe=params.get("p_pe_uw", 0),
             e_dma=params.get("e_dma_uj", 0),
         )
 
     @staticmethod
     def _predict_ptb(params: Dict[str, float], features: Dict[str, Numeric]) -> Numeric:
-        """Power-Time-Byte (v16): E = (P_BASE + P_CORE*P)*T + E_BYTE*db + E_STARTUP.
+        """Power-Time-Byte (v16): E = (P_BASE + P_PE*P)*T + E_BYTE*db + E_STARTUP.
 
         Time-proportional power dissipation (base + per-core leakage/active)
         plus volume-proportional data transfer energy (NoC switching).
@@ -448,7 +448,7 @@ class EnergyModel:
         energy model uses additive terms because energy is consumed by both.
         """
         p_base = params.get("p_base_uw", 0)
-        p_core = params.get("p_core_uw", 0)
+        p_pe = params.get("p_pe_uw", 0)
         e_byte = params.get("e_byte_uj_per_byte", 0)
         e_startup = params.get("e_startup_uj", 0)
         t_us = features["t_total_cy"] / CLOCK_MHZ
@@ -456,7 +456,7 @@ class EnergyModel:
         data_bytes = features["data_bytes"]
 
         # (uW * us) = pJ
-        e_power = (p_base + p_core * n_cores) * t_us
+        e_power = (p_base + p_pe * n_cores) * t_us
         e_data = e_byte * data_bytes * 1e6    # uJ -> pJ
         e_start = e_startup * 1e6             # uJ -> pJ
         return e_power + e_data + e_start
@@ -509,20 +509,20 @@ class EnergyModel:
 
     @staticmethod
     def _predict_ed(params: Dict[str, float], features: Dict[str, Numeric]) -> Numeric:
-        """E-D: E = P_core*N*T + E_startup"""
-        p_core = params.get("p_core_uw", 0)
+        """E-D: E = P_PE*N*T + E_startup"""
+        p_pe = params.get("p_pe_uw", 0)
         e_startup = params.get("e_startup_uj", 0)
         t_us = features["t_total_cy"] / CLOCK_MHZ
-        return (p_core * features["n_cores"] * t_us / 1e6 + e_startup) * 1e6
+        return (p_pe * features["n_cores"] * t_us / 1e6 + e_startup) * 1e6
 
     @staticmethod
     def _predict_ef(params: Dict[str, float], features: Dict[str, Numeric]) -> Numeric:
-        """E-F: E = (P_base + P_core*N)*T + E_startup"""
+        """E-F: E = (P_base + P_PE*N)*T + E_startup"""
         p_base = params.get("p_base_uw", 0)
-        p_core = params.get("p_core_uw", 0)
+        p_pe = params.get("p_pe_uw", 0)
         e_startup = params.get("e_startup_uj", 0)
         t_us = features["t_total_cy"] / CLOCK_MHZ
-        return ((p_base + p_core * features["n_cores"]) * t_us / 1e6
+        return ((p_base + p_pe * features["n_cores"]) * t_us / 1e6
                 + e_startup) * 1e6
 
     @staticmethod
@@ -554,7 +554,7 @@ class EnergyModel:
     # magnitudes reasonable. These functions use the SAME formulas as
     # the deployment-unit versions above, just in different units:
     #   e_mac/e_dram: uJ (not pJ)
-    #   p_base/p_core: uJ/cycle (not uW)
+    #   p_base/p_pe: uJ/cycle (not uW)
     #   e_dma/e_sync: uJ (same as deployment)
     #   output: uJ (not pJ)
     # -----------------------------------------------------------------
@@ -570,35 +570,35 @@ class EnergyModel:
     ) -> Numeric:
         """T-E in optimization units (uJ). Same formula, different scale.
 
-        params = (e_mac, e_dram, e_dma, e_sync, p_base, p_core) all in uJ-based.
+        params = (e_mac, e_dram, e_dma, e_sync, p_base, p_pe) all in uJ-based.
         output in uJ.
         """
-        e_mac, e_dram, e_dma, e_sync, p_base, p_core = params
+        e_mac, e_dram, e_dma, e_sync, p_base, p_pe = params
         _a = EnergyModel._to_arr
         return (e_mac * _a(features["macs"]) + e_dram * _a(features["data_bytes"])
                 + e_dma * _a(features["ndma_tp"]) + e_sync * _a(features["tp_total"])
-                + p_base * _a(features["t_total_cy"]) + p_core * _a(features["nt"]))
+                + p_base * _a(features["t_total_cy"]) + p_pe * _a(features["nt"]))
 
     @staticmethod
     def predict_tb_optim(
         params: Tuple, features: Dict[str, Numeric],
     ) -> Numeric:
         """T-B in optimization units (uJ)."""
-        e_mac, e_dram, p_base, p_core = params
+        e_mac, e_dram, p_base, p_pe = params
         _a = EnergyModel._to_arr
         return (e_mac * _a(features["macs"]) + e_dram * _a(features["data_bytes"])
-                + p_base * _a(features["t_total_cy"]) + p_core * _a(features["nt"]))
+                + p_base * _a(features["t_total_cy"]) + p_pe * _a(features["nt"]))
 
     @staticmethod
     def predict_td_optim(
         params: Tuple, features: Dict[str, Numeric],
     ) -> Numeric:
         """T-D in optimization units (uJ)."""
-        e_mac, e_dram, e_dma, p_base, p_core = params
+        e_mac, e_dram, e_dma, p_base, p_pe = params
         _a = EnergyModel._to_arr
         return (e_mac * _a(features["macs"]) + e_dram * _a(features["data_bytes"])
                 + e_dma * _a(features["ndma_tp"])
-                + p_base * _a(features["t_total_cy"]) + p_core * _a(features["nt"]))
+                + p_base * _a(features["t_total_cy"]) + p_pe * _a(features["nt"]))
 
     @staticmethod
     def predict_ta_optim(
@@ -615,10 +615,10 @@ class EnergyModel:
         params: Tuple, features: Dict[str, Numeric],
     ) -> Numeric:
         """T-C in optimization units (uJ). T-B + startup."""
-        e_mac, e_dram, p_base, p_core, e_startup = params
+        e_mac, e_dram, p_base, p_pe, e_startup = params
         _a = EnergyModel._to_arr
         return (e_mac * _a(features["macs"]) + e_dram * _a(features["data_bytes"])
-                + p_base * _a(features["t_total_cy"]) + p_core * _a(features["nt"])
+                + p_base * _a(features["t_total_cy"]) + p_pe * _a(features["nt"])
                 + e_startup)
 
     @staticmethod
@@ -627,13 +627,13 @@ class EnergyModel:
     ) -> Numeric:
         """T-3 in optimization units (uJ).
 
-        params = (p_sys, p_core, e_dma) in uJ-cycle / uJ units.
+        params = (p_sys, p_pe, e_dma) in uJ-cycle / uJ units.
         output in uJ.
         """
-        p_sys, p_core, e_dma = params
+        p_sys, p_pe, e_dma = params
         _a = EnergyModel._to_arr
         return (p_sys * _a(features["t_total_cy"])
-                + p_core * _a(features["nt"])
+                + p_pe * _a(features["nt"])
                 + e_dma * _a(features["d_total"]))
 
     @staticmethod
@@ -641,10 +641,10 @@ class EnergyModel:
         params: Tuple, features: Dict[str, Numeric],
     ) -> Numeric:
         """T-3S in optimization units (uJ). T-3 + sync."""
-        p_sys, p_core, e_dma, e_sync = params
+        p_sys, p_pe, e_dma, e_sync = params
         _a = EnergyModel._to_arr
         return (p_sys * _a(features["t_total_cy"])
-                + p_core * _a(features["nt"])
+                + p_pe * _a(features["nt"])
                 + e_dma * _a(features["d_total"])
                 + e_sync * _a(features["tp_total"]))
 
@@ -666,31 +666,31 @@ class EnergyModel:
         Optimization uses uJ-based units; calibration uses pJ/uW units.
         """
         if model_name == "T-E":
-            e_mac, e_dram, e_dma, e_sync, p_base, p_core = params
+            e_mac, e_dram, e_dma, e_sync, p_base, p_pe = params
             return {
                 "e_mac_pj": e_mac * 1e6,
                 "e_dram_pj": e_dram * 1e6,
                 "e_dma_uj": e_dma,
                 "e_sync_uj": e_sync,
                 "p_base_uw": p_base * CLOCK_MHZ * 1e6,
-                "p_core_uw": p_core * CLOCK_MHZ * 1e6,
+                "p_pe_uw": p_pe * CLOCK_MHZ * 1e6,
             }
         elif model_name == "T-B":
-            e_mac, e_dram, p_base, p_core = params
+            e_mac, e_dram, p_base, p_pe = params
             return {
                 "e_mac_pj": e_mac * 1e6,
                 "e_dram_pj": e_dram * 1e6,
                 "p_base_uw": p_base * CLOCK_MHZ * 1e6,
-                "p_core_uw": p_core * CLOCK_MHZ * 1e6,
+                "p_pe_uw": p_pe * CLOCK_MHZ * 1e6,
             }
         elif model_name == "T-D":
-            e_mac, e_dram, e_dma, p_base, p_core = params
+            e_mac, e_dram, e_dma, p_base, p_pe = params
             return {
                 "e_mac_pj": e_mac * 1e6,
                 "e_dram_pj": e_dram * 1e6,
                 "e_dma_uj": e_dma,
                 "p_base_uw": p_base * CLOCK_MHZ * 1e6,
-                "p_core_uw": p_core * CLOCK_MHZ * 1e6,
+                "p_pe_uw": p_pe * CLOCK_MHZ * 1e6,
             }
         elif model_name == "T-A":
             e_mac, e_dram, p_static = params
@@ -700,26 +700,26 @@ class EnergyModel:
                 "p_static_pj": p_static * 1e6,
             }
         elif model_name == "T-C":
-            e_mac, e_dram, p_base, p_core, e_startup = params
+            e_mac, e_dram, p_base, p_pe, e_startup = params
             return {
                 "e_mac_pj": e_mac * 1e6,
                 "e_dram_pj": e_dram * 1e6,
                 "p_base_uw": p_base * CLOCK_MHZ * 1e6,
-                "p_core_uw": p_core * CLOCK_MHZ * 1e6,
+                "p_pe_uw": p_pe * CLOCK_MHZ * 1e6,
                 "e_startup_uj": e_startup,
             }
         elif model_name == "T-3":
-            p_sys, p_core, e_dma = params
+            p_sys, p_pe, e_dma = params
             return {
                 "p_sys_uw": p_sys * CLOCK_MHZ * 1e6,
-                "p_core_uw": p_core * CLOCK_MHZ * 1e6,
+                "p_pe_uw": p_pe * CLOCK_MHZ * 1e6,
                 "e_dma_uj": e_dma,
             }
         elif model_name == "T-3S":
-            p_sys, p_core, e_dma, e_sync = params
+            p_sys, p_pe, e_dma, e_sync = params
             return {
                 "p_sys_uw": p_sys * CLOCK_MHZ * 1e6,
-                "p_core_uw": p_core * CLOCK_MHZ * 1e6,
+                "p_pe_uw": p_pe * CLOCK_MHZ * 1e6,
                 "e_dma_uj": e_dma,
                 "e_sync_uj": e_sync,
             }
@@ -733,11 +733,11 @@ class EnergyModel:
                 "e_dma_uj": e_dma,
             }
         elif model_name == "E2":
-            # E2: E = P_sys*T + P_core*P*T + E_core*P + E_DMA*D_total
-            p_sys, p_core, e_core, e_dma = params
+            # E2: E = P_sys*T + P_PE*P*T + E_core*P + E_DMA*D_total
+            p_sys, p_pe, e_core, e_dma = params
             return {
                 "p_sys_uw": p_sys * CLOCK_MHZ * 1e6,
-                "p_core_uw": p_core * CLOCK_MHZ * 1e6,
+                "p_pe_uw": p_pe * CLOCK_MHZ * 1e6,
                 "e_core_uj": e_core,
                 "e_dma_uj": e_dma,
             }

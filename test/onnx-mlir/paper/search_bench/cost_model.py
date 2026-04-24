@@ -7,12 +7,12 @@ Performance Model (v16 DMA-Bottleneck):
     T_comm  = N_dma * max(L_DMA, b_bar / bw_eff)
               where b_bar = Total_Data / N_dma
               (per-descriptor cost is the larger of setup latency and payload transfer)
-    T_overhead = L_SYNC * TP_total + L_CORE * P * TP_total + L_STARTUP
+    T_overhead = L_SYNC * TP_total + L_PE * P * TP_total + L_STARTUP
               (L_DMA moved into T_comm; no longer duplicated here)
 
 Energy Model (v16 4-term decomposition):
     E_total = E_active + E_comm + E_startup + E_static
-            = P_CORE * P * T_total  (active core power, mW × µs)
+            = P_PE * P * T_total  (active PE power, mW × µs)
             + E_BYTE * Total_Data   (per-byte data-movement energy, µJ/B × B)
             + E_STARTUP             (one-time dispatch energy, µJ)
             + P_BASE * T_total      (system base power, W × µs)
@@ -174,7 +174,7 @@ def t_overhead(mc: MappingConfig, cfg: Config) -> float:
     tp_total = mc.TP_total
     P = mc.P
     return (p.L_SYNC * tp_total
-            + p.L_CORE * P * tp_total
+            + p.L_PE * P * tp_total
             + p.L_STARTUP)
 
 
@@ -188,10 +188,10 @@ def e_total(mc: MappingConfig, cfg: Config) -> float:
     """Total energy in µJ (v16 4-term decomposition).
 
     E_total = E_active + E_comm + E_startup + E_static
-            = P_CORE·P·T + E_BYTE·Total_Data + E_STARTUP + P_BASE·T
+            = P_PE·P·T + E_BYTE·Total_Data + E_STARTUP + P_BASE·T
 
     Unit conversions (all terms → µJ):
-      P_CORE (mW) × P × T (µs) × 1e-3   → µJ
+      P_PE (mW) × P × T (µs) × 1e-3   → µJ
       E_BYTE (µJ/B) × Total_Data (B)     → µJ
       E_STARTUP (µJ)                     → µJ
       P_BASE (W) × T (µs)                → µJ
@@ -202,7 +202,7 @@ def e_total(mc: MappingConfig, cfg: Config) -> float:
     t_us = t_cy / cfg.hw.clock_mhz              # µs
     td = total_data_bytes(mc, cfg.hw.elem_bytes)  # bytes
 
-    return (e.P_CORE * P * t_us * 1e-3          # mW × µs × 1e-3 = µJ
+    return (e.P_PE * P * t_us * 1e-3          # mW × µs × 1e-3 = µJ
             + e.E_BYTE * td                      # µJ/B × B = µJ
             + e.E_STARTUP                        # µJ
             + e.P_BASE * t_us)                   # W × µs = µJ
