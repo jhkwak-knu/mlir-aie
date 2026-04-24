@@ -1,0 +1,39 @@
+{
+    "_comment": "v16 calibration coefficients. DMA-bottleneck perf + 4-term energy.",
+    "_updated_at": "2026-04-18",
+    "_data_base": "result_v14.csv (1290 PASS rows, 18 shapes)",
+
+    "hw": {
+        "P_total": 32,
+        "G_size": 4,
+        "L_mem_bytes": 61440,
+        "elem_bytes": 2,
+        "P_set": [4, 8, 12, 16, 32],
+        "TM_align": 8,
+        "TK_align": 8,
+        "TN_align": 16,
+        "clock_mhz": 1500.0
+    },
+
+    "perf": {
+        "_model": "DMA-Bottleneck v16",
+        "eff_macs": 24.28,
+        "bw_eff_bpc": 4.0,
+        "L_SYNC": 4200.0,
+        "L_CORE": 1896.0,
+        "L_DMA": 3109.0,
+        "L_STARTUP": 45086.0,
+        "_units": "eff_macs: MACs/cy, bw_eff_bpc: bytes/cy, L_*: cycles",
+        "_accuracy": "T MAPE=13.6%, Spearman rho=0.995, Bias=+2.5% (v14 PASS, N=1290)"
+    },
+
+    "energy": {
+        "_model": "4-term decomposition v16",
+        "P_CORE": 17.9,
+        "E_BYTE": 0.0012,
+        "E_STARTUP": 278.7,
+        "P_BASE": 10.85,
+        "_units": "P_CORE: mW, E_BYTE: uJ/B (= 1.2 nJ/B), E_STARTUP: uJ, P_BASE: W",
+        "_accuracy": "E MAPE=11.9%, Spearman rho=0.995 (v14 PASS + energy_valid)"
+    }
+}
