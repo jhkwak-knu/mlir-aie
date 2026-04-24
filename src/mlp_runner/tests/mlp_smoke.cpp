@@ -156,15 +156,26 @@ static void testOutputSlicingPadded() {
   assert(probs[1] > probs[0]);
 }
 
-static void testXrtStubThrows() {
+static void testNpuDispatcherConstructs() {
+  // When XRT support is compiled in, makeDispatcher("npu") must return an
+  // XrtDispatcher instance that constructs without error (device probe is
+  // deferred to the first dispatch). When XRT is disabled, the legacy stub
+  // throws. Cover both branches so the smoke test keeps working regardless
+  // of build flavor.
+#ifdef MLP_RUNNER_HAS_XRT
+  auto d = makeDispatcher("npu");
+  assert(d && "XrtDispatcher must construct when XRT is enabled");
+  assert(std::string(d->name()) == "xrt");
+#else
   bool threw = false;
   try {
     auto d = makeDispatcher("npu");
     (void)d;
-  } catch (const std::exception& e) {
+  } catch (const std::exception&) {
     threw = true;
   }
-  assert(threw && "XrtDispatcherStub must throw in Step 6-3");
+  assert(threw && "XrtDispatcherStub must throw when XRT is disabled");
+#endif
 }
 
 static void testRaplDeltaWrapAround() {
@@ -224,7 +235,7 @@ int main() {
   testForwardShapeAndSoftmax();
   testDeterministicSeed();
   testOutputSlicingPadded();
-  testXrtStubThrows();
+  testNpuDispatcherConstructs();
   testRaplDeltaWrapAround();
   testComputeMeanCv();
   testInstrumentedForwardRecordsLayers();

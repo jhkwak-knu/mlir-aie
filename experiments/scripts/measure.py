@@ -49,7 +49,7 @@ def _rel_or_abs(path: Path) -> str:
         return str(path)
 SETUP_ENV_SCRIPT = REPO_ROOT / "test" / "onnx-mlir" / "scripts" / "setup_env.sh"
 RAPL_PKG_PATH = "/sys/class/powercap/intel-rapl:0/energy_uj"
-NPU_DRIVER_TIMEOUT_PATH = "/sys/module/amdxdna/parameters/timeout"
+NPU_DRIVER_TIMEOUT_PATH = "/sys/module/amdxdna/parameters/timeout_in_sec"
 
 
 # ----- Environment preflight ------------------------------------------------

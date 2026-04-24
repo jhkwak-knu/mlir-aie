@@ -6,6 +6,9 @@
 #include <string>
 
 #include "gemm_cpu.h"
+#ifdef MLP_RUNNER_HAS_XRT
+#include "xrt_dispatcher.h"
+#endif
 
 namespace mlp_runner {
 
@@ -29,8 +32,13 @@ void XrtDispatcherStub::dispatch(const LayerKernelEntry&, const float*,
 std::unique_ptr<Dispatcher> makeDispatcher(const std::string& backend) {
   if (backend == "cpu")
     return std::make_unique<CpuDispatcher>();
-  if (backend == "npu" || backend == "xrt")
+  if (backend == "npu" || backend == "xrt") {
+#ifdef MLP_RUNNER_HAS_XRT
+    return std::make_unique<XrtDispatcher>();
+#else
     return std::make_unique<XrtDispatcherStub>();
+#endif
+  }
   throw std::runtime_error("unknown dispatcher backend: " + backend);
 }
 
