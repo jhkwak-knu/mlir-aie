@@ -180,7 +180,7 @@ def build_metadata(
     """Build metadata dict for tc_list.json and result CSV traceability.
 
     searcher_name (optional) records which searcher produced the cases, so
-    downstream consumers can tell STAR-Map / SM-exh / Naive / Timeloop apart.
+    downstream consumers can tell STAR-Map / SM-exh / Max-P / Timeloop apart.
     """
     meta: Dict[str, Any] = {
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),

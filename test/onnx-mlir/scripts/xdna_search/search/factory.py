@@ -9,7 +9,7 @@ Registered factory names:
   "star-map" STAR-Map framework (pruned: Rule 1/2/3)
   "charm"    CHARM-CDSE 1-level (throughput-cycle, SP_k=1)
   "timeloop" Timeloop EDP adapter (stub until Phase 3)
-  "naive"    Naive P_max baseline (stub)
+  "max-p"    Max-P (naive P_max) baseline: V16 EdpCost with P=P_max filter
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ from xdna_search.search.searcher import Searcher
 from xdna_search.search.selector import (
     CycleSelector,
     EdpSelector,
+    MaxPEdpSelector,
     TimeloopEdpSelector,
 )
 from xdna_search.types import CalibCoeffs, SystemInfo
@@ -109,14 +110,32 @@ def make_charm_searcher(
     )
 
 
-def make_naive_searcher(
+def make_max_p_searcher(
     sys_info: SystemInfo,
     coeffs: Optional[CalibCoeffs] = None,
     *,
     exclude_cores: Optional[set] = None,
 ) -> Searcher:
-    """Naive (P_max / vendor-default) baseline. Not yet implemented."""
-    raise NotImplementedError("make_naive_searcher: Naive P_max baseline is a stub")
+    """Max-P (naive P_max) baseline: pick the configuration that uses the
+    maximum feasible number of PEs, and among those minimize EDP under the
+    V16 cost model.
+
+    Shares the same enumerator / feasibility set / cost model as STAR-Map,
+    so the contrast is isolated to the P=P_max restriction enforced by
+    MaxPEdpSelector. This mirrors paper/fig/baselines.py::find_naive_max
+    semantics without requiring measured EDP — the max-feasible-P filter
+    is applied on top of predicted V16 EDP.
+    """
+    return Searcher(
+        name="max-p",
+        enumerator=ExhaustiveEnumerator(),
+        filter_set=FilterSet(DefaultFeasibility()),
+        cost_fn=V16EdpCost(),
+        selector=MaxPEdpSelector(),
+        sys_info=sys_info,
+        coeffs=coeffs,
+        exclude_cores=exclude_cores,
+    )
 
 
 def make_timeloop_searcher(
@@ -149,7 +168,7 @@ _REGISTRY: Dict[str, SearcherFactory] = {
     "sm-exh": make_sm_exh_searcher,
     "star-map": make_starmap_searcher,
     "charm": make_charm_searcher,
-    "naive": make_naive_searcher,
+    "max-p": make_max_p_searcher,
     "timeloop": make_timeloop_searcher,
 }
 
