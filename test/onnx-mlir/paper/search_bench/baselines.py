@@ -8,11 +8,19 @@ baselines.py — Compute GT, Naive-Max, and Framework optimal configurations.
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+
+# Allow importing from scripts/xdna_search/ so pruning rules and divisor
+# helpers come from the single canonical library.
+_XDNA_SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
+if str(_XDNA_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_XDNA_SCRIPTS))
 
 from config import Config
 from cost_model import (
@@ -20,6 +28,11 @@ from cost_model import (
     TPORDER_M_INNER, TPORDER_N_INNER, TPORDER_K_INNER,
 )
 from data_loader import WorkloadKey
+from xdna_search.math_utils import divisors as _xs_divisors
+from xdna_search.search.constraints.pruning import (
+    enumerate_tp_rule1 as _xs_enumerate_tp_rule1,
+    enumerate_tp_rule12 as _xs_enumerate_tp_rule12,
+)
 
 
 @dataclass
@@ -170,14 +183,8 @@ def find_naive_max(
 
 # ─── Framework: cost-model exhaustive search ─────────────────────────────────
 def _divisors(n: int) -> List[int]:
-    """All divisors of n."""
-    divs = []
-    for i in range(1, int(n**0.5) + 1):
-        if n % i == 0:
-            divs.append(i)
-            if i != n // i:
-                divs.append(n // i)
-    return sorted(divs)
+    """All divisors of n (delegates to xdna_search.math_utils.divisors)."""
+    return _xs_divisors(n)
 
 
 def _aligned_divisors(n: int, align: int) -> List[int]:
@@ -242,95 +249,18 @@ def enumerate_configs(
 
 
 # ─── Pruned configuration generation (Rules 1–3) ──────────────────────────
-def _valid_tile_sizes(dim: int, sp: int, align: int) -> List[int]:
-    """Return all valid tile sizes T for a dimension: T = dim/(sp*TP),
-    T >= align, T % align == 0, dim % (sp*TP) == 0.
-    Returns T values in descending order (largest tile first)."""
-    tiles = []
-    for tp in range(1, dim // sp + 1):
-        if dim % (sp * tp) != 0:
-            continue
-        t = dim // (sp * tp)
-        if t < align or t % align != 0:
-            continue
-        tiles.append(t)
-    return sorted(tiles, reverse=True)  # largest first
-
-
-def _valid_tile_sizes_k(K: int, align: int) -> List[int]:
-    """Valid tile sizes for K dimension (SP_k = 1)."""
-    tiles = []
-    for tpk in range(1, K + 1):
-        if K % tpk != 0:
-            continue
-        tk = K // tpk
-        if tk < align or tk % align != 0:
-            continue
-        tiles.append(tk)
-    return sorted(tiles, reverse=True)
-
-
-def _tp_from_tile(dim: int, sp: int, T: int) -> int:
-    """TP = dim / (sp * T)."""
-    return dim // (sp * T)
-
+# Rule 1 (TP monotonicity) and Rule 2 (allocation priority) live in the
+# xdna_search library and are imported above. The thin local wrappers below
+# keep the paper-dialect call signature (hw object) intact for existing
+# callers in enumerate_configs_pruned.
 
 def _enumerate_tp_rule1(
     M: int, K: int, N: int,
     SPm: int, SPn: int,
     hw,
 ) -> List[Tuple[int, int, int]]:
-    """Rule 1: TP monotonicity pruning (exact).
-
-    Only keep TP combinations at the C1 boundary — where no single
-    tile dimension can be increased without violating memory constraint.
-    """
-    TMs = _valid_tile_sizes(M, SPm, hw.TM_align)
-    TNs = _valid_tile_sizes(N, SPn, hw.TN_align)
-    TKs = _valid_tile_sizes_k(K, hw.TK_align)
-
-    results = []
-    for TM in TMs:
-        for TN in TNs:
-            for TK in TKs:
-                tile_bytes = hw.elem_bytes * (TM * TK + TK * TN + TM * TN)
-                if tile_bytes > hw.L_mem_bytes:
-                    continue
-
-                # Check C1 boundary: no single tile can grow further
-                at_boundary = True
-
-                # Can TM grow?
-                idx_m = TMs.index(TM)
-                if idx_m > 0:  # larger TM exists
-                    TM_next = TMs[idx_m - 1]
-                    if hw.elem_bytes * (TM_next * TK + TK * TN + TM_next * TN) <= hw.L_mem_bytes:
-                        at_boundary = False
-                        continue
-
-                # Can TN grow?
-                idx_n = TNs.index(TN)
-                if idx_n > 0:
-                    TN_next = TNs[idx_n - 1]
-                    if hw.elem_bytes * (TM * TK + TK * TN_next + TM * TN_next) <= hw.L_mem_bytes:
-                        at_boundary = False
-                        continue
-
-                # Can TK grow?
-                idx_k = TKs.index(TK)
-                if idx_k > 0:
-                    TK_next = TKs[idx_k - 1]
-                    if hw.elem_bytes * (TM * TK_next + TK_next * TN + TM * TN) <= hw.L_mem_bytes:
-                        at_boundary = False
-                        continue
-
-                if at_boundary:
-                    TPm = _tp_from_tile(M, SPm, TM)
-                    TPn = _tp_from_tile(N, SPn, TN)
-                    TPk = K // TK
-                    results.append((TPm, TPk, TPn))
-
-    return results
+    """Rule 1 adapter: delegates to xdna_search.search.constraints.pruning."""
+    return _xs_enumerate_tp_rule1(M, K, N, SPm, SPn, hw.elem_bytes, hw.L_mem_bytes)
 
 
 def _enumerate_tp_rule12(
@@ -339,123 +269,8 @@ def _enumerate_tp_rule12(
     inner: int,
     hw,
 ) -> List[Tuple[int, int, int]]:
-    """Rule 1 + Rule 2: TP monotonicity + allocation priority.
-
-    Rule 2: Maximize non-inner axis tiles first (they reduce Total_Data),
-    then fill remaining memory with inner-axis tile.
-    """
-    TMs = _valid_tile_sizes(M, SPm, hw.TM_align)
-    TNs = _valid_tile_sizes(N, SPn, hw.TN_align)
-    TKs = _valid_tile_sizes_k(K, hw.TK_align)
-
-    results = []
-
-    if inner == TPORDER_K_INNER:
-        # Prioritize TM, TN; TK gets remaining memory
-        for TM in TMs:
-            for TN in TNs:
-                # Check if at boundary for TM and TN (non-inner)
-                can_grow_m = False
-                idx_m = TMs.index(TM)
-                if idx_m > 0:
-                    TM_next = TMs[idx_m - 1]
-                    # Check with smallest TK
-                    min_TK = TKs[-1] if TKs else None
-                    if min_TK and hw.elem_bytes * (TM_next * min_TK + min_TK * TN + TM_next * TN) <= hw.L_mem_bytes:
-                        can_grow_m = True
-
-                can_grow_n = False
-                idx_n = TNs.index(TN)
-                if idx_n > 0:
-                    TN_next = TNs[idx_n - 1]
-                    min_TK = TKs[-1] if TKs else None
-                    if min_TK and hw.elem_bytes * (TM * min_TK + min_TK * TN_next + TM * TN_next) <= hw.L_mem_bytes:
-                        can_grow_n = True
-
-                if can_grow_m or can_grow_n:
-                    continue  # non-inner tiles not maximized yet
-
-                # Find largest TK that fits
-                best_TK = None
-                for TK in TKs:
-                    if hw.elem_bytes * (TM * TK + TK * TN + TM * TN) <= hw.L_mem_bytes:
-                        best_TK = TK
-                        break  # TKs sorted descending
-                if best_TK is not None:
-                    TPm = _tp_from_tile(M, SPm, TM)
-                    TPn = _tp_from_tile(N, SPn, TN)
-                    TPk = K // best_TK
-                    results.append((TPm, TPk, TPn))
-
-    elif inner == TPORDER_M_INNER:
-        # Prioritize TN, TK; TM gets remaining memory
-        for TN in TNs:
-            for TK in TKs:
-                can_grow_n = False
-                idx_n = TNs.index(TN)
-                if idx_n > 0:
-                    TN_next = TNs[idx_n - 1]
-                    min_TM = TMs[-1] if TMs else None
-                    if min_TM and hw.elem_bytes * (min_TM * TK + TK * TN_next + min_TM * TN_next) <= hw.L_mem_bytes:
-                        can_grow_n = True
-
-                can_grow_k = False
-                idx_k = TKs.index(TK)
-                if idx_k > 0:
-                    TK_next = TKs[idx_k - 1]
-                    min_TM = TMs[-1] if TMs else None
-                    if min_TM and hw.elem_bytes * (min_TM * TK_next + TK_next * TN + min_TM * TN) <= hw.L_mem_bytes:
-                        can_grow_k = True
-
-                if can_grow_n or can_grow_k:
-                    continue
-
-                best_TM = None
-                for TM in TMs:
-                    if hw.elem_bytes * (TM * TK + TK * TN + TM * TN) <= hw.L_mem_bytes:
-                        best_TM = TM
-                        break
-                if best_TM is not None:
-                    TPm = _tp_from_tile(M, SPm, best_TM)
-                    TPn = _tp_from_tile(N, SPn, TN)
-                    TPk = K // TK
-                    results.append((TPm, TPk, TPn))
-
-    elif inner == TPORDER_N_INNER:
-        # Prioritize TM, TK; TN gets remaining memory
-        for TM in TMs:
-            for TK in TKs:
-                can_grow_m = False
-                idx_m = TMs.index(TM)
-                if idx_m > 0:
-                    TM_next = TMs[idx_m - 1]
-                    min_TN = TNs[-1] if TNs else None
-                    if min_TN and hw.elem_bytes * (TM_next * TK + TK * min_TN + TM_next * min_TN) <= hw.L_mem_bytes:
-                        can_grow_m = True
-
-                can_grow_k = False
-                idx_k = TKs.index(TK)
-                if idx_k > 0:
-                    TK_next = TKs[idx_k - 1]
-                    min_TN = TNs[-1] if TNs else None
-                    if min_TN and hw.elem_bytes * (TM * TK_next + TK_next * min_TN + TM * min_TN) <= hw.L_mem_bytes:
-                        can_grow_k = True
-
-                if can_grow_m or can_grow_k:
-                    continue
-
-                best_TN = None
-                for TN in TNs:
-                    if hw.elem_bytes * (TM * TK + TK * TN + TM * TN) <= hw.L_mem_bytes:
-                        best_TN = TN
-                        break
-                if best_TN is not None:
-                    TPm = _tp_from_tile(M, SPm, TM)
-                    TPn = _tp_from_tile(N, SPn, best_TN)
-                    TPk = K // TK
-                    results.append((TPm, TPk, TPn))
-
-    return results
+    """Rule 1+2 adapter: delegates to xdna_search.search.constraints.pruning."""
+    return _xs_enumerate_tp_rule12(M, K, N, SPm, SPn, inner, hw.elem_bytes, hw.L_mem_bytes)
 
 
 def enumerate_configs_pruned(
