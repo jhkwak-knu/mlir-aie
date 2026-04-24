@@ -41,3 +41,60 @@ class EdpSelector:
             if cur is None or cr.edp < cur.edp:
                 best_by_cand[cid] = cr
         return sorted(best_by_cand.values(), key=lambda r: r.edp)
+
+
+class CycleSelector:
+    """Per-candidate argmin-cycle, then global ascending sort by (cycle, P, TP_total).
+
+    Designed for CHARM-CDSE whose objective is throughput-cycle, not EDP.
+    Tie-breaks by increasing `num_cores` and `tp_total` so that simpler
+    shapes win among cost-equivalent candidates — matching
+    paper/fig/baselines_charm.py::find_charm_cdse's `_charm_key`.
+    """
+
+    name = "cycle"
+
+    def rank(self, scored: List[CostResult]) -> List[CostResult]:
+        best_by_cand: "OrderedDict[int, CostResult]" = OrderedDict()
+        for cr in scored:
+            cid = id(cr.candidate)
+            cur = best_by_cand.get(cid)
+            if cur is None or cr.t_total < cur.t_total:
+                best_by_cand[cid] = cr
+        return sorted(
+            best_by_cand.values(),
+            key=lambda r: (
+                r.t_total,
+                r.candidate.num_cores,
+                r.candidate.tp_total,
+            ),
+        )
+
+
+class TimeloopEdpSelector:
+    """Per-candidate argmin-EDP, then global sort by (EDP, P, TP_total).
+
+    Tie-break matches paper/fig/baselines_timeloop.py::find_timeloop's
+    `_timeloop_key`. The (P, TP_total) secondary key is an addition for
+    determinism; Timeloop's activity-only energy often ties at fixed
+    tile shape, and without a deterministic secondary we would pick by
+    enumeration order.
+    """
+
+    name = "timeloop-edp"
+
+    def rank(self, scored: List[CostResult]) -> List[CostResult]:
+        best_by_cand: "OrderedDict[int, CostResult]" = OrderedDict()
+        for cr in scored:
+            cid = id(cr.candidate)
+            cur = best_by_cand.get(cid)
+            if cur is None or cr.edp < cur.edp:
+                best_by_cand[cid] = cr
+        return sorted(
+            best_by_cand.values(),
+            key=lambda r: (
+                r.edp,
+                r.candidate.num_cores,
+                r.candidate.tp_total,
+            ),
+        )

@@ -6,15 +6,18 @@ produce a ready-to-run Searcher.
 
 Registered factory names:
   "sm-exh"   STAR-Map w/o pruning = exhaustive enumerate + default feasibility
-  "star-map" STAR-Map framework (stub until Step 9)
-  "naive"    Naive P_max baseline (stub, Step 10)
-  "timeloop" Timeloop / CHARM-CDSE adapter (stub, Step 10)
+  "star-map" STAR-Map framework (pruned: Rule 1/2/3)
+  "charm"    CHARM-CDSE 1-level (throughput-cycle, SP_k=1)
+  "timeloop" Timeloop EDP adapter (stub until Phase 3)
+  "naive"    Naive P_max baseline (stub)
 """
 
 from __future__ import annotations
 
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Literal, Optional
 
+from xdna_search.cost.charm import CharmCost, StageMode
+from xdna_search.cost.timeloop_edp import TimeloopCoeffs, TimeloopEdpCost
 from xdna_search.cost.v16_edp import V16EdpCost
 from xdna_search.search.constraints.filter_set import DefaultFeasibility, FilterSet
 from xdna_search.search.enumerator import (
@@ -22,7 +25,11 @@ from xdna_search.search.enumerator import (
     StarMapPrunedEnumerator,
 )
 from xdna_search.search.searcher import Searcher
-from xdna_search.search.selector import EdpSelector
+from xdna_search.search.selector import (
+    CycleSelector,
+    EdpSelector,
+    TimeloopEdpSelector,
+)
 from xdna_search.types import CalibCoeffs, SystemInfo
 
 
@@ -77,6 +84,31 @@ def make_starmap_searcher(
     )
 
 
+def make_charm_searcher(
+    sys_info: SystemInfo,
+    coeffs: Optional[CalibCoeffs] = None,
+    *,
+    stage_mode: StageMode = "sum",
+    exclude_cores: Optional[set] = None,
+) -> Searcher:
+    """CHARM-CDSE 1-level baseline: min-cycle over broadcast-reuse model.
+
+    SP_k is implicitly 1 because xdna_search's Candidate has no SP_k field
+    (the K axis is partitioned only temporally via TP_k). This matches the
+    paper/fig CHARM "Variant B" adaptation exactly.
+    """
+    return Searcher(
+        name=f"charm-{stage_mode}",
+        enumerator=ExhaustiveEnumerator(),
+        filter_set=FilterSet(DefaultFeasibility()),
+        cost_fn=CharmCost(stage_mode=stage_mode),
+        selector=CycleSelector(),
+        sys_info=sys_info,
+        coeffs=coeffs,
+        exclude_cores=exclude_cores,
+    )
+
+
 def make_naive_searcher(
     sys_info: SystemInfo,
     coeffs: Optional[CalibCoeffs] = None,
@@ -91,17 +123,32 @@ def make_timeloop_searcher(
     sys_info: SystemInfo,
     coeffs: Optional[CalibCoeffs] = None,
     *,
+    tl_coeffs: Optional[TimeloopCoeffs] = None,
     exclude_cores: Optional[set] = None,
 ) -> Searcher:
-    """Timeloop / CHARM-CDSE baseline adapter. Not yet implemented."""
-    raise NotImplementedError(
-        "make_timeloop_searcher: Timeloop / CHARM-CDSE adapter is a stub"
+    """Timeloop EDP adapter: min-EDP under activity-only energy model.
+
+    Uses Timeloop's default goodness metric (EDP, §V-E) and our 3-component
+    activity-proportional energy model (§VI-D) WITHOUT a P_BASE term. The
+    structural absence of P_BASE is the paper's main claim about Cat B
+    frameworks; `tl_coeffs` only tunes magnitudes, not that structural gap.
+    """
+    return Searcher(
+        name="timeloop",
+        enumerator=ExhaustiveEnumerator(),
+        filter_set=FilterSet(DefaultFeasibility()),
+        cost_fn=TimeloopEdpCost(tl_coeffs),
+        selector=TimeloopEdpSelector(),
+        sys_info=sys_info,
+        coeffs=coeffs,
+        exclude_cores=exclude_cores,
     )
 
 
 _REGISTRY: Dict[str, SearcherFactory] = {
     "sm-exh": make_sm_exh_searcher,
     "star-map": make_starmap_searcher,
+    "charm": make_charm_searcher,
     "naive": make_naive_searcher,
     "timeloop": make_timeloop_searcher,
 }
