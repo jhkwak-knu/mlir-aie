@@ -29,3 +29,6 @@ utils/vitisVariables.config
 runtime_lib/xaiengine/src
 /ironenv
 /.cache
+
+# Paper artifacts (regeneratable)
+test/onnx-mlir/paper/search_bench/output/
