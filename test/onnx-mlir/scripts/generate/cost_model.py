@@ -15,190 +15,61 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import random
 import sys
-from dataclasses import dataclass, asdict
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from tiling_common import (                       # noqa: E402
-    DEFAULT_OP_PATH, DEFAULT_SYS_PATH, DEFAULT_CALIB_PATH,
-    CTILE_RESERVED_BYTES, ELEM_SIZE_MAP, MMUL_R, MMUL_S, MMUL_T,
-    TP_AXIS_M, TP_AXIS_N, TP_AXIS_K,
-    OpCase, SystemInfo, CalibCoeffs, DEFAULT_COEFFS,
-    divisors, factor_pairs, ws_bytes,
-    load_op_list, load_system_info, load_calibration, write_tc_list,
-    build_tp_order, build_metadata,
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from xdna_search.cost.v16_edp import V16EdpCost, evaluate_candidate  # noqa: E402
+from xdna_search.hw_constants import (  # noqa: E402
+    DEFAULT_CALIB_PATH, DEFAULT_OP_PATH, DEFAULT_SYS_PATH,
 )
-import models as _models                          # noqa: E402
+from xdna_search.io import (  # noqa: E402
+    build_metadata, load_calibration, load_op_list, load_system_info, write_tc_list,
+)
+from xdna_search.math_utils import build_tp_order  # noqa: E402
+from xdna_search.search.constraints.filter_set import (  # noqa: E402
+    DefaultFeasibility, FilterSet,
+)
+from xdna_search.search.enumerator import ExhaustiveEnumerator  # noqa: E402
+from xdna_search.search.factory import get_searcher_factory  # noqa: E402
+from xdna_search.search.selector import EdpSelector  # noqa: E402
+from xdna_search.types import (  # noqa: E402
+    CalibCoeffs, Candidate, CostResult, DEFAULT_COEFFS,
+    FilterResult, OpCase, SystemInfo,
+)
 
-# Hardware coefficients for XDNA2 (Ryzen AI 9 HX 370, Strix Point, TSMC N4P).
-# Sources: AMD XDNA2 spec (256 MACs/cycle BF16 per tile, 32 tiles, ~1.5 GHz),
-#          LPDDR5X-7500 measured bandwidth ~80 GB/s (Chips and Cheese),
-#          Horowitz 2014 scaled to N4P for energy estimates.
-PEAK_MACS       = 256    # MACs/Cycle/Tile (BF16)
-BANDWIDTH_BPC   = 4      # Bytes/Cycle (NoC stream bandwidth per channel)
-ALPHA_CYCLES    = 20     # Cycles per temporal iteration (pipeline drain/fill)
-E_MAC_PJ        = 0.2    # pJ per MAC (TSMC N4P estimate)
-E_DRAM_PJ       = 40     # pJ per Byte DRAM access (LPDDR5X estimate)
-P_STATIC_PJ     = 27     # pJ/Cycle per Tile (default mode, 0.04W @ 1.5 GHz)
-
-
-@dataclass
-class Candidate:
-    """A single spatio-temporal parallelization configuration."""
-    # Spatial
-    num_cores: int
-    num_columns: int
-    SPm: int
-    SPn: int
-    # Temporal
-    TPm: int
-    TPk: int
-    TPn: int
-    # Tile sizes (derived)
-    TM: int
-    TK: int
-    TN: int
-    # Working set
-    ws_bytes: int = 0
-
-    @property
-    def tp_total(self) -> int:
-        return self.TPm * self.TPk * self.TPn
-
-
-@dataclass
-class CostResult:
-    """Cost model evaluation result for a candidate + tpOrder pair."""
-    candidate: Candidate
-    tp_order: int           # 0=M, 1=N, 2=K (innermost temporal axis)
-    # Performance (Cycles)
-    t_comp: float
-    t_comm: float
-    t_overhead: float
-    t_total: float
-    # Energy (pJ)
-    e_dynamic_comp: float
-    e_dynamic_comm: float
-    e_static: float
-    e_total: float
-    # EDP (pJ * Cycles)
-    edp: float
+# Hardware coefficients (PEAK_MACS, BANDWIDTH_BPC, ALPHA_CYCLES, E_MAC_PJ,
+# E_DRAM_PJ, P_STATIC_PJ) live in xdna_search.cost.v16_edp. Import from there
+# if you need them outside this CLI.
 
 
 # ============================================================
 # Stage 1: Exhaustive enumeration
 # ============================================================
+_EXHAUSTIVE_ENUMERATOR = ExhaustiveEnumerator()
+
+
 def enumerate_candidates(
     op: OpCase, sys_info: SystemInfo,
     exclude_cores: Optional[set] = None,
 ) -> List[Candidate]:
+    """Thin wrapper around xdna_search.search.enumerator.ExhaustiveEnumerator.
+
+    Kept for backward compatibility; see the class for the enumeration
+    loop and complexity discussion.
     """
-    Enumerate ALL (num_cores, SPm, SPn, TPm, TPk, TPn) combinations.
-
-    Loop hierarchy (resource usage as the primary independent variable):
-      1. num_cores  ∈ [1, C]         — resource budget (PE count)
-      2. SPm        ∈ [1, num_cores]  — spatial M-axis split
-         SPn        = num_cores / SPm  (determined, not a free variable)
-      3. TPm ∈ [1, M/SPm], TPk ∈ [1, K], TPn ∈ [1, N/SPn] — temporal splits
-         (exact ranges depend on spatial split; M/SPm ≤ M, N/SPn ≤ N)
-
-    Theoretical search space (upper bound):
-      Total spatial iterations = ∑_{c=1}^{C} c = C(C+1)/2 = O(C²).
-      Temporal ranges are bounded by M, K, N (since M/SPm ≤ M, N/SPn ≤ N).
-      Upper bound: O(C² × M × K × N).
-
-    Implementation uses divisor ranges as a lossless compression:
-      - SPm × SPn via factor_pairs(num_cores)  — only integer SPn values
-      - TPm/TPk/TPn via divisors(M/K/N)        — non-divisors always fail C2/C3
-      Using divisors of M (not M/SPm) is safe: values that do not divide
-      M/SPm are eliminated by constraint C3, so the result set is identical.
-
-    Actual complexity: O(C · d(C) · d(M) · d(K) · d(N))
-      d(n) = number of divisors of n  (average O(ln n))
-
-    All hardware constraints are deferred to Stage 2 filters.
-    """
-    candidates: List[Candidate] = []
-    eb = op.elem_bytes
-
-    divs_M = divisors(op.M)
-    divs_K = divisors(op.K)
-    divs_N = divisors(op.N)
-
-    for num_cores in range(1, sys_info.total_cores + 1):
-        if exclude_cores and num_cores in exclude_cores:
-            continue
-        for SPm, SPn in factor_pairs(num_cores):
-            for TPm in divs_M:
-                for TPk in divs_K:
-                    for TPn in divs_N:
-                        # Tile sizes — 0 when spatial×temporal does not
-                        # evenly divide the problem dimension.
-                        sp_tp_m = SPm * TPm
-                        sp_tp_n = SPn * TPn
-                        TM = op.M // sp_tp_m if op.M % sp_tp_m == 0 else 0
-                        TK = op.K // TPk
-                        TN = op.N // sp_tp_n if op.N % sp_tp_n == 0 else 0
-                        ws = ws_bytes(TM, TK, TN, eb) if (TM > 0 and TN > 0) else 0
-                        num_cols = math.ceil(num_cores / sys_info.comp_tiles_per_col)
-
-                        candidates.append(Candidate(
-                            num_cores=num_cores,
-                            num_columns=num_cols,
-                            SPm=SPm, SPn=SPn,
-                            TPm=TPm, TPk=TPk, TPn=TPn,
-                            TM=TM, TK=TK, TN=TN,
-                            ws_bytes=ws,
-                        ))
-
-    return candidates
+    return _EXHAUSTIVE_ENUMERATOR.generate(op, sys_info, exclude_cores=exclude_cores)
 
 
 # ============================================================
 # Stage 2: Constraint filters
 # ============================================================
-def c1_memory(c: Candidate, ct_limit: int) -> bool:
-    """C1: Working set must fit in compute tile memory."""
-    return c.ws_bytes <= ct_limit
-
-
-def c2_spatial_divisibility(c: Candidate, op: OpCase) -> bool:
-    """C2: Spatial split must evenly divide M and N."""
-    return (op.M % c.SPm == 0) and (op.N % c.SPn == 0)
-
-
-def c3_temporal_divisibility(c: Candidate, op: OpCase) -> bool:
-    """C3: Temporal split must evenly divide per-core block sizes."""
-    M0 = op.M // c.SPm
-    K0 = op.K
-    N0 = op.N // c.SPn
-    return (M0 % c.TPm == 0) and (K0 % c.TPk == 0) and (N0 % c.TPn == 0)
-
-
-def c4_column_alignment(c: Candidate, sys_info: SystemInfo) -> bool:
-    """C4: Core count must be a multiple of comp_tiles_per_col (column power gating)."""
-    return c.num_cores % sys_info.comp_tiles_per_col == 0
-
-
-def c5_mmul_shape(c: Candidate) -> bool:
-    """C5: Tile dimensions must satisfy bf16 mmul<4,8,8> 2x2 expansion alignment."""
-    return (c.TM % (2 * MMUL_R) == 0) and (c.TK % MMUL_S == 0) and (c.TN % (2 * MMUL_T) == 0)
-
-
-@dataclass
-class FilterResult:
-    """Tracks how many candidates each constraint removes."""
-    name: str
-    before: int
-    after: int
-
-    @property
-    def removed(self) -> int:
-        return self.before - self.after
+_DEFAULT_FILTER_SET = FilterSet(DefaultFeasibility())
 
 
 def filter_candidates(
@@ -206,264 +77,50 @@ def filter_candidates(
     op: OpCase,
     sys_info: SystemInfo,
 ) -> Tuple[List[Candidate], List[FilterResult]]:
+    """Thin wrapper around FilterSet(DefaultFeasibility()).apply().
+
+    Kept for backward compatibility; constraint classes (C1Memory, ..., C5MmulShape)
+    live in xdna_search.search.constraints.feasibility.
     """
-    Apply all constraints sequentially and track the filtering effect of each.
-    """
-    ct_limit = sys_info.ct_usable_bytes
-    results: List[FilterResult] = []
-
-    filters = [
-        ("C1: memory",               lambda c: c1_memory(c, ct_limit)),
-        ("C2: spatial divisibility",  lambda c: c2_spatial_divisibility(c, op)),
-        ("C3: temporal divisibility", lambda c: c3_temporal_divisibility(c, op)),
-        ("C4: column alignment",      lambda c: c4_column_alignment(c, sys_info)),
-        ("C5: mmul shape",            lambda c: c5_mmul_shape(c)),
-    ]
-
-    current = candidates
-    for name, fn in filters:
-        before = len(current)
-        current = [c for c in current if fn(c)]
-        results.append(FilterResult(name=name, before=before, after=len(current)))
-
-    return current, results
+    return _DEFAULT_FILTER_SET.apply(candidates, op, sys_info)
 
 
 # ============================================================
-# Stage 3: Cost model evaluation
+# Stage 3: Cost model evaluation (moved to xdna_search.cost.v16_edp)
 # ============================================================
-def total_data_bytes(op: OpCase, c: Candidate, tp_order: int) -> int:
-    """Total data transfer volume (bytes). Delegates to models.py."""
-    return _models.total_data_bytes(
-        op.M, op.K, op.N, op.elem_bytes,
-        c.SPm, c.SPn, c.TPm, c.TPk, c.TPn, tp_order)
-
-
-# --- Performance functions (unit: Cycles) ---
-
-def perf_compute(
-    op: OpCase, c: Candidate, coeffs: Optional[CalibCoeffs] = None,
-) -> float:
-    """T_comp: compute time assuming all cores run in parallel."""
-    eff = coeffs.eff_macs if coeffs else PEAK_MACS
-    return (op.M * op.N * op.K) / (c.SPm * c.SPn * eff)
-
-
-def perf_comm(
-    op: OpCase, c: Candidate, tp_order: int,
-    coeffs: Optional[CalibCoeffs] = None,
-) -> float:
-    """T_comm: pure data transfer time at stream bandwidth."""
-    bw = coeffs.bw_eff_bpc if coeffs else BANDWIDTH_BPC
-    return total_data_bytes(op, c, tp_order) / bw
-
-
-def _d_total(c: Candidate, tp_order: int) -> float:
-    """Refined total DMA descriptor setups (D_total) for Candidate c."""
-    return _models.d_total(
-        c.SPm, c.SPn, c.num_cores,
-        c.TPm, c.TPk, c.TPn, c.tp_total, tp_order)
-
-
-def _dma_ops_per_step(c: Candidate, tp_order: int) -> int:
-    """Delegates to models.dma_ops_per_step()."""
-    return _models.dma_ops_per_step(c.SPm, c.SPn, c.num_cores, tp_order)
-
-
-def perf_overhead(
-    c: Candidate, coeffs: Optional[CalibCoeffs] = None,
-    tp_order: int = TP_AXIS_K,
-) -> float:
-    """T_overhead: delegates to the appropriate PerfModel variant.
-
-    DMA-Bottleneck (v16): D * max(L_SETUP, avg_tile/BW) + sync overhead
-    DMA-Refined (v13+):   L_DMA * D_total + sync overhead
-    Core-Sync (v9):       L_DMA * N_dma * TP_total + sync overhead
-    """
-    if coeffs and coeffs.calibrated:
-        if coeffs.perf_model == "DMA-Bottleneck":
-            d_tot = _d_total(c, tp_order)
-            op_dummy = OpCase(M=1, K=1, N=1, elem_type="bf16")
-            # Need actual data_bytes for avg_tile calculation
-            # Caller passes data_bytes=0; compute here for the overhead
-            l_setup = coeffs.l_setup_cy if hasattr(coeffs, 'l_setup_cy') else coeffs.l_dma_cy
-            _, t_dma, t_sync = _models.PerfModel.components_dma_bottleneck(
-                macs=0, data_bytes=0,
-                n_cores=c.num_cores, tp_total=c.tp_total, d_total_val=d_tot,
-                eff_macs=coeffs.eff_macs, bw_bpc=coeffs.bw_eff_bpc,
-                l_sync=coeffs.l_sync_cy, l_pe=coeffs.l_pe_cy,
-                l_setup=l_setup, l_startup=coeffs.l_startup_cy)
-            return t_dma + t_sync
-        elif coeffs.perf_model == "DMA-Refined":
-            d_tot = _d_total(c, tp_order)
-            _, _, t_ovh = _models.PerfModel.components_dma_refined(
-                macs=0, data_bytes=0,
-                n_cores=c.num_cores, tp_total=c.tp_total, d_total_val=d_tot,
-                eff_macs=coeffs.eff_macs, bw_bpc=coeffs.bw_eff_bpc,
-                l_sync=coeffs.l_sync_cy, l_pe=coeffs.l_pe_cy,
-                l_dma=coeffs.l_dma_cy, l_startup=coeffs.l_startup_cy)
-            return t_ovh
-        else:
-            n_dma = _dma_ops_per_step(c, tp_order)
-            _, _, t_ovh = _models.PerfModel.components_v9(
-                macs=0, data_bytes=0,
-                n_cores=c.num_cores, tp_total=c.tp_total, n_dma=n_dma,
-                eff_macs=coeffs.eff_macs, bw_bpc=coeffs.bw_eff_bpc,
-                l_sync=coeffs.l_sync_cy, l_pe=coeffs.l_pe_cy,
-                l_dma=coeffs.l_dma_cy, l_startup=coeffs.l_startup_cy)
-            return t_ovh
-    return ALPHA_CYCLES * (c.TPm * c.TPn * c.TPk)
-
-
-# --- Energy functions (unit: pJ) ---
-# When coeffs.energy_calibrated is True, energy_total_calibrated() is used
-# instead of the three component functions below.
-
-def energy_dynamic_comp(
-    op: OpCase, coeffs: Optional[CalibCoeffs] = None,
-) -> float:
-    """E_dynamic_comp: total MAC energy (constant across candidates)."""
-    if coeffs and coeffs.energy_calibrated:
-        e_mac = coeffs.energy_params.get("e_mac_pj", E_MAC_PJ)
-    else:
-        e_mac = E_MAC_PJ
-    return op.M * op.N * op.K * e_mac
-
-
-def energy_dynamic_comm(
-    op: OpCase, c: Candidate, tp_order: int,
-    coeffs: Optional[CalibCoeffs] = None,
-) -> float:
-    """E_dynamic_comm: DRAM access energy proportional to transfer volume."""
-    if coeffs and coeffs.energy_calibrated:
-        e_dram = coeffs.energy_params.get("e_byte_pj", E_DRAM_PJ)
-    else:
-        e_dram = E_DRAM_PJ
-    return total_data_bytes(op, c, tp_order) * e_dram
-
-
-def energy_static(
-    c: Candidate, t_total: float,
-    coeffs: Optional[CalibCoeffs] = None,
-) -> float:
-    """E_static: leakage energy for active tiles over total execution time."""
-    if coeffs and coeffs.energy_calibrated:
-        p_static = coeffs.energy_params.get("p_static_pj", P_STATIC_PJ)
-    else:
-        p_static = P_STATIC_PJ
-    return (c.SPm * c.SPn) * p_static * t_total
-
-
-def energy_total_calibrated(
-    op: OpCase, c: Candidate, tp_order: int,
-    t_comp: float, t_comm: float, t_overhead: float, t_total: float,
-    coeffs: CalibCoeffs,
-) -> Tuple[float, float, float, float]:
-    """Compute energy using calibrated model. Delegates to models.EnergyModel.
-
-    Returns (e_comp_pj, e_comm_pj, e_static_pj, e_total_pj).
-    Component breakdown is approximate for models that don't decompose.
-    """
-    features = {
-        "macs": op.M * op.N * op.K,
-        "data_bytes": total_data_bytes(op, c, tp_order),
-        "n_cores": c.SPm * c.SPn,
-        "tp_total": c.tp_total,
-        "n_dma": _dma_ops_per_step(c, tp_order),
-        "d_total": _d_total(c, tp_order),
-        "t_total_cy": t_total,
-        "t_comp_cy": t_comp,
-        "t_comm_cy": t_comm,
-        "t_overhead_cy": t_overhead,
-    }
-    e_total = _models.EnergyModel.predict(
-        coeffs.energy_model, coeffs.energy_params, features)
-
-    # Approximate component breakdown for reporting
-    e_mac_pj = coeffs.energy_params.get("e_mac_pj", E_MAC_PJ)
-    e_dram_pj = coeffs.energy_params.get("e_dram_pj",
-                coeffs.energy_params.get("e_byte_pj", E_DRAM_PJ))
-    e_comp = features["macs"] * e_mac_pj
-    e_comm = features["data_bytes"] * e_dram_pj
-    e_static = max(0.0, e_total - e_comp - e_comm)
-    return e_comp, e_comm, e_static, e_total
-
-
-# --- Combined evaluation ---
-
-def evaluate_candidate(
-    op: OpCase, c: Candidate, tp_order: int,
-    coeffs: Optional[CalibCoeffs] = None,
-) -> CostResult:
-    """Evaluate a single candidate with a specific tpOrder."""
-    if coeffs and coeffs.calibrated and coeffs.perf_model == "DMA-Bottleneck":
-        # v16: T = T_comp + D*max(L_SETUP, avg_tile/BW) + sync + startup
-        # T_comm is integrated into the DMA bottleneck term (no separate T_comm)
-        l_setup = coeffs.l_setup_cy if hasattr(coeffs, 'l_setup_cy') else coeffs.l_dma_cy
-        data_bytes = total_data_bytes(op, c, tp_order)
-        d_tot = _d_total(c, tp_order)
-        tc_cy, td_cy, to_cy = _models.PerfModel.components_dma_bottleneck(
-            macs=op.M * op.N * op.K,
-            data_bytes=data_bytes,
-            n_cores=c.num_cores, tp_total=c.tp_total, d_total_val=d_tot,
-            eff_macs=coeffs.eff_macs, bw_bpc=coeffs.bw_eff_bpc,
-            l_sync=coeffs.l_sync_cy, l_pe=coeffs.l_pe_cy,
-            l_setup=l_setup, l_startup=coeffs.l_startup_cy)
-        tc = tc_cy  # T_comp in cycles
-        tm = td_cy  # T_dma in cycles (replaces T_comm)
-        to = to_cy  # T_sync + T_startup in cycles
-        tt = tc + tm + to
-    else:
-        tc = perf_compute(op, c, coeffs)
-        tm = perf_comm(op, c, tp_order, coeffs)
-        to = perf_overhead(c, coeffs, tp_order)
-        tt = tc + tm + to
-
-    if coeffs and coeffs.energy_calibrated:
-        edc, edm, es, et = energy_total_calibrated(
-            op, c, tp_order, tc, tm, to, tt, coeffs)
-    else:
-        edc = energy_dynamic_comp(op, coeffs)
-        edm = energy_dynamic_comm(op, c, tp_order, coeffs)
-        es = energy_static(c, tt, coeffs)
-        et = edc + edm + es
-
-    return CostResult(
-        candidate=c, tp_order=tp_order,
-        t_comp=tc, t_comm=tm, t_overhead=to, t_total=tt,
-        e_dynamic_comp=edc, e_dynamic_comm=edm, e_static=es, e_total=et,
-        edp=tt * et,
-    )
+# The module-level functions total_data_bytes / perf_* / energy_* /
+# evaluate_candidate now live in xdna_search.cost.v16_edp. `evaluate_candidate`
+# is re-imported above for select_optimal() below.
 
 
 # ============================================================
 # Stage 4: EDP-based optimal selection
 # ============================================================
+_EDP_SELECTOR = EdpSelector()
+
+
 def select_optimal(
     valid: List[Candidate], op: OpCase,
     coeffs: Optional[CalibCoeffs] = None,
     keep_all_tporders: bool = False,
 ) -> List[CostResult]:
-    """
-    For each candidate, evaluate all 3 tpOrders, keep the one with lowest EDP.
-    Return the full list sorted by EDP ascending.
+    """For each candidate, evaluate all 3 tpOrders and rank via EdpSelector.
 
     If keep_all_tporders=True, also returns a dict mapping candidate index
-    to all 3 CostResults (for tpOrder verification).
+    to all 3 CostResults (used by select_tporder_verify_cases()).
     """
-    best_per_candidate: List[CostResult] = []
+    scored: List[CostResult] = []
     all_tporder_results: Dict[int, List[CostResult]] = {}
     for i, c in enumerate(valid):
         results = [evaluate_candidate(op, c, tpo, coeffs) for tpo in (0, 1, 2)]
-        best = min(results, key=lambda r: r.edp)
-        best_per_candidate.append(best)
+        scored.extend(results)
         if keep_all_tporders:
             all_tporder_results[i] = results
 
-    best_per_candidate.sort(key=lambda r: r.edp)
+    ranked = _EDP_SELECTOR.rank(scored)
     if keep_all_tporders:
-        return best_per_candidate, all_tporder_results
-    return best_per_candidate
+        return ranked, all_tporder_results
+    return ranked
 
 
 def select_tporder_verify_cases(
@@ -709,6 +366,14 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     p.add_argument("--exclude-cores", default="",
                    help="Comma-separated numCores values to exclude from enumeration "
                         "(e.g., '24' to skip all 24-core configs)")
+    p.add_argument("--search", default="sm-exh",
+                   choices=("sm-exh", "star-map", "naive", "timeloop"),
+                   help="Searcher to use. Default 'sm-exh' preserves legacy "
+                        "exhaustive behavior; 'star-map' applies STAR-Map pruning.")
+    p.add_argument("--pruning-level", type=int, default=123,
+                   choices=(1, 12, 123),
+                   help="STAR-Map pruning level (1, 12, or 123). Only effective "
+                        "when --search=star-map.")
     return p.parse_args(argv)
 
 
@@ -717,18 +382,29 @@ def process_op(
     coeffs: Optional[CalibCoeffs] = None,
     keep_all_tporders: bool = False,
     exclude_cores: Optional[set] = None,
+    searcher_name: str = "sm-exh",
+    pruning_level: int = 123,
 ):
-    """Run Stage 1 through Stage 4 for a single op case."""
-    all_candidates = enumerate_candidates(op, sys_info, exclude_cores=exclude_cores)
-    valid, filter_results = filter_candidates(all_candidates, op, sys_info)
-    print_search_summary(op, len(all_candidates), valid, filter_results)
+    """Run the full 4-component pipeline for a single op via the factory."""
+    factory = get_searcher_factory(searcher_name)
+    if searcher_name == "star-map":
+        searcher = factory(
+            sys_info, coeffs,
+            pruning_level=pruning_level,
+            exclude_cores=exclude_cores,
+        )
+    else:
+        searcher = factory(sys_info, coeffs, exclude_cores=exclude_cores)
+    output = searcher.search(op, keep_all_tporders=keep_all_tporders)
+
+    print_search_summary(
+        op, output.total_enumerated, output.valid, output.filter_results,
+    )
+    print_cost_summary(op, output.ranked)
+
     if keep_all_tporders:
-        ranked, tpo_data = select_optimal(valid, op, coeffs, keep_all_tporders=True)
-        print_cost_summary(op, ranked)
-        return ranked, tpo_data
-    ranked = select_optimal(valid, op, coeffs)
-    print_cost_summary(op, ranked)
-    return ranked
+        return output.ranked, output.all_tporder_data
+    return output.ranked
 
 
 def main(argv: List[str]) -> int:
@@ -778,6 +454,19 @@ def main(argv: List[str]) -> int:
         targets = list(enumerate(ops))
 
     need_tporder = args.tporder_verify > 0
+    if need_tporder and args.search not in ("sm-exh",):
+        print(
+            f"[WARN] --tporder-verify is only meaningful for --search=sm-exh; "
+            f"ignoring under --search={args.search}",
+            file=sys.stderr,
+        )
+        need_tporder = False
+    searcher_label = (
+        f"star-map-rule{args.pruning_level}"
+        if args.search == "star-map" else args.search
+    )
+    print(f"[INFO] Searcher: {searcher_label}")
+
     exclude_cores_set = set()
     if args.exclude_cores:
         exclude_cores_set = {int(x) for x in args.exclude_cores.split(",") if x.strip()}
@@ -786,11 +475,21 @@ def main(argv: List[str]) -> int:
     all_tporder_data: Dict[int, Dict[int, List[CostResult]]] = {}
     for idx, op in targets:
         if need_tporder:
-            ranked, tpo_data = process_op(op, sys_info, coeffs, keep_all_tporders=True,
-                                          exclude_cores=exclude_cores_set)
+            ranked, tpo_data = process_op(
+                op, sys_info, coeffs,
+                keep_all_tporders=True,
+                exclude_cores=exclude_cores_set,
+                searcher_name=args.search,
+                pruning_level=args.pruning_level,
+            )
             all_tporder_data[idx] = tpo_data
         else:
-            ranked = process_op(op, sys_info, coeffs, exclude_cores=exclude_cores_set)
+            ranked = process_op(
+                op, sys_info, coeffs,
+                exclude_cores=exclude_cores_set,
+                searcher_name=args.search,
+                pruning_level=args.pruning_level,
+            )
         all_ranked[idx] = ranked
 
     # Write output if requested
@@ -857,7 +556,10 @@ def main(argv: List[str]) -> int:
             tc_cases.extend(verify_tcs)
             print(f"[INFO] Added {len(verify_tcs)} tpOrder verification cases")
 
-        meta = build_metadata(calib_path=Path(args.calib), coeffs=coeffs)
+        meta = build_metadata(
+            calib_path=Path(args.calib), coeffs=coeffs,
+            searcher_name=searcher_label,
+        )
         write_tc_list(tc_cases, val_path, metadata=meta)
         print(f"[INFO] Wrote {val_path} ({len(tc_cases)} cases total)")
 
