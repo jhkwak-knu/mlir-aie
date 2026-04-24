@@ -1,0 +1,24 @@
+{
+    "description": "19 matrix sizes for paper evaluation",
+    "cases": [
+        {"M": 32,   "K": 32,   "N": 32,   "elemType": "bf16", "source": "square",          "dnn_layer": "small_model"},
+        {"M": 64,   "K": 64,   "N": 64,   "elemType": "bf16", "source": "square",          "dnn_layer": "small_model"},
+        {"M": 128,  "K": 128,  "N": 128,  "elemType": "bf16", "source": "square",          "dnn_layer": "small_model"},
+        {"M": 256,  "K": 256,  "N": 256,  "elemType": "bf16", "source": "square",          "dnn_layer": "medium_model"},
+        {"M": 384,  "K": 384,  "N": 384,  "elemType": "bf16", "source": "square_ext",      "dnn_layer": "crossover_point"},
+        {"M": 512,  "K": 512,  "N": 512,  "elemType": "bf16", "source": "square",          "dnn_layer": "medium_model"},
+        {"M": 768,  "K": 768,  "N": 768,  "elemType": "bf16", "source": "square_ext",      "dnn_layer": "bert_d_model"},
+        {"M": 1024, "K": 1024, "N": 1024, "elemType": "bf16", "source": "square",          "dnn_layer": "large_projection"},
+        {"M": 2048, "K": 2048, "N": 2048, "elemType": "bf16", "source": "square_ext",      "dnn_layer": "upper_bound"},
+        {"M": 128,  "K": 64,   "N": 128,  "elemType": "bf16", "source": "nonsquare",       "dnn_layer": "attention_head_d64"},
+        {"M": 256,  "K": 64,   "N": 256,  "elemType": "bf16", "source": "nonsquare_ext",   "dnn_layer": "attention_seq256"},
+        {"M": 512,  "K": 64,   "N": 512,  "elemType": "bf16", "source": "nonsquare_ext",   "dnn_layer": "attention_seq512"},
+        {"M": 32,   "K": 768,  "N": 768,  "elemType": "bf16", "source": "nonsquare_ext",   "dnn_layer": "edge_qkv_proj"},
+        {"M": 128,  "K": 768,  "N": 768,  "elemType": "bf16", "source": "nonsquare",       "dnn_layer": "qkv_projection"},
+        {"M": 128,  "K": 768,  "N": 3072, "elemType": "bf16", "source": "nonsquare",       "dnn_layer": "ffn_up"},
+        {"M": 128,  "K": 3072, "N": 768,  "elemType": "bf16", "source": "nonsquare",       "dnn_layer": "ffn_down"},
+        {"M": 128,  "K": 1024, "N": 1024, "elemType": "bf16", "source": "nonsquare_ext",   "dnn_layer": "gpt_projection"},
+        {"M": 256,  "K": 1024, "N": 1024, "elemType": "bf16", "source": "nonsquare",       "dnn_layer": "large_projection"},
+        {"M": 256,  "K": 1024, "N": 4096, "elemType": "bf16", "source": "nonsquare",       "dnn_layer": "large_ffn"}
+    ]
+}

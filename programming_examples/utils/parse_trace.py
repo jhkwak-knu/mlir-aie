@@ -456,6 +456,8 @@ def convert_commands_to_json(trace_events, commands, pid_events, of):
 
         for loc, command in byte_stream_dict.items():  # row,col with list of commands
             timer = 0  # TODO Some way to set this or sync this between trace types and row,col
+            cycles = 0  # delta cycles from previous event (used by Repeat)
+            multiple_list = list()  # event list from previous Single/Multiple (used by Repeat)
             # timer on each execution is the time for the last execution
             # so we by default will increment it by 1 for each event
             if DEBUG:

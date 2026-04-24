@@ -1,0 +1,5 @@
+# Local Python virtualenv (see README.md -- user creates on setup)
+.venv/
+
+# Generated figures and tables -- regenerable via `python main.py`
+output/

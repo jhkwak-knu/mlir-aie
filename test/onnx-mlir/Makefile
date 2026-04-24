@@ -5,7 +5,7 @@ AIETOOLS_DIR       ?= $(shell realpath $(dir $(shell which xchesscc))/../)
 AIE2_INCLUDE_DIR   ?= $(AIETOOLS_DIR)/data/aie2p/lib
 AIE_ARCH           ?= aie2p
 CHESSCC_FLAGS      ?= --aiearch $(AIE_ARCH) -f -p me -P $(AIE2_INCLUDE_DIR) -I $(AIETOOLS_DIR)/include
-AIECC_FLAGS        ?= --aie-generate-xclbin --no-compile-host --aie-generate-npu-insts --npu-insts-name=insts.bin
+AIECC_FLAGS        ?= --aie-generate-xclbin --no-compile-host --aie-generate-npu-insts --npu-insts-name=insts.bin -j 24
 
 # =========================
 # Paths (new tree layout)
@@ -16,7 +16,6 @@ SCRIPTS_DIR:= $(ROOT_DIR)/scripts
 DATA_DIR   := $(ROOT_DIR)/data
 OUT_DIR    := $(ROOT_DIR)/out
 BUILD_DIR  := $(OUT_DIR)/build
-ONNX_DIR   := $(OUT_DIR)/onnx
 MLIR_DIR   := $(OUT_DIR)/mlir
 LOGS_DIR   := $(OUT_DIR)/logs
 REPORTS_DIR:= $(OUT_DIR)/reports
@@ -48,7 +47,7 @@ CXXFLAGS ?=
 all: $(BUILD_DIR)/final.xclbin
 
 # Prepare directories
-$(BUILD_DIR) $(LOGS_DIR) $(MLIR_DIR) $(ONNX_DIR) $(REPORTS_DIR):
+$(BUILD_DIR) $(LOGS_DIR) $(MLIR_DIR) $(REPORTS_DIR):
 	mkdir -p $@
 
 # 1) Prepare conversion outputs: ONNX-MLIR -> AIE MLIR
@@ -59,8 +58,11 @@ $(BUILD_DIR)/aie.mlir: $(MLIR_SRCS) | $(BUILD_DIR)
 		-o $(BUILD_DIR)/host.mlir
 
 # 2) Compile kernel (xchesscc)
-$(BUILD_DIR)/kernel.o: $(KERNEL_SRCS) | $(BUILD_DIR)
-	xchesscc $(CHESSCC_FLAGS) -c $< -o $@
+#    Extract tile dimensions from tc.json so the kernel uses compile-time constants.
+TILE_DIMS = $(shell python3 -c "import json; j=json.load(open('$(TC_JSON)')); L=j['levels'][0]; print('-DM_TILE=%d -DK_TILE=%d -DN_TILE=%d' % (L['TM'], L['TK'], L['TN']))")
+
+$(BUILD_DIR)/kernel.o: $(KERNEL_SRCS) $(TC_JSON) | $(BUILD_DIR)
+	xchesscc $(CHESSCC_FLAGS) $(TILE_DIMS) -c $< -o $@
 
 # 3) Generate xclbin/insts.bin with aiecc.py
 $(BUILD_DIR)/final.xclbin: $(BUILD_DIR)/aie.mlir $(BUILD_DIR)/kernel.o
@@ -76,14 +78,19 @@ $(BUILD_DIR)/$(TARGET): $(SRC_DIR)/host.cpp CMakeLists.txt | $(BUILD_DIR)
 	cp $(HOST_BUILD_DIR)/$(TARGET) $(BUILD_DIR)/$(TARGET)
 
 # 5) Run (logs at out/logs/log.txt)
+# CPU pinning: reduce scheduling noise during measurement.
+TASKSET ?= taskset -c 0
 run: host all | $(LOGS_DIR)
-	$(BUILD_DIR)/$(TARGET) \
+	$(TASKSET) $(BUILD_DIR)/$(TARGET) \
 		-x $(BUILD_DIR)/final.xclbin \
 		-i $(BUILD_DIR)/insts.bin \
 		-k MLIR_AIE -v 2 \
 		--tc-json $(TC_JSON) \
 		$(if $(JSON_OUTPUT),--json-output $(JSON_OUTPUT)) \
 		$(if $(STRICT_VERIFY),--strict-verify) \
+		$(if $(TRACE_SZ),--trace_sz $(TRACE_SZ)) \
+		$(if $(TRACE_FILE),--trace_file $(TRACE_FILE)) \
+		$(HOST_ARGS) \
 		> $(LOGS_DIR)/log.txt
 
 # Convenience: print paths

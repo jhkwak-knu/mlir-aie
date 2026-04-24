@@ -1,0 +1,56 @@
+#version 460
+
+// Tiled fp32 GEMM: C = A * B.
+// Layout: A is row-major (M x K), B is row-major (K x N), C is row-major (M x N).
+// Workgroup = 16 x 16 threads; each thread computes one C[i,j].
+// Per workgroup iterates over K in TILE_K chunks, cooperatively loading
+// A_tile [TILE_M x TILE_K] and B_tile [TILE_K x TILE_N] into shared memory.
+
+#define TILE_M 16
+#define TILE_N 16
+#define TILE_K 16
+
+layout(local_size_x = TILE_N, local_size_y = TILE_M, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer AB { float A[]; };
+layout(set = 0, binding = 1) readonly buffer BB { float B[]; };
+layout(set = 0, binding = 2) writeonly buffer CB { float C[]; };
+
+layout(push_constant) uniform PC {
+    uint M;
+    uint K;
+    uint N;
+} pc;
+
+shared float As[TILE_M][TILE_K];
+shared float Bs[TILE_K][TILE_N];
+
+void main() {
+    uint row = gl_WorkGroupID.y * TILE_M + gl_LocalInvocationID.y;
+    uint col = gl_WorkGroupID.x * TILE_N + gl_LocalInvocationID.x;
+
+    float acc = 0.0;
+
+    uint numTiles = (pc.K + TILE_K - 1) / TILE_K;
+    for (uint t = 0; t < numTiles; ++t) {
+        uint aCol = t * TILE_K + gl_LocalInvocationID.x;
+        uint bRow = t * TILE_K + gl_LocalInvocationID.y;
+
+        As[gl_LocalInvocationID.y][gl_LocalInvocationID.x] =
+            (row < pc.M && aCol < pc.K) ? A[row * pc.K + aCol] : 0.0;
+        Bs[gl_LocalInvocationID.y][gl_LocalInvocationID.x] =
+            (bRow < pc.K && col < pc.N) ? B[bRow * pc.N + col] : 0.0;
+
+        barrier();
+
+        for (uint k = 0; k < TILE_K; ++k) {
+            acc += As[gl_LocalInvocationID.y][k] * Bs[k][gl_LocalInvocationID.x];
+        }
+
+        barrier();
+    }
+
+    if (row < pc.M && col < pc.N) {
+        C[row * pc.N + col] = acc;
+    }
+}

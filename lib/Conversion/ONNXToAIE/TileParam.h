@@ -36,7 +36,13 @@ struct DeviceConfig {
 //===----------------------------------------------------------------------===//
 // Layout constants (device-independent)
 //===----------------------------------------------------------------------===//
-// pres packet IDs start above lhs/rhs range to avoid packet-filter collisions
+// Packet IDs use power-of-2 assignment: (1u << tileIndex) per type.
+// Each ID has exactly one bit set, so the pathfinder can distinguish
+// individual flows with a single-bit mask — minimising arbiter and
+// msel usage in the AIE2 switchbox (6 arbiters, 4 msels each).
+// LHS/RHS/RES share the same ID space {1,2,4,8} on disjoint DMA
+// channels / directions, so they never collide in the switch fabric.
+// PRES adds offset 16 (bit4) to separate from LHS on a shared channel.
 static constexpr uint32_t PRES_PKT_ID_OFFSET     = 16;
 // Upper bound that makes an SCF ForOp behave as an infinite loop in the core
 static constexpr int64_t  CORE_LOOP_INFINITE     = 0x7FFFFFFFFFFFFFFFLL;
@@ -78,8 +84,10 @@ struct TileSize {
   uint32_t TM, TK, TN;
 };
 
+/// Per-level tiling parameters.  Currently only level 0 (DRAM <-> compute
+/// tile) is used; the array structure mirrors xdna2_info.json's spm_levels[]
+/// so that future mem-tile (L2) support can be added without schema changes.
 struct LevelParam {
-  uint32_t numSpm;
   uint32_t SPm, SPn;
   uint32_t TPm, TPk, TPn;
   TileSize tileSize;
@@ -89,9 +97,11 @@ struct LevelParam {
 struct TileParam {
   TileSize opSize;
   mlir::Type elemType;
-  uint32_t numLevel;
-  uint32_t numLastSpm;
+  uint32_t numCores;
   bool doubleBufferEnabled;
+  bool traceEnabled = false;
+  /// One entry per memory-hierarchy level.  Only single-level (levels[0])
+  /// is supported; the parser rejects inputs with levels.size() != 1.
   std::vector<LevelParam> levels;
 };
 
@@ -113,6 +123,7 @@ struct TilingContext {
   std::vector<uint32_t> tpOrder;
   mlir::Type elemType;
   bool doubleBufferEnabled;
+  bool traceEnabled = false;
 };
 
 TilingContext buildTilingContext(const TileParam &tp, const SystemInfo &sysInfo);

@@ -182,7 +182,6 @@ AiePlacement optimizeAiePlacement(const TilingContext &tilingCtx,
 void generateAieOps(mlir::ConversionPatternRewriter &rewriter,
                     AiePlacement &placement,
                     const TilingContext &tilingCtx,
-                    const TileParam &tileParam,
                     const std::string &outputPath);
 
 } // namespace onnx_to_aie

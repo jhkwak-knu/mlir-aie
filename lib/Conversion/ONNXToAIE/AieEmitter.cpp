@@ -21,6 +21,54 @@ using namespace xilinx::AIE;
 namespace onnx_to_aie {
 
 //===----------------------------------------------------------------------===//
+// Trace configuration constants (AIE2 core tile)
+//===----------------------------------------------------------------------===//
+// Register addresses
+static constexpr uint32_t TRACE_CTRL0_ADDR  = 0x340D0;  // start/stop/mode
+static constexpr uint32_t TRACE_CTRL1_ADDR  = 0x340D4;  // packet config
+static constexpr uint32_t TRACE_EVENT0_ADDR = 0x340E0;  // events 0-3
+static constexpr uint32_t TRACE_EVENT1_ADDR = 0x340E4;  // events 4-7
+static constexpr uint32_t TRACE_TIMER_ADDR  = 0x34000;  // timer control
+static constexpr uint32_t TRACE_BCAST_ADDR  = 0x34010;  // broadcast base (+N*4)
+static constexpr uint32_t TRACE_EVTGEN_ADDR = 0x34008;  // event generation
+
+// Core tile event codes
+static constexpr uint8_t EVT_NONE         = 0x00;
+static constexpr uint8_t EVT_INSTR_EVT_0  = 0x21; // INSTR_EVENT_0 (CoreEvent=33) — kernel start
+static constexpr uint8_t EVT_INSTR_EVT_1  = 0x22; // INSTR_EVENT_1 (CoreEvent=34) — kernel end
+static constexpr uint8_t EVT_BCAST_14   = 0x79;  // BROADCAST_14 (107+14)
+static constexpr uint8_t EVT_BCAST_15   = 0x7A;  // BROADCAST_15 (107+15)
+static constexpr uint8_t EVT_USER_EVT_0 = 0x7E;  // USER_EVENT_0 (stop signal)
+static constexpr uint8_t EVT_USER_EVT_1 = 0x7F;  // USER_EVENT_1 (start signal)
+
+// Memory module trace register addresses (AIE2 compute tile)
+static constexpr uint32_t MEM_TRACE_CTRL0_ADDR  = 0x140D0;  // start/stop/mode
+static constexpr uint32_t MEM_TRACE_CTRL1_ADDR  = 0x140D4;  // packet config
+static constexpr uint32_t MEM_TRACE_EVENT0_ADDR = 0x140E0;  // events 0-3
+static constexpr uint32_t MEM_TRACE_EVENT1_ADDR = 0x140E4;  // events 4-7
+static constexpr uint32_t MEM_TRACE_TIMER_ADDR  = 0x14000;  // timer control
+
+// Memory module DMA event codes (MemEvent values)
+// S2MM ch0 = LHS input (+PRES when M-inner), ch1 = RHS input (+PRES when N-inner)
+// MM2S ch0 = RES output
+// STALLED_LOCK: level event, active while DMA waits for lock acquisition.
+// Transfer duration = FINISHED_BD timestamp - STALLED_LOCK fall timestamp.
+static constexpr uint8_t MEM_EVT_DMA_S2MM_0_STARV = 35;  // LHS stream starvation
+static constexpr uint8_t MEM_EVT_DMA_S2MM_1_STARV = 36;  // RHS stream starvation
+static constexpr uint8_t MEM_EVT_DMA_MM2S_0_STALL = 33;  // RES lock stall
+static constexpr uint8_t MEM_EVT_DMA_S2MM_0_DONE  = 23;  // LHS done
+static constexpr uint8_t MEM_EVT_DMA_S2MM_1_DONE  = 24;  // RHS done
+static constexpr uint8_t MEM_EVT_DMA_MM2S_0_DONE  = 25;  // RES done
+// MemEvent BROADCAST_14/15 have same code (121/122) as CoreEvent — reuse EVT_BCAST_*
+
+// Shim DMA trace config
+static constexpr uint32_t TRACE_BD_ID      = 15;
+static constexpr uint32_t TRACE_PER_STREAM = 262144;  // bytes per trace stream (256KB)
+static constexpr uint32_t XDNA2_COL_SHIFT  = 25;
+static constexpr uint32_t TRACE_BCAST_NUM      = 15;  // broadcast channel for start
+static constexpr uint32_t TRACE_BCAST_STOP_NUM = 14;  // broadcast channel for stop
+
+//===----------------------------------------------------------------------===//
 // Type aliases used by emitCoreOps
 //===----------------------------------------------------------------------===//
 using Args = SmallVector<Value, 3>;
@@ -182,6 +230,64 @@ static void emitBufferAndLockOps(OpBuilder &builder, Location loc,
             buf.calcLockValue = lockOp;
           }
         }
+      }
+    }
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// emitTraceFlowOps
+//===----------------------------------------------------------------------===//
+// Creates PacketFlowOps routing each compute tile's Trace port to the shim
+// tile's DMA ch1 (S2MM) in the same column.  Each tile gets a unique packet_id
+// (1-based within the column) so parse_trace.py can de-interleave per tile.
+static void emitTraceFlowOps(OpBuilder &builder, Location loc,
+                              AiePlacement &placement,
+                              const TilingContext &tilingCtx) {
+  if (!tilingCtx.traceEnabled) return;
+  const auto &device = tilingCtx.device;
+
+  for (uint32_t col = 0; col < tilingCtx.numCols; ++col) {
+    uint32_t shimIdx = placement.findAieTileIdx(col, device.shimRow);
+    auto &shimTile = placement.getAieTile(shimIdx);
+
+    for (uint32_t i = 0; i < tilingCtx.numCompTilesPerCol; ++i) {
+      uint32_t row = device.compTileLastRow() - i;
+      uint32_t compIdx = placement.findAieTileIdx(col, row);
+      auto &compTile = placement.getAieTile(compIdx);
+
+      // Core trace: Trace port 0, pktId 1..N
+      uint32_t corePktId = i + 1;
+      auto coreFlowOp = builder.create<PacketFlowOp>(
+          loc, static_cast<int8_t>(corePktId),
+          /*keep_pkt_header=*/builder.getBoolAttr(true), /*bp_id=*/nullptr);
+      {
+        OpBuilder::InsertionGuard g(builder);
+        Region &flowRegion = coreFlowOp.getBodyRegion();
+        Block *flowBlock = builder.createBlock(&flowRegion);
+        builder.setInsertionPointToStart(flowBlock);
+        builder.create<PacketSourceOp>(
+            loc, compTile.value, WireBundle::Trace, 0);
+        builder.create<PacketDestOp>(
+            loc, shimTile.value, WireBundle::DMA, 1);
+        builder.create<EndOp>(loc);
+      }
+
+      // Memory module trace: Trace port 1, pktId (N+1)..2N
+      uint32_t memPktId = i + 1 + tilingCtx.numCompTilesPerCol;
+      auto memFlowOp = builder.create<PacketFlowOp>(
+          loc, static_cast<int8_t>(memPktId),
+          /*keep_pkt_header=*/builder.getBoolAttr(true), /*bp_id=*/nullptr);
+      {
+        OpBuilder::InsertionGuard g(builder);
+        Region &flowRegion = memFlowOp.getBodyRegion();
+        Block *flowBlock = builder.createBlock(&flowRegion);
+        builder.setInsertionPointToStart(flowBlock);
+        builder.create<PacketSourceOp>(
+            loc, compTile.value, WireBundle::Trace, 1);
+        builder.create<PacketDestOp>(
+            loc, shimTile.value, WireBundle::DMA, 1);
+        builder.create<EndOp>(loc);
       }
     }
   }
@@ -442,9 +548,11 @@ static void emitCoreOps(OpBuilder &builder, Location loc,
       auto cMax = builder.create<mlir::arith::ConstantOp>(loc, builder.getIndexAttr(CORE_LOOP_INFINITE));
       auto cCnt = builder.create<mlir::arith::ConstantOp>(loc, builder.getIndexAttr(repeatCount));
 
-      auto cRow = builder.create<mlir::arith::ConstantIntOp>(loc, compTM, /*width=*/getElemBytes(elemType)*8);
-      auto cCol = builder.create<mlir::arith::ConstantIntOp>(loc, compTN, /*width=*/getElemBytes(elemType)*8);
-      auto cDep = builder.create<mlir::arith::ConstantIntOp>(loc, compTK, /*width=*/getElemBytes(elemType)*8);
+      // Dimension args (N_ROW, N_COL, N_DEP) are always uint32_t in the kernel
+      // signature, regardless of the element data type.
+      auto cRow = builder.create<mlir::arith::ConstantIntOp>(loc, compTM, /*width=*/32);
+      auto cCol = builder.create<mlir::arith::ConstantIntOp>(loc, compTN, /*width=*/32);
+      auto cDep = builder.create<mlir::arith::ConstantIntOp>(loc, compTK, /*width=*/32);
 
       auto trueI1 = builder.create<arith::ConstantIntOp>(loc, /*value=*/1, /*bitWidth=*/1);
       auto falseI1 = builder.create<arith::ConstantIntOp>(loc, /*value=*/0, /*bitWidth=*/1);
@@ -511,8 +619,15 @@ static void emitCoreOps(OpBuilder &builder, Location loc,
           auto callArgs = buildKernelCallArgs(tpOrder, arg1, arg2, reuseArgs,
                                               cRow, cCol, cDep, acc);
 
+          // Mark kernel start/end for trace timing (INSTR_EVENT_0/1)
+          if (tilingCtx.traceEnabled)
+            builder.create<EventOp>(loc, /*val=*/0);
+
           auto calleeAttr = SymbolRefAttr::get(builder.getContext(), "extern_kernel");
           builder.create<mlir::func::CallOp>(loc, calleeAttr, TypeRange{}, ValueRange(callArgs));
+
+          if (tilingCtx.traceEnabled)
+            builder.create<EventOp>(loc, /*val=*/1);
 
           // Generate AIE UseLockOp (arg1/arg2)
           builder.create<UseLockOp>(loc, arg2[2], LockAction::Release, 1);
@@ -696,6 +811,159 @@ static void emitRuntimeSequenceOp(OpBuilder &builder, Location loc,
       arg_pres = seqBlock->addArgument(presMemrefType, loc);
     }
 
+    // Add trace buffer argument (last arg) when trace is enabled
+    // 2 streams per tile: core trace + memory module trace
+    Value arg_trace;
+    if (tilingCtx.traceEnabled) {
+      uint32_t numStreams = tilingCtx.numCols * tilingCtx.numCompTilesPerCol * 2;
+      uint32_t totalTraceBytes = TRACE_PER_STREAM * numStreams;
+      auto traceType = MemRefType::get(
+          {static_cast<int64_t>(totalTraceBytes / 4)}, builder.getI32Type());
+      arg_trace = seqBlock->addArgument(traceType, loc);
+    }
+
+    // Emit trace setup ops before DMA schedule so tracing captures all activity
+    if (tilingCtx.traceEnabled) {
+      // Per-tile: configure core trace and memory module trace
+      for (uint32_t col = 0; col < tilingCtx.numCols; ++col) {
+        for (uint32_t i = 0; i < tilingCtx.numCompTilesPerCol; ++i) {
+          uint32_t row = device.compTileLastRow() - i;
+          auto colAttr = builder.getI32IntegerAttr(col);
+          auto rowAttr = builder.getI32IntegerAttr(row);
+          uint32_t corePktId = i + 1;
+          uint32_t memPktId  = i + 1 + tilingCtx.numCompTilesPerCol;
+
+          //--- Core trace (0x340xx) ---
+
+          // Trace Control 0: start=BROADCAST_15, stop=BROADCAST_14, mode=event-time
+          builder.create<xilinx::AIEX::NpuWrite32Op>(loc,
+              TRACE_CTRL0_ADDR,
+              static_cast<uint32_t>((EVT_BCAST_14 << 24) | (EVT_BCAST_15 << 16)),
+              nullptr, colAttr, rowAttr);
+
+          // Trace Control 1: packet mode, type=CORE(0), packet_id
+          builder.create<xilinx::AIEX::NpuWrite32Op>(loc,
+              TRACE_CTRL1_ADDR,
+              static_cast<uint32_t>((0u << 12) | (corePktId & 0x1F)),
+              nullptr, colAttr, rowAttr);
+
+          // Event Group 0: [3]=NONE [2]=NONE [1]=INSTR_EVENT_1 [0]=INSTR_EVENT_0
+          uint32_t coreEg0 = (EVT_NONE << 24) | (EVT_NONE << 16) |
+                             (EVT_INSTR_EVT_1 << 8) | EVT_INSTR_EVT_0;
+          builder.create<xilinx::AIEX::NpuWrite32Op>(loc,
+              TRACE_EVENT0_ADDR, coreEg0, nullptr, colAttr, rowAttr);
+
+          // Event Group 1: [7..4] = all NONE (disabled)
+          builder.create<xilinx::AIEX::NpuWrite32Op>(loc,
+              TRACE_EVENT1_ADDR, static_cast<uint32_t>(0), nullptr, colAttr, rowAttr);
+
+          // Timer control: reset on BROADCAST_15 for cross-tile synchronization
+          builder.create<xilinx::AIEX::NpuWrite32Op>(loc,
+              TRACE_TIMER_ADDR,
+              static_cast<uint32_t>((EVT_BCAST_15 & 0x7F) << 8),
+              nullptr, colAttr, rowAttr);
+
+          //--- Memory module trace (0x140xx) ---
+
+          // Trace Control 0: same start/stop broadcast events
+          builder.create<xilinx::AIEX::NpuWrite32Op>(loc,
+              MEM_TRACE_CTRL0_ADDR,
+              static_cast<uint32_t>((EVT_BCAST_14 << 24) | (EVT_BCAST_15 << 16)),
+              nullptr, colAttr, rowAttr);
+
+          // Trace Control 1: packet mode, type=MEM(1), packet_id
+          builder.create<xilinx::AIEX::NpuWrite32Op>(loc,
+              MEM_TRACE_CTRL1_ADDR,
+              static_cast<uint32_t>((1u << 12) | (memPktId & 0x1F)),
+              nullptr, colAttr, rowAttr);
+
+          // Event Group 0: [3]=S2MM_1_DONE [2]=S2MM_1_STARV [1]=S2MM_0_DONE [0]=S2MM_0_STARV
+          uint32_t memEg0 = (MEM_EVT_DMA_S2MM_1_DONE  << 24) |
+                            (MEM_EVT_DMA_S2MM_1_STARV << 16) |
+                            (MEM_EVT_DMA_S2MM_0_DONE  << 8)  |
+                             MEM_EVT_DMA_S2MM_0_STARV;
+          builder.create<xilinx::AIEX::NpuWrite32Op>(loc,
+              MEM_TRACE_EVENT0_ADDR, memEg0, nullptr, colAttr, rowAttr);
+
+          // Event Group 1: [7..6]=NONE [5]=MM2S_0_DONE [4]=MM2S_0_STALL
+          uint32_t memEg1 = (EVT_NONE << 24) | (EVT_NONE << 16) |
+                            (MEM_EVT_DMA_MM2S_0_DONE  << 8) |
+                             MEM_EVT_DMA_MM2S_0_STALL;
+          builder.create<xilinx::AIEX::NpuWrite32Op>(loc,
+              MEM_TRACE_EVENT1_ADDR, memEg1, nullptr, colAttr, rowAttr);
+
+          // Timer control: reset on BROADCAST_15 for cross-tile synchronization
+          builder.create<xilinx::AIEX::NpuWrite32Op>(loc,
+              MEM_TRACE_TIMER_ADDR,
+              static_cast<uint32_t>((EVT_BCAST_15 & 0x7F) << 8),
+              nullptr, colAttr, rowAttr);
+        }
+      }
+
+      // Per-column: configure shim DMA BD for trace collection
+      // 2 streams per tile (core + mem) share the same shim DMA BD
+      for (uint32_t col = 0; col < tilingCtx.numCols; ++col) {
+        uint32_t traceSizeBytes = TRACE_PER_STREAM * tilingCtx.numCompTilesPerCol * 2;
+        uint32_t traceOffsetBytes = col * traceSizeBytes;
+        // NpuWriteBdOp buffer_length/offset are in 32-bit words (AIE2 addr gen granularity)
+        uint32_t traceLenWords = traceSizeBytes / 4;
+        uint32_t traceOffWords = traceOffsetBytes / 4;
+
+        // Shim DMA BD with enable_packet=1 to receive interleaved packets
+        builder.create<xilinx::AIEX::NpuWriteBdOp>(loc,
+            /*column=*/col, /*bd_id=*/TRACE_BD_ID,
+            /*buffer_length=*/traceLenWords, /*buffer_offset=*/traceOffWords,
+            /*enable_packet=*/1, /*out_of_order_id=*/0,
+            /*packet_id=*/0, /*packet_type=*/0,
+            /*d0_size=*/0, /*d0_stride=*/0,
+            /*d1_size=*/0, /*d1_stride=*/0,
+            /*d2_size=*/0, /*d2_stride=*/0,
+            /*iteration_current=*/0, /*iteration_size=*/0, /*iteration_stride=*/0,
+            /*next_bd=*/0, /*row=*/0, /*use_next_bd=*/0, /*valid_bd=*/1,
+            /*lock_rel_val=*/0, /*lock_rel_id=*/0,
+            /*lock_acq_enable=*/0, /*lock_acq_val=*/0, /*lock_acq_id=*/0,
+            /*d0_zero_before=*/0, /*d1_zero_before=*/0, /*d2_zero_before=*/0,
+            /*d0_zero_after=*/0, /*d1_zero_after=*/0, /*d2_zero_after=*/0);
+
+        // Patch DDR address for trace buffer arg
+        uint32_t traceArgIdx = needsPres(tilingCtx) ? 4 : 3;
+        uint32_t patchAddr = (col << XDNA2_COL_SHIFT) |
+                             (0x1D004 + TRACE_BD_ID * 0x20);
+        builder.create<xilinx::AIEX::NpuAddressPatchOp>(loc,
+            patchAddr, traceArgIdx, traceOffsetBytes);
+
+        // Start shim S2MM ch1
+        builder.create<xilinx::AIEX::NpuWrite32Op>(loc,
+            static_cast<uint32_t>(0x1D20C),
+            static_cast<uint32_t>(TRACE_BD_ID),
+            nullptr,
+            builder.getI32IntegerAttr(col),
+            builder.getI32IntegerAttr(0));
+      }
+
+      // Broadcast timer sync: shim tile col=0 generates USER_EVENT_1 → broadcast 15
+      auto shimCol0 = builder.getI32IntegerAttr(0);
+      auto shimRow0 = builder.getI32IntegerAttr(0);
+
+      // Timer control on shim tile: reset on USER_EVENT_1
+      builder.create<xilinx::AIEX::NpuWrite32Op>(loc,
+          TRACE_TIMER_ADDR,
+          static_cast<uint32_t>((EVT_USER_EVT_1 & 0x7F) << 8),
+          nullptr, shimCol0, shimRow0);
+
+      // Broadcast config: broadcast 15 = USER_EVENT_1
+      builder.create<xilinx::AIEX::NpuWrite32Op>(loc,
+          static_cast<uint32_t>(TRACE_BCAST_ADDR + TRACE_BCAST_NUM * 4),
+          static_cast<uint32_t>(EVT_USER_EVT_1),
+          nullptr, shimCol0, shimRow0);
+
+      // Generate USER_EVENT_1 → triggers broadcast → all tiles start tracing
+      builder.create<xilinx::AIEX::NpuWrite32Op>(loc,
+          TRACE_EVTGEN_ADDR,
+          static_cast<uint32_t>(EVT_USER_EVT_1 & 0x7F),
+          nullptr, shimCol0, shimRow0);
+    }
+
     // Generate AIEX NpuDmaMemcpyNdOp
     for (auto &sch : placement.aieSchedule) {
       Value arg;
@@ -738,6 +1006,25 @@ static void emitRuntimeSequenceOp(OpBuilder &builder, Location loc,
         builder.create<xilinx::AIEX::NpuDmaWaitOp>(loc, metadata);
       }
     }
+
+    // Stop trace: USER_EVENT_0 → broadcast 14 → all tiles stop tracing
+    // Must come after all DMA waits so trace captures the full execution.
+    if (tilingCtx.traceEnabled) {
+      auto shimCol0 = builder.getI32IntegerAttr(0);
+      auto shimRow0 = builder.getI32IntegerAttr(0);
+
+      // Broadcast config: broadcast 14 = USER_EVENT_0
+      builder.create<xilinx::AIEX::NpuWrite32Op>(loc,
+          static_cast<uint32_t>(TRACE_BCAST_ADDR + TRACE_BCAST_STOP_NUM * 4),
+          static_cast<uint32_t>(EVT_USER_EVT_0),
+          nullptr, shimCol0, shimRow0);
+
+      // Generate USER_EVENT_0 → triggers broadcast 14 → all tiles stop tracing
+      builder.create<xilinx::AIEX::NpuWrite32Op>(loc,
+          TRACE_EVTGEN_ADDR,
+          static_cast<uint32_t>(EVT_USER_EVT_0 & 0x7F),
+          nullptr, shimCol0, shimRow0);
+    }
   }
 }
 
@@ -747,7 +1034,6 @@ static void emitRuntimeSequenceOp(OpBuilder &builder, Location loc,
 void generateAieOps(ConversionPatternRewriter &rewriter,
                     AiePlacement &placement,
                     const TilingContext &tilingCtx,
-                    const TileParam &tileParam,
                     const std::string &outputPath) {
   MLIRContext *ctx = rewriter.getContext();
   auto loc = mlir::UnknownLoc::get(ctx);
@@ -758,6 +1044,7 @@ void generateAieOps(ConversionPatternRewriter &rewriter,
   emitDeviceOp(builder, loc, tilingCtx);
   emitTileOps(builder, loc, placement);
   emitBufferAndLockOps(builder, loc, placement, tilingCtx);
+  emitTraceFlowOps(builder, loc, placement, tilingCtx);
   emitPacketFlowOps(builder, loc, placement, tilingCtx);
   emitMemDmaOps(builder, loc, placement, tilingCtx);
   emitCoreOps(builder, loc, placement, tilingCtx);

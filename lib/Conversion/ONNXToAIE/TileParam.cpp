@@ -45,6 +45,12 @@ static bool getBoolReq(const llvm::json::Object &obj, llvm::StringRef key) {
   llvm::report_fatal_error("missing bool");
 }
 
+static bool getBoolOpt(const llvm::json::Object &obj, llvm::StringRef key,
+                       bool def) {
+  if (auto v = obj.getBoolean(key)) return *v;
+  return def;
+}
+
 static mlir::Type getElemTypeReq(const llvm::json::Object &obj,
                                  llvm::StringRef key,
                                  mlir::MLIRContext &ctx) {
@@ -272,7 +278,7 @@ std::optional<SystemInfo> loadSystemInfo(const std::string &filePath,
 //===----------------------------------------------------------------------===//
 // TODO(algorithm): Implement the full spatio-temporal tiling optimization here.
 // During development and validation, tiling parameters are loaded from an
-// external JSON file (--tile-param-json) produced by gen_tc_list.py, which
+// external JSON file (--tile-param-json) produced by cost_model.py, which
 // enumerates all valid (SPm,SPn,TPm,TPk,TPn) candidates, applies the cost
 // model, and selects the optimal configuration. Once the cost model is
 // validated against real hardware, this function will perform the full
@@ -309,7 +315,6 @@ TileParam findOptimalTileParam(const SystemInfo &sysInfo,
     llvm::report_fatal_error("tile param json root type error");
   }
 
-  // Top-level fields
   TileParam tp;
   tp.opSize = TileSize{
       .TM = getU32Req(*rootObj, "M"),
@@ -317,43 +322,36 @@ TileParam findOptimalTileParam(const SystemInfo &sysInfo,
       .TN = getU32Req(*rootObj, "N"),
   };
   tp.elemType            = getElemTypeReq(*rootObj, "elemType", *opInfo.elemType.getContext());
-  tp.numLevel            = getU32Req(*rootObj, "numLevel");
-  tp.numLastSpm          = getU32Req(*rootObj, "numLastSpm");
+  tp.numCores            = getU32Req(*rootObj, "numCores");
   tp.doubleBufferEnabled = getBoolReq(*rootObj, "doubleBuffer");
+  tp.traceEnabled        = getBoolOpt(*rootObj, "trace", false);
 
   auto *levelsArr = rootObj->getArray("levels");
   if (!levelsArr) {
-    llvm::errs() << "Error: 'levels' array missing in case\n";
+    llvm::errs() << "Error: 'levels' array missing in tc.json\n";
     llvm::report_fatal_error("levels missing");
   }
-
-  tp.levels.reserve(levelsArr->size());
-  for (size_t i = 0; i < levelsArr->size(); ++i) {
-    auto *Lobj = (*levelsArr)[i].getAsObject();
-    if (!Lobj) {
-      llvm::errs() << "Error: level[" << i << "] is not an object\n";
-      llvm::report_fatal_error("level type error");
-    }
-
-    LevelParam lv;
-    lv.numSpm = getU32Req(*Lobj, "numSpm");
-    lv.SPm    = getU32Req(*Lobj, "SPm");
-    lv.SPn    = getU32Req(*Lobj, "SPn");
-    lv.TPm    = getU32Req(*Lobj, "TPm");
-    lv.TPk    = getU32Req(*Lobj, "TPk");
-    lv.TPn    = getU32Req(*Lobj, "TPn");
-
-    lv.tileSize = getLevelTileSize(*Lobj);
-    lv.tpOrder  = getAxisArrayOpt(*Lobj, "tpOrder");
-
-    tp.levels.push_back(std::move(lv));
+  if (levelsArr->size() != 1) {
+    llvm::errs() << "Error: only single-level tiling is supported, got "
+                 << levelsArr->size() << " levels\n";
+    llvm::report_fatal_error("multi-level tiling not supported");
   }
 
-  if (tp.numLevel != tp.levels.size()) {
-    llvm::errs() << "Error: numLevel(" << tp.numLevel
-                 << ") != levels.size(" << tp.levels.size() << ")\n";
-    llvm::report_fatal_error("numLevel mismatch");
+  auto *Lobj = (*levelsArr)[0].getAsObject();
+  if (!Lobj) {
+    llvm::errs() << "Error: levels[0] is not an object\n";
+    llvm::report_fatal_error("level type error");
   }
+
+  LevelParam lv;
+  lv.SPm  = getU32Req(*Lobj, "SPm");
+  lv.SPn  = getU32Req(*Lobj, "SPn");
+  lv.TPm  = getU32Req(*Lobj, "TPm");
+  lv.TPk  = getU32Req(*Lobj, "TPk");
+  lv.TPn  = getU32Req(*Lobj, "TPn");
+  lv.tileSize = getLevelTileSize(*Lobj);
+  lv.tpOrder  = getAxisArrayOpt(*Lobj, "tpOrder");
+  tp.levels.push_back(std::move(lv));
 
   if (debug) {
     llvm::dbgs() << "[TileParam] Loaded TileParam:\n"
@@ -366,35 +364,31 @@ TileParam findOptimalTileParam(const SystemInfo &sysInfo,
     tp.elemType.print(llvm::dbgs());
     llvm::dbgs() << "\n";
 
-    llvm::dbgs() << "  numLevel:     " << tp.numLevel << "\n"
-                << "  numLastSpm:   " << tp.numLastSpm << "\n"
+    llvm::dbgs() << "  numCores:     " << tp.numCores << "\n"
                 << "  doubleBuffer: " << (tp.doubleBufferEnabled ? "true" : "false") << "\n";
 
-    for (size_t i = 0; i < tp.levels.size(); ++i) {
-      const auto &lv = tp.levels[i];
-      llvm::dbgs() << "    level=" << i << ":"
-                  << " numSpm=" << lv.numSpm
-                  << " SPm=" << lv.SPm
-                  << " SPn=" << lv.SPn << " |"
-                  << " TPm=" << lv.TPm
-                  << " TPk=" << lv.TPk
-                  << " TPn=" << lv.TPn << " |"
-                  << " tile(M/K/N)="
-                  << lv.tileSize.TM << "/"
-                  << lv.tileSize.TK << "/"
-                  << lv.tileSize.TN << " |"
-                  << " tpOrder=";
+    const auto &l0 = tp.levels[0];
+    llvm::dbgs() << "  levels[0]:"
+                << " SPm=" << l0.SPm
+                << " SPn=" << l0.SPn << " |"
+                << " TPm=" << l0.TPm
+                << " TPk=" << l0.TPk
+                << " TPn=" << l0.TPn << " |"
+                << " tile(M/K/N)="
+                << l0.tileSize.TM << "/"
+                << l0.tileSize.TK << "/"
+                << l0.tileSize.TN << " |"
+                << " tpOrder=";
 
-      if (lv.tpOrder.empty()) {
-        llvm::dbgs() << "[]\n";
-      } else {
-        llvm::dbgs() << "[";
-        for (size_t j = 0; j < lv.tpOrder.size(); ++j) {
-          llvm::dbgs() << lv.tpOrder[j];
-          if (j + 1 < lv.tpOrder.size()) llvm::dbgs() << ",";
-        }
-        llvm::dbgs() << "]\n";
+    if (l0.tpOrder.empty()) {
+      llvm::dbgs() << "[]\n";
+    } else {
+      llvm::dbgs() << "[";
+      for (size_t j = 0; j < l0.tpOrder.size(); ++j) {
+        llvm::dbgs() << l0.tpOrder[j];
+        if (j + 1 < l0.tpOrder.size()) llvm::dbgs() << ",";
       }
+      llvm::dbgs() << "]\n";
     }
     llvm::dbgs() << "\n";
   }
@@ -408,24 +402,25 @@ TileParam findOptimalTileParam(const SystemInfo &sysInfo,
 TilingContext buildTilingContext(const TileParam &tp, const SystemInfo &sysInfo) {
   TilingContext tc;
   tc.device = sysInfo.device;
-  const auto &lv = tp.levels[0];
   tc.numCompTilesPerCol = tc.device.compTilesPerCol;
 
-  // numLastSpm must be a positive multiple of compTilesPerCol so that
+  // numCores must be a positive multiple of compTilesPerCol so that
   // the tile grid fills complete columns without remainder.
-  if (tp.numLastSpm == 0 || tp.numLastSpm % tc.device.compTilesPerCol != 0)
+  if (tp.numCores == 0 || tp.numCores % tc.device.compTilesPerCol != 0)
     llvm::report_fatal_error(
-        llvm::Twine("numLastSpm=") + llvm::Twine(tp.numLastSpm) +
+        llvm::Twine("numCores=") + llvm::Twine(tp.numCores) +
         " must be a positive multiple of " +
         llvm::Twine(tc.device.compTilesPerCol));
 
-  tc.numCols = tp.numLastSpm / tc.numCompTilesPerCol;
+  tc.numCols = tp.numCores / tc.numCompTilesPerCol;
 
   if (tc.numCols > tc.device.maxColumns)
     llvm::report_fatal_error(
         llvm::Twine("numCols=") + llvm::Twine(tc.numCols) +
         " exceeds maximum supported columns (" +
         llvm::Twine(tc.device.maxColumns) + ")");
+
+  const auto &lv = tp.levels[0];
   tc.compTM              = lv.tileSize.TM;
   tc.compTK              = lv.tileSize.TK;
   tc.compTN              = lv.tileSize.TN;
@@ -437,6 +432,7 @@ TilingContext buildTilingContext(const TileParam &tp, const SystemInfo &sysInfo)
   tc.tpOrder             = lv.tpOrder;
   tc.elemType            = tp.elemType;
   tc.doubleBufferEnabled = tp.doubleBufferEnabled;
+  tc.traceEnabled        = tp.traceEnabled;
   return tc;
 }
 

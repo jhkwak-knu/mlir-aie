@@ -1,0 +1,27 @@
+% Algorithm 1: STAR-Map search procedure with structure-based pruning
+% Flow: P → d_inner → SP (Rule 3) → TP (Rules 1+2) → cost evaluation → optimal selection
+\begin{algorithm}[H]
+\caption{STAR-Map search procedure with structure-based pruning.}\label{alg:search}
+\begin{algorithmic}[1]
+\REQUIRE Workload dimensions $(M, N, K)$; hardware parameters; cost model $f_{\mathrm{EDP}}$; top-$K$ SP parameter $K_{\mathrm{top}}$
+\ENSURE Mapping configuration $c^*$ minimizing predicted EDP
+\STATE $c^* \leftarrow \varnothing$;\quad $\mathrm{EDP}^* \leftarrow \infty$
+\FOR{each $P \in \mathcal{P}_{\mathrm{set}}$}
+    \FOR{each $d_{\mathrm{inner}} \in \{M, N, K\}$}
+        \STATE $\mathcal{S} \leftarrow$ all $(SP_m, SP_n)$ s.t.\ $SP_m \cdot SP_n = P$
+        \STATE $\mathcal{S} \leftarrow \textsc{PruneSP}(\mathcal{S}, d_{\mathrm{inner}}, K_{\mathrm{top}})$ \hfill\COMMENT{Rule~3}
+        \FOR{each $(SP_m, SP_n) \in \mathcal{S}$}
+            \STATE $\mathcal{T} \leftarrow \textsc{GenerateTP}(M, N, K, SP_m, SP_n, d_{\mathrm{inner}})$
+            \STATE $\mathcal{T} \leftarrow \textsc{PruneTP}(\mathcal{T}, d_{\mathrm{inner}})$ \hfill\COMMENT{Rules~1+2}
+            \FOR{each $(TP_m, TP_n, TP_k) \in \mathcal{T}$}
+                \STATE $c \leftarrow (P, SP_m, SP_n, TP_m, TP_n, TP_k, d_{\mathrm{inner}})$
+                \IF{$f_{\mathrm{EDP}}(c) < \mathrm{EDP}^*$}
+                    \STATE $c^* \leftarrow c$;\quad $\mathrm{EDP}^* \leftarrow f_{\mathrm{EDP}}(c)$
+                \ENDIF
+            \ENDFOR
+        \ENDFOR
+    \ENDFOR
+\ENDFOR
+\RETURN $c^*$
+\end{algorithmic}
+\end{algorithm}
