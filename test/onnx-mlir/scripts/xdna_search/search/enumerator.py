@@ -39,7 +39,11 @@ class ExhaustiveEnumerator:
       1. num_cores in [1, C]         -- resource budget (PE count)
       2. SPm in [1, num_cores]        -- spatial M-axis split
          SPn = num_cores / SPm        (determined, not a free variable)
-      3. TPm, TPk, TPn over divisors of M, K, N respectively.
+      3. TPm, TPn, TPk over divisors of M, N, K respectively.
+
+    Loop order matches paper/fig/baselines.py::enumerate_configs
+    (TPm -> TPn -> TPk) so tie-break results from stable sorts are
+    identical to the paper reference implementation.
 
     Hardware constraints are deferred to Stage 2 (filters). Tile sizes
     (TM, TK, TN) are 0 whenever the split does not evenly divide the
@@ -66,8 +70,8 @@ class ExhaustiveEnumerator:
                 continue
             for SPm, SPn in factor_pairs(num_cores):
                 for TPm in divs_M:
-                    for TPk in divs_K:
-                        for TPn in divs_N:
+                    for TPn in divs_N:
+                        for TPk in divs_K:
                             sp_tp_m = SPm * TPm
                             sp_tp_n = SPn * TPn
                             TM = op.M // sp_tp_m if op.M % sp_tp_m == 0 else 0
