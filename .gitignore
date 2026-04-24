@@ -32,3 +32,6 @@ runtime_lib/xaiengine/src
 
 # Paper artifacts (regeneratable)
 test/onnx-mlir/paper/search_bench/output/
+
+# Claude Code runtime lock (session-local, not for version control)
+.claude/scheduled_tasks.lock
