@@ -43,18 +43,22 @@ from typing import Dict, List, Optional, Tuple
 
 # Allow importing from scripts/generate/
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE.parent / "generate"))
 
-from tiling_common import (  # noqa: E402
-    DEFAULT_OP_PATH, DEFAULT_SYS_PATH, DEFAULT_CALIB_PATH,
-    OpCase, SystemInfo, CalibCoeffs,
-    load_op_list, load_system_info, load_calibration,
-    CommentFilterFile,
+from xdna_search.hw_constants import (  # noqa: E402
+    DEFAULT_CALIB_PATH, DEFAULT_OP_PATH, DEFAULT_SYS_PATH,
 )
+from xdna_search.io import (  # noqa: E402
+    CommentFilterFile,
+    load_calibration, load_op_list, load_system_info,
+)
+from xdna_search.types import (  # noqa: E402
+    CalibCoeffs, Candidate, CostResult, OpCase, SystemInfo,
+)
+from xdna_search.cost.v16_edp import evaluate_candidate  # noqa: E402
 from cost_model import (  # noqa: E402
-    Candidate, CostResult,
-    enumerate_candidates, filter_candidates, evaluate_candidate,
-    select_optimal,
+    enumerate_candidates, filter_candidates, select_optimal,
 )
 
 CLOCK_MHZ = 1500  # XDNA2 clock for cycle -> us conversion

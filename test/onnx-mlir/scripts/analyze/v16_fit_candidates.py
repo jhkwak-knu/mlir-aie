@@ -33,8 +33,9 @@ from scipy.stats import spearmanr
 
 # Resolve project paths
 SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR.parent))
 sys.path.insert(0, str(SCRIPT_DIR.parent / "generate"))
-from models import (  # noqa: E402
+from xdna_search.models import (  # noqa: E402
     CLOCK_MHZ,
     d_total as compute_d_total,
     total_data_bytes as compute_total_data_bytes,

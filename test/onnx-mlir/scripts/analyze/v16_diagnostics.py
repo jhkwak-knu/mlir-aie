@@ -30,13 +30,14 @@ from scipy.stats import spearmanr
 
 # Resolve project paths
 SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR.parent))
 sys.path.insert(0, str(SCRIPT_DIR.parent / "generate"))
-from models import (  # noqa: E402
+from xdna_search.models import (  # noqa: E402
     CLOCK_MHZ, PerfModel, EnergyModel,
     d_total, total_data_bytes, dma_ops_per_step,
     TP_AXIS_M, TP_AXIS_N, TP_AXIS_K,
 )
-from tiling_common import load_calibration  # noqa: E402
+from xdna_search.io import load_calibration  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Constants

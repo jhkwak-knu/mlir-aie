@@ -37,21 +37,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "generate"))
-from tiling_common import (  # noqa: E402
-    OpCase, CalibCoeffs,
-    load_calibration, DEFAULT_CALIB_PATH,
-    load_system_info, DEFAULT_SYS_PATH,
-    CommentFilterFile,
-    spearman_rank_correlation,
+from xdna_search.hw_constants import DEFAULT_CALIB_PATH, DEFAULT_SYS_PATH  # noqa: E402
+from xdna_search.io import (  # noqa: E402
+    CommentFilterFile, load_calibration, load_system_info,
 )
-from cost_model import (  # noqa: E402
-    Candidate, evaluate_candidate, total_data_bytes,
-    E_MAC_PJ, E_DRAM_PJ, P_STATIC_PJ,
-    PEAK_MACS, BANDWIDTH_BPC, ALPHA_CYCLES,
-    _dma_ops_per_step,
+from xdna_search.math_utils import spearman_rank_correlation  # noqa: E402
+from xdna_search.types import CalibCoeffs, Candidate, OpCase  # noqa: E402
+from xdna_search.cost.v16_edp import (  # noqa: E402
+    ALPHA_CYCLES, BANDWIDTH_BPC, E_DRAM_PJ, E_MAC_PJ,
+    P_STATIC_PJ, PEAK_MACS,
+    _dma_ops_per_step, evaluate_candidate, total_data_bytes,
 )
-import models as _models  # noqa: E402
+from xdna_search import models as _models  # noqa: E402
 
 CLOCK_MHZ = 1500
 DEFAULT_MIN_WALL_S = 0.005
