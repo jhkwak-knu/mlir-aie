@@ -69,10 +69,12 @@ def test_aggregate_per_setter_min_across_batches(synthetic_measurements):
     out = analyze.aggregate_per_setter(synthetic_measurements)
     star_fc1 = out[(out.setter == "star_map") & (out.measurement_type == "kernel")
                    & (out.layer == "fc1")].iloc[0]
-    # batch=0 is lower in our fixture -> min = base value
+    # batch=0 is lower in our fixture -> min = base value.
+    # `energy_uj_min_package` is per-batch TOTAL (n_inner=3 inferences); the
+    # per-inference normalization divides by n_inner before taking the min.
     assert star_fc1["time_us_min"] == pytest.approx(40.0)
-    assert star_fc1["energy_uj_min_package"] == pytest.approx(400.0)
-    assert star_fc1["edp_min"] == pytest.approx(40.0 * 400.0)
+    assert star_fc1["energy_per_inference_uj_min"] == pytest.approx(400.0 / 3)
+    assert star_fc1["edp_min"] == pytest.approx(40.0 * 400.0 / 3)
     assert star_fc1["n_batches"] == 2
 
 

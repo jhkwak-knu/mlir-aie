@@ -54,14 +54,26 @@ def _df_to_markdown(df: pd.DataFrame, floatfmt: str = ".3f") -> str:
 
 
 def aggregate_per_setter(df: pd.DataFrame) -> pd.DataFrame:
-    """Aggregate measurements.csv into per-(setter, measurement_type, layer) mins."""
+    """Aggregate measurements.csv into per-(setter, measurement_type, layer) mins.
+
+    The runner's `energy_uj_min_package` column is a *per-batch* total over
+    `n_inner` inference replays, whereas `time_us_min` is already the per-inference
+    minimum observed within that batch. Normalize energy to per-inference before
+    computing EDP so the two axes share the same unit.
+    """
+    df = df.copy()
+    # Guard against rows with n_inner == 0 (shouldn't happen, but be explicit).
+    df["energy_per_inference_uj"] = df.apply(
+        lambda r: (r["energy_uj_min_package"] / r["n_inner"]) if r["n_inner"] else 0.0,
+        axis=1,
+    )
     g = df.groupby(["setter", "measurement_type", "layer"], as_index=False).agg(
         time_us_min=("time_us_min", "min"),
         time_us_mean=("time_us_mean", "mean"),
-        energy_uj_min_package=("energy_uj_min_package", "min"),
+        energy_per_inference_uj_min=("energy_per_inference_uj", "min"),
         n_batches=("batch_idx", "nunique"),
     )
-    g["edp_min"] = g["time_us_min"] * g["energy_uj_min_package"]
+    g["edp_min"] = g["time_us_min"] * g["energy_per_inference_uj_min"]
     return g
 
 
@@ -177,15 +189,15 @@ def write_report(report_path: Path,
                  f"Runs: **{metadata.get('num_runs', '?')}**, "
                  f"Baseline setter: **{metadata.get('baseline_setter')}**.\n")
 
-    lines.append("\n## Model-level aggregates (min across batches)\n")
+    lines.append("\n## Model-level aggregates (per inference, min across batches)\n")
     lines.append(_df_to_markdown(
-        model[["setter", "time_us_min", "energy_uj_min_package", "edp_min"]],
+        model[["setter", "time_us_min", "energy_per_inference_uj_min", "edp_min"]],
         floatfmt=".2f"))
 
-    lines.append("\n\n## Per-layer kernel aggregates (min across batches)\n")
+    lines.append("\n\n## Per-layer kernel aggregates (per inference, min across batches)\n")
     lines.append(_df_to_markdown(
-        kernels[["setter", "layer", "time_us_min", "energy_uj_min_package",
-                 "edp_min"]],
+        kernels[["setter", "layer", "time_us_min",
+                 "energy_per_inference_uj_min", "edp_min"]],
         floatfmt=".2f"))
 
     lines.append("\n\n## Dilution factor (vs baseline)\n")

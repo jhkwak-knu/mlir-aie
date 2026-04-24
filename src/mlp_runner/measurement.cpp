@@ -189,10 +189,11 @@ RunStats runMeasurement(const ExperimentConfig& cfg,
       if (global_min == 0.0 || *mn < global_min) global_min = *mn;
     }
     for (const auto& [layer, es] : layer_energies_pkg) {
-      int64_t mn = *std::min_element(es.begin(), es.end());
-      bs.layer_energy_uj_min[layer] = mn;
-      auto& g = stats.layer_energy_uj_min_global[layer];
-      if (g == 0 || mn < g) g = mn;
+      int64_t sum = 0;
+      for (int64_t v : es) sum += v;
+      bs.layer_energy_uj_sum[layer] = sum;
+      auto& g = stats.layer_energy_uj_sum_min_global[layer];
+      if (g == 0 || sum < g) g = sum;
     }
 
     batch_energies_per_inf.push_back(bs.energy_per_inference_uj);
@@ -272,9 +273,14 @@ void writeMeasurements(const std::string& output_dir,
               stats.batch_energy_cv_pct, stats.batch_time_cv_pct);
     for (const auto& [layer, t_min] : bs.layer_time_us_min) {
       double t_mean = bs.layer_time_us_mean.at(layer);
-      int64_t e_min = bs.layer_energy_uj_min.at(layer);
+      // For layer rows, `energy_uj_min_package` column carries the batch SUM of
+      // per-inference RAPL deltas. analyze.py divides by n_inner to obtain the
+      // per-inference energy, consistent with the model row's npu_uj_package
+      // (which is also a batch-total scalar). See measurement.h for the
+      // rationale behind sum vs min aggregation.
+      int64_t e_sum = bs.layer_energy_uj_sum.at(layer);
       write_row("kernel", layer, bs.index, bs.n_inner,
-                t_min, t_mean, e_min,
+                t_min, t_mean, e_sum,
                 bs.wall_s, bs.idle_power_pre_mw, bs.idle_power_post_mw,
                 stats.batch_energy_cv_pct, stats.batch_time_cv_pct);
     }

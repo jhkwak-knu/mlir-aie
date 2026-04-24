@@ -64,7 +64,11 @@ struct BatchStats {
   double model_time_us_mean = 0.0;
   std::map<std::string, double> layer_time_us_min;
   std::map<std::string, double> layer_time_us_mean;
-  std::map<std::string, int64_t> layer_energy_uj_min;
+  // Per-batch sum of per-inference RAPL deltas for this layer. Used instead of
+  // min because short layers (fc3 ~680us) can sit below the RAPL update tick
+  // (~1ms) and return delta=0 on individual inferences; summing across
+  // n_inner iterations always captures multiple ticks and remains positive.
+  std::map<std::string, int64_t> layer_energy_uj_sum;
 };
 
 /// Top-level run stats collected across outer_batches.
@@ -86,7 +90,9 @@ struct RunStats {
 
   // Global per-layer min across all inner iterations in all batches.
   std::map<std::string, double> layer_time_us_min_global;
-  std::map<std::string, int64_t> layer_energy_uj_min_global;
+  // Global per-layer sum-of-deltas minimum across batches (batch with the
+  // lowest cumulative layer energy — robust to RAPL tick quantization).
+  std::map<std::string, int64_t> layer_energy_uj_sum_min_global;
 };
 
 /// One instrumented forward pass: records per-layer + whole-inference
