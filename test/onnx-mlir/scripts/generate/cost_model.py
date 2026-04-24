@@ -348,9 +348,15 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     p.add_argument("--sys", default=str(DEFAULT_SYS_PATH),
                    help="Path to xdna2_info.json")
     p.add_argument("--out", default="",
-                   help="Path to write cost results JSON (optional)")
-    p.add_argument("--validate", default="",
-                   help="Path to write validation tc_list.json (optional)")
+                   help="Path to write full ranked debug JSON (one entry per "
+                        "candidate x tp_order with cost breakdown). Optional.")
+    p.add_argument("--tc-list", dest="tc_list", default="",
+                   help="Output path for tc_list.json consumed by "
+                        "run_tc_all.sh. Case count is controlled by "
+                        "--top-n / --per-core-top / --random-sample "
+                        "(all zero = every candidate).")
+    p.add_argument("--validate", dest="validate_deprecated", default="",
+                   help=argparse.SUPPRESS)   # deprecated alias, see below
     p.add_argument("--op-index", type=int, default=-1,
                    help="Run only this 0-based op index (-1 = all)")
     p.add_argument("--calib", default=str(DEFAULT_CALIB_PATH),
@@ -367,13 +373,19 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
                    help="Comma-separated numCores values to exclude from enumeration "
                         "(e.g., '24' to skip all 24-core configs)")
     p.add_argument("--search", default="sm-exh",
-                   choices=("sm-exh", "star-map", "naive", "timeloop"),
+                   choices=("sm-exh", "star-map", "charm", "naive", "timeloop"),
                    help="Searcher to use. Default 'sm-exh' preserves legacy "
-                        "exhaustive behavior; 'star-map' applies STAR-Map pruning.")
+                        "exhaustive behavior; 'star-map' applies STAR-Map pruning; "
+                        "'charm' selects by CHARM-CDSE throughput-cycle.")
     p.add_argument("--pruning-level", type=int, default=123,
                    choices=(1, 12, 123),
                    help="STAR-Map pruning level (1, 12, or 123). Only effective "
                         "when --search=star-map.")
+    p.add_argument("--charm-stage-mode", default="sum",
+                   choices=("sum", "max"),
+                   help="CHARM-CDSE per-iteration aggregation mode. 'sum' models "
+                        "sequential XDNA2 execution (default); 'max' preserves "
+                        "CHARM's original pipelined assumption.")
     return p.parse_args(argv)
 
 
@@ -384,6 +396,7 @@ def process_op(
     exclude_cores: Optional[set] = None,
     searcher_name: str = "sm-exh",
     pruning_level: int = 123,
+    charm_stage_mode: str = "sum",
 ):
     """Run the full 4-component pipeline for a single op via the factory."""
     factory = get_searcher_factory(searcher_name)
@@ -391,6 +404,12 @@ def process_op(
         searcher = factory(
             sys_info, coeffs,
             pruning_level=pruning_level,
+            exclude_cores=exclude_cores,
+        )
+    elif searcher_name == "charm":
+        searcher = factory(
+            sys_info, coeffs,
+            stage_mode=charm_stage_mode,
             exclude_cores=exclude_cores,
         )
     else:
@@ -411,6 +430,17 @@ def main(argv: List[str]) -> int:
     args = parse_args(argv)
     op_path = Path(args.op).resolve()
     sys_path = Path(args.sys).resolve()
+
+    # Backward-compat: --validate is a deprecated alias for --tc-list. Accept
+    # either, warn once when the old name is used.
+    if args.validate_deprecated:
+        if args.tc_list:
+            print("[ERROR] pass either --tc-list or --validate, not both",
+                  file=sys.stderr)
+            return 1
+        print("[WARN] --validate is deprecated; use --tc-list instead",
+              file=sys.stderr)
+        args.tc_list = args.validate_deprecated
 
     try:
         ops = load_op_list(op_path)
@@ -461,10 +491,12 @@ def main(argv: List[str]) -> int:
             file=sys.stderr,
         )
         need_tporder = False
-    searcher_label = (
-        f"star-map-rule{args.pruning_level}"
-        if args.search == "star-map" else args.search
-    )
+    if args.search == "star-map":
+        searcher_label = f"star-map-rule{args.pruning_level}"
+    elif args.search == "charm":
+        searcher_label = f"charm-{args.charm_stage_mode}"
+    else:
+        searcher_label = args.search
     print(f"[INFO] Searcher: {searcher_label}")
 
     exclude_cores_set = set()
@@ -481,6 +513,7 @@ def main(argv: List[str]) -> int:
                 exclude_cores=exclude_cores_set,
                 searcher_name=args.search,
                 pruning_level=args.pruning_level,
+                charm_stage_mode=args.charm_stage_mode,
             )
             all_tporder_data[idx] = tpo_data
         else:
@@ -489,6 +522,7 @@ def main(argv: List[str]) -> int:
                 exclude_cores=exclude_cores_set,
                 searcher_name=args.search,
                 pruning_level=args.pruning_level,
+                charm_stage_mode=args.charm_stage_mode,
             )
         all_ranked[idx] = ranked
 
@@ -525,8 +559,8 @@ def main(argv: List[str]) -> int:
         print(f"\n[INFO] Wrote {out_path}")
 
     # Write validation tc_list.json if requested
-    if args.validate:
-        val_path = Path(args.validate).resolve()
+    if args.tc_list:
+        val_path = Path(args.tc_list).resolve()
         tc_cases: List[Dict[str, Any]] = []
         for idx, ranked in all_ranked.items():
             op = ops[idx]

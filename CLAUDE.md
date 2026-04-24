@@ -89,10 +89,18 @@ All commands run from `test/onnx-mlir/`.
 
 ### Step 1 -- Generate test case list
 ```bash
-python3 scripts/generate/cost_model.py --op data/op_list.json --validate out/tc_list.json
-# Dry-run (validate only, no output):
+# Every valid candidate (for cost-model validation sweeps)
+python3 scripts/generate/cost_model.py --op data/op_list.json --tc-list out/tc_list.json
+
+# Top-1 per workload only (final pick)
+python3 scripts/generate/cost_model.py --op data/op_list.json --top-n 1 --tc-list out/tc_list.json
+
+# Dry-run (in-memory enumeration + rank, no file output):
 python3 scripts/generate/cost_model.py --op data/op_list.json --op-index 0
 ```
+Notes:
+- `--search {sm-exh, star-map, charm, timeloop}` selects the searcher (default `sm-exh`).
+- `--validate` is a deprecated alias of `--tc-list` (still accepted, prints a warning).
 
 ### Step 2 -- Run all test cases (batch)
 ```bash
