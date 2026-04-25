@@ -24,6 +24,7 @@
 //===----------------------------------------------------------------------===//
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <exception>
 #include <iostream>
@@ -33,6 +34,7 @@
 #include "cxxopts.hpp"
 
 #include "config_loader_distilbert.h"
+#include "model.h"
 
 // bert.cpp public API
 #include "bert.h"
@@ -127,10 +129,35 @@ int main(int argc, char** argv) try {
     }
     std::cout << "] (" << tokens.size() << ")\n";
 
-    // Step 4-3-C-2 will add the encoder forward + classifier head; for
-    // 4-3-C-1 we stop after tokenization so the wiring is verifiable
-    // independent of the rest of the pipeline.
-    std::cout << "  forward sanity OK (encoder forward arrives in 4-3-C-2)\n";
+    distilbert_runner::ClassifierHead head =
+        distilbert_runner::loadClassifierHead(bctx);
+    std::cout << "  classifier: num_labels=" << head.num_labels << "\n";
+
+    std::vector<float> logits;
+    distilbert_runner::runForwardClassify(bctx, head, tokens,
+                                          /*n_threads=*/4, logits);
+
+    std::cout << "  logits=[";
+    for (size_t i = 0; i < logits.size(); ++i) {
+      std::cout << logits[i];
+      if (i + 1 < logits.size()) std::cout << ", ";
+    }
+    std::cout << "]\n";
+
+    // Argmax + softmax probability for the predicted label.
+    int argmax = 0;
+    for (int i = 1; i < head.num_labels; ++i) {
+      if (logits[i] > logits[argmax]) argmax = i;
+    }
+    double max_logit = logits[argmax];
+    double denom = 0.0;
+    for (int i = 0; i < head.num_labels; ++i) {
+      denom += std::exp(static_cast<double>(logits[i]) - max_logit);
+    }
+    const double prob_argmax = 1.0 / denom;
+    const char* label_str = (argmax == 1) ? "POSITIVE" : "NEGATIVE";
+    std::cout << "  predicted_label=" << argmax
+              << " (" << label_str << ") prob=" << prob_argmax << "\n";
 
     bert_free(bctx);
     return 0;

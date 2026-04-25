@@ -68,6 +68,7 @@ endif()
 
 set(DISTILBERT_SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/config_loader_distilbert.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/model.cpp
 )
 
 add_library(distilbert_runner_core STATIC ${SHARED_SOURCES} ${DISTILBERT_SOURCES})
