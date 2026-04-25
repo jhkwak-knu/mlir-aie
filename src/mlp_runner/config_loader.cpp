@@ -2,8 +2,10 @@
 
 #include "config_loader.h"
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <stdexcept>
 
 #include "nlohmann/json.hpp"
@@ -114,14 +116,22 @@ std::vector<LayerKernelEntry> loadLayerKernels(
         "configurations.json: no entries matched setter '" + setter + "'");
   }
 
-  // Layer name ordering (fc1, fc2, ...) — lexicographic on the numeric suffix.
+  // Layer name ordering: "fc<N>" sorts numerically (MLP convention);
+  // anything else (DistilBERT's "attention_qkv" etc.) falls back to
+  // lexicographic so the loader stays model-agnostic.
   std::sort(picked.begin(), picked.end(),
             [](const LayerKernelEntry& a, const LayerKernelEntry& b) {
-              // "fc" + int; strip prefix.
-              auto suffix = [](const std::string& s) {
-                return std::stoi(s.substr(2));
+              auto numeric_suffix = [](const std::string& s) -> std::optional<int> {
+                if (s.size() > 2 && s[0] == 'f' && s[1] == 'c') {
+                  try { return std::stoi(s.substr(2)); }
+                  catch (...) { return std::nullopt; }
+                }
+                return std::nullopt;
               };
-              return suffix(a.layer) < suffix(b.layer);
+              auto na = numeric_suffix(a.layer);
+              auto nb = numeric_suffix(b.layer);
+              if (na && nb) return *na < *nb;
+              return a.layer < b.layer;
             });
   return picked;
 }
