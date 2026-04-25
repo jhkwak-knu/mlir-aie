@@ -137,5 +137,7 @@ def test_cli_writes_expected_artifacts(tmp_path, synthetic_measurements,
     assert (out_dir / "figures" / "fig1_kernel_edp.png").is_file()
     assert (out_dir / "figures" / "fig2_dilution_gain.pdf").is_file()
     assert (out_dir / "figures" / "fig2_dilution_gain.png").is_file()
+    assert (out_dir / "figures" / "fig3_edp_decomposition.pdf").is_file()
+    assert (out_dir / "figures" / "fig3_edp_decomposition.png").is_file()
     assert (out_dir / "tables" / "table1_main.csv").is_file()
     assert (out_dir / "tables" / "table2_configs.csv").is_file()

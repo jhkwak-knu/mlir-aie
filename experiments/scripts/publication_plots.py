@@ -9,6 +9,7 @@ Outputs (under `<output-dir>`):
 
     figures/fig1_kernel_edp.{pdf,png}
     figures/fig2_dilution_gain.{pdf,png}
+    figures/fig3_edp_decomposition.{pdf,png}
     tables/table1_main.csv
     tables/table2_configs.csv
 
@@ -120,6 +121,71 @@ def figure_kernel_edp(per_setter: pd.DataFrame, base_path: Path) -> None:
     ax.set_ylabel(r"Kernel-level EDP ($\mu s \cdot \mu J$, log scale)")
     ax.set_yscale("log")
     ax.legend(loc="upper right", frameon=False, ncol=2)
+    fig.tight_layout()
+    _save(fig, base_path)
+    plt.close(fig)
+
+
+def figure_edp_decomposition(dilution: pd.DataFrame, base_path: Path) -> None:
+    """Stacked-bar decomposition of model EDP into kernel sum and host overhead.
+
+    Each setter's bar stacks:
+      bottom = sum of per-layer kernel EDPs (Level-1)
+      top    = model EDP - kernel sum    (host-side dispatch / activations /
+                                          softmax / runtime overhead)
+
+    Visualizes how the host overhead is approximately uniform across setters
+    (i.e. the ratio compression seen in fig2 is driven by additive overhead).
+    Total bar height equals the absolute Level-2 (model) EDP.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
+
+    plt.rcParams.update(RC_PARAMS)
+    if dilution.empty:
+        return
+
+    setters = [s for s in SETTER_ORDER if s in dilution["setter"].values]
+    l1 = [float(dilution[dilution["setter"] == s].iloc[0]["level1_edp"])
+          for s in setters]
+    l2 = [float(dilution[dilution["setter"] == s].iloc[0]["level2_edp"])
+          for s in setters]
+    overhead = [max(0.0, l2[i] - l1[i]) for i in range(len(setters))]
+
+    x = np.arange(len(setters))
+    width = 0.6
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    OVERHEAD_COLOR = "#BDBDBD"
+
+    for i, s in enumerate(setters):
+        ax.bar(x[i], l1[i], width,
+               color=SETTER_PALETTE.get(s, "gray"),
+               edgecolor="black", linewidth=0.5)
+    ax.bar(x, overhead, width, bottom=l1,
+           color=OVERHEAD_COLOR, edgecolor="black", linewidth=0.5,
+           hatch="...")
+
+    # Annotate total (model EDP) above each bar.
+    for i, s in enumerate(setters):
+        ax.text(x[i], l2[i], f"{l2[i] / 1e9:.2f}",
+                ha="center", va="bottom", fontsize=8)
+        # Annotate kernel-sum portion inside the lower segment.
+        ax.text(x[i], l1[i] / 2.0, f"{l1[i] / 1e9:.2f}",
+                ha="center", va="center", fontsize=8, color="white")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([SETTER_DISPLAY.get(s, s) for s in setters])
+    ax.set_ylabel(r"Model-level EDP ($\mu s \cdot \mu J \times 10^{9}$)")
+    ax.yaxis.set_major_formatter(
+        plt.FuncFormatter(lambda v, _: f"{v / 1e9:.1f}")
+    )
+    legend_handles = [
+        Patch(facecolor="white", edgecolor="black", label="Kernel sum (Level-1)"),
+        Patch(facecolor=OVERHEAD_COLOR, edgecolor="black", hatch="...",
+              label="Host overhead"),
+    ]
+    ax.legend(handles=legend_handles, loc="upper left", frameon=False)
     fig.tight_layout()
     _save(fig, base_path)
     plt.close(fig)
@@ -283,6 +349,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     figure_kernel_edp(per_setter, fig_dir / "fig1_kernel_edp")
     figure_dilution_gain(dilution, fig_dir / "fig2_dilution_gain",
                          baseline_label=args.baseline_setter)
+    figure_edp_decomposition(dilution, fig_dir / "fig3_edp_decomposition")
 
     t1 = table1_main(df, per_setter, dilution, gemm_frac)
     t2 = table2_configs(args.configurations_json)
