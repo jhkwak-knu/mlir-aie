@@ -2,7 +2,7 @@ import sys
 import torch
 
 from gguf import GGUFWriter, GGMLQuantizationType
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel, AutoModelForSequenceClassification, AutoTokenizer
 
 KEY_PAD_ID = 'tokenizer.ggml.padding_token_id'
 KEY_UNK_ID = 'tokenizer.ggml.unknown_token_id'
@@ -48,10 +48,32 @@ _DISTILBERT_EMBEDDING_PASSTHROUGH = {
 }
 
 
+_CLASSIFIER_HEAD_PASSTHROUGH = {
+    "pre_classifier.weight",
+    "pre_classifier.bias",
+    "classifier.weight",
+    "classifier.bias",
+}
+
+
 def distilbert_to_bert_name(name):
     """Translate a DistilBert state_dict key to the BERT-style key used by
-    src/bert.cpp. Returns None for keys we deliberately drop (the SST-2
-    classifier head and similar are handled in a later step)."""
+    src/bert.cpp. Returns None for keys we deliberately drop.
+
+    Accepts both DistilBertModel-style keys (no prefix) and
+    DistilBertForSequenceClassification-style keys (`distilbert.` prefix
+    on the body, plus a `pre_classifier` / `classifier` head). Classifier
+    head tensors pass through unchanged so that distilbert_runner can
+    `gguf_get_tensor()` them directly while leaving src/bert.cpp's
+    BERT-shaped lookups undisturbed.
+    """
+    if name in _CLASSIFIER_HEAD_PASSTHROUGH:
+        return name
+    # Strip the `distilbert.` prefix that DistilBertForSequenceClassification
+    # adds to every body tensor; vanilla DistilBertModel state_dicts don't
+    # carry it so the no-prefix path still works.
+    if name.startswith("distilbert."):
+        name = name[len("distilbert."):]
     if name in _DISTILBERT_EMBEDDING_PASSTHROUGH:
         return name
     if name.startswith("transformer.layer."):
@@ -94,7 +116,7 @@ def _hparams_from_config(config):
     }
 
 
-def convert_hf(repo_id, output_path, float_type='f16'):
+def convert_hf(repo_id, output_path, float_type='f16', with_classifier_head=False):
     # convert to ggml quantization type
     if float_type not in ['f16', 'f32']:
         print(f'Float type must be f16 or f32, got: {float_type}')
@@ -105,7 +127,14 @@ def convert_hf(repo_id, output_path, float_type='f16'):
 
     # load tokenizer and model
     vocab = AutoTokenizer.from_pretrained(repo_id)
-    model = AutoModel.from_pretrained(repo_id)
+    if with_classifier_head:
+        # SST-2 fine-tuned models live as DistilBertForSequenceClassification:
+        # body + pre_classifier (Linear 768->768) + classifier (Linear 768->n).
+        # AutoModel would silently strip the head, so we ask for the full
+        # classifier here.
+        model = AutoModelForSequenceClassification.from_pretrained(repo_id)
+    else:
+        model = AutoModel.from_pretrained(repo_id)
     config = model.config
     model_type = getattr(config, "model_type", "")
     is_distilbert = (model_type == "distilbert")
@@ -226,20 +255,26 @@ def convert_hf(repo_id, output_path, float_type='f16'):
 
 # script usage
 if __name__ == '__main__':
-    # primay usage
-    if len(sys.argv) < 3:
-        print('Usage: convert-to-ggml.py repo_id output_path [float-type=f16,f32]\n')
-        sys.exit(1)
+    import argparse
 
-    # output in the same directory as the model
-    repo_id = sys.argv[1]
-    output_path = sys.argv[2]
+    parser = argparse.ArgumentParser(
+        description="Convert a HuggingFace BERT/DistilBERT checkpoint to GGUF."
+    )
+    parser.add_argument("repo_id",
+                        help="HuggingFace repo id (e.g. distilbert-base-uncased)")
+    parser.add_argument("output_path",
+                        help="Path for the resulting .gguf file")
+    parser.add_argument("float_type", nargs="?", default="f16",
+                        choices=("f16", "f32"),
+                        help="Tensor float type (default: f16)")
+    parser.add_argument("--with-classifier-head", action="store_true",
+                        help="Load via AutoModelForSequenceClassification and "
+                             "store pre_classifier / classifier tensors for "
+                             "downstream consumers (e.g. distilbert_runner).")
+    args = parser.parse_args()
 
-    # get float type
-    if len(sys.argv) > 3:
-        kwargs = {'float_type': sys.argv[3].lower()}
-    else:
-        kwargs = {}
-
-    # convert to ggml
-    convert_hf(repo_id, output_path, **kwargs)
+    convert_hf(
+        args.repo_id, args.output_path,
+        float_type=args.float_type,
+        with_classifier_head=args.with_classifier_head,
+    )
