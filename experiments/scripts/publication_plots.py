@@ -55,8 +55,8 @@ SETTER_PALETTE: Dict[str, str] = {
 }
 PNG_DPI = 300
 RC_PARAMS: Dict[str, Any] = {
-    "font.family":       "serif",
-    "font.serif":        ["Nimbus Roman", "Liberation Serif", "DejaVu Serif"],
+    # Font is left at matplotlib default (DejaVu Sans) for consistency with
+    # earlier figures already pulled into the dissertation chapter.
     "font.size":         10,
     "axes.labelsize":    11,
     "axes.titlesize":    11,
