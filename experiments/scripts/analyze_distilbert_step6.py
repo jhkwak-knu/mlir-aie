@@ -236,25 +236,64 @@ def write_markdown_report(out_md: Path, configs: pd.DataFrame,
                  .pipe(lambda d: _df_to_markdown(d)))
     lines.append("")
 
-    # Key finding
-    lines.append("\n## 7. Key finding\n")
-    lines.append("- For every NPU-dispatched shape, **STAR-Map and max_p chose **")
-    lines.append("  **identical tile configurations** (P=32, same SP/TP/tile/order).")
-    lines.append("- STAR-Map's parallelism-reduction heuristic only fires for the")
-    lines.append("  two head-batched shapes (attention_score 128x64x128 and ")
-    lines.append("  attention_context 128x128x64), where it picks **P=4** while")
-    lines.append("  every other setter sticks with P=32. Those shapes are not")
-    lines.append("  NPU-dispatched at runtime (hook rejects ne[2]>1), so the P=4")
-    lines.append("  choice does not affect the measured EDP.")
-    lines.append("- DistilBERT's NPU-dispatched GEMMs are large enough")
-    lines.append("  (M*K*N >= 75M MACs) that the V16 cost model identifies")
-    lines.append("  max-parallelism as EDP-optimal. STAR-Map's value emerges only")
-    lines.append("  on smaller GEMMs (cf. MLP-512-512 results).")
-    lines.append("- Timeloop's 1.9% model-level EDP lead comes entirely from a")
-    lines.append("  different cost-model formula (TimeloopEdpCost vs V16EdpCost)")
-    lines.append("  picking different SP/tile splits on attention_qkv (2/16 vs 4/8)")
-    lines.append("  and ffn_expand (1/32 vs 2/16). Same number of cores (32),")
-    lines.append("  different work distribution.")
+    # Key finding (derived from the data, not hardcoded)
+    lines.append("\n## 7. Key finding (data-derived)\n")
+
+    # Model-level ranking
+    summary_sorted = summary.sort_values("edp_rel")
+    rank = list(summary_sorted["setter"])
+    best = summary_sorted.iloc[0]
+    rank_str = " < ".join(f"{r['setter']} ({r['edp_rel']:.3f})"
+                          for _, r in summary_sorted.iterrows())
+    lines.append(f"- Model-level EDP ranking (lower better): {rank_str}.")
+
+    # Best vs second
+    if len(summary_sorted) >= 2:
+        second = summary_sorted.iloc[1]
+        # Signed deltas: positive = runner-up is worse (winner saves on that
+        # metric); negative = runner-up beats winner on this metric (winner's
+        # EDP lead came from the *other* axis).
+        delta_t_pct = (second["t_us_min"] - best["t_us_min"]) / best["t_us_min"] * 100
+        delta_e_pct = (second["e_uj_min"] - best["e_uj_min"]) / best["e_uj_min"] * 100
+        delta_edp_pct = (second["edp"] - best["edp"]) / best["edp"] * 100
+        lines.append(
+            f"- **{best['setter']}** wins (lower EDP). vs runner-up "
+            f"`{second['setter']}` (signed gap, +ve = winner ahead): "
+            f"time {delta_t_pct:+.1f}%, energy {delta_e_pct:+.1f}%, "
+            f"EDP {delta_edp_pct:+.1f}%."
+        )
+
+    # NPU-dispatched shapes where star_map and max_p differ
+    sm_mp = cmp_[["shape_label", "identical"]]
+    npu_shapes = set(configs[configs["npu_dispatched"]]["shape_label"])
+    differ_npu = [r["shape_label"] for _, r in sm_mp.iterrows()
+                  if not r["identical"] and r["shape_label"] in npu_shapes]
+    same_npu = [r["shape_label"] for _, r in sm_mp.iterrows()
+                if r["identical"] and r["shape_label"] in npu_shapes]
+    lines.append(
+        f"- NPU-dispatched shapes where star_map != max_p: "
+        f"{len(differ_npu)} ({', '.join(differ_npu) or '-'})."
+    )
+    lines.append(
+        f"- NPU-dispatched shapes where star_map == max_p: "
+        f"{len(same_npu)} ({', '.join(same_npu) or '-'})."
+    )
+
+    # P-core picks per setter
+    p_per_setter = (configs.groupby("setter")["P_cores"]
+                    .agg(lambda s: sorted(set(int(x) for x in s)))
+                    .to_dict())
+    p_str = "; ".join(f"{k}: {v}" for k, v in p_per_setter.items())
+    lines.append(f"- P-cores picked per setter (across all 6 shapes): {p_str}.")
+
+    # Per-gemm_type winners
+    gemm_winners: List[str] = []
+    for gemm in sorted(gemm_decomp["gemm_type"].unique()):
+        sub = gemm_decomp[gemm_decomp["gemm_type"] == gemm].sort_values("edp")
+        w = sub.iloc[0]["setter"]
+        gemm_winners.append(f"{gemm}->{w}")
+    lines.append(f"- Per-gemm_type EDP winners: {', '.join(gemm_winners)}.")
+
     lines.append("")
 
     out_md.write_text("\n".join(lines))
