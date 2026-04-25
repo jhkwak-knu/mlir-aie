@@ -9,7 +9,8 @@
     "sequence_length": 128,
     "multi_head_strategy": "batched",
     "use_pretrained_classifier_head": false,
-    "_note_classifier": "Not SST-2 finetuned. Classifier head is randomly initialized via convert.py --random-classifier-head; we measure NPU GEMM timing/energy and verify CPU<->NPU bit-equivalence, not classification accuracy."
+    "_note_classifier": "Not SST-2 finetuned. Classifier head is randomly initialized via convert.py --random-classifier-head; we measure NPU GEMM timing/energy and verify CPU<->NPU bit-equivalence, not classification accuracy.",
+    "gguf": "external/bert.cpp/models/bert-small.gguf"
   },
   "dataset": {
     "name": "sst2",

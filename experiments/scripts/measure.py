@@ -10,8 +10,8 @@ drift back to baseline.  The Python side only:
   * resolves input paths (config.json, configurations.json,
     kernel_binaries/, runner binary, GGUF for DistilBERT),
   * picks the runner binary based on `config.model.type`
-    (mlp -> mlp_runner, distilbert -> distilbert_runner; --runner-binary
-    overrides),
+    (mlp -> mlp_runner, distilbert/bert -> distilbert_runner;
+    --runner-binary overrides),
   * invokes the runner per setter and captures its stdout / stderr,
   * collates per-setter exit codes + the aggregated CV stats surfaced
     by the runner, emits `measurement_run.json` next to
@@ -51,6 +51,9 @@ DEFAULT_DISTILBERT_GGUF = (
 )
 
 
+_BERT_LIKE_TYPES = ("distilbert", "bert")
+
+
 def _resolve_runner_binary(
     config: Dict[str, Any], override: Optional[Path]
 ) -> tuple[Path, str]:
@@ -58,11 +61,13 @@ def _resolve_runner_binary(
 
     Returns (binary_path, model_type). Defaults to mlp when model.type is
     absent so older mlp configs that pre-date the field keep working.
+    distilbert_runner accepts both "distilbert" and "bert" model.type
+    (same encoder graph), so route both to the same binary.
     """
     model_type = (config.get("model") or {}).get("type", "mlp")
     if override is not None:
         return override, model_type
-    if model_type == "distilbert":
+    if model_type in _BERT_LIKE_TYPES:
         return DEFAULT_DISTILBERT_RUNNER, model_type
     return DEFAULT_MLP_RUNNER, model_type
 
@@ -157,10 +162,11 @@ def run_one_setter(
         "--seed", str(seed),
         "--output-dir", str(output_dir),
     ]
-    if model_type == "distilbert":
+    if model_type in _BERT_LIKE_TYPES:
         if gguf_path is None:
             raise RuntimeError(
-                "distilbert measurement requires --gguf <path>"
+                f"{model_type} measurement requires --gguf <path> or "
+                "model.gguf in the config"
             )
         cmd += ["--gguf", str(gguf_path)]
     else:
@@ -226,13 +232,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--runner-binary", type=Path, default=None,
                         help="override the runner binary; default is "
                              "auto-detected from config.model.type "
-                             "(mlp -> mlp_runner, distilbert -> "
+                             "(mlp -> mlp_runner, distilbert/bert -> "
                              "distilbert_runner)")
     parser.add_argument("--gguf", type=Path, default=None,
-                        help="GGUF weights for DistilBERT runs; defaults to "
+                        help="GGUF weights for DistilBERT/BERT runs; "
+                             "resolution order: --gguf > config.model.gguf > "
                              "external/bert.cpp/models/"
-                             "distilbert-sst2-f16.gguf when model.type is "
-                             "distilbert; ignored for MLP runs")
+                             "distilbert-sst2-f16.gguf (only when model.type "
+                             "is distilbert); ignored for MLP runs")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--configurations", type=Path, default=None)
     parser.add_argument("--kernel-binaries-dir", type=Path, default=None)
@@ -256,8 +263,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         config, args.runner_binary
     )
     gguf_path: Optional[Path] = None
-    if model_type == "distilbert":
-        gguf_path = args.gguf or DEFAULT_DISTILBERT_GGUF
+    if model_type in _BERT_LIKE_TYPES:
+        if args.gguf is not None:
+            gguf_path = args.gguf
+        else:
+            cfg_gguf = (config.get("model") or {}).get("gguf")
+            if cfg_gguf:
+                gguf_path = Path(cfg_gguf).expanduser()
+                if not gguf_path.is_absolute():
+                    gguf_path = (REPO_ROOT / gguf_path).resolve()
+            elif model_type == "distilbert":
+                gguf_path = DEFAULT_DISTILBERT_GGUF
 
     setters = args.setters or config.get("setters") or []
     if not setters:
@@ -287,11 +303,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
     if not configurations_path.is_file():
         issues.append(f"configurations.json missing: {configurations_path}")
-    if model_type == "distilbert":
+    if model_type in _BERT_LIKE_TYPES:
         if gguf_path is None or not gguf_path.is_file():
             issues.append(
-                f"DistilBERT GGUF missing: {gguf_path}. "
-                "Provide --gguf or place the file at the default path."
+                f"{model_type} GGUF missing: {gguf_path}. "
+                "Provide --gguf, set model.gguf in the config, or place the "
+                "file at the default DistilBERT path."
             )
 
     if issues:
@@ -302,7 +319,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 2
 
     print(f"measure: runner={runner_binary} (model_type={model_type})")
-    if model_type == "distilbert":
+    if model_type in _BERT_LIKE_TYPES:
         print(f"measure: gguf={gguf_path}")
     print(f"measure: setters={setters}")
     print(f"measure: backend={args.backend}, seed={args.seed}")
