@@ -11,6 +11,89 @@ KEY_EOS_ID = 'tokenizer.ggml.eos_token_id'
 KEY_WORD_PREFIX = 'tokenizer.ggml.word_prefix'
 KEY_SUBWORD_PREFIX = 'tokenizer.ggml.subword_prefix'
 
+# DistilBERT-only: state_dict tensor names use a different vocabulary from
+# BERT. src/bert.cpp expects BERT-style keys, so when the source model is a
+# DistilBertModel we rename each tensor on the way into the GGUF file.
+#
+# In addition, DistilBERT has no `token_type_embeddings`, but src/bert.cpp
+# always indexes that tensor (with token_type_id = 0 hard-coded at line
+# 816 of src/bert.cpp). We synthesize a zero tensor so the lookup returns
+# a zero vector, leaving the embedding sum unchanged — which matches what
+# DistilBERT's forward actually does.
+
+_DISTILBERT_PER_LAYER_RENAME = {
+    "attention.q_lin.weight":      "attention.self.query.weight",
+    "attention.q_lin.bias":        "attention.self.query.bias",
+    "attention.k_lin.weight":      "attention.self.key.weight",
+    "attention.k_lin.bias":        "attention.self.key.bias",
+    "attention.v_lin.weight":      "attention.self.value.weight",
+    "attention.v_lin.bias":        "attention.self.value.bias",
+    "attention.out_lin.weight":    "attention.output.dense.weight",
+    "attention.out_lin.bias":      "attention.output.dense.bias",
+    "sa_layer_norm.weight":        "attention.output.LayerNorm.weight",
+    "sa_layer_norm.bias":          "attention.output.LayerNorm.bias",
+    "ffn.lin1.weight":             "intermediate.dense.weight",
+    "ffn.lin1.bias":               "intermediate.dense.bias",
+    "ffn.lin2.weight":             "output.dense.weight",
+    "ffn.lin2.bias":               "output.dense.bias",
+    "output_layer_norm.weight":    "output.LayerNorm.weight",
+    "output_layer_norm.bias":      "output.LayerNorm.bias",
+}
+
+_DISTILBERT_EMBEDDING_PASSTHROUGH = {
+    "embeddings.word_embeddings.weight",
+    "embeddings.position_embeddings.weight",
+    "embeddings.LayerNorm.weight",
+    "embeddings.LayerNorm.bias",
+}
+
+
+def distilbert_to_bert_name(name):
+    """Translate a DistilBert state_dict key to the BERT-style key used by
+    src/bert.cpp. Returns None for keys we deliberately drop (the SST-2
+    classifier head and similar are handled in a later step)."""
+    if name in _DISTILBERT_EMBEDDING_PASSTHROUGH:
+        return name
+    if name.startswith("transformer.layer."):
+        rest = name[len("transformer.layer."):]
+        sep = rest.find(".")
+        if sep == -1:
+            return None
+        layer_idx, sub = rest[:sep], rest[sep + 1:]
+        mapped = _DISTILBERT_PER_LAYER_RENAME.get(sub)
+        if mapped is None:
+            return None
+        return f"encoder.layer.{layer_idx}.{mapped}"
+    return None
+
+
+def _hparams_from_config(config):
+    """Resolve BERT-style hparam values from either a BertConfig or a
+    DistilBertConfig. src/bert.cpp consumes the BERT names, so the
+    DistilBert path translates dim / hidden_dim / n_heads / n_layers."""
+    model_type = getattr(config, "model_type", "")
+    if model_type == "distilbert":
+        return {
+            "vocab_size":              config.vocab_size,
+            "max_position_embeddings": config.max_position_embeddings,
+            "hidden_size":             config.dim,
+            "intermediate_size":       config.hidden_dim,
+            "num_attention_heads":     config.n_heads,
+            "num_hidden_layers":       config.n_layers,
+            # DistilBertConfig has no layer_norm_eps; BERT default is 1e-12.
+            "layer_norm_eps":          getattr(config, "layer_norm_eps", 1e-12),
+        }
+    return {
+        "vocab_size":              config.vocab_size,
+        "max_position_embeddings": config.max_position_embeddings,
+        "hidden_size":             config.hidden_size,
+        "intermediate_size":       config.intermediate_size,
+        "num_attention_heads":     config.num_attention_heads,
+        "num_hidden_layers":       config.num_hidden_layers,
+        "layer_norm_eps":          config.layer_norm_eps,
+    }
+
+
 def convert_hf(repo_id, output_path, float_type='f16'):
     # convert to ggml quantization type
     if float_type not in ['f16', 'f32']:
@@ -24,6 +107,9 @@ def convert_hf(repo_id, output_path, float_type='f16'):
     vocab = AutoTokenizer.from_pretrained(repo_id)
     model = AutoModel.from_pretrained(repo_id)
     config = model.config
+    model_type = getattr(config, "model_type", "")
+    is_distilbert = (model_type == "distilbert")
+    hparams = _hparams_from_config(config)
 
     # get token list
     token_list = vocab.convert_ids_to_tokens(range(vocab.vocab_size))
@@ -37,14 +123,13 @@ def convert_hf(repo_id, output_path, float_type='f16'):
         subword_prefix = '##'
 
     # print model
-    param_keys = [
-        'vocab_size', 'max_position_embeddings', 'hidden_size', 'intermediate_size',
-        'num_attention_heads', 'num_hidden_layers', 'layer_norm_eps'
-    ]
-    print('PARAMS')
-    for k in param_keys:
-        v = getattr(config, k)
-        print(f'{k:<24s} = {v}')
+    print(f'PARAMS (model_type={model_type or "?"})')
+    for k in (
+        'vocab_size', 'max_position_embeddings', 'hidden_size',
+        'intermediate_size', 'num_attention_heads', 'num_hidden_layers',
+        'layer_norm_eps',
+    ):
+        print(f'{k:<24s} = {hparams[k]}')
     print()
 
     # print vocab
@@ -64,17 +149,19 @@ def convert_hf(repo_id, output_path, float_type='f16'):
 
     # write metadata
     gguf_writer.add_name('BERT')
-    gguf_writer.add_description('GGML BERT model')
+    gguf_writer.add_description(
+        'GGML BERT model' + (' (converted from DistilBERT)' if is_distilbert else '')
+    )
     gguf_writer.add_file_type(qtype)
 
     # write model params
-    gguf_writer.add_uint32('vocab_size', config.vocab_size)
-    gguf_writer.add_uint32('max_position_embedding', config.max_position_embeddings)
-    gguf_writer.add_uint32('hidden_size', config.hidden_size)
-    gguf_writer.add_uint32('intermediate_size', config.intermediate_size)
-    gguf_writer.add_uint32('num_attention_heads', config.num_attention_heads)
-    gguf_writer.add_uint32('num_hidden_layers', config.num_hidden_layers)
-    gguf_writer.add_float32('layer_norm_eps', config.layer_norm_eps)
+    gguf_writer.add_uint32('vocab_size', hparams['vocab_size'])
+    gguf_writer.add_uint32('max_position_embedding', hparams['max_position_embeddings'])
+    gguf_writer.add_uint32('hidden_size', hparams['hidden_size'])
+    gguf_writer.add_uint32('intermediate_size', hparams['intermediate_size'])
+    gguf_writer.add_uint32('num_attention_heads', hparams['num_attention_heads'])
+    gguf_writer.add_uint32('num_hidden_layers', hparams['num_hidden_layers'])
+    gguf_writer.add_float32('layer_norm_eps', hparams['layer_norm_eps'])
 
     # write vocab params
     gguf_writer.add_int32(KEY_PAD_ID, vocab.pad_token_id)
@@ -87,22 +174,45 @@ def convert_hf(repo_id, output_path, float_type='f16'):
 
     # write tensors
     print('TENSORS')
+    n_dropped = 0
     for name, data in model.state_dict().items():
+        if is_distilbert:
+            out_name = distilbert_to_bert_name(name)
+            if out_name is None:
+                n_dropped += 1
+                print(f'  drop  {name}')
+                continue
+        else:
+            out_name = name
+
         # get correct dtype
-        if 'LayerNorm' in name or 'bias' in name:
+        if 'LayerNorm' in out_name or 'bias' in out_name:
             dtype = torch.float32
         else:
             dtype = dtype0
 
         # print info
         shape_str = str(list(data.shape))
-        print(f'{name:64s} = {shape_str:16s} {data.dtype} → {dtype}')
+        print(f'{out_name:64s} = {shape_str:16s} {data.dtype} → {dtype}')
 
         # do conversion
         data = data.to(dtype)
 
         # add to gguf output
-        gguf_writer.add_tensor(name, data.numpy())
+        gguf_writer.add_tensor(out_name, data.numpy())
+
+    # DistilBERT has no token_type_embeddings, but src/bert.cpp always
+    # gathers row 0 of that tensor (token_type_id is hard-coded to 0). A
+    # zero tensor of shape [2, hidden_size] gives the same numerics as
+    # DistilBERT's forward without breaking BERT-style consumers.
+    if is_distilbert:
+        zero_tte = torch.zeros((2, hparams['hidden_size']), dtype=dtype0)
+        gguf_writer.add_tensor(
+            'embeddings.token_type_embeddings.weight', zero_tte.numpy(),
+        )
+        print(f'{"embeddings.token_type_embeddings.weight (zero)":64s} = '
+              f'{list(zero_tte.shape)} synthesized')
+        print(f'  ({n_dropped} DistilBERT tensors dropped)')
 
     # execute and close writer
     gguf_writer.write_header_to_file()
