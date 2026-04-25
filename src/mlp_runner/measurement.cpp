@@ -245,13 +245,11 @@ static std::string _headerCsv() {
          "gemm_type,layer_idx,sub_type";
 }
 
-void writeMeasurements(const std::string& output_dir,
-                       const std::string& setter,
-                       const std::string& backend,
-                       const ExperimentConfig& cfg,
-                       const std::vector<LayerKernelEntry>& layers,
-                       const RunStats& stats) {
-  (void)layers;  // reserved for Step 6-6 when we stamp xclbin hashes per row
+void writeMeasurementsCore(const std::string& output_dir,
+                           const std::string& setter,
+                           const std::string& backend,
+                           const RunStats& stats,
+                           const nlohmann::json& model_summary) {
   fs::create_directories(output_dir);
 
   const fs::path csv_path = fs::path(output_dir) / "measurements.csv";
@@ -309,10 +307,9 @@ void writeMeasurements(const std::string& output_dir,
   json doc;
   doc["setter"] = setter;
   doc["backend"] = backend;
-  doc["config_path"] = cfg.config_path;
-  doc["layer_sizes"] = cfg.layer_sizes;
-  doc["batch_size"] = cfg.batch_size;
-  doc["output_classes"] = cfg.output_classes;
+  for (auto it = model_summary.begin(); it != model_summary.end(); ++it) {
+    doc[it.key()] = it.value();
+  }
   doc["warmup_iterations"] = stats.warmup_iterations;
   doc["outer_batches"] = stats.outer_batches;
   doc["inner_target_seconds"] = stats.inner_target_seconds;
@@ -368,6 +365,24 @@ void writeMeasurements(const std::string& output_dir,
   root["runs"].push_back(doc);
   std::ofstream ofs(json_path);
   ofs << root.dump(2) << "\n";
+}
+
+// MLP-flavored thin wrapper. Builds the model_summary from the MLP cfg
+// fields and forwards to the core. `layers` is reserved for Step 6-6 when
+// we stamp xclbin hashes per row.
+void writeMeasurements(const std::string& output_dir,
+                       const std::string& setter,
+                       const std::string& backend,
+                       const ExperimentConfig& cfg,
+                       const std::vector<LayerKernelEntry>& layers,
+                       const RunStats& stats) {
+  (void)layers;
+  json model_summary;
+  model_summary["config_path"] = cfg.config_path;
+  model_summary["layer_sizes"] = cfg.layer_sizes;
+  model_summary["batch_size"] = cfg.batch_size;
+  model_summary["output_classes"] = cfg.output_classes;
+  writeMeasurementsCore(output_dir, setter, backend, stats, model_summary);
 }
 
 }  // namespace mlp_runner

@@ -50,6 +50,7 @@ option(DISTILBERT_RUNNER_WITH_XRT
 set(SHARED_SOURCES
   ${MLP_RUNNER_DIR}/config_loader.cpp
   ${MLP_RUNNER_DIR}/gemm_cpu.cpp
+  ${MLP_RUNNER_DIR}/measurement.cpp
   ${MLP_RUNNER_DIR}/npu_dispatch.cpp
   ${MLP_RUNNER_DIR}/rapl.cpp
 )

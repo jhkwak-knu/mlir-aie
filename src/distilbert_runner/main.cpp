@@ -24,6 +24,7 @@
 //===----------------------------------------------------------------------===//
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -33,6 +34,8 @@
 #include <iomanip>
 #include <map>
 #include <memory>
+#include <numeric>
+#include <sstream>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -42,9 +45,13 @@
 #include "config_loader_distilbert.h"
 #include "model.h"
 
-// mlp_runner shared primitives: LayerKernelEntry table + dispatcher factory.
+// mlp_runner shared primitives: LayerKernelEntry table + dispatcher factory,
+// RAPL helpers, and the measurement RunStats / writeMeasurementsCore that
+// distilbert reuses verbatim (Step 4-4-B).
 #include "config_loader.h"
+#include "measurement.h"
 #include "npu_dispatch.h"
+#include "rapl.h"
 
 // bert.cpp public API
 #include "bert.h"
@@ -54,11 +61,47 @@ namespace {
 
 constexpr const char* kDefaultProbe = "Hello world";
 
+// One slot in the per-layer NPU dispatch sequence. iamlemec/bert.cpp's
+// encoder block fires mul_mat in a deterministic order — Q, K, V, attention
+// output, ffn_expand, ffn_compress — and the hook's recording path uses the
+// observed call ordinal modulo |expected_seq| to label each sample without
+// needing string-matching against the GGUF tensor names.
+struct ExpectedCall {
+  std::string gemm_type;
+  std::string sub_type;  // "Q"/"K"/"V" for qkv, "" otherwise
+  int M;
+  int K;
+  int N;
+};
+
+// Build the per-layer NPU dispatch sequence from the experiment config.
+// Shapes are derived from cfg (sequence_length, hidden_dim, ffn_dim) so a
+// non-DistilBERT-base config (e.g. larger hidden) still labels correctly.
+std::vector<ExpectedCall> buildExpectedSeq(
+    const distilbert_runner::ExperimentConfig& cfg) {
+  const int M = cfg.sequence_length;
+  const int K = cfg.hidden_dim;
+  const int N_ffn = cfg.ffn_dim;
+  return {
+      {"attention_qkv",    "Q", M, K, K},
+      {"attention_qkv",    "K", M, K, K},
+      {"attention_qkv",    "V", M, K, K},
+      {"attention_output", "",  M, K, K},
+      {"ffn_expand",       "",  M, K, N_ffn},
+      {"ffn_compress",     "",  M, N_ffn, K},
+  };
+}
+
 // Step 4-3-D-2 dispatch table: holds the XRT-backed dispatcher and a
 // (M, K, N) -> LayerKernelEntry index built once at startup. The hook
 // uses this to decide whether to claim a mul_mat for the NPU. Entries
 // not in the table (classifier head M=1, attention_score / attention_
 // context per-head batched, etc.) fall back to ggml's CPU kernel.
+//
+// Step 4-4-B additions: optional per-call recorder. When `recording=true`
+// the hook brackets each NPU dispatch with steady_clock + RAPL and pushes
+// a labeled mlp_runner::PerLayerSample onto current_inference_samples.
+// expected_seq drives the (gemm_type, layer_idx, sub_type) labeling.
 struct HookContext {
   std::unique_ptr<mlp_runner::Dispatcher> dispatcher;
   std::vector<mlp_runner::LayerKernelEntry> entries;
@@ -66,6 +109,13 @@ struct HookContext {
       by_shape;
   long long calls_dispatched = 0;
   long long calls_fallback = 0;
+
+  // Recording state — only consulted on the ith==0 path.
+  bool recording = false;
+  int call_idx_in_inference = 0;
+  std::vector<mlp_runner::PerLayerSample> current_inference_samples;
+  std::vector<ExpectedCall> expected_seq;
+  int total_npu_dispatches_per_inference = 0;
 };
 
 bool distilbert_mul_mat_hook(const ggml_tensor* src0, const ggml_tensor* src1,
@@ -159,7 +209,67 @@ bool distilbert_mul_mat_hook(const ggml_tensor* src0, const ggml_tensor* src1,
   // C buffer [M, N] f32 — XrtDispatcher applies bf16 truncation + tile
   // staging internally and writes the fp32 result back into C.
   std::vector<float> C(static_cast<size_t>(M) * N);
+
+  // Optional per-call instrumentation (Step 4-4-B). Only wraps the dispatch
+  // itself — the surrounding A/B copies are workload-independent host work
+  // shared by every backend, so charging them to a kernel sample would
+  // overstate the NPU's energy footprint.
+  using clock_t_ = std::chrono::steady_clock;
+  const bool record = ctx->recording;
+  clock_t_::time_point t0;
+  int64_t e0_pkg = 0, e0_core = 0;
+  if (record) {
+    e0_pkg  = mlp_runner::readRaplEnergyUj(mlp_runner::kRaplPackagePath);
+    e0_core = mlp_runner::readRaplEnergyUj(mlp_runner::kRaplCorePath);
+    t0 = clock_t_::now();
+  }
+
   ctx->dispatcher->dispatch(*it->second, A.data(), B.data(), C.data());
+
+  if (record) {
+    const auto t1 = clock_t_::now();
+    const int64_t e1_pkg  =
+        mlp_runner::readRaplEnergyUj(mlp_runner::kRaplPackagePath);
+    const int64_t e1_core =
+        mlp_runner::readRaplEnergyUj(mlp_runner::kRaplCorePath);
+
+    const int call_idx = ctx->call_idx_in_inference;
+    const int per_layer_n = static_cast<int>(ctx->expected_seq.size());
+    if (per_layer_n == 0 ||
+        call_idx >= ctx->total_npu_dispatches_per_inference) {
+      std::ostringstream oss;
+      oss << "hook: extra NPU dispatch beyond expected ("
+          << ctx->total_npu_dispatches_per_inference << "); call_idx="
+          << call_idx;
+      throw std::runtime_error(oss.str());
+    }
+    const int per_layer_idx = call_idx % per_layer_n;
+    const int layer_idx = call_idx / per_layer_n;
+    const auto& exp = ctx->expected_seq[per_layer_idx];
+    if (M != exp.M || K != exp.K || N != exp.N) {
+      std::ostringstream oss;
+      oss << "hook: shape mismatch at call_idx=" << call_idx
+          << " per_layer_idx=" << per_layer_idx
+          << " expected (" << exp.M << "," << exp.K << "," << exp.N
+          << ") got (" << M << "," << K << "," << N << ")";
+      throw std::runtime_error(oss.str());
+    }
+
+    mlp_runner::PerLayerSample ps;
+    std::ostringstream key;
+    key << "L" << layer_idx << "/" << exp.gemm_type;
+    if (!exp.sub_type.empty()) key << "/" << exp.sub_type;
+    ps.layer = key.str();
+    ps.meta.gemm_type = exp.gemm_type;
+    ps.meta.layer_idx = layer_idx;
+    ps.meta.sub_type  = exp.sub_type;
+    ps.time_us =
+        std::chrono::duration<double, std::micro>(t1 - t0).count();
+    ps.energy_uj_package = mlp_runner::raplDelta(e1_pkg, e0_pkg);
+    ps.energy_uj_core    = mlp_runner::raplDelta(e1_core, e0_core);
+    ctx->current_inference_samples.push_back(std::move(ps));
+    ++ctx->call_idx_in_inference;
+  }
 
   // dst (N, M) contiguous: data[m*N + n] = result[m, n] — same layout as C.
   if (ggml_is_contiguous(dst)) {
@@ -400,10 +510,224 @@ int main(int argc, char** argv) try {
   }
 
   if (mode == "measure") {
-    std::cerr << "distilbert_runner: --mode measure not yet implemented "
-                 "(arrives in Step 4-3-D)\n";
+    if (!hook_ctx) {
+      std::cerr << "distilbert_runner: --mode measure requires "
+                   "--backend npu (CPU baseline measurement is "
+                   "covered by --mode forward)\n";
+      bert_free(bctx);
+      return 2;
+    }
+    if (cfg.warmup_iterations <= 0 || cfg.outer_batches <= 0 ||
+        cfg.inner_target_seconds <= 0.0 || cfg.bracket_idle_count <= 0 ||
+        cfg.bracket_idle_seconds <= 0.0) {
+      std::cerr << "distilbert_runner: measurement.* config fields must all "
+                   "be positive (warmup_iterations, outer_batches, "
+                   "inner_target_seconds, bracket_idle_count, "
+                   "bracket_idle_seconds)\n";
+      bert_free(bctx);
+      return 2;
+    }
+
+    using clock_t_ = std::chrono::steady_clock;
+    using dseconds = std::chrono::duration<double>;
+    using dmicro   = std::chrono::duration<double, std::micro>;
+
+    // Hook recorder setup. Per-layer NPU dispatches arrive in fixed order
+    // (Q, K, V, attention_output, ffn_expand, ffn_compress) per encoder
+    // block; total = num_layers * 6 calls per inference.
+    hook_ctx->expected_seq = buildExpectedSeq(cfg);
+    hook_ctx->total_npu_dispatches_per_inference =
+        cfg.num_layers * static_cast<int>(hook_ctx->expected_seq.size());
+
+    // Workload: a single fixed sentence, tokenized once. Drives identical
+    // graph structure on every inference so per-iteration variability comes
+    // from execution noise rather than payload differences.
+    distilbert_runner::ClassifierHead head =
+        distilbert_runner::loadClassifierHead(bctx);
+    const std::string probe = args["probe"].as<std::string>();
+    bert_tokens tokens = bert_tokenize(bctx, probe, n_max_tokens);
+    std::vector<float> scratch_logits;
+
+    auto run_one_inference = [&]() {
+      hook_ctx->recording = true;
+      hook_ctx->call_idx_in_inference = 0;
+      hook_ctx->current_inference_samples.clear();
+      distilbert_runner::runForwardClassify(bctx, head, tokens, n_threads,
+                                            scratch_logits);
+      hook_ctx->recording = false;
+      const int got = static_cast<int>(
+          hook_ctx->current_inference_samples.size());
+      if (got != hook_ctx->total_npu_dispatches_per_inference) {
+        std::ostringstream oss;
+        oss << "measure: expected "
+            << hook_ctx->total_npu_dispatches_per_inference
+            << " NPU dispatches per inference, observed " << got
+            << " — call ordering changed (verify bert.cpp encoder block)";
+        throw std::runtime_error(oss.str());
+      }
+    };
+
+    mlp_runner::RunStats stats;
+    stats.warmup_iterations = cfg.warmup_iterations;
+    stats.outer_batches = cfg.outer_batches;
+    stats.inner_target_seconds = cfg.inner_target_seconds;
+    stats.idle_baseline_mw =
+        mlp_runner::measureIdlePowerMw(mlp_runner::kRaplPackagePath);
+
+    std::cout << "[measure] idle_baseline=" << stats.idle_baseline_mw
+              << " mW, warmup=" << cfg.warmup_iterations
+              << ", outer_batches=" << cfg.outer_batches << "\n";
+
+    for (int w = 0; w < cfg.warmup_iterations; ++w) {
+      run_one_inference();
+    }
+
+    std::vector<double> batch_energies_per_inf;
+    std::vector<double> batch_times;
+
+    for (int b = 0; b < cfg.outer_batches; ++b) {
+      mlp_runner::BatchStats bs;
+      bs.index = b;
+      bs.idle_power_pre_mw = mlp_runner::measureBracketIdlePowerMw(
+          mlp_runner::kRaplPackagePath, cfg.bracket_idle_count,
+          cfg.bracket_idle_seconds);
+
+      const int64_t batch_e0_pkg =
+          mlp_runner::readRaplEnergyUj(mlp_runner::kRaplPackagePath);
+      const int64_t batch_e0_core =
+          mlp_runner::readRaplEnergyUj(mlp_runner::kRaplCorePath);
+      const auto batch_t0 = clock_t_::now();
+
+      std::vector<double> inner_times;
+      std::map<std::string, std::vector<double>> layer_times;
+      std::map<std::string, std::vector<int64_t>> layer_energies_pkg;
+
+      int n_inner = 0;
+      while (true) {
+        const auto inf_t0 = clock_t_::now();
+        run_one_inference();
+        const auto inf_t1 = clock_t_::now();
+
+        inner_times.push_back(dmicro(inf_t1 - inf_t0).count());
+        for (const auto& ps : hook_ctx->current_inference_samples) {
+          layer_times[ps.layer].push_back(ps.time_us);
+          layer_energies_pkg[ps.layer].push_back(ps.energy_uj_package);
+          if (!bs.layer_meta.count(ps.layer)) bs.layer_meta[ps.layer] = ps.meta;
+        }
+        ++n_inner;
+
+        const double elapsed_s = dseconds(clock_t_::now() - batch_t0).count();
+        if (elapsed_s >= cfg.inner_target_seconds) break;
+      }
+
+      const auto batch_t1 = clock_t_::now();
+      const int64_t batch_e1_pkg =
+          mlp_runner::readRaplEnergyUj(mlp_runner::kRaplPackagePath);
+      const int64_t batch_e1_core =
+          mlp_runner::readRaplEnergyUj(mlp_runner::kRaplCorePath);
+
+      bs.idle_power_post_mw = mlp_runner::measureBracketIdlePowerMw(
+          mlp_runner::kRaplPackagePath, cfg.bracket_idle_count,
+          cfg.bracket_idle_seconds);
+
+      bs.n_inner = n_inner;
+      bs.wall_s = dseconds(batch_t1 - batch_t0).count();
+      bs.active_uj_package = mlp_runner::raplDelta(batch_e1_pkg, batch_e0_pkg);
+      bs.active_uj_core    = mlp_runner::raplDelta(batch_e1_core, batch_e0_core);
+      bs.idle_power_mw = 0.5 * (bs.idle_power_pre_mw + bs.idle_power_post_mw);
+      const double idle_uj =
+          bs.idle_power_mw * bs.wall_s * 1000.0;  // mW * s * 1000 -> uJ
+      bs.npu_uj_package = static_cast<int64_t>(
+          std::max<double>(0.0, bs.active_uj_package - idle_uj));
+      bs.npu_uj_core = bs.active_uj_core;
+      bs.energy_per_inference_uj = (n_inner > 0)
+          ? static_cast<double>(bs.npu_uj_package) / n_inner
+          : 0.0;
+
+      if (!inner_times.empty()) {
+        auto mn = std::min_element(inner_times.begin(), inner_times.end());
+        const double sum = std::accumulate(inner_times.begin(),
+                                           inner_times.end(), 0.0);
+        bs.model_time_us_min = *mn;
+        bs.model_time_us_mean = sum / inner_times.size();
+      }
+      for (const auto& [layer, ts] : layer_times) {
+        auto mn = std::min_element(ts.begin(), ts.end());
+        const double sum = std::accumulate(ts.begin(), ts.end(), 0.0);
+        bs.layer_time_us_min[layer] = *mn;
+        bs.layer_time_us_mean[layer] = sum / ts.size();
+        auto& g = stats.layer_time_us_min_global[layer];
+        if (g == 0.0 || *mn < g) g = *mn;
+      }
+      for (const auto& [layer, es] : layer_energies_pkg) {
+        const int64_t s = std::accumulate(es.begin(), es.end(), int64_t{0});
+        bs.layer_energy_uj_sum[layer] = s;
+        auto& g = stats.layer_energy_uj_sum_min_global[layer];
+        if (g == 0 || s < g) g = s;
+      }
+
+      batch_energies_per_inf.push_back(bs.energy_per_inference_uj);
+      batch_times.push_back(bs.wall_s);
+
+      std::cout << "[measure] batch " << b << ": n_inner=" << n_inner
+                << " wall_s=" << bs.wall_s
+                << " model_time_us_min=" << bs.model_time_us_min
+                << " npu_uj=" << bs.npu_uj_package
+                << " idle_pre=" << bs.idle_power_pre_mw
+                << " idle_post=" << bs.idle_power_post_mw << "\n";
+
+      stats.batches.push_back(std::move(bs));
+    }
+
+    stats.idle_post_mw =
+        mlp_runner::measureIdlePowerMw(mlp_runner::kRaplPackagePath);
+
+    const auto e_cv = mlp_runner::computeMeanCv(batch_energies_per_inf);
+    const auto t_cv = mlp_runner::computeMeanCv(batch_times);
+    stats.batch_energy_mean_uj = e_cv.mean;
+    stats.batch_energy_cv_pct = e_cv.cv_pct;
+    stats.batch_time_mean_s = t_cv.mean;
+    stats.batch_time_cv_pct = t_cv.cv_pct;
+
+    if (!stats.batches.empty()) {
+      stats.batch_min_energy_per_inference_uj = std::min_element(
+          stats.batches.begin(), stats.batches.end(),
+          [](const auto& a, const auto& b) {
+            return a.energy_per_inference_uj < b.energy_per_inference_uj;
+          })->energy_per_inference_uj;
+      stats.batch_min_model_time_us = std::min_element(
+          stats.batches.begin(), stats.batches.end(),
+          [](const auto& a, const auto& b) {
+            return a.model_time_us_min < b.model_time_us_min;
+          })->model_time_us_min;
+    }
+
+    nlohmann::json model_summary;
+    model_summary["config_path"] = cfg.config_path;
+    model_summary["model_type"] = "distilbert";
+    model_summary["pretrained_source"] = cfg.pretrained_source;
+    model_summary["num_layers"] = cfg.num_layers;
+    model_summary["hidden_dim"] = cfg.hidden_dim;
+    model_summary["ffn_dim"] = cfg.ffn_dim;
+    model_summary["num_heads"] = cfg.num_heads;
+    model_summary["sequence_length"] = cfg.sequence_length;
+    model_summary["batch_size"] = cfg.batch_size;
+    model_summary["multi_head_strategy"] = cfg.multi_head_strategy;
+
+    std::string out_dir = args["output-dir"].as<std::string>();
+    if (out_dir.empty()) out_dir = cfg.results_dir;
+    mlp_runner::writeMeasurementsCore(out_dir, setter, backend, stats,
+                                      model_summary);
+
+    std::cout << "[measure] done — energy_cv=" << stats.batch_energy_cv_pct
+              << "%  time_cv=" << stats.batch_time_cv_pct << "%  "
+              << "min_model_us=" << stats.batch_min_model_time_us << "  "
+              << "min_energy_per_inf_uj="
+              << stats.batch_min_energy_per_inference_uj << "  "
+              << "wrote -> " << out_dir << "\n";
+
     bert_free(bctx);
-    return 2;
+    return 0;
   }
 
   std::cerr << "distilbert_runner: unknown --mode '" << mode << "'\n";

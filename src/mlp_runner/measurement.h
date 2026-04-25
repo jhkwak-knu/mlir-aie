@@ -136,3 +136,21 @@ void writeMeasurements(const std::string& output_dir,
                        const RunStats& stats);
 
 }  // namespace mlp_runner
+
+// nlohmann::json forward declaration is awkward; just include it.
+#include "nlohmann/json.hpp"
+
+namespace mlp_runner {
+
+/// Model-agnostic CSV + JSON writer. CSV format is identical to the MLP
+/// path; JSON top-level model summary fields come from `model_summary`
+/// (caller supplies e.g. {"layer_sizes": ..., "batch_size": ...} for MLP
+/// or {"num_layers": ..., "hidden_dim": ...} for DistilBERT). Used by
+/// distilbert_runner so the two runners share `RunStats` serialization.
+void writeMeasurementsCore(const std::string& output_dir,
+                           const std::string& setter,
+                           const std::string& backend,
+                           const RunStats& stats,
+                           const nlohmann::json& model_summary);
+
+}  // namespace mlp_runner
