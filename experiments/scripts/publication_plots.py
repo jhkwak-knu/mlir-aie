@@ -7,9 +7,8 @@ script writes vector + raster figures plus CSV tables.
 
 Outputs (under `<output-dir>`):
 
-    figures/fig1_kernel_edp.{pdf,png}
-    figures/fig2_dilution_gain.{pdf,png}
-    figures/fig3_edp_decomposition.{pdf,png}
+    figures/fig1_setter_breakdown.{pdf,png}
+    figures/fig2_te_decomposition.{pdf,png}
     tables/table1_main.csv
     tables/table2_configs.csv
 
@@ -49,10 +48,15 @@ SETTER_DISPLAY: Dict[str, str] = {
     "timeloop":   "Timeloop",
 }
 SETTER_PALETTE: Dict[str, str] = {
-    "star_map":   "#C0392B",  # dark red
-    "max_p":      "#2980B9",  # blue
-    "charm_cdse": "#27AE60",  # green
-    "timeloop":   "#E67E22",  # orange
+    "star_map":   "#3E5972",  # dark slate blue (proposed method, emphasized)
+    "max_p":      "#E89B7B",  # coral (matches reference figure)
+    "charm_cdse": "#B5A07A",  # warm khaki
+    "timeloop":   "#6A8E7F",  # sage green
+}
+LAYER_PALETTE: Dict[str, str] = {
+    "fc1": "#3E5972",  # dark slate blue (matches reference)
+    "fc2": "#E89B7B",  # coral (matches reference)
+    "fc3": "#B0B0B0",  # neutral grey
 }
 PNG_DPI = 300
 RC_PARAMS: Dict[str, Any] = {
@@ -89,104 +93,192 @@ def _setters_present(per_setter: pd.DataFrame) -> List[str]:
     return [s for s in SETTER_ORDER if s in seen]
 
 
-def figure_kernel_edp(per_setter: pd.DataFrame, base_path: Path) -> None:
-    """Per-layer kernel EDP grouped bar (log-scale because fc3 is much smaller)."""
+def figure_setter_breakdown(per_setter: pd.DataFrame, base_path: Path,
+                             baseline_setter: str) -> None:
+    """X-axis = setter; per setter, three layer EDP-gain bars plus a model
+    EDP-gain marker.
+
+    Bars and the marker are normalized to the baseline setter at matching
+    granularity (per-layer for the bars, per-inference for the marker), so
+    a value above 1.0 means the setter beats the baseline. The vertical
+    distance between the bars and the diamond visualizes the per-setter
+    kernel->model dilution. The diamond carries the model gain as a text
+    label so the figure is readable without the table.
+    """
     import matplotlib.pyplot as plt
-
     plt.rcParams.update(RC_PARAMS)
-    kernels = per_setter[per_setter["measurement_type"] == "kernel"].copy()
-    if kernels.empty:
+
+    kernels = per_setter[per_setter["measurement_type"] == "kernel"]
+    models = per_setter[per_setter["measurement_type"] == "model"]
+    if kernels.empty or models.empty:
         return
 
-    layers = sorted(kernels["layer"].unique())
-    setters = _setters_present(per_setter)
-    if not setters:
+    setters = [s for s in SETTER_ORDER if s in per_setter["setter"].unique()]
+    layers = ["fc1", "fc2", "fc3"]
+    layers = [l for l in layers if l in kernels["layer"].unique()]
+    if not setters or not layers:
         return
 
-    width = 0.8 / max(len(setters), 1)
-    x = np.arange(len(layers))
+    base_kernel: Dict[str, float] = {}
+    for l in layers:
+        r = kernels[(kernels["setter"] == baseline_setter)
+                    & (kernels["layer"] == l)]
+        base_kernel[l] = float(r.iloc[0]["edp_min"]) if not r.empty else 1.0
+    rb = models[models["setter"] == baseline_setter]
+    base_model = float(rb.iloc[0]["edp_min"]) if not rb.empty else 1.0
 
-    fig, ax = plt.subplots(figsize=(6, 4))
-    for i, s in enumerate(setters):
-        rows = kernels[kernels["setter"] == s].set_index("layer")
-        vals = [rows.loc[l, "edp_min"] if l in rows.index else 0.0 for l in layers]
-        offset = (i - (len(setters) - 1) / 2) * width
-        ax.bar(x + offset, vals, width, label=SETTER_DISPLAY.get(s, s),
-               color=SETTER_PALETTE.get(s, "gray"),
+    width = 0.22
+    x = np.arange(len(setters))
+
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    layer_ratios: Dict[str, List[float]] = {}
+    for j, l in enumerate(layers):
+        vals: List[float] = []
+        for s in setters:
+            r = kernels[(kernels["setter"] == s) & (kernels["layer"] == l)]
+            v = float(r.iloc[0]["edp_min"]) if not r.empty else 0.0
+            vals.append((base_kernel[l] / v) if v > 0 else 0.0)
+        layer_ratios[l] = vals
+        offset = (j - (len(layers) - 1) / 2) * width
+        ax.bar(x + offset, vals, width, label=l,
+               color=LAYER_PALETTE.get(l, "gray"),
                edgecolor="black", linewidth=0.4)
 
+    model_ratios: List[float] = []
+    for s in setters:
+        r = models[models["setter"] == s]
+        v = float(r.iloc[0]["edp_min"]) if not r.empty else 0.0
+        model_ratios.append((base_model / v) if v > 0 else 0.0)
+    ax.scatter(x, model_ratios, marker="D", s=70, color="black",
+               zorder=10, label="Model")
+    for i in range(len(setters)):
+        ax.text(x[i], model_ratios[i],
+                f"  {model_ratios[i]:.2f}",
+                ha="left", va="center", fontsize=8)
+
+    ax.axhline(1.0, color="black", linestyle="--", linewidth=0.8, alpha=0.5)
     ax.set_xticks(x)
-    ax.set_xticklabels(layers)
-    ax.set_xlabel("Layer")
-    ax.set_ylabel(r"Kernel-level EDP ($\mu s \cdot \mu J$, log scale)")
-    ax.set_yscale("log")
-    ax.legend(loc="upper right", frameon=False, ncol=2)
+    ax.set_xticklabels([SETTER_DISPLAY.get(s, s) for s in setters])
+    ax.set_ylabel(f"EDP gain (baseline = "
+                  f"{SETTER_DISPLAY.get(baseline_setter, baseline_setter)})")
+    all_vals = [v for vs in layer_ratios.values() for v in vs] + model_ratios
+    ymax = max(max(all_vals), 1.0) * 1.15
+    ax.set_ylim(0, ymax)
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, 1.12),
+              ncol=4, frameon=True)
     fig.tight_layout()
     _save(fig, base_path)
     plt.close(fig)
 
 
-def figure_edp_decomposition(dilution: pd.DataFrame, base_path: Path) -> None:
-    """Stacked-bar decomposition of model EDP into kernel sum and host overhead.
+def figure_te_decomposition(per_setter: pd.DataFrame, base_path: Path) -> None:
+    """Two-panel decomposition: model time and model energy split into
 
-    Each setter's bar stacks:
-      bottom = sum of per-layer kernel EDPs (Level-1)
-      top    = model EDP - kernel sum    (host-side dispatch / activations /
-                                          softmax / runtime overhead)
+        host overhead | kernel (sum of per-layer dispatches)
 
-    Visualizes how the host overhead is approximately uniform across setters
-    (i.e. the ratio compression seen in fig2 is driven by additive overhead).
-    Total bar height equals the absolute Level-2 (model) EDP.
+    Time decomposition uses the directly measured per-layer dispatch times
+    (their sum equals the kernel time, the residual is the host time).
+    Energy is decomposed by time-proportional attribution
+    (E_host = E_model x T_host / T_model) because per-layer RAPL deltas are
+    too coarse-grained relative to fc3's ~680us dispatch to attribute
+    energy reliably layer by layer.
+
+    Putting host overhead at the bottom and the colored kernel segment on
+    top makes the host band's roughly uniform thickness across setters
+    visible at a glance, which is what the dilution-factor argument
+    relies on.
     """
     import matplotlib.pyplot as plt
     from matplotlib.patches import Patch
 
     plt.rcParams.update(RC_PARAMS)
-    if dilution.empty:
+    setters = [s for s in SETTER_ORDER
+               if s in per_setter["setter"].unique()]
+    if not setters:
         return
 
-    setters = [s for s in SETTER_ORDER if s in dilution["setter"].values]
-    l1 = [float(dilution[dilution["setter"] == s].iloc[0]["level1_edp"])
-          for s in setters]
-    l2 = [float(dilution[dilution["setter"] == s].iloc[0]["level2_edp"])
-          for s in setters]
-    overhead = [max(0.0, l2[i] - l1[i]) for i in range(len(setters))]
+    # Pull model & summed-kernel time/energy per setter.
+    rows = []
+    for s in setters:
+        model_row = per_setter[(per_setter["setter"] == s)
+                               & (per_setter["measurement_type"] == "model")]
+        kernel_rows = per_setter[(per_setter["setter"] == s)
+                                 & (per_setter["measurement_type"] == "kernel")]
+        if model_row.empty or kernel_rows.empty:
+            continue
+        m = model_row.iloc[0]
+        t_model = float(m["time_us_min"])
+        e_model = float(m["energy_per_inference_uj_min"])
+        t_kernel = float(kernel_rows["time_us_min"].sum())
+        t_host = max(0.0, t_model - t_kernel)
+        e_host = e_model * (t_host / t_model) if t_model > 0 else 0.0
+        e_kernel = max(0.0, e_model - e_host)
+        rows.append({
+            "setter": s,
+            "T_model_ms":  t_model / 1e3,
+            "T_kernel_ms": t_kernel / 1e3,
+            "T_host_ms":   t_host / 1e3,
+            "E_model_mJ":  e_model / 1e3,
+            "E_kernel_mJ": e_kernel / 1e3,
+            "E_host_mJ":   e_host / 1e3,
+        })
+    sd = pd.DataFrame(rows)
+    if sd.empty:
+        return
 
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
+    OVERHEAD_COLOR = "#BDBDBD"
     x = np.arange(len(setters))
     width = 0.6
 
-    fig, ax = plt.subplots(figsize=(6, 4))
-    OVERHEAD_COLOR = "#BDBDBD"
-
+    # ----- (a) Time -----
+    ax1.bar(x, sd["T_host_ms"], width,
+            color=OVERHEAD_COLOR, edgecolor="black", linewidth=0.5, hatch="...")
     for i, s in enumerate(setters):
-        ax.bar(x[i], l1[i], width,
-               color=SETTER_PALETTE.get(s, "gray"),
-               edgecolor="black", linewidth=0.5)
-    ax.bar(x, overhead, width, bottom=l1,
-           color=OVERHEAD_COLOR, edgecolor="black", linewidth=0.5,
-           hatch="...")
+        ax1.bar(x[i], sd["T_kernel_ms"].iloc[i], width,
+                bottom=sd["T_host_ms"].iloc[i],
+                color=SETTER_PALETTE.get(s, "gray"),
+                edgecolor="black", linewidth=0.5)
+    for i in range(len(setters)):
+        ax1.text(x[i], sd["T_model_ms"].iloc[i],
+                 f"{sd['T_model_ms'].iloc[i]:.1f}",
+                 ha="center", va="bottom", fontsize=8)
+        ax1.text(x[i], sd["T_host_ms"].iloc[i] + sd["T_kernel_ms"].iloc[i] / 2,
+                 f"{sd['T_kernel_ms'].iloc[i]:.1f}",
+                 ha="center", va="center", fontsize=8, color="white")
+    ax1.set_xticks(x)
+    ax1.set_xticklabels([SETTER_DISPLAY.get(s, s) for s in setters])
+    ax1.set_ylabel("Time per inference (ms)")
+    ax1.set_title("(a) Time")
 
-    # Annotate total (model EDP) above each bar.
+    # ----- (b) Energy -----
+    ax2.bar(x, sd["E_host_mJ"], width,
+            color=OVERHEAD_COLOR, edgecolor="black", linewidth=0.5, hatch="...")
     for i, s in enumerate(setters):
-        ax.text(x[i], l2[i], f"{l2[i] / 1e9:.2f}",
-                ha="center", va="bottom", fontsize=8)
-        # Annotate kernel-sum portion inside the lower segment.
-        ax.text(x[i], l1[i] / 2.0, f"{l1[i] / 1e9:.2f}",
-                ha="center", va="center", fontsize=8, color="white")
+        ax2.bar(x[i], sd["E_kernel_mJ"].iloc[i], width,
+                bottom=sd["E_host_mJ"].iloc[i],
+                color=SETTER_PALETTE.get(s, "gray"),
+                edgecolor="black", linewidth=0.5)
+    for i in range(len(setters)):
+        ax2.text(x[i], sd["E_model_mJ"].iloc[i],
+                 f"{sd['E_model_mJ'].iloc[i]:.0f}",
+                 ha="center", va="bottom", fontsize=8)
+        ax2.text(x[i], sd["E_host_mJ"].iloc[i] + sd["E_kernel_mJ"].iloc[i] / 2,
+                 f"{sd['E_kernel_mJ'].iloc[i]:.0f}",
+                 ha="center", va="center", fontsize=8, color="white")
+    ax2.set_xticks(x)
+    ax2.set_xticklabels([SETTER_DISPLAY.get(s, s) for s in setters])
+    ax2.set_ylabel("Energy per inference (mJ)")
+    ax2.set_title("(b) Energy")
 
-    ax.set_xticks(x)
-    ax.set_xticklabels([SETTER_DISPLAY.get(s, s) for s in setters])
-    ax.set_ylabel(r"Model-level EDP ($\mu s \cdot \mu J \times 10^{9}$)")
-    ax.yaxis.set_major_formatter(
-        plt.FuncFormatter(lambda v, _: f"{v / 1e9:.1f}")
-    )
     legend_handles = [
-        Patch(facecolor="white", edgecolor="black", label="Kernel sum (Level-1)"),
+        Patch(facecolor="white", edgecolor="black", label="Kernel"),
         Patch(facecolor=OVERHEAD_COLOR, edgecolor="black", hatch="...",
               label="Host overhead"),
     ]
-    ax.legend(handles=legend_handles, loc="upper left", frameon=False)
-    fig.tight_layout()
+    fig.legend(handles=legend_handles, loc="upper center",
+               bbox_to_anchor=(0.5, 1.0), ncol=2, frameon=True)
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
     _save(fig, base_path)
     plt.close(fig)
 
@@ -346,10 +438,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     fig_dir.mkdir(parents=True, exist_ok=True)
     tab_dir.mkdir(parents=True, exist_ok=True)
 
-    figure_kernel_edp(per_setter, fig_dir / "fig1_kernel_edp")
-    figure_dilution_gain(dilution, fig_dir / "fig2_dilution_gain",
-                         baseline_label=args.baseline_setter)
-    figure_edp_decomposition(dilution, fig_dir / "fig3_edp_decomposition")
+    figure_setter_breakdown(per_setter, fig_dir / "fig1_setter_breakdown",
+                            baseline_setter=args.baseline_setter)
+    figure_te_decomposition(per_setter, fig_dir / "fig2_te_decomposition")
 
     t1 = table1_main(df, per_setter, dilution, gemm_frac)
     t2 = table2_configs(args.configurations_json)
