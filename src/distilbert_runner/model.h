@@ -41,9 +41,16 @@ ClassifierHead loadClassifierHead(bert_ctx* ctx);
 
 /// Run a single-sample forward pass: tokens -> logits.
 ///
-/// `tokens` is the output of bert_tokenize (already [CLS]..[SEP]). On
-/// return `logits_out` holds num_labels floats; softmax is the caller's
-/// job (we expose raw logits to keep numerics auditable).
+/// `tokens` is the output of bert_tokenize (already [CLS]..[SEP]).
+/// `real_token_count` is the number of NON-PAD tokens. When the caller
+/// pads `tokens` to a fixed sequence length so NPU mul_mat shapes match
+/// the kernel table, real_token_count must be the unpadded length so
+/// the attention mask zeroes out pad positions; without this the [CLS]
+/// representation absorbs noise from the padded tail. Pass <0 (default)
+/// to fall back to tokens.size() — the historical behaviour.
+///
+/// On return `logits_out` holds num_labels floats; softmax is the
+/// caller's job (we expose raw logits to keep numerics auditable).
 ///
 /// Internally builds the same encoder graph as bert.cpp without the
 /// mean-pool tail, slices the [CLS] hidden state, then runs
@@ -53,6 +60,7 @@ void runForwardClassify(
     const ClassifierHead& head,
     const bert_tokens& tokens,
     int n_threads,
-    std::vector<float>& logits_out);
+    std::vector<float>& logits_out,
+    int real_token_count = -1);
 
 }  // namespace distilbert_runner

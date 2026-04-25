@@ -292,6 +292,32 @@ static std::string joinPath(const std::string& a, const std::string& b) {
   return a.back() == '/' ? a + b : a + "/" + b;
 }
 
+// runForwardClassify uses tokens.size() as the encoder sequence length
+// (M dimension of every mul_mat). cfg.sequence_length (e.g. 128) is what
+// the NPU kernel binaries are compiled for; if the input tokenizes to
+// fewer tokens, every mul_mat instantiates with M < cfg.sequence_length
+// and the hook's by_shape lookup misses, sending the op to ggml's CPU
+// kernel. Pad short inputs with PAD so the encoder graph instantiates
+// the expected NPU shape.
+//
+// model.cpp builds pad_mask_data[i]=1.0 for all i < tokens.size(), so
+// padded positions are NOT attention-masked here. That breaks the
+// model's logits on the pad positions, but the [CLS] representation
+// pulled out by the classifier head is still mostly meaningful for
+// short sentences (the classifier head GEMM stays on CPU and consumes
+// only the first row). For correctness work this would need an
+// attention-mask fix; for NPU dispatch coverage it does not.
+static void padTokensToSeqLen(bert_ctx* bctx, bert_tokens& tokens,
+                              int seq_len) {
+  const int n = static_cast<int>(tokens.size());
+  if (n < seq_len) {
+    const bert_token pad_id = bctx->vocab.pad_id;
+    tokens.resize(seq_len, pad_id);
+  } else if (n > seq_len) {
+    tokens.resize(seq_len);
+  }
+}
+
 // Build the HookContext from configurations.json + kernel_binaries dir
 // resolved off cfg.results_dir. Throws on missing files / empty entries
 // so misconfigured runs fail loud rather than silently CPU-falling-back.
@@ -446,8 +472,14 @@ int main(int argc, char** argv) try {
       while (std::getline(sin, line)) {
         if (line.empty()) continue;
         auto tokens = bert_tokenize(bctx, line, n_max_tokens);
+        // Pad to cfg.sequence_length so NPU dispatch shapes match the
+        // kernel table; without this every mul_mat falls back to ggml's
+        // CPU kernel even when --backend npu is selected. Pass the
+        // unpadded count so attention masks out the pad tail.
+        const int real_count = static_cast<int>(tokens.size());
+        padTokensToSeqLen(bctx, tokens, cfg.sequence_length);
         distilbert_runner::runForwardClassify(bctx, head_for_batch, tokens,
-                                              n_threads, logits);
+                                              n_threads, logits, real_count);
         for (size_t i = 0; i < logits.size(); ++i) {
           if (i) *logits_sink << ' ';
           *logits_sink << logits[i];
@@ -468,20 +500,20 @@ int main(int argc, char** argv) try {
 
     const std::string probe = args["probe"].as<std::string>();
     bert_tokens tokens = bert_tokenize(bctx, probe, n_max_tokens);
-    std::cout << "  probe='" << probe << "' tokens=[";
-    for (size_t i = 0; i < tokens.size(); ++i) {
-      std::cout << tokens[i];
-      if (i + 1 < tokens.size()) std::cout << ", ";
-    }
-    std::cout << "] (" << tokens.size() << ")\n";
+    const int probe_real_len = static_cast<int>(tokens.size());
+    // Same padding as the batch path so --backend npu actually exercises
+    // the dispatch hook for short single probes too.
+    padTokensToSeqLen(bctx, tokens, cfg.sequence_length);
+    std::cout << "  probe='" << probe << "' real_tokens=" << probe_real_len
+              << " padded_to=" << tokens.size() << "\n";
 
     distilbert_runner::ClassifierHead head =
         distilbert_runner::loadClassifierHead(bctx);
     std::cout << "  classifier: num_labels=" << head.num_labels << "\n";
 
     std::vector<float> logits;
-    distilbert_runner::runForwardClassify(bctx, head, tokens,
-                                          /*n_threads=*/4, logits);
+    distilbert_runner::runForwardClassify(bctx, head, tokens, n_threads,
+                                          logits, probe_real_len);
 
     std::cout << "  logits=[";
     for (size_t i = 0; i < logits.size(); ++i) {
@@ -541,28 +573,41 @@ int main(int argc, char** argv) try {
 
     // Workload: a single fixed sentence, tokenized once. Drives identical
     // graph structure on every inference so per-iteration variability comes
-    // from execution noise rather than payload differences.
+    // from execution noise rather than payload differences. Padding to
+    // cfg.sequence_length is what makes the per-mul_mat shapes hit our
+    // NPU kernel table (see padTokensToSeqLen comment).
     distilbert_runner::ClassifierHead head =
         distilbert_runner::loadClassifierHead(bctx);
     const std::string probe = args["probe"].as<std::string>();
     bert_tokens tokens = bert_tokenize(bctx, probe, n_max_tokens);
+    const int real_tokens_measure = static_cast<int>(tokens.size());
+    padTokensToSeqLen(bctx, tokens, cfg.sequence_length);
+    std::cout << "[measure] real_tokens=" << real_tokens_measure
+              << " padded_to=" << tokens.size()
+              << " (cfg.sequence_length=" << cfg.sequence_length << ")\n";
     std::vector<float> scratch_logits;
 
     auto run_one_inference = [&]() {
+      const long long disp_before = hook_ctx->calls_dispatched;
       hook_ctx->recording = true;
       hook_ctx->call_idx_in_inference = 0;
       hook_ctx->current_inference_samples.clear();
       distilbert_runner::runForwardClassify(bctx, head, tokens, n_threads,
-                                            scratch_logits);
+                                            scratch_logits,
+                                            real_tokens_measure);
       hook_ctx->recording = false;
       const int got = static_cast<int>(
           hook_ctx->current_inference_samples.size());
+      const long long disp_delta = hook_ctx->calls_dispatched - disp_before;
       if (got != hook_ctx->total_npu_dispatches_per_inference) {
         std::ostringstream oss;
         oss << "measure: expected "
             << hook_ctx->total_npu_dispatches_per_inference
             << " NPU dispatches per inference, observed " << got
-            << " — call ordering changed (verify bert.cpp encoder block)";
+            << " (hook NPU dispatches in this call: " << disp_delta
+            << ", calls_fallback total=" << hook_ctx->calls_fallback
+            << ") — if disp_delta>0 but got==0 the recording branch did "
+               "not push; if both are 0 the hook never fired";
         throw std::runtime_error(oss.str());
       }
     };

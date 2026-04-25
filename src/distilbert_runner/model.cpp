@@ -22,6 +22,7 @@
 
 #include "model.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -69,7 +70,8 @@ void runForwardClassify(bert_ctx* ctx,
                         const ClassifierHead& head,
                         const bert_tokens& tokens,
                         int n_threads,
-                        std::vector<float>& logits_out) {
+                        std::vector<float>& logits_out,
+                        int real_token_count) {
   // ----- Mirror of bert_build_graph() up to last_hidden_state ---------
   const bert_vocab& vocab = ctx->vocab;
   const bert_token pad_id = vocab.pad_id;
@@ -119,7 +121,16 @@ void runForwardClassify(bert_ctx* ctx,
     std::vector<int32_t> pos_data(cur_max_len * n_batch_size);
     const float m1 = -1.0f;
 
-    const int cur_len = static_cast<int>(tokens.size());
+    // real_token_count < 0 (default) preserves the historical behaviour of
+    // treating every token as real. When the caller pre-pads `tokens` to
+    // a fixed length so NPU mul_mat shapes hit the kernel table, it must
+    // pass the unpadded count so pad_mask zeroes out trailing positions
+    // (otherwise [CLS] attends to garbage and the classifier head
+    // misclassifies short sentences).
+    const int cur_len =
+        (real_token_count < 0)
+            ? static_cast<int>(tokens.size())
+            : std::min(real_token_count, cur_max_len);
     for (int i = 0; i < cur_max_len; ++i) {
       if (i < cur_len) {
         token_layer_data[i] = tokens[i];
