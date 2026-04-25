@@ -1,4 +1,4 @@
-"""Orchestrate mlp_runner --mode measure across every requested setter.
+"""Orchestrate <model>_runner --mode measure across every requested setter.
 
 Each setter is executed as an independent subprocess. Between setters the
 orchestrator sleeps for `--inter-setter-idle-seconds` so RAPL counters can
@@ -8,7 +8,10 @@ drift back to baseline.  The Python side only:
     already sourced so aie-opt / aiecc.py / xchesscc are on PATH, NPU
     driver timeout set),
   * resolves input paths (config.json, configurations.json,
-    kernel_binaries/, mlp_runner binary),
+    kernel_binaries/, runner binary, GGUF for DistilBERT),
+  * picks the runner binary based on `config.model.type`
+    (mlp -> mlp_runner, distilbert -> distilbert_runner; --runner-binary
+    overrides),
   * invokes the runner per setter and captures its stdout / stderr,
   * collates per-setter exit codes + the aggregated CV stats surfaced
     by the runner, emits `measurement_run.json` next to
@@ -18,11 +21,11 @@ The runner itself writes measurements.csv (append) + measurements.json
 (runs[] append) into <config.output.results_dir>, so after this script
 finishes those two files contain every setter's data.
 
-Typical usage (after Step 5 full build + Step 6-3..6-4 mlp_runner built):
+Typical usage:
 
   source test/onnx-mlir/scripts/setup_env.sh --measure
   python experiments/scripts/measure.py \\
-      --config experiments/configs/mlp_512_512_bs32.json \\
+      --config experiments/configs/distilbert_L128_bs1.json \\
       --backend npu
 """
 
@@ -39,7 +42,29 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_RUNNER_BINARY = REPO_ROOT / "src" / "mlp_runner" / "build" / "mlp_runner"
+DEFAULT_MLP_RUNNER = REPO_ROOT / "src" / "mlp_runner" / "build" / "mlp_runner"
+DEFAULT_DISTILBERT_RUNNER = (
+    REPO_ROOT / "src" / "distilbert_runner" / "build" / "distilbert_runner"
+)
+DEFAULT_DISTILBERT_GGUF = (
+    REPO_ROOT / "external" / "bert.cpp" / "models" / "distilbert-sst2-f16.gguf"
+)
+
+
+def _resolve_runner_binary(
+    config: Dict[str, Any], override: Optional[Path]
+) -> tuple[Path, str]:
+    """Pick the runner binary based on `model.type` (override wins).
+
+    Returns (binary_path, model_type). Defaults to mlp when model.type is
+    absent so older mlp configs that pre-date the field keep working.
+    """
+    model_type = (config.get("model") or {}).get("type", "mlp")
+    if override is not None:
+        return override, model_type
+    if model_type == "distilbert":
+        return DEFAULT_DISTILBERT_RUNNER, model_type
+    return DEFAULT_MLP_RUNNER, model_type
 
 
 def _rel_or_abs(path: Path) -> str:
@@ -111,8 +136,15 @@ def run_one_setter(
     kernel_binaries_dir: Optional[Path],
     output_dir: Path,
     log_dir: Path,
+    model_type: str = "mlp",
+    gguf_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
-    """Run mlp_runner once for a single setter; capture stdout/stderr."""
+    """Run <model>_runner once for a single setter; capture stdout/stderr.
+
+    For distilbert we pass --gguf and skip mlp-only flags (--configurations
+    / --kernel-binaries-dir) — distilbert_runner derives those paths from
+    cfg.results_dir internally.
+    """
     log_path = log_dir / f"measure_{setter}.log"
     log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -125,10 +157,18 @@ def run_one_setter(
         "--seed", str(seed),
         "--output-dir", str(output_dir),
     ]
-    if configurations_path is not None:
-        cmd += ["--configurations", str(configurations_path)]
-    if kernel_binaries_dir is not None:
-        cmd += ["--kernel-binaries-dir", str(kernel_binaries_dir)]
+    if model_type == "distilbert":
+        if gguf_path is None:
+            raise RuntimeError(
+                "distilbert measurement requires --gguf <path>"
+            )
+        cmd += ["--gguf", str(gguf_path)]
+    else:
+        # mlp_runner-specific flags. distilbert_runner doesn't accept these.
+        if configurations_path is not None:
+            cmd += ["--configurations", str(configurations_path)]
+        if kernel_binaries_dir is not None:
+            cmd += ["--kernel-binaries-dir", str(kernel_binaries_dir)]
 
     t0 = time.time()
     with log_path.open("w", encoding="utf-8") as log:
@@ -183,7 +223,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--backend", choices=("cpu", "npu"), default="npu")
-    parser.add_argument("--runner-binary", type=Path, default=DEFAULT_RUNNER_BINARY)
+    parser.add_argument("--runner-binary", type=Path, default=None,
+                        help="override the runner binary; default is "
+                             "auto-detected from config.model.type "
+                             "(mlp -> mlp_runner, distilbert -> "
+                             "distilbert_runner)")
+    parser.add_argument("--gguf", type=Path, default=None,
+                        help="GGUF weights for DistilBERT runs; defaults to "
+                             "external/bert.cpp/models/"
+                             "distilbert-sst2-f16.gguf when model.type is "
+                             "distilbert; ignored for MLP runs")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--configurations", type=Path, default=None)
     parser.add_argument("--kernel-binaries-dir", type=Path, default=None)
@@ -202,6 +251,13 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     with args.config.open("r", encoding="utf-8") as f:
         config = json.load(f)
+
+    runner_binary, model_type = _resolve_runner_binary(
+        config, args.runner_binary
+    )
+    gguf_path: Optional[Path] = None
+    if model_type == "distilbert":
+        gguf_path = args.gguf or DEFAULT_DISTILBERT_GGUF
 
     setters = args.setters or config.get("setters") or []
     if not setters:
@@ -224,13 +280,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     issues = []
     if not args.skip_env_check:
         issues = check_environment(require_npu_driver=(args.backend == "npu"))
-    if not args.runner_binary.is_file():
+    if not runner_binary.is_file():
         issues.append(
-            f"runner binary missing: {args.runner_binary}. "
-            "Run `experiments/scripts/build_runner.sh` first."
+            f"runner binary missing: {runner_binary}. "
+            "Build the runner first (cmake --build src/<runner>/build)."
         )
     if not configurations_path.is_file():
         issues.append(f"configurations.json missing: {configurations_path}")
+    if model_type == "distilbert":
+        if gguf_path is None or not gguf_path.is_file():
+            issues.append(
+                f"DistilBERT GGUF missing: {gguf_path}. "
+                "Provide --gguf or place the file at the default path."
+            )
 
     if issues:
         print("measure: preflight failed:", file=sys.stderr)
@@ -239,7 +301,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not args.dry_run:
             return 2
 
-    print(f"measure: runner={args.runner_binary}")
+    print(f"measure: runner={runner_binary} (model_type={model_type})")
+    if model_type == "distilbert":
+        print(f"measure: gguf={gguf_path}")
     print(f"measure: setters={setters}")
     print(f"measure: backend={args.backend}, seed={args.seed}")
     print(f"measure: output_dir={output_dir}")
@@ -263,9 +327,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         print(f"[{i+1}/{len(setters)}] running setter={setter}")
         entry = run_one_setter(
-            args.runner_binary, args.config, setter, args.backend,
+            runner_binary, args.config, setter, args.backend,
             args.seed, configurations_path, kernel_binaries_dir,
             output_dir, log_dir,
+            model_type=model_type,
+            gguf_path=gguf_path,
         )
         run_log.append(entry)
         status = "ok" if entry["returncode"] == 0 else f"FAIL({entry['returncode']})"
@@ -275,6 +341,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     cv_summary = collect_cv_stats(measurements_json)
     meta = {
         "config": str(args.config.resolve()),
+        "model_type": model_type,
+        "runner_binary": str(runner_binary),
+        "gguf": str(gguf_path) if gguf_path is not None else None,
         "backend": args.backend,
         "seed": args.seed,
         "runs": run_log,
