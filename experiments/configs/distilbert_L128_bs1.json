@@ -1,0 +1,31 @@
+{
+  "model": {
+    "type": "distilbert",
+    "pretrained_source": "distilbert-base-uncased",
+    "num_layers": 6,
+    "hidden_dim": 768,
+    "ffn_dim": 3072,
+    "num_heads": 12,
+    "sequence_length": 128,
+    "multi_head_strategy": "batched"
+  },
+  "dataset": {
+    "name": "sst2",
+    "batch_size": 1,
+    "num_inference_samples": 100
+  },
+  "measurement": {
+    "warmup_iterations": 10,
+    "outer_batches": 5,
+    "inner_target_seconds": 1.0,
+    "rapl_domains": ["package", "core"],
+    "bracket_idle_seconds": 0.3,
+    "bracket_idle_count": 5
+  },
+  "setters": ["star_map", "max_p", "charm_cdse", "timeloop"],
+  "output": {
+    "results_dir": "./experiments/results/distilbert_L128_bs1/",
+    "figure_format": "png",
+    "log_level": "info"
+  }
+}
