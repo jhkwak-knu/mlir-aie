@@ -2,7 +2,14 @@ import sys
 import torch
 
 from gguf import GGUFWriter, GGMLQuantizationType
-from transformers import AutoModel, AutoModelForSequenceClassification, AutoTokenizer
+from transformers import (
+    AutoModel,
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    BertConfig,
+    BertModel,
+    BertForSequenceClassification,
+)
 
 KEY_PAD_ID = 'tokenizer.ggml.padding_token_id'
 KEY_UNK_ID = 'tokenizer.ggml.unknown_token_id'
@@ -89,6 +96,31 @@ def distilbert_to_bert_name(name):
     return None
 
 
+def bert_seqcls_to_bert_cpp_name(name):
+    """Translate a BertForSequenceClassification state_dict key to the
+    src/bert.cpp tensor-name convention.
+
+    Accepts both BertModel-style keys (no prefix) and
+    BertForSequenceClassification-style keys (`bert.` prefix on the body
+    plus a `pooler` / `classifier` head).
+
+    The pooler is renamed to `pre_classifier` so distilbert_runner's
+    shared classifier-head loader (which already expects pre_classifier)
+    works with both DistilBERT and BERT GGUFs without further changes.
+
+    Classifier head tensors pass through.
+    """
+    if name in _CLASSIFIER_HEAD_PASSTHROUGH:
+        return name
+    if name.startswith("bert."):
+        name = name[len("bert."):]
+    if name == "pooler.dense.weight":
+        return "pre_classifier.weight"
+    if name == "pooler.dense.bias":
+        return "pre_classifier.bias"
+    return name
+
+
 def _hparams_from_config(config):
     """Resolve BERT-style hparam values from either a BertConfig or a
     DistilBertConfig. src/bert.cpp consumes the BERT names, so the
@@ -116,7 +148,8 @@ def _hparams_from_config(config):
     }
 
 
-def convert_hf(repo_id, output_path, float_type='f16', with_classifier_head=False):
+def convert_hf(repo_id, output_path, float_type='f16', with_classifier_head=False,
+               tokenizer_repo_id=None):
     # convert to ggml quantization type
     if float_type not in ['f16', 'f32']:
         print(f'Float type must be f16 or f32, got: {float_type}')
@@ -125,19 +158,36 @@ def convert_hf(repo_id, output_path, float_type='f16', with_classifier_head=Fals
         qtype = GGMLQuantizationType[float_type.upper()]
         dtype0 = {'f16': torch.float16, 'f32': torch.float32}[float_type]
 
-    # load tokenizer and model
-    vocab = AutoTokenizer.from_pretrained(repo_id)
-    if with_classifier_head:
-        # SST-2 fine-tuned models live as DistilBertForSequenceClassification:
-        # body + pre_classifier (Linear 768->768) + classifier (Linear 768->n).
-        # AutoModel would silently strip the head, so we ask for the full
-        # classifier here.
-        model = AutoModelForSequenceClassification.from_pretrained(repo_id)
-    else:
-        model = AutoModel.from_pretrained(repo_id)
+    # load tokenizer and model. Some compact BERT checkpoints (e.g.
+    # prajjwal1/bert-{tiny,mini,small,medium}) ship only vocab.txt without a
+    # tokenizer_config.json, so AutoTokenizer fails to pick a class. The
+    # vocab is identical to bert-base-uncased for that family — let the
+    # caller override --tokenizer-repo accordingly.
+    tok_repo = tokenizer_repo_id or repo_id
+    vocab = AutoTokenizer.from_pretrained(tok_repo)
+
+    # Some old prajjwal1/bert-* configs lack the `model_type` key, which
+    # makes AutoModel/AutoConfig raise ValueError. Fall back to explicit
+    # BertConfig + BertModel/BertForSequenceClassification so those compact
+    # checkpoints convert without manual config patching.
+    def _load_model():
+        if with_classifier_head:
+            try:
+                return AutoModelForSequenceClassification.from_pretrained(repo_id)
+            except ValueError:
+                cfg = BertConfig.from_pretrained(repo_id)
+                return BertForSequenceClassification.from_pretrained(repo_id, config=cfg)
+        try:
+            return AutoModel.from_pretrained(repo_id)
+        except ValueError:
+            cfg = BertConfig.from_pretrained(repo_id)
+            return BertModel.from_pretrained(repo_id, config=cfg)
+
+    model = _load_model()
     config = model.config
     model_type = getattr(config, "model_type", "")
     is_distilbert = (model_type == "distilbert")
+    is_bert = (model_type == "bert")
     hparams = _hparams_from_config(config)
 
     # get token list
@@ -211,6 +261,8 @@ def convert_hf(repo_id, output_path, float_type='f16', with_classifier_head=Fals
                 n_dropped += 1
                 print(f'  drop  {name}')
                 continue
+        elif is_bert:
+            out_name = bert_seqcls_to_bert_cpp_name(name)
         else:
             out_name = name
 
@@ -271,10 +323,16 @@ if __name__ == '__main__':
                         help="Load via AutoModelForSequenceClassification and "
                              "store pre_classifier / classifier tensors for "
                              "downstream consumers (e.g. distilbert_runner).")
+    parser.add_argument("--tokenizer-repo", default=None,
+                        help="Override HF repo for tokenizer. Useful when "
+                             "compact BERT checkpoints (prajjwal1/bert-*) "
+                             "ship only vocab.txt — pass "
+                             "bert-base-uncased here.")
     args = parser.parse_args()
 
     convert_hf(
         args.repo_id, args.output_path,
         float_type=args.float_type,
         with_classifier_head=args.with_classifier_head,
+        tokenizer_repo_id=args.tokenizer_repo,
     )

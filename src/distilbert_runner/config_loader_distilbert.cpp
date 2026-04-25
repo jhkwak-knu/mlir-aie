@@ -37,9 +37,12 @@ ExperimentConfig loadExperimentConfig(const std::string& path) {
   }
   const auto& m = doc["model"];
   const std::string mtype = m.value("type", "");
-  if (mtype != "distilbert") {
-    throw std::runtime_error(path + ": model.type must be 'distilbert' (got '" +
-                             mtype + "')");
+  // distilbert_runner is a misnomer at this point — the same encoder graph
+  // covers any standard BERT-base architecture (DistilBERT, BERT, prajjwal1
+  // compact BERTs). Accept either label.
+  if (mtype != "distilbert" && mtype != "bert") {
+    throw std::runtime_error(path + ": model.type must be 'distilbert' or "
+                             "'bert' (got '" + mtype + "')");
   }
 
   if (!doc.contains("dataset") || !doc["dataset"].is_object()) {

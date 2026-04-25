@@ -241,6 +241,12 @@ def _derive_shapes_distilbert(config: Dict[str, Any]) -> Dict[str, Any]:
 _DERIVERS = {
     "mlp": _derive_shapes_mlp,
     "distilbert": _derive_shapes_distilbert,
+    # BERT-base shares DistilBERT's encoder GEMM topology (Q/K/V/O linears,
+    # head-batched attention score/context matmuls, FFN expand/compress).
+    # The only differences (token_type_embeddings used, post-norm placement)
+    # are not on the NPU dispatch path. Register the same deriver under
+    # "bert" so prajjwal1/bert-{tiny,mini,small,medium} configs reuse it.
+    "bert": _derive_shapes_distilbert,
 }
 
 
