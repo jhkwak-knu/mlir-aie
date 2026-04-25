@@ -9971,6 +9971,17 @@ static bool ggml_compute_forward_mul_mat_use_blas(struct ggml_tensor * dst) {
 }
 #endif
 
+// Custom mul_mat dispatch hook (Notion task #22 §4-3-D). Plain
+// thread-unsafe globals: the runner sets the hook once before
+// ggml_backend_graph_compute and clears it after. ggml never sets it.
+static ggml_mul_mat_hook_t g_mul_mat_hook = NULL;
+static void *              g_mul_mat_hook_user = NULL;
+
+void ggml_set_mul_mat_hook(ggml_mul_mat_hook_t fn, void * user_data) {
+    g_mul_mat_hook = fn;
+    g_mul_mat_hook_user = user_data;
+}
+
 static void ggml_compute_forward_mul_mat(
         const struct ggml_compute_params * params,
         const struct ggml_tensor * src0,
@@ -9978,6 +9989,17 @@ static void ggml_compute_forward_mul_mat(
               struct ggml_tensor * dst) {
     int64_t t0 = ggml_perf_time_us();
     UNUSED(t0);
+
+    // External dispatch hook. Run in COMPUTE phase only — INIT/FINALIZE
+    // are bookkeeping and don't carry the actual matmul. If the hook
+    // claims the op, every worker thread skips the CPU kernel.
+    if (g_mul_mat_hook != NULL && params->type == GGML_TASK_COMPUTE) {
+        if (g_mul_mat_hook(src0, src1, dst,
+                           params->ith, params->nth,
+                           g_mul_mat_hook_user)) {
+            return;
+        }
+    }
 
     GGML_TENSOR_BINARY_OP_LOCALS
 

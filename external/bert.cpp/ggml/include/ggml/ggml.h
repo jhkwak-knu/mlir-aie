@@ -2300,6 +2300,31 @@ extern "C" {
 
     GGML_API ggml_type_traits_t ggml_internal_get_type_traits(enum ggml_type type);
 
+    //
+    // Custom mul_mat dispatch hook (Notion task #22 §4-3-D).
+    //
+    // When set, ggml_compute_forward_mul_mat consults the hook on every
+    // matmul op. If the hook returns true, the op is considered handled
+    // and the CPU kernel is skipped. Returning false falls through to
+    // the existing CPU path.
+    //
+    // The hook is called once per ggml worker thread for the same op
+    // (ggml's thread pool replicates the task across threads). It is the
+    // hook's responsibility to single-source the dispatch — typically by
+    // doing the actual work only on ith == 0 and returning true from
+    // every thread so all of them skip the CPU fallback.
+    //
+    typedef bool (*ggml_mul_mat_hook_t)(
+            const struct ggml_tensor * src0,
+            const struct ggml_tensor * src1,
+            struct ggml_tensor       * dst,
+            int                        ith,
+            int                        nth,
+            void                     * user_data);
+
+    GGML_API void ggml_set_mul_mat_hook(ggml_mul_mat_hook_t fn,
+                                        void * user_data);
+
 #ifdef  __cplusplus
 }
 #endif

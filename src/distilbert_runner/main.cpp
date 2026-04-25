@@ -40,14 +40,36 @@
 
 // bert.cpp public API
 #include "bert.h"
+#include "ggml.h"
 
 namespace {
 
 constexpr const char* kDefaultProbe = "Hello world";
 
+// Step 4-3-D-1 hook: count mul_mat dispatches and fall through to the
+// CPU kernel by returning false. This proves ggml's hook plumbing
+// reaches us without changing any numerics; 4-3-D-2 swaps the body
+// for a real NPU dispatch.
+static long long g_mul_mat_hook_calls = 0;
+
+bool distilbert_mul_mat_hook(const ggml_tensor* src0, const ggml_tensor* src1,
+                             ggml_tensor* dst, int ith, int nth,
+                             void* /*user_data*/) {
+  (void)src0; (void)src1; (void)dst; (void)nth;
+  if (ith == 0) {
+    ++g_mul_mat_hook_calls;
+  }
+  return false;  // CPU fallback for now
+}
+
 }  // namespace
 
 int main(int argc, char** argv) try {
+  // Register the mul_mat hook before any forward pass. ggml stores it as
+  // a global, so a single call covers every ggml_backend_graph_compute
+  // we will issue below.
+  ggml_set_mul_mat_hook(distilbert_mul_mat_hook, nullptr);
+
   cxxopts::Options opts(
       "distilbert_runner",
       "DistilBERT End-to-End EDP runner (Notion task #22 §4-3)"
@@ -166,7 +188,8 @@ int main(int argc, char** argv) try {
         *logits_sink << '\n';
         n += 1;
       }
-      std::cout << "  batch sentences processed: " << n << "\n";
+      std::cout << "  batch sentences processed: " << n
+                << " mul_mat_hook_calls=" << g_mul_mat_hook_calls << "\n";
       bert_free(bctx);
       return 0;
     }
