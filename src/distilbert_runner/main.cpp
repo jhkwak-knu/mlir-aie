@@ -27,7 +27,9 @@
 #include <cmath>
 #include <cstdint>
 #include <exception>
+#include <fstream>
 #include <iostream>
+#include <iomanip>
 #include <string>
 #include <vector>
 
@@ -73,6 +75,15 @@ int main(int argc, char** argv) try {
       ("probe",
        "probe sentence used by --mode forward (defaults to 'Hello world')",
        cxxopts::value<std::string>()->default_value(kDefaultProbe))
+      ("sentences-file",
+       "newline-separated input sentences for batched inference; when set, "
+       "the runner ignores --probe and writes one logits row per line to "
+       "--output-logits",
+       cxxopts::value<std::string>()->default_value(""))
+      ("output-logits",
+       "destination for batched logits (one space-separated row per "
+       "sentence). Defaults to stdout when --sentences-file is set.",
+       cxxopts::value<std::string>()->default_value(""))
       ("h,help", "print help");
   auto args = opts.parse(argc, argv);
   if (args.count("help") || !args.count("config") || !args.count("gguf")
@@ -120,6 +131,46 @@ int main(int argc, char** argv) try {
   bert_allocate_buffers(bctx, n_max_tokens, /*batch_size=*/1);
 
   if (mode == "forward") {
+    distilbert_runner::ClassifierHead head_for_batch;
+    const std::string sfile = args["sentences-file"].as<std::string>();
+    if (!sfile.empty()) {
+      // Batch mode: SST-2 sweep. Load the head once, stream sentences.
+      head_for_batch = distilbert_runner::loadClassifierHead(bctx);
+      std::ifstream sin(sfile);
+      if (!sin.is_open()) {
+        throw std::runtime_error("cannot open --sentences-file: " + sfile);
+      }
+      std::ostream* logits_sink = &std::cout;
+      std::ofstream lout;
+      const std::string lpath = args["output-logits"].as<std::string>();
+      if (!lpath.empty()) {
+        lout.open(lpath);
+        if (!lout.is_open()) {
+          throw std::runtime_error("cannot open --output-logits: " + lpath);
+        }
+        logits_sink = &lout;
+      }
+      *logits_sink << std::setprecision(7);
+      std::string line;
+      int n = 0;
+      std::vector<float> logits;
+      while (std::getline(sin, line)) {
+        if (line.empty()) continue;
+        auto tokens = bert_tokenize(bctx, line, n_max_tokens);
+        distilbert_runner::runForwardClassify(bctx, head_for_batch, tokens,
+                                              /*n_threads=*/4, logits);
+        for (size_t i = 0; i < logits.size(); ++i) {
+          if (i) *logits_sink << ' ';
+          *logits_sink << logits[i];
+        }
+        *logits_sink << '\n';
+        n += 1;
+      }
+      std::cout << "  batch sentences processed: " << n << "\n";
+      bert_free(bctx);
+      return 0;
+    }
+
     const std::string probe = args["probe"].as<std::string>();
     bert_tokens tokens = bert_tokenize(bctx, probe, n_max_tokens);
     std::cout << "  probe='" << probe << "' tokens=[";

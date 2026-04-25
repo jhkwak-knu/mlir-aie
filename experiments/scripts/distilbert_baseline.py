@@ -41,6 +41,10 @@ BERT_CPP_DIR = REPO_ROOT / "external" / "bert.cpp"
 BERT_CPP_BIN = BERT_CPP_DIR / "build" / "bin" / "main"
 BERT_CPP_MODELS = BERT_CPP_DIR / "models"
 DEFAULT_PROBE_GGUF = BERT_CPP_MODELS / "distilbert-base-uncased-f16.gguf"
+DEFAULT_SST2_GGUF = BERT_CPP_MODELS / "distilbert-sst2-f16.gguf"
+DISTILBERT_RUNNER_BIN = (
+    REPO_ROOT / "src" / "distilbert_runner" / "build" / "distilbert_runner"
+)
 PROBE_SENTENCES = [
     "Hello world",
     "The movie was absolutely brilliant.",
@@ -174,6 +178,85 @@ def reference_accuracy(reference_repo: str, num_samples: int) -> Dict[str, Any]:
     }
 
 
+# ----- distilbert_runner CPU accuracy (SST-2 100 samples) -------------------
+
+
+def cpp_runner_accuracy(
+    runner_bin: Path,
+    config_path: Path,
+    sst2_gguf: Path,
+    num_samples: int,
+    workdir: Path,
+) -> Dict[str, Any]:
+    """Run distilbert_runner in batch mode over the SST-2 validation split
+    and compare its argmax labels with the ground truth.
+
+    Returns a dict shaped to slot into baseline.json next to the PyTorch
+    reference. Raises on missing binary / GGUF / runtime errors instead of
+    swallowing them — Step 4-3-D depends on this number being trustworthy.
+    """
+    from datasets import load_dataset
+
+    if not runner_bin.is_file():
+        raise FileNotFoundError(
+            f"distilbert_runner not built: {runner_bin}. "
+            "Run `cmake -B build . && make -C build -j` from src/distilbert_runner first."
+        )
+    if not sst2_gguf.is_file():
+        raise FileNotFoundError(
+            f"SST-2 GGUF missing: {sst2_gguf}. "
+            "Run `python bert_cpp/convert.py distilbert-base-uncased-finetuned-sst-2-english "
+            f"{sst2_gguf} --with-classifier-head` from external/bert.cpp."
+        )
+
+    ds = load_dataset("glue", "sst2", split=f"validation[:{num_samples}]")
+    sentences = [row["sentence"].rstrip() for row in ds]
+    gold = [int(row["label"]) for row in ds]
+
+    workdir.mkdir(parents=True, exist_ok=True)
+    sentences_path = workdir / "sst2_sentences.txt"
+    logits_path    = workdir / "sst2_cpp_logits.txt"
+    sentences_path.write_text("\n".join(sentences) + "\n")
+
+    cmd = [
+        str(runner_bin),
+        "--config", str(config_path),
+        "--gguf",   str(sst2_gguf),
+        "--setter", "star_map",
+        "--backend", "cpu",
+        "--mode",   "forward",
+        "--sentences-file", str(sentences_path),
+        "--output-logits",  str(logits_path),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    print(proc.stdout.splitlines()[-2:][-1] if proc.stdout else "(no stdout)")
+
+    pred_labels: List[int] = []
+    with logits_path.open() as f:
+        for line in f:
+            parts = line.split()
+            if not parts:
+                continue
+            row = [float(x) for x in parts]
+            pred_labels.append(int(max(range(len(row)), key=lambda i: row[i])))
+
+    if len(pred_labels) != len(gold):
+        raise RuntimeError(
+            f"distilbert_runner emitted {len(pred_labels)} rows, "
+            f"expected {len(gold)}"
+        )
+    correct = sum(1 for p, g in zip(pred_labels, gold) if p == g)
+    return {
+        "runner_binary": str(runner_bin),
+        "gguf_path":     str(sst2_gguf),
+        "num_samples":   len(gold),
+        "correct":       correct,
+        "accuracy":      correct / len(gold) if gold else 0.0,
+        "first_10_pred": pred_labels[:10],
+        "first_10_gold": gold[:10],
+    }
+
+
 # ----- CLI -----------------------------------------------------------------
 
 
@@ -191,6 +274,13 @@ def main(argv: List[str] | None = None) -> int:
                    help="skip the bert.cpp/PyTorch cosine-similarity check")
     p.add_argument("--skip-reference", action="store_true",
                    help="skip the SST-2 reference accuracy run")
+    p.add_argument("--include-cpp-runner", action="store_true",
+                   help="also run distilbert_runner CPU mode over the same "
+                        "SST-2 split (gates Step 4-3-D)")
+    p.add_argument("--cpp-config", type=Path,
+                   default=REPO_ROOT / "experiments" / "configs" / "distilbert_L128_bs1.json")
+    p.add_argument("--cpp-runner-binary", type=Path, default=DISTILBERT_RUNNER_BIN)
+    p.add_argument("--cpp-sst2-gguf", type=Path, default=DEFAULT_SST2_GGUF)
     args = p.parse_args(argv)
 
     out_path = args.output or (
@@ -218,6 +308,21 @@ def main(argv: List[str] | None = None) -> int:
         )
         print(f"  acc = {report['reference']['accuracy']:.4f} "
               f"({report['reference']['correct']}/{report['reference']['num_samples']})")
+    if args.include_cpp_runner:
+        print(f"== distilbert_runner CPU accuracy "
+              f"(SST-2 validation[:{args.num_samples}]) ==")
+        report["cpp_runner"] = cpp_runner_accuracy(
+            args.cpp_runner_binary, args.cpp_config, args.cpp_sst2_gguf,
+            args.num_samples,
+            workdir=out_path.parent / "cpp_runner_inputs",
+        )
+        print(f"  acc = {report['cpp_runner']['accuracy']:.4f} "
+              f"({report['cpp_runner']['correct']}/{report['cpp_runner']['num_samples']})")
+        if "reference" in report:
+            ref = report["reference"]["accuracy"]
+            cpp = report["cpp_runner"]["accuracy"]
+            delta_pp = (cpp - ref) * 100.0
+            print(f"  delta vs PyTorch reference = {delta_pp:+.2f} pp")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(report, indent=2) + "\n")
