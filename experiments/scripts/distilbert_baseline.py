@@ -187,13 +187,17 @@ def cpp_runner_accuracy(
     sst2_gguf: Path,
     num_samples: int,
     workdir: Path,
+    backend: str = "cpu",
+    setter: str = "star_map",
 ) -> Dict[str, Any]:
     """Run distilbert_runner in batch mode over the SST-2 validation split
     and compare its argmax labels with the ground truth.
 
-    Returns a dict shaped to slot into baseline.json next to the PyTorch
-    reference. Raises on missing binary / GGUF / runtime errors instead of
-    swallowing them — Step 4-3-D depends on this number being trustworthy.
+    `backend` selects the runner's GEMM dispatcher: "cpu" routes every
+    mul_mat through ggml's CPU kernel; "npu" engages the XrtDispatcher
+    for the three matched shapes (Step 4-3-D-2). The logits + first-10
+    predictions are returned per-backend so callers can compute CPU vs
+    NPU agreement.
     """
     from datasets import load_dataset
 
@@ -215,21 +219,32 @@ def cpp_runner_accuracy(
 
     workdir.mkdir(parents=True, exist_ok=True)
     sentences_path = workdir / "sst2_sentences.txt"
-    logits_path    = workdir / "sst2_cpp_logits.txt"
+    # Per-backend logits file so CPU and NPU runs don't clobber each
+    # other when both flags are passed in one invocation.
+    logits_filename = (
+        "sst2_cpp_logits.txt" if backend == "cpu"
+        else f"sst2_cpp_logits_{backend}.txt"
+    )
+    logits_path = workdir / logits_filename
     sentences_path.write_text("\n".join(sentences) + "\n")
 
     cmd = [
         str(runner_bin),
         "--config", str(config_path),
         "--gguf",   str(sst2_gguf),
-        "--setter", "star_map",
-        "--backend", "cpu",
+        "--setter", setter,
+        "--backend", backend,
         "--mode",   "forward",
         "--sentences-file", str(sentences_path),
         "--output-logits",  str(logits_path),
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
-    print(proc.stdout.splitlines()[-2:][-1] if proc.stdout else "(no stdout)")
+    # Surface the runner's last status line ("batch sentences processed: N
+    # dispatched_mul_mat=... cpu_fallback_mul_mat=...") so the user can
+    # eyeball whether the NPU dispatch actually fired.
+    if proc.stdout:
+        for line in proc.stdout.splitlines()[-3:]:
+            print(f"  {line}")
 
     pred_labels: List[int] = []
     with logits_path.open() as f:
@@ -249,9 +264,12 @@ def cpp_runner_accuracy(
     return {
         "runner_binary": str(runner_bin),
         "gguf_path":     str(sst2_gguf),
+        "backend":       backend,
+        "setter":        setter,
         "num_samples":   len(gold),
         "correct":       correct,
         "accuracy":      correct / len(gold) if gold else 0.0,
+        "pred_labels":   pred_labels,
         "first_10_pred": pred_labels[:10],
         "first_10_gold": gold[:10],
     }
@@ -277,6 +295,12 @@ def main(argv: List[str] | None = None) -> int:
     p.add_argument("--include-cpp-runner", action="store_true",
                    help="also run distilbert_runner CPU mode over the same "
                         "SST-2 split (gates Step 4-3-D)")
+    p.add_argument("--include-cpp-runner-npu", action="store_true",
+                   help="also run distilbert_runner --backend npu over the "
+                        "same SST-2 split (gates Step 4-3-D-3); requires "
+                        "setup_env.sh sourced for XRT")
+    p.add_argument("--cpp-runner-setter", default="star_map",
+                   help="setter the cpp_runner consumes (default: star_map)")
     p.add_argument("--cpp-config", type=Path,
                    default=REPO_ROOT / "experiments" / "configs" / "distilbert_L128_bs1.json")
     p.add_argument("--cpp-runner-binary", type=Path, default=DISTILBERT_RUNNER_BIN)
@@ -315,6 +339,8 @@ def main(argv: List[str] | None = None) -> int:
             args.cpp_runner_binary, args.cpp_config, args.cpp_sst2_gguf,
             args.num_samples,
             workdir=out_path.parent / "cpp_runner_inputs",
+            backend="cpu",
+            setter=args.cpp_runner_setter,
         )
         print(f"  acc = {report['cpp_runner']['accuracy']:.4f} "
               f"({report['cpp_runner']['correct']}/{report['cpp_runner']['num_samples']})")
@@ -323,6 +349,34 @@ def main(argv: List[str] | None = None) -> int:
             cpp = report["cpp_runner"]["accuracy"]
             delta_pp = (cpp - ref) * 100.0
             print(f"  delta vs PyTorch reference = {delta_pp:+.2f} pp")
+    if args.include_cpp_runner_npu:
+        print(f"== distilbert_runner NPU accuracy "
+              f"(SST-2 validation[:{args.num_samples}], setter="
+              f"{args.cpp_runner_setter}) ==")
+        report["cpp_runner_npu"] = cpp_runner_accuracy(
+            args.cpp_runner_binary, args.cpp_config, args.cpp_sst2_gguf,
+            args.num_samples,
+            workdir=out_path.parent / "cpp_runner_inputs",
+            backend="npu",
+            setter=args.cpp_runner_setter,
+        )
+        print(f"  acc = {report['cpp_runner_npu']['accuracy']:.4f} "
+              f"({report['cpp_runner_npu']['correct']}/{report['cpp_runner_npu']['num_samples']})")
+        if "reference" in report:
+            ref = report["reference"]["accuracy"]
+            npu = report["cpp_runner_npu"]["accuracy"]
+            delta_pp = (npu - ref) * 100.0
+            print(f"  delta vs PyTorch reference = {delta_pp:+.2f} pp")
+        if "cpp_runner" in report:
+            cpu_pred = report["cpp_runner"].get("pred_labels", [])
+            npu_pred = report["cpp_runner_npu"].get("pred_labels", [])
+            if cpu_pred and len(cpu_pred) == len(npu_pred):
+                agree = sum(1 for c, n in zip(cpu_pred, npu_pred) if c == n)
+                report["cpp_runner_npu"]["agreement_with_cpu"] = (
+                    agree / len(cpu_pred)
+                )
+                print(f"  CPU/NPU label agreement = {agree}/{len(cpu_pred)} "
+                      f"({100.0 * agree / len(cpu_pred):.1f}%)")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(report, indent=2) + "\n")
