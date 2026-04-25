@@ -31,9 +31,19 @@
 
 namespace mlp_runner {
 
+/// Optional richer metadata for a per-layer sample. Populated by runners that
+/// know the ggml call's role (DistilBERT step 4-4); mlp_runner leaves the
+/// defaults so existing fc1/fc2/fc3 rows stay schema-equivalent.
+struct LayerMeta {
+  std::string gemm_type = "";   // e.g. "attention_qkv", "ffn_expand"
+  int layer_idx = -1;           // 0..num_layers-1, -1 when N/A
+  std::string sub_type = "";    // e.g. "Q"/"K"/"V" within attention_qkv
+};
+
 /// Per-layer timing sample within a single inference.
 struct PerLayerSample {
   std::string layer;
+  LayerMeta meta;
   double time_us;
   int64_t energy_uj_package;
   int64_t energy_uj_core;
@@ -69,6 +79,10 @@ struct BatchStats {
   // (~1ms) and return delta=0 on individual inferences; summing across
   // n_inner iterations always captures multiple ticks and remains positive.
   std::map<std::string, int64_t> layer_energy_uj_sum;
+  // Optional richer per-layer metadata (gemm_type / layer_idx / sub_type).
+  // Keyed by the same `layer` string used by the maps above. Empty/default
+  // when the runner does not provide it (e.g. mlp_runner's fc1/fc2/fc3).
+  std::map<std::string, LayerMeta> layer_meta;
 };
 
 /// Top-level run stats collected across outer_batches.

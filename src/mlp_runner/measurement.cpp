@@ -140,6 +140,9 @@ RunStats runMeasurement(const ExperimentConfig& cfg,
       for (const auto& ps : s.layers) {
         layer_times[ps.layer].push_back(ps.time_us);
         layer_energies_pkg[ps.layer].push_back(ps.energy_uj_package);
+        // First-seen meta wins (samples carry identical metadata across
+        // inferences for a given layer key, so re-assignment is a no-op).
+        if (!bs.layer_meta.count(ps.layer)) bs.layer_meta[ps.layer] = ps.meta;
       }
       ++n_inner;
       double elapsed_s = std::chrono::duration<double>(
@@ -230,11 +233,16 @@ RunStats runMeasurement(const ExperimentConfig& cfg,
 // ------------- Output serialization ----------------------------------------
 
 static std::string _headerCsv() {
+  // Trailing gemm_type / layer_idx / sub_type columns are optional metadata
+  // populated by runners that know the ggml-call role (DistilBERT step 4-4).
+  // Empty strings / -1 mean "not applicable" (e.g. mlp_runner's fc1/fc2/fc3
+  // and every "model" row), so analyze.py can always select them by name.
   return "measurement_type,setter,backend,layer,batch_idx,n_inner,"
          "time_us_min,time_us_mean,"
          "energy_uj_min_package,wall_s,"
          "idle_power_pre_mw,idle_power_post_mw,"
-         "batch_energy_cv_pct,batch_time_cv_pct";
+         "batch_energy_cv_pct,batch_time_cv_pct,"
+         "gemm_type,layer_idx,sub_type";
 }
 
 void writeMeasurements(const std::string& output_dir,
@@ -257,20 +265,26 @@ void writeMeasurements(const std::string& output_dir,
                        int batch_idx, int n_inner,
                        double t_min, double t_mean, int64_t e_min,
                        double wall_s, double idle_pre, double idle_post,
-                       double e_cv, double t_cv) {
+                       double e_cv, double t_cv,
+                       const LayerMeta& meta) {
     csv << mtype << "," << setter << "," << backend << ","
         << (layer.empty() ? "_" : layer) << "," << batch_idx << "," << n_inner
         << "," << std::fixed << std::setprecision(3) << t_min << "," << t_mean
         << "," << e_min << "," << std::setprecision(6) << wall_s << ","
         << std::setprecision(2) << idle_pre << "," << idle_post << ","
-        << std::setprecision(3) << e_cv << "," << t_cv << "\n";
+        << std::setprecision(3) << e_cv << "," << t_cv << ","
+        << meta.gemm_type << "," << meta.layer_idx << "," << meta.sub_type
+        << "\n";
   };
+
+  static const LayerMeta kEmptyMeta{};
 
   for (const auto& bs : stats.batches) {
     write_row("model", "", bs.index, bs.n_inner,
               bs.model_time_us_min, bs.model_time_us_mean, bs.npu_uj_package,
               bs.wall_s, bs.idle_power_pre_mw, bs.idle_power_post_mw,
-              stats.batch_energy_cv_pct, stats.batch_time_cv_pct);
+              stats.batch_energy_cv_pct, stats.batch_time_cv_pct,
+              kEmptyMeta);
     for (const auto& [layer, t_min] : bs.layer_time_us_min) {
       double t_mean = bs.layer_time_us_mean.at(layer);
       // For layer rows, `energy_uj_min_package` column carries the batch SUM of
@@ -279,10 +293,14 @@ void writeMeasurements(const std::string& output_dir,
       // (which is also a batch-total scalar). See measurement.h for the
       // rationale behind sum vs min aggregation.
       int64_t e_sum = bs.layer_energy_uj_sum.at(layer);
+      auto meta_it = bs.layer_meta.find(layer);
+      const LayerMeta& meta =
+          (meta_it != bs.layer_meta.end()) ? meta_it->second : kEmptyMeta;
       write_row("kernel", layer, bs.index, bs.n_inner,
                 t_min, t_mean, e_sum,
                 bs.wall_s, bs.idle_power_pre_mw, bs.idle_power_post_mw,
-                stats.batch_energy_cv_pct, stats.batch_time_cv_pct);
+                stats.batch_energy_cv_pct, stats.batch_time_cv_pct,
+                meta);
     }
   }
   csv.close();
