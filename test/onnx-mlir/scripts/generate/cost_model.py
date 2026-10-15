@@ -373,10 +373,11 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
                    help="Comma-separated numCores values to exclude from enumeration "
                         "(e.g., '24' to skip all 24-core configs)")
     p.add_argument("--search", default="sm-exh",
-                   choices=("sm-exh", "star-map", "charm", "naive", "timeloop"),
+                   choices=("sm-exh", "star-map", "charm", "max-p", "timeloop"),
                    help="Searcher to use. Default 'sm-exh' preserves legacy "
                         "exhaustive behavior; 'star-map' applies STAR-Map pruning; "
-                        "'charm' selects by CHARM-CDSE throughput-cycle.")
+                        "'charm' selects by CHARM-CDSE throughput-cycle; "
+                        "'max-p' picks P=P_max under V16 EDP cost.")
     p.add_argument("--pruning-level", type=int, default=123,
                    choices=(1, 12, 123),
                    help="STAR-Map pruning level (1, 12, or 123). Only effective "

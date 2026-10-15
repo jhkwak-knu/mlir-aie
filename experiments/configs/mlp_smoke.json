@@ -1,0 +1,29 @@
+{
+  "model": {
+    "type": "mlp",
+    "layer_sizes": [784, 512, 512, 16],
+    "activations": ["relu", "relu"],
+    "output_classes": 10,
+    "weight_init": "random",
+    "note": "Tiny smoke config for mlp_runner: same shapes as the canonical MLP so the generated configurations.json can be reused, but with measurement knobs turned down so a full --mode measure run finishes in seconds."
+  },
+  "dataset": {
+    "name": "mnist",
+    "batch_size": 32,
+    "num_inference_samples": 10
+  },
+  "measurement": {
+    "warmup_iterations": 2,
+    "outer_batches": 2,
+    "inner_target_seconds": 0.1,
+    "rapl_domains": ["package"],
+    "bracket_idle_seconds": 0.05,
+    "bracket_idle_count": 2
+  },
+  "setters": ["star_map", "max_p", "charm_cdse", "timeloop"],
+  "output": {
+    "results_dir": "./experiments/results/mlp_smoke/",
+    "figure_format": "png",
+    "log_level": "info"
+  }
+}

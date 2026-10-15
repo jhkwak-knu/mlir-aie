@@ -1,0 +1,29 @@
+{
+  "model": {
+    "type": "mlp",
+    "layer_sizes": [784, 512, 512, 16],
+    "activations": ["relu", "relu"],
+    "output_classes": 10,
+    "weight_init": "random",
+    "note_output_padding": "Output N padded from MNIST 10 classes to 16 to satisfy the XDNA2 mmul<4,8,8> 2x2 expansion constraint (TN % 16 == 0). The mlp_runner slices the first output_classes logits before softmax."
+  },
+  "dataset": {
+    "name": "mnist",
+    "batch_size": 32,
+    "num_inference_samples": 100
+  },
+  "measurement": {
+    "warmup_iterations": 10,
+    "outer_batches": 5,
+    "inner_target_seconds": 0.5,
+    "rapl_domains": ["package", "core"],
+    "bracket_idle_seconds": 0.3,
+    "bracket_idle_count": 5
+  },
+  "setters": ["star_map", "max_p", "charm_cdse", "timeloop"],
+  "output": {
+    "results_dir": "./experiments/results/mlp_512_512_bs32/",
+    "figure_format": "png",
+    "log_level": "info"
+  }
+}

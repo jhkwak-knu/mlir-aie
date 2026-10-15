@@ -4,7 +4,7 @@ Composes (Enumerator, FilterSet, CostFunction, Selector) into a single
 run: enumerate candidates, apply constraints, evaluate every surviving
 candidate across the three innermost temporal axis choices, then rank.
 
-Every baseline (STAR-Map, SM-exh, Naive, Timeloop, ...) differs only in
+Every baseline (STAR-Map, SM-exh, Max-P, Timeloop, ...) differs only in
 which components get plugged in; see xdna_search.search.factory.
 """
 

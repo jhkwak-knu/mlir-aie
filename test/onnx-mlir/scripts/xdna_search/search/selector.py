@@ -71,6 +71,37 @@ class CycleSelector:
         )
 
 
+class MaxPEdpSelector:
+    """Restrict to P == P_max, then per-candidate argmin-EDP + sort by EDP.
+
+    "P_max" is computed from the CostResult list AFTER feasibility filtering,
+    so it reflects the maximum feasible num_cores for the specific OpCase.
+    This reproduces paper/fig/baselines.py::find_naive_max semantics (pick
+    the configuration that uses the maximum feasible number of PEs, then
+    minimize EDP among those) without requiring measured data.
+
+    Primary objective remains EDP, and the V16 cost model is shared with
+    STAR-Map so the two selectors contrast solely on the P=P_max constraint.
+    """
+
+    name = "max-p-edp"
+
+    def rank(self, scored: List[CostResult]) -> List[CostResult]:
+        if not scored:
+            return []
+
+        p_max = max(cr.candidate.num_cores for cr in scored)
+        filtered = [cr for cr in scored if cr.candidate.num_cores == p_max]
+
+        best_by_cand: "OrderedDict[int, CostResult]" = OrderedDict()
+        for cr in filtered:
+            cid = id(cr.candidate)
+            cur = best_by_cand.get(cid)
+            if cur is None or cr.edp < cur.edp:
+                best_by_cand[cid] = cr
+        return sorted(best_by_cand.values(), key=lambda r: r.edp)
+
+
 class TimeloopEdpSelector:
     """Per-candidate argmin-EDP, then global sort by (EDP, P, TP_total).
 
