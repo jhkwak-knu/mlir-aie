@@ -41,7 +41,7 @@ CXXFLAGS ?=
 # =========================
 # Phony
 # =========================
-.PHONY: all clean run host paths
+.PHONY: all clean run host host_reconfig paths
 
 # Default build artifact: AIE xclbin
 all: $(BUILD_DIR)/final.xclbin
@@ -76,6 +76,19 @@ $(BUILD_DIR)/$(TARGET): $(SRC_DIR)/host.cpp CMakeLists.txt | $(BUILD_DIR)
 	cd $(HOST_BUILD_DIR) && cmake $(ROOT_DIR) -DTARGET_NAME=$(TARGET) -DCMAKE_CXX_FLAGS:STRING="$(CXXFLAGS)"
 	cd $(HOST_BUILD_DIR) && cmake --build . --config Release
 	cp $(HOST_BUILD_DIR)/$(TARGET) $(BUILD_DIR)/$(TARGET)
+
+# 4b) Build reconfiguration microbenchmark host (src/host_reconfig.cpp).
+#     Independent of tc.json/xclbin; loads configs at runtime from --config-dir.
+RECONFIG_TARGET      ?= reconfig_bench
+RECONFIG_BUILD_DIR   ?= $(BUILD_DIR)/reconfig_host
+host_reconfig: $(BUILD_DIR)/$(RECONFIG_TARGET)
+
+$(BUILD_DIR)/$(RECONFIG_TARGET): $(SRC_DIR)/host_reconfig.cpp CMakeLists.txt | $(BUILD_DIR)
+	mkdir -p $(RECONFIG_BUILD_DIR)
+	cd $(RECONFIG_BUILD_DIR) && cmake $(ROOT_DIR) -DTARGET_NAME=$(RECONFIG_TARGET) \
+		-DHOST_SRC=src/host_reconfig.cpp -DCMAKE_CXX_FLAGS:STRING="$(CXXFLAGS)"
+	cd $(RECONFIG_BUILD_DIR) && cmake --build . --config Release
+	cp $(RECONFIG_BUILD_DIR)/$(RECONFIG_TARGET) $(BUILD_DIR)/$(RECONFIG_TARGET)
 
 # 5) Run (logs at out/logs/log.txt)
 # CPU pinning: reduce scheduling noise during measurement.

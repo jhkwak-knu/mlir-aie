@@ -29,15 +29,19 @@ set(TARGET_NAME onnx_matmul CACHE STRING "Target to be built")
 set(ProjectName ${TARGET_NAME})
 set(currentTarget ${TARGET_NAME})
 
+# Host source file (Makefile passes -DHOST_SRC=src/host_reconfig.cpp for the
+# reconfiguration microbenchmark; defaults to the main matmul host).
+set(HOST_SRC src/host.cpp CACHE STRING "Host source file relative to this dir")
+
 # ---- Source layout (new tree) ----
 # CMakeLists.txt is at repo root: onnx-mlir/CMakeLists.txt
-# Host source lives in src/host.cpp
+# Host source lives in src/host.cpp (or src/host_reconfig.cpp via HOST_SRC)
 # Runtime helper remains in ../../runtime_lib relative to this file (unchanged)
 set(RUNTIME_LIB_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../runtime_lib)
 
 add_executable(${currentTarget}
   ${RUNTIME_LIB_DIR}/test_lib/test_utils.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/host.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/${HOST_SRC}
 )
 
 target_compile_definitions(${currentTarget} PUBLIC DISABLE_ABI_CHECK=1)
