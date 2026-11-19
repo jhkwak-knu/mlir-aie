@@ -10,7 +10,7 @@ task status transitions).**
 
 MLIR-AIE is an MLIR-based toolchain targeting AMD Ryzen AI NPUs (AI Engine tiles). This fork adds an **ONNX-to-AIE compilation pass** (`--convert-onnx-to-aie`) that lowers ONNX dialect operations to AIE/AIEX dialect with spatio-temporal tiling for matrix multiplication.
 
-Active branch: `energy-cost-model`
+Active branch: `dev`
 
 ### Project Goals
 
@@ -79,13 +79,16 @@ Before running any build or test, activate the environment (must be **sourced**,
 source test/onnx-mlir/scripts/setup_env.sh
 ```
 
-This activates `ironenv` (Python venv), runs `utils/env_setup.sh <install_dir>` (sets `PATH`, `LD_LIBRARY_PATH`, `PYTHONPATH`), and sets the `amdxdna` driver timeout to 60 seconds. Install dir is `$HOME/ryzen_ai/mlir-aie-dev/mlir-aie/install`.
+This activates `ironenv` (Python venv), runs `utils/env_setup.sh <install_dir>` (sets `PATH`, `LD_LIBRARY_PATH`, `PYTHONPATH`), and sets the `amdxdna` driver timeout to 60 seconds. Install dir is `<repo>/install` (repo root is derived from the script location). XRT must be sourced first (`source /opt/xilinx/xrt/setup.sh`); the sudo steps (driver timeout, RAPL chmod) need a password, so run `setup_env.sh` yourself or skip them when the timeout is already 60.
 
 ---
 
 ## Build & Test Commands (ONNX-to-AIE Pass)
 
 All commands run from `test/onnx-mlir/`.
+
+Laptop memory limit: each Chess core compile in `aiecc` peaks at ~6-7GB. Keep `aiecc -j 2`
+(Makefile default); `-j 12` froze the machine. Rebuilding the compiler: `ninja -C build -j 12` under `nice -n 19`.
 
 ### Step 1 -- Generate test case list
 ```bash
@@ -115,11 +118,11 @@ bash scripts/run/run_tc_all.sh -i out/tc_list.json -n 1
 
 ### Manual single-case flow
 ```bash
-# 1. Generate ONNX MLIR (M K N)
-bash scripts/generate/gen_onnx_matmul_mlir.sh 64 64 64
+# 1. Put one case in out/tc.json, then generate ONNX MLIR from it (M/K/N read from tc.json)
+bash scripts/generate/gen_onnx_matmul_mlir.sh out/tc.json
 
 # 2. Full build + run (reads out/tc.json for tiling config)
-make run CPPDEFS="-DM_SIZE=64 -DK_SIZE=64 -DN_SIZE=64"
+make run
 
 # 3. Build only (xclbin)
 make
@@ -184,7 +187,7 @@ test/onnx-mlir/
 - `AieTile`, `AieBuf`, `AieDma`, `AiePacket` -- hardware abstraction structs
 
 **AIE MLIR generation order**:
-`DeviceOp` -> `TileOp` -> `BufferOp`/`LockOp` -> `FlowOp` (packet routing) -> `DmaOp` (MemTileDMAOp/MemOp/DMABdOp) -> `CoreOp`/`CallOp` (with `SCF ForOp`) -> `RuntimeSequenceOp`/`NpuDmaMemcpyNdOp` (AIEX)
+`DeviceOp` -> `TileOp` -> `BufferOp`/`LockOp` -> `FlowOp` (packet routing) -> `DmaOp` (MemTileDMAOp/MemOp/DMABdOp) -> `CoreOp`/`CallOp` (with `SCF ForOp`) -> `RuntimeSequenceOp`/`NpuDmaMemcpyNdOp`
 
 **Spatio-temporal parallelization**:
 - **Spatial**: `SPm x SPn` compute tiles handle M/N axis splits (`M0 = M/SPm`, `N0 = N/SPn`)
@@ -235,5 +238,5 @@ Result CSV columns (39 total, since commit 7c984731):
 Git conventions (conventional commits, PR workflow) are inherited from
 the user-level CLAUDE.md. Project-specific notes:
 
-- Active branch: `energy-cost-model` (will merge into `dev`)
+- Active branch: `dev`
 - Result CSV columns changed at commit 7c984731 (39 columns with step_time)
