@@ -26,7 +26,7 @@ the user-level CLAUDE.md. Below are **project-specific additions only**.
 
 1. **Pre-test environment check** -- Before running any NPU test batch:
    - Verify RAPL is accessible: `cat /sys/class/powercap/intel-rapl:0/energy_uj`
-   - Verify NPU driver timeout: `cat /sys/module/amdxdna/parameters/timeout`
+   - Verify NPU driver timeout: `sudo cat /sys/module/amdxdna/parameters/tdr_timeout_ms` (expect 60000; set via `/etc/modprobe.d/amdxdna.conf`, read-only at runtime)
    - Verify no stale `out/tc.json` or `out/build/` from previous runs
    - Close unnecessary applications (browser, IDE) to reduce measurement noise
 
@@ -50,8 +50,8 @@ the user-level CLAUDE.md. Below are **project-specific additions only**.
    - `D` state is uninterruptible -- `kill -9`, PCI reset, driver rmmod are all ineffective
    - **Only reliable recovery is reboot**
    - After reboot, resume with `run_tc_all.sh -s <next_case>` (preserves existing CSV)
-   - Prevention: ensure `timeout_in_sec` is set to 60 via `setup_env.sh` before batch start
-   - Note: timeout_in_sec=60 does NOT prevent all hangs -- some D states bypass driver timeout
+   - Prevention: ensure `tdr_timeout_ms=60000` before batch start (`setup_env.sh` verifies it)
+   - Note: timeout_in_sec=60 does NOT prevent all hangs -- some D states bypass driver timeout (observed with amdxdna 2.20)
 
 5. **Autonomous batch execution** -- When running batches via Claude Code:
    - **Before start**: verify RAPL readable, NPU timeout set, no stale artifacts
@@ -75,7 +75,7 @@ Before running any build or test, activate the environment (must be **sourced**,
 source test/onnx-mlir/scripts/setup_env.sh
 ```
 
-This activates `ironenv` (Python venv), runs `utils/env_setup.sh <install_dir>` (sets `PATH`, `LD_LIBRARY_PATH`, `PYTHONPATH`), and sets the `amdxdna` driver timeout to 60 seconds. Install dir is `<repo>/install` (repo root is derived from the script location). XRT must be sourced first (`source /opt/xilinx/xrt/setup.sh`); the sudo steps (driver timeout, RAPL chmod) need a password, so run `setup_env.sh` yourself or skip them when the timeout is already 60.
+This activates `ironenv` (Python venv), runs `utils/env_setup.sh <install_dir>` (sets `PATH`, `LD_LIBRARY_PATH`, `PYTHONPATH`), and verifies the `amdxdna` TDR timeout is 60000 ms (set at module load via `/etc/modprobe.d/amdxdna.conf`). Install dir is `<repo>/install` (repo root is derived from the script location). XRT must be sourced first (`source /opt/xilinx/xrt/setup.sh`); the sudo steps (timeout check, RAPL chmod) need a password, so run `setup_env.sh` yourself.
 
 ---
 
