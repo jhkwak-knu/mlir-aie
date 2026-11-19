@@ -1,0 +1,48 @@
+# ===- test.py -------------------------------------------------*- Python -*-===#
+#
+# Copyright (C) 2025-2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+#
+# ===----------------------------------------------------------------------===#
+
+# This gets launched from run.lit, so disable it with a bogus requires line
+# REQUIRES: dont_run
+# RUN: echo FAIL | FileCheck %s
+# CHECK: PASS
+import argparse
+import sys
+import numpy as np
+
+import aie.utils.test as test_utils
+import aie.iron as iron
+from aie.utils import DefaultNPURuntime
+from aie.utils.hostruntime.argparse import add_runtime_args
+
+IN_SIZE = 64
+OUT_SIZE = 64
+
+
+def main(opts):
+    inA = iron.arange(1, IN_SIZE + 1, dtype=np.uint32)
+    inB = iron.arange(1, IN_SIZE + 1, dtype=np.uint32)
+    out = iron.zeros((OUT_SIZE,), dtype=np.uint32)
+    ref_data = inA.numpy() + 41
+
+    npu_opts = test_utils.create_npu_kernel(opts)
+    if not DefaultNPURuntime.run_test(
+        npu_opts.npu_kernel,
+        [inA, inB, out],
+        {2: ref_data},
+        verify=npu_opts.verify,
+        verbosity=npu_opts.verbosity,
+    ):
+        print("PASS!")
+    else:
+        print("Failed.")
+
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    add_runtime_args(p)
+    opts = p.parse_args(sys.argv[1:])
+    sys.exit(main(opts))

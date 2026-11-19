@@ -1,0 +1,257 @@
+# whole_array.py -*- Python -*-
+#
+# Copyright (C) 2025-2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+#
+"""Whole-array mixed bf16/bfp16 matmul — ``@iron.jit`` IRON design.
+
+n_aie_rows x n_aie_cols cores running mixed (bf16, bfp16) -> bf16 mac
+on AIE2P. Strix-only.
+"""
+
+import argparse
+
+import aie.iron as iron
+import aie.iron.kernels as kernels
+import numpy as np
+from aie.dialects.aiex import v8bfp16ebs8
+from aie.helpers.taplib import TensorAccessPattern
+from aie.iron import (
+    CompileTime,
+    In,
+    ObjectFifo,
+    Out,
+    Program,
+    Runtime,
+    TaskGroup,
+    Worker,
+)
+from aie.iron.controlflow import range_
+from aie.utils.hostruntime.argparse import (
+    add_compile_args,
+    device_from_args,
+)
+from aie.utils.hostruntime.cli import run_design_cli
+from ml_dtypes import bfloat16
+
+
+@iron.jit(aiecc_flags=["--dynamic-objFifos"])
+def whole_array_mixed(
+    A: In,
+    B: In,
+    C: Out,
+    *,
+    M: CompileTime[int] = 512,
+    K: CompileTime[int] = 512,
+    N: CompileTime[int] = 512,
+    m: CompileTime[int] = 64,
+    k: CompileTime[int] = 64,
+    n: CompileTime[int] = 64,
+    n_aie_cols: CompileTime[int] = 4,
+):
+    n_aie_rows = 4
+    n_aie_cores = n_aie_rows * n_aie_cols
+    matmul_kernel = kernels.mm_bfp(dim_m=m, dim_k=k, dim_n=n, mixed=True)
+    zero_kernel = kernels.zero(m * n, bfloat16)
+    r, s, t = matmul_kernel.mac_dims  # the bfp16ebs8 mmul is 8x8x8
+    assert m % r == 0, f"m ({m}) must be a multiple of {r}"
+    assert k % s == 0, f"k ({k}) must be a multiple of {s}"
+    assert n % t == 0, f"n ({n}) must be a multiple of {t}"
+    fifo_depth = 2
+
+    n_tiles_per_core = (M // m) * (N // n) // n_aie_cores
+    n_shim_mem_A = n_aie_rows if n_aie_cols > n_aie_rows else n_aie_cols
+    n_A_tiles_per_shim = n_aie_rows // n_aie_cols if n_aie_cols < 4 else 1
+
+    A_l2_ty = np.ndarray[(m * k * n_A_tiles_per_shim,), np.dtype[bfloat16]]
+    B_l2_ty = np.ndarray[(k * n // 8,), np.dtype[v8bfp16ebs8]]
+    C_l2_ty = np.ndarray[(m * n * n_aie_rows,), np.dtype[bfloat16]]
+    A_l1_ty = np.ndarray[(m, k), np.dtype[bfloat16]]
+    B_l1_ty = np.ndarray[(k, n // 8), np.dtype[v8bfp16ebs8]]
+    C_l1_ty = np.ndarray[(m, n), np.dtype[bfloat16]]
+
+    A_l3l2_fifos: list[ObjectFifo] = []
+    A_l2l1_fifos: list[ObjectFifo] = []
+    B_l3l2_fifos: list[ObjectFifo] = []
+    B_l2l1_fifos: list[ObjectFifo] = []
+    C_l1l2_fifos: list[list[ObjectFifo]] = [[] for _ in range(n_aie_rows)]
+    C_l2l3_fifos: list[ObjectFifo] = []
+
+    for i in range(n_shim_mem_A):
+        a_l3l2 = ObjectFifo(A_l2_ty, name=f"A_L3L2_{i}", depth=fifo_depth)
+        A_l3l2_fifos.append(a_l3l2)
+        start_row = i * n_A_tiles_per_shim
+        stop_row = start_row + n_A_tiles_per_shim
+        of_offsets = [m * k * j for j in range(stop_row - start_row)]
+        to_stream = [matmul_kernel.stream_dims.A] * (stop_row - start_row)
+        a_tmp_fifos = a_l3l2.cons().split(
+            of_offsets,
+            obj_types=[A_l1_ty] * (stop_row - start_row),
+            names=[f"A_L2L1_{row}" for row in range(start_row, stop_row)],
+            to_stream=to_stream,
+        )
+        A_l2l1_fifos.extend(a_tmp_fifos)
+
+    for col in range(n_aie_cols):
+        b_l3l2 = ObjectFifo(B_l2_ty, name=f"B_L3L2_{col}", depth=fifo_depth)
+        B_l3l2_fifos.append(b_l3l2)
+        B_l2l1_fifos.append(
+            b_l3l2.cons().forward(obj_type=B_l1_ty, name=f"B_L2L1_{col}")
+        )
+
+        c_l2l3_dims = matmul_kernel.stream_dims.C
+        c_l2l3 = ObjectFifo(
+            C_l2_ty,
+            name=f"C_L2L3_{col}",
+            depth=fifo_depth,
+            to_stream=c_l2l3_dims,
+        )
+        C_l2l3_fifos.append(c_l2l3)
+        of_offsets = [m * n * i for i in range(n_aie_rows)]
+        c_tmp_fifos = c_l2l3.prod().join(
+            of_offsets,
+            obj_types=[C_l1_ty] * n_aie_rows,
+            names=[f"C_L1L2_{col}_{row}" for row in range(n_aie_rows)],
+            depths=[fifo_depth] * n_aie_rows,
+        )
+        for j in range(n_aie_rows):
+            C_l1l2_fifos[j].append(c_tmp_fifos[j])
+
+    def core_fn(in_a, in_b, out_c, zero, matmul):
+        loop = range_(n_tiles_per_core) if n_tiles_per_core > 1 else range(1)
+        for _ in loop:
+            elem_out = out_c.acquire(1)
+            zero(elem_out)
+            for _ in range_(K // k):
+                elem_in_a = in_a.acquire(1)
+                elem_in_b = in_b.acquire(1)
+                matmul(elem_in_a, elem_in_b, elem_out)
+                in_a.release(1)
+                in_b.release(1)
+            out_c.release(1)
+
+    workers = Worker.grid(
+        n_aie_rows,
+        n_aie_cols,
+        lambda row, col: Worker(
+            core_fn,
+            [
+                A_l2l1_fifos[row].cons(),
+                B_l2l1_fifos[col].cons(),
+                C_l1l2_fifos[row][col].prod(),
+                zero_kernel,
+                matmul_kernel,
+            ],
+            stack_size=0xD00,
+        ),
+    )
+
+    A_ty = np.ndarray[(M * K,), np.dtype[bfloat16]]
+    B_ty = np.ndarray[(K * N // 8,), np.dtype[v8bfp16ebs8]]
+    C_ty = np.ndarray[(M * N,), np.dtype[bfloat16]]
+
+    tb_max_n_rows = 4
+
+    A_tiles = TensorAccessPattern.full((M, K)).tile((m * n_A_tiles_per_shim, k))
+    B_tiles = TensorAccessPattern.full((N, K // 8)).tile((n, k // 8))
+    C_tiles = TensorAccessPattern.full((M, N)).tile((m * n_aie_rows, n))
+
+    def sequence(a, b, c, A_prods, B_prods, C_conses):
+        tg = TaskGroup()
+        for tb in range(iron.ceildiv(M // m // n_aie_rows, tb_max_n_rows)):
+            for pingpong in [0, 1]:
+                row_base = tb * tb_max_n_rows + pingpong * tb_max_n_rows // 2
+                current_tb_n_rows = min(
+                    [tb_max_n_rows // 2, M // m // n_aie_rows - row_base]
+                )
+                if current_tb_n_rows <= 0:
+                    break
+                for col in range(n_aie_cols):
+                    C_conses[col].drain(
+                        c,
+                        tap=C_tiles[
+                            row_base : row_base + current_tb_n_rows, col::n_aie_cols
+                        ],
+                        wait=True,
+                        group=tg,
+                    )
+                    for tile_row in range(current_tb_n_rows):
+                        tile_offset = (
+                            (row_base + tile_row) * n_shim_mem_A + col
+                        ) % A_tiles.sizes[0]
+                        if col < n_aie_rows:
+                            A_prods[col].fill(
+                                a,
+                                tap=A_tiles[tile_offset].repeat(N // n // n_aie_cols),
+                                group=tg,
+                            )
+                        B_prods[col].fill(
+                            b,
+                            tap=B_tiles[col::n_aie_cols],
+                            group=tg,
+                        )
+                if tb > 0 or (tb == 0 and pingpong > 0):
+                    tg.finish()
+                    tg = TaskGroup()
+        tg.finish()
+
+    rt = Runtime(
+        sequence,
+        [
+            A_ty,
+            B_ty,
+            C_ty,
+            [f.prod() for f in A_l3l2_fifos],
+            [f.prod() for f in B_l3l2_fifos],
+            [f.cons() for f in C_l2l3_fifos],
+        ],
+    )
+
+    return Program(
+        iron.get_current_device(),
+        rt,
+        workers=[w for row in workers for w in row],
+    ).resolve_program()
+
+
+def _make_argparser():
+    p = argparse.ArgumentParser(
+        prog="AIE Whole-Array Mixed bf16/bfp16 Matmul",
+    )
+    add_compile_args(p, default_dev="npu2")
+    p.add_argument("-M", type=int, default=512)
+    p.add_argument("-K", type=int, default=512)
+    p.add_argument("-N", type=int, default=512)
+    p.add_argument("-m", type=int, default=64)
+    p.add_argument("-k", type=int, default=64)
+    p.add_argument("-n", type=int, default=64)
+    p.add_argument(
+        "--n-aie-cols", dest="n_aie_cols", type=int, choices=[1, 2, 4, 8], default=4
+    )
+    return p
+
+
+def _compile_kwargs(opts):
+    return dict(
+        M=opts.M,
+        K=opts.K,
+        N=opts.N,
+        m=opts.m,
+        k=opts.k,
+        n=opts.n,
+        n_aie_cols=opts.n_aie_cols,
+    )
+
+
+def main():
+    opts = _make_argparser().parse_args()
+    run_design_cli(
+        whole_array_mixed,
+        opts,
+        compile_kwargs=_compile_kwargs,
+        device=lambda o: device_from_args(o, n_cols=o.n_aie_cols),
+    )
+
+
+if __name__ == "__main__":
+    main()

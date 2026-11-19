@@ -1,10 +1,7 @@
 //===- test.cpp -------------------------------------------------*- C++ -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2025-2026 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// Copyright (C) 2025, Advanced Micro Devices, Inc.
 //
 //===----------------------------------------------------------------------===//
 
@@ -15,15 +12,14 @@
 #include <string>
 #include <vector>
 
+#include "test_utils.h"
 #include "xrt/xrt_bo.h"
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_kernel.h"
 #include <cstdint>
-#include "test_utils.h"
 
 using IN_DATATYPE = int8_t;
 using OUT_DATATYPE = int8_t;
-
 
 int main(int argc, const char *argv[]) {
 
@@ -31,9 +27,10 @@ int main(int argc, const char *argv[]) {
   int app_id = 1;
 
   if (argc < 4) {
-    std::cerr << "Usage: " << argv[0] << " <app_id> <instruction_file> <bitstream_file>\n";
+    std::cerr << "Usage: " << argv[0]
+              << " <app_id> <instruction_file> <bitstream_file>\n";
     return 1;
-}
+  }
   app_id = atoi(argv[1]);
   std::string instruction_file = argv[2];
   std::string bitstream_file = argv[3];
@@ -113,10 +110,13 @@ int main(int argc, const char *argv[]) {
       ref = srcVecA[i] + 2; // ref for the second input packet
     }
     if (*(bufOut + i) != ref) {
-      if (errors < 10) {
+      if (errors < 100) {
         std::cout << "Error in output " << i << "; Input: " << srcVecA[i]
                   << "; Output: " << *(bufOut + i) << " != reference:" << ref
                   << std::endl;
+      } else if (errors == 100) {
+        std::cout << "..." << std::endl;
+        std::cout << "[Errors truncated]" << std::endl;
       }
       errors++;
     }

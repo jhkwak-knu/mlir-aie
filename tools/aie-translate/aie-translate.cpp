@@ -1,10 +1,8 @@
 //===- aie-translate.cpp ----------------------------------------*- C++ -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2021-2022 Xilinx, Inc.
+// Copyright (C) 2022-2025 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2021 Xilinx Inc.
 //
 //===----------------------------------------------------------------------===//
 
@@ -29,7 +27,7 @@ using namespace mlir;
 namespace aie {
 // We redefine the MLIR -> LLVM IR translation to include our AIE intrinsics
 // translations.
-void registerToLLVMIRTranslation() {
+static void registerToLLVMIRTranslation() {
   TranslateFromMLIRRegistration registration(
       "mlir-to-llvmir", "Translate MLIR to LLVMIR",
       [](Operation *op, raw_ostream &output) {
@@ -49,8 +47,9 @@ void registerToLLVMIRTranslation() {
 }
 } // namespace aie
 
-void version_printer(raw_ostream &os) {
+static void version_printer(raw_ostream &os) {
   os << "aie-translate " << AIE_GIT_COMMIT << "\n";
+  os << "  peano: " << AIE_PEANO_VERSION << "\n";
 }
 
 int main(int argc, char **argv) {
@@ -62,7 +61,6 @@ int main(int argc, char **argv) {
   registerToSPIRVTranslation();
 
   xilinx::AIE::registerAIETranslations();
-  xilinx::aievec::registerAIEVecToCppTranslation();
 
   llvm::cl::AddExtraVersionPrinter(version_printer);
 

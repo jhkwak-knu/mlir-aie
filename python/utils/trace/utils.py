@@ -1,0 +1,546 @@
+# Copyright (C) 2024-2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+# from CppHeaderParser import CppHeader
+import json
+import logging
+import os
+import re
+import sys
+from typing import Optional
+
+import numpy as np
+
+from .events import NUM_TRACE_TYPES
+
+logger = logging.getLogger(__name__)
+
+
+# checks # of bits. Odd number returns a 1. Even returns 0.
+def parity(x):
+    return x.bit_count() & 1
+
+
+def extract_tile(data):
+    col = (data >> 21) & 0x7F
+    row = (data >> 16) & 0x1F
+    pkt_type = (data >> 12) & 0x3
+    pkt_id = data & 0x1F
+    return (col, row, pkt_type, pkt_id)
+
+
+def pack4bytes(b3, b2, b1, b0):
+    w = (b3 & 0xFF) << 24
+    w |= (b2 & 0xFF) << 16
+    w |= (b1 & 0xFF) << 8
+    w |= (b0 & 0xFF) << 0
+    return w
+
+
+def create_ctrl_pkt(
+    operation,
+    beats,
+    addr,
+    ctrl_pkt_read_id=28,  # global id used for all ctrl packet reads
+    # WARNING: this needs to match the packet id used in packetflow/.py
+):
+    header = (ctrl_pkt_read_id << 24) | (operation << 22) | (beats << 20) | addr
+    header |= (0x1 ^ parity(header)) << 31
+    return header
+
+
+def get_kernel_code(test: dict, solutions_path: Optional[str] = None) -> Optional[str]:
+    """Fetch the kernel code from the provided solution path.
+
+    If none provided, default to the canonical solution.
+    """
+    if not solutions_path:
+        return test["prompt"] + test["canonical_solution"]
+
+    with open(
+        os.path.join(solutions_path, f"{test['kernel_name']}.json"), "r"
+    ) as sol_file:
+        solution = json.load(sol_file)
+        if not solution.get("code"):
+            logger.warning(
+                "No code available in %s for %s", solutions_path, test["kernel_name"]
+            )
+            return None
+
+        srccode = solution["code"]
+
+        # if gpt decides to be too helpful and adds a main()... remove it
+        srccode = re.sub(
+            r"int\s+main\s*\([^)]*\)\s*{[^{}]*({[^{}]*}[^{}]*)*}",
+            "",
+            srccode,
+            flags=re.DOTALL,
+        )
+
+        # cppheaderparser will complain if we don't remove trailing comments
+        srccode = srccode.split('// extern "C"')[0]
+
+        return srccode
+
+
+def extract_buffers(test):
+    """Specific helper for the AIEval dataset - parses the test dictionary and returns input buffers, output buffers and RTPs as separate lists."""
+    input_buffers = []
+    for x in test["test_vectors"]["inputs"]:
+        array, dtype = list(x.values())
+        input_buffers.append(np.array(array, dtype=dtype))
+
+    output_buffers = []
+    for x in test["test_vectors"]["outputs"]:
+        array, dtype = list(x.values())
+        output_buffers.append(np.array(array, dtype=dtype))
+
+    rtps = []
+    if test["test_vectors"].get("rtps") is not None:
+        for rtp in test["test_vectors"]["rtps"]:
+            array, dtype = rtp.values()
+            rtps.append(np.array(array, dtype=dtype))
+            # rtp_names.append(list(rtp.keys())[0])
+
+    return input_buffers, output_buffers, rtps
+
+
+def get_cycles(trace_path):
+    """Extract the cycle count from an NPUEval trace file with exactly 1 event0 and 1 event1."""
+    with open(trace_path, "r") as f:
+        data = json.load(f)
+
+    event0 = []
+    event1 = []
+    try:
+        for x in data:
+            if (x["name"] == "INSTR_EVENT_0") and (x["ph"] == "B"):
+                event0.append(x["ts"])
+
+            if x["name"] == "INSTR_EVENT_1" and x["ph"] == "B":
+                event1.append(x["ts"])
+
+        return event1[0] - event0[0]
+    except Exception:
+        return np.inf
+
+
+def get_cycles_summary(trace_path):
+    """Extract cycle counts between pairs of event0 and event1 from a trace file.
+
+    This always assumes each event0 is followed by an event1 and ignores
+    extra event0 and event1's.
+    """
+    with open(trace_path, "r") as f:
+        data = json.load(f)
+
+    try:
+        deltas = []
+        in_kernel = []
+        event0 = []
+        for x in data:
+            if x["name"] == "process_name":
+                deltas.append([x["args"]["name"]])
+                in_kernel.append(False)
+                event0.append(0)
+
+        for x in data:
+            idx = int(x["pid"])
+            if (x["name"] == "INSTR_EVENT_0") and (x["ph"] == "B"):
+                if not in_kernel[idx]:
+                    event0[idx] = x["ts"]
+                    in_kernel[idx] = True
+
+            if x["name"] == "INSTR_EVENT_1" and x["ph"] == "B":
+                if in_kernel[idx]:
+                    deltas[idx].append(x["ts"] - event0[idx])
+                    in_kernel[idx] = False
+
+        return deltas
+    except Exception:
+        logger.exception("Exception found")
+        return []
+
+
+def print_cycles_summary(trace_path):
+    cycles = get_cycles_summary(trace_path)
+    for entry in cycles:
+        print(entry[0])
+        runs = len(entry) - 1
+        print(f"Total number of full kernel invocations is {runs}")
+        if runs > 0:
+            samples = entry[1:]
+            print(
+                "First/Min/Avg/Max cycles is "
+                f"{samples[0]}/ {min(samples)}/ "
+                f"{sum(samples) / runs}/ {max(samples)}"
+            )
+
+
+def get_vector_time(trace):
+    """Extract the total time spent on the vectorized unit from an NPUEval trace.
+
+    The trace must have exactly 1 event0 and 1 event1 sandwiching the kernel
+    call.
+    """
+    with open(trace, "r") as f:
+        data = json.load(f)
+
+    start, end = None, None
+
+    # find start and end
+    for x in data:
+        if (x["name"] == "INSTR_EVENT_0") and (x["ph"] == "B"):
+            start = x["ts"]
+        if x["name"] == "INSTR_EVENT_1" and x["ph"] == "B":
+            end = x["ts"]
+
+    if not start or not end:
+        return 0
+
+    total_duration = 0
+    stack = []
+
+    for event in data:
+        if event["name"] == "INSTR_VECTOR":
+            if event["ts"] < start:
+                continue
+
+            if event["ts"] > end:
+                continue
+
+            if event["ph"] == "B":
+                stack.append(event)
+            elif event["ph"] == "E" and stack:
+                # Get matching begin event
+                begin_event = stack.pop()
+                # Calculate duration for this pair
+                duration = event["ts"] - begin_event["ts"]
+                total_duration += duration
+
+    return total_duration / (end - start)
+
+
+def check_odd_word_parity(word):
+    val = 0
+    for i in range(32):
+        val = val ^ ((word >> i) & 0x1)
+    return val == 1
+
+
+def parse_pkt_hdr_in_stream(word):
+    hdr = dict()
+    w = int(word)
+    hdr["valid"] = check_odd_word_parity(w)
+    # TODO can we assume non used fields must be 0 to rule out other data packets?
+    # what about bit[5:10]?
+    if (((w >> 5) & 0x7F) != 0) or (((w >> 19) & 0x1) != 0) or (((w >> 28) & 0x7) != 0):
+        hdr["valid"] = False
+    else:
+        # TODO Do we need to check for valid row/col for given device?
+        col, row, pkt_type, pkt_id = extract_tile(w)
+        hdr["col"] = col
+        hdr["row"] = row
+        hdr["type"] = pkt_type
+        hdr["id"] = pkt_id
+    return hdr
+
+
+def trace_pkts_de_interleave(word_stream):
+    trace_pkts_sorted = list()
+    for t in range(NUM_TRACE_TYPES):
+        trace_pkts_sorted.append(dict())
+
+    curr_pkt_type = 0
+    curr_loc = ""
+    curr_vld = False  # only used in the beginning
+
+    for i in range(len(word_stream)):
+        if word_stream[i] == "":
+            break  # TODO Assumes a blank line is the last line
+        if (i % 8) == 0:
+            pkt_hdr = parse_pkt_hdr_in_stream(int(word_stream[i], 16))
+            if not pkt_hdr["valid"]:
+                # With no earlier packet, its payload has no location.
+                if not curr_vld:
+                    raise ValueError(
+                        "trace segment starts with an invalid packet header "
+                        f"at word {i}: {word_stream[i]}"
+                    )
+                continue
+            curr_loc = str(pkt_hdr["row"]) + "," + str(pkt_hdr["col"])
+            valid_type_found = False
+            for tt in range(NUM_TRACE_TYPES):
+                if pkt_hdr["type"] == tt:
+                    curr_pkt_type = tt
+                    if trace_pkts_sorted[tt].get(curr_loc) is None:
+                        trace_pkts_sorted[tt][curr_loc] = list()
+                    valid_type_found = True
+            if not valid_type_found:
+                sys.exit("Error: Invalid packet type")
+            curr_vld = True
+        else:
+            if curr_vld:
+                trace_pkts_sorted[curr_pkt_type][curr_loc].append(word_stream[i])
+    return trace_pkts_sorted
+
+
+def convert_to_byte_stream(toks_list):
+    byte_stream_list = list()
+    for toks in toks_list:
+        byte_stream_dict = dict()
+        for loc, stream in toks.items():
+            byte_stream_dict[loc] = list()
+            f = ["", "a5a5a5a5"]
+            toks = [t for t in stream if t not in f]
+            events = [int(t, 16) for t in toks]
+            for event in events:
+                for top in range(4):
+                    byte = 3 - top
+                    opcode = event >> (byte * 8) & 0xFF
+                    byte_stream_dict[loc].append(opcode)
+        byte_stream_list.append(byte_stream_dict)
+    return byte_stream_list
+
+
+def convert_to_commands(byte_stream_list, zero=True):
+    commands = list()
+    for t in range(NUM_TRACE_TYPES):
+        commands.append(dict())
+
+    for t in range(NUM_TRACE_TYPES):
+        for key, byte_stream in byte_stream_list[t].items():
+            cursor = 0
+            commands[t][key] = list()
+            try:
+                while True:
+                    if (byte_stream[cursor] & 0b11111011) == 0b11110000:
+                        com = {"type": "Start", "timer_value": 0}
+                        if not zero:
+                            for i in range(7):
+                                com["timer_value"] += (byte_stream[cursor + i + 1]) * (
+                                    256 ** (6 - i)
+                                )
+                        commands[t][key].append(com)
+                        cursor = cursor + 8
+                    if (byte_stream[cursor] & 0b11111100) == 0b11011100:
+                        cursor = cursor + 4
+                    if (byte_stream[cursor] & 0b10000000) == 0b00000000:
+                        com = {"type": "Single0"}
+                        com["event"] = (byte_stream[cursor]) >> 4 & 0b111
+                        com["cycles"] = (byte_stream[cursor]) & 0b1111
+                        commands[t][key].append(com)
+                        cursor = cursor + 1
+                    if (byte_stream[cursor] & 0b11100000) == 0b10000000:
+                        com = {"type": "Single1"}
+                        com["event"] = (byte_stream[cursor]) >> 2 & 0b111
+                        com["cycles"] = ((byte_stream[cursor]) & 0b11) * 256
+                        com["cycles"] += byte_stream[cursor + 1]
+                        commands[t][key].append(com)
+                        cursor = cursor + 2
+                    if (byte_stream[cursor] & 0b11100000) == 0b10100000:
+                        com = {"type": "Single2"}
+                        com["event"] = (byte_stream[cursor]) >> 2 & 0b111
+                        com["cycles"] = ((byte_stream[cursor]) & 0b11) * 256 * 256
+                        com["cycles"] += byte_stream[cursor + 1] * 256
+                        com["cycles"] += byte_stream[cursor + 2]
+                        commands[t][key].append(com)
+                        cursor = cursor + 3
+                    if (byte_stream[cursor] & 0b11110000) == 0b11000000:
+                        com: dict = {"type": "Multiple0"}
+                        com["cycles"] = byte_stream[cursor + 1] & 0b1111
+                        events = (byte_stream[cursor] & 0b1111) << 4
+                        events = events + (byte_stream[cursor + 1] >> 4)
+                        for i in range(0, 8):
+                            e = (events >> i) & 0b1
+                            if e:
+                                com["event" + str(i)] = i
+                        commands[t][key].append(com)
+                        cursor = cursor + 2
+                    if (byte_stream[cursor] & 0b11111100) == 0b11010000:
+                        com = {"type": "Multiple1"}
+                        cycles = (byte_stream[cursor + 1] & 0b11) << 8
+                        com["cycles"] = cycles + (byte_stream[cursor + 2])
+                        events = (byte_stream[cursor] & 0b11) << 6
+                        events = events + (byte_stream[cursor + 1] >> 2)
+                        for i in range(0, 8):
+                            e = (events >> i) & 0b1
+                            if e:
+                                com["event" + str(i)] = i
+                        commands[t][key].append(com)
+                        cursor = cursor + 3
+                    if (byte_stream[cursor] & 0b11111100) == 0b11010100:
+                        com = {"type": "Multiple2"}
+                        cycles = (byte_stream[cursor + 1] & 0b11) << 16
+                        cycles = cycles + ((byte_stream[cursor + 2]) << 8)
+                        com["cycles"] = cycles + (byte_stream[cursor + 3])
+                        events = (byte_stream[cursor] & 0b11) << 6
+                        events = events + (byte_stream[cursor + 1] >> 2)
+                        for i in range(0, 8):
+                            e = (events >> i) & 0b1
+                            if e:
+                                com["event" + str(i)] = i
+                        commands[t][key].append(com)
+                        cursor = cursor + 4
+                    if (byte_stream[cursor] & 0b11110000) == 0b11100000:
+                        com = {"type": "Repeat0"}
+                        com["repeats"] = (byte_stream[cursor]) & 0b1111
+                        commands[t][key].append(com)
+                        cursor = cursor + 1
+                    if (byte_stream[cursor] & 0b11111100) == 0b11011000:
+                        com = {"type": "Repeat1"}
+                        com["repeats"] = ((byte_stream[cursor]) & 0b11) * 256
+                        com["repeats"] += byte_stream[cursor + 1]
+                        commands[t][key].append(com)
+                        cursor = cursor + 2
+                    if (byte_stream[cursor] & 0b11111111) == 0b11111110:
+                        cursor = cursor + 1
+                    if (byte_stream[cursor] & 0b11111111) == 0b11111111:
+                        com = {"type": "Event_Sync"}
+                        commands[t][key].append(com)
+                        cursor = cursor + 1
+            except IndexError:
+                pass
+
+    return commands
+
+
+def decode_event_pc_stream(byte_stream, zero=True):
+    """Decode a mode-1 (EVENT_PC) trace byte stream into commands.
+
+    Mode 1 records the program counter of each traced event instead of a
+    cycle delta.  The opcode skeleton is shared with mode 0 (Start, DC,
+    Repeat0/1, Sync, Skip); only the per-event encoding differs -- the
+    mode-0 Single*/Multiple* opcodes are replaced by a single 4-byte
+    ``EventPC`` opcode carrying an 8-bit event mask and a 14-bit PC.
+
+    EventPC layout (32-bit word, MSB-first):
+        bits 31..26  opcode discriminator (0b110001)
+        bits 25..18  8-bit event mask (which of the 8 trace slots fired)
+        bits 17..14  reserved (zero in every observed capture)
+        bits 13..0   14-bit PC value
+
+    The mask is expanded into ``eventN`` keys, matching the mode-0
+    Multiple* convention; the PC is carried in a ``pc`` field.
+
+    Provenance: the byte-level skeleton is the mode-0 opcode table
+    documented openly in ``convert_to_commands`` above.  The EVENT_PC
+    extension was derived black-box, by diffing mode-0 and mode-1
+    captures of an identical kernel; every field follows from the
+    observed bytes.
+    """
+    commands = []
+    cursor = 0
+    n = len(byte_stream)
+    try:
+        while cursor < n:
+            b = byte_stream[cursor]
+            # Start: 1111 0X01 (0xF1/0xF5) + 7 timer bytes.  Same family as
+            # mode-0's 1111 0X00 Start, but bit 0 is the trace-mode
+            # discriminator (set for mode 1).  Big-endian 7-byte timer.
+            if (b & 0b11111011) == 0b11110001:
+                com = {"type": "Start", "timer_value": 0}
+                if not zero:
+                    for i in range(7):
+                        com["timer_value"] += (byte_stream[cursor + i + 1]) * (
+                            256 ** (6 - i)
+                        )
+                commands.append(com)
+                cursor = cursor + 8
+                continue
+            # Sync (decoder resync): 1111 1111 (0xFF), one byte.
+            if b == 0xFF:
+                commands.append({"type": "Event_Sync"})
+                cursor = cursor + 1
+                continue
+            # DC (don't-care padding): 1101 11xx + 3 bytes, no command.
+            if (b & 0b11111100) == 0b11011100:
+                cursor = cursor + 4
+                continue
+            # Repeat0: 1110 xxxx, 4-bit repeat count, one byte.
+            if (b & 0b11110000) == 0b11100000:
+                commands.append({"type": "Repeat0", "repeats": b & 0b1111})
+                cursor = cursor + 1
+                continue
+            # Repeat1: 1101 10xx + 1 byte, 10-bit repeat count.
+            if (b & 0b11111100) == 0b11011000:
+                repeats = (b & 0b11) * 256 + byte_stream[cursor + 1]
+                commands.append({"type": "Repeat1", "repeats": repeats})
+                cursor = cursor + 2
+                continue
+            # EventPC: 1100 01xx + 3 bytes (8b event mask + 14b PC)
+            if (b & 0b11111100) == 0b11000100:
+                b1 = byte_stream[cursor + 1]
+                b2 = byte_stream[cursor + 2]
+                b3 = byte_stream[cursor + 3]
+                mask = ((b & 0b11) << 6) | (b1 >> 2)
+                pc = ((b2 & 0b00111111) << 8) | b3
+                com = {"type": "EventPC", "pc": pc}
+                for i in range(8):
+                    if (mask >> i) & 0b1:
+                        com["event" + str(i)] = i
+                commands.append(com)
+                cursor = cursor + 4
+                continue
+            cursor = cursor + 1
+    except IndexError:
+        pass
+    return commands
+
+
+def trim_trace_pkts(trace_pkts):
+    for i in range(len(trace_pkts)):
+        if trace_pkts[i] == "fefefefe" or trace_pkts[i] == "FEFEFEFE":
+            if i + 2 < len(trace_pkts):
+                if trace_pkts[i + 1] == "00000000" and trace_pkts[i + 2] == "00000000":
+                    return trace_pkts[0 : i + 1]
+    return trace_pkts
+
+
+def split_trace_segments(trace_pkts, min_gap=8):
+    """Split trace packets into contiguous non-zero segments.
+
+    When trace data from multiple S2MM DMA channels shares a single buffer
+    (via offset splitting), each channel's data occupies a separate region
+    separated by a run of zero words. This function finds each contiguous
+    block of non-zero data, treating runs of min_gap or more consecutive
+    zero words as segment boundaries.
+
+    Short runs of zeros (< min_gap) are kept within the current segment,
+    since zero words can occasionally appear within valid trace data.
+    Leading and trailing zeros are always dropped.
+
+    Args:
+        trace_pkts: list of 8-char lowercase hex strings
+        min_gap: minimum consecutive zeros to treat as a boundary (default: 8,
+                 matching the 8-word trace packet size)
+
+    Returns:
+        list of lists, where each inner list is one contiguous trace segment.
+        Returns [] if the input contains no non-zero data.
+    """
+    segments = []
+    current = []
+    zero_run = []
+
+    for pkt in trace_pkts:
+        if pkt == "":
+            continue
+        if pkt == "00000000":
+            zero_run.append(pkt)
+        else:
+            if len(zero_run) >= min_gap:
+                # Real gap: finalize the current segment and start a new one
+                if current:
+                    segments.append(current)
+                current = [pkt]
+            else:
+                # Short zero run: keep as part of the current segment
+                current.extend(zero_run)
+                current.append(pkt)
+            zero_run = []
+
+    if current:
+        segments.append(current)
+
+    return segments

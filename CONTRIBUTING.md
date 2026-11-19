@@ -1,43 +1,251 @@
-## Pull Requests
+<!-- Copyright (C) 2024-2026 Advanced Micro Devices, Inc.
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception -->
 
-We actively welcome community involvement in this project!
+# Contributing
 
-## Developer Guidelines
+AMD values and encourages community contributions to IRON / MLIR-AIE — bug
+reports, questions, docs, and code are all welcome. Please review the guidance
+below before contributing.
 
-### Formatting C++
+## Development workflow
 
-Make sure to format any C++ files you may have modified with:
+We use GitHub to host code, collaborate, and manage version control. All changes
+go through pull requests; [GitHub issues](https://github.com/Xilinx/mlir-aie/issues)
+track known bugs, and [GitHub Discussions](https://github.com/Xilinx/mlir-aie/discussions)
+are the place for usage questions and feature ideas. For more informal, real-time
+chat with the team and other users, join the [ROCm Discord](https://discord.gg/UbXzGdXsR5)
+and look for the **ROCm-NPU** channel.
+
+## Issue tracking
+
+Before filing a new issue, search the [existing issues](https://github.com/Xilinx/mlir-aie/issues)
+to make sure it isn't already listed.
+
+- If your issue already exists, add a comment with any extra detail (such as how
+  you reproduced it) rather than opening a duplicate.
+- If you're not sure whether it's the same, err on the side of filing and link
+  the similar issue by number — we'll close duplicates if they turn out to match.
+- Otherwise, open a new issue with the bug-report or feature-request
+  [template](https://github.com/Xilinx/mlir-aie/issues/new/choose). Include as
+  much detail as you can — what you ran, what you expected, what happened, and
+  your environment (device, OS, IRON version) — so we can reproduce it quickly.
+  Check back on the issue, since we may need more information.
+
+## Pull requests
+
+1. **Fork** the repo and create a branch off `main` — the default integration
+   branch.
+2. **Set up the dev environment** so the formatting and lint hooks are in place:
+   ```shell
+   source utils/env_install.sh --dev
+   ```
+   This installs the toolchain and registers the pre-commit / pre-push hooks
+   (see [Formatting and hooks](#formatting-and-hooks) below). To build the
+   toolchain from source instead of installing wheels, see
+   [Building from source](docs/Building.md).
+3. **Make your change**, targeting `main`. Keep the PR focused, and make sure it
+   builds.
+4. **Add tests for new functionality.** New features should come with a test or
+   example so we can confirm they work and stay working. Don't break existing
+   tests.
+5. **Open the PR** using the
+   [pull request template](https://github.com/Xilinx/mlir-aie/blob/main/.github/PULL_REQUEST_TEMPLATE.md).
+   Fill in the description and checklist, and link the related issue with
+   `Fixes #123`.
+6. **Get CI green and work with your reviewer.** CI runs builds, tests, linting,
+   and type checks. If a check fails in code you didn't touch, the
+   [maintainer dashboard](https://xilinx.github.io/mlir-aie/dashboard/#view=ci)
+   shows whether it is failing on `main` too. A maintainer reviews once it
+   passes; push follow-up commits to the same branch to address feedback.
+   We'll let you know once your change is merged.
+
+Small, self-contained PRs with a clear description are the easiest to review and
+the fastest to merge.
+
+By creating a PR, you agree that your contribution will be licensed under the
+terms of the [LICENSE](https://github.com/Xilinx/mlir-aie/blob/main/LICENSE) file
+in the root of this repository.
+
+## New feature development
+
+For larger features, start a [Discussion](https://github.com/Xilinx/mlir-aie/discussions)
+before writing code — maintainers are happy to give direction and feedback early.
+Any new feature or API should also come with the corresponding documentation
+update (this repository holds its own docs; there is no separate docs repo).
+
+## Formatting and hooks
+
+Formatting and linting are enforced by [pre-commit](https://pre-commit.com/),
+installed by `utils/env_install.sh --dev`. The hooks run automatically —
+lightweight validators (REUSE, merge-conflict markers, etc.) on every commit,
+and the heavier formatting/lint checks (`clang-format`, `black`, `ruff check`)
+on `git push` — so CI should never be the first place you find out about a
+formatting or lint issue. To run them by hand:
+
 ```shell
-clang-format -i <the-file-i-changed>
+pre-commit run --all-files
 ```
 
-### Formatting Python and Notebooks
+The hooks cover:
 
-For Python, install the formatting packages:
+- **C++ and TableGen (`*.td`)** — [`clang-format`](https://clang.llvm.org/docs/ClangFormat.html)
+  (LLVM style; config in `.clang-format`). The hook pins clang-format 23.1.3,
+  which is what CI runs; a system `clang-format` of another version can
+  format the same file differently.
+- **Python and notebooks** — [`black`](https://black.readthedocs.io/) for
+  formatting, plus `nbstripout` to scrub notebook output before it is
+  committed.
+- **Python lint** — [`ruff check`](https://docs.astral.sh/ruff/) (see
+  [Linting Python](#linting-python) below).
+- **C++ static analysis** — [`clang-tidy`](https://clang.llvm.org/extra/clang-tidy/),
+  scoped to a growing list of files (see
+  [Static analysis for C++](#static-analysis-for-c-clang-tidy) below).
+- **Comment slop** — `utils/check_comment_slop.py`, on every commit, reads
+  the diff and flags a concept explained again at three or more sites,
+  comment blocks over 12 lines, and high comment density. CI runs it over
+  everything since the merge base with the PR's target branch, so a
+  history of individually clean commits can still fail there.
+- **Submodule pointers** — `utils/check_submodule_regression.py`, on every
+  commit and push, rejects a submodule pointer change unless the new commit
+  descends from the old one, so a stale checkout swept in by `git commit -a`
+  can't roll a submodule back. Bumps pass; for an intentional downgrade, use
+  `SKIP=check-submodule-regression`.
+- **Baseline hygiene** — trailing whitespace, end-of-file, merge-conflict
+  markers, and [REUSE](https://reuse.software/) license-header compliance.
+
+If you would rather not install the hooks, you can run `clang-format -i <file>`,
+`black <file>`, and `ruff check --fix <file>` directly, but the hooks are the
+supported path.
+
+## Linting Python
+
+Python style and common bugs are checked with
+[ruff](https://docs.astral.sh/ruff/), scoped to `python/{iron,utils,helpers,
+compiler}` and a growing set of `programming_examples/` directories —
+`ruff.toml`'s `include` list at the repo root is the source of truth for
+exactly which paths are covered. The pre-push hook runs `ruff check` on the
+files you push and blocks the push on any violation. CI runs it on every
+covered file, so a violation in a file you didn't touch (after a merge, for
+instance) fails CI but not the hook; run it by hand with:
+
 ```shell
-pip install black
-pip install black[jupyter]
+ruff check
 ```
 
-Make sure to run `black` on all Python and Jupyter notebooks, like so:
+Rules enabled: pyflakes/pycodestyle errors (`E`, `F`), import sorting (`I`), a
+narrow pep8-naming subset (`N802`, `N816`), and pydocstyle (`D`, Google
+convention, `python/{iron,utils,helpers,compiler}` only for now) for docstring
+*style* — see [Documenting your code](#documenting-your-code). `ruff.toml`
+documents, rule by rule, why anything is excluded from the default rule set;
+per-file exceptions live in `[lint.per-file-ignores]`, each with an inline
+justification. Follow that pattern if you need a new one — an unexplained
+exception won't pass review.
+
+## Static analysis for C++ (clang-tidy)
+
+C++ is checked with [clang-tidy](https://clang.llvm.org/extra/clang-tidy/)
+(config in `.clang-tidy`), scoped to an explicit, growing list of files
+rather than the whole repo at once: the clang-tidy hook's `files:` pattern
+in `.pre-commit-config.yaml`, kept in sync with `lintAndFormat.yml`. Unlike
+clang-format, clang-tidy needs a real compile database
+(`compile_commands.json`) and the tablegen'd headers a file includes to parse
+anything, so it can't run as a bare per-file text check the way the
+formatting hooks do.
+
+If you already have a build (see [Building from source](docs/Building.md)),
+point the pre-push hook and CI at it — any build works, clang or GCC:
+
 ```shell
-black <the-file-i-changed>
+# If your build wasn't configured with -DCMAKE_EXPORT_COMPILE_COMMANDS=ON,
+# generate compile_commands.json in place:
+ninja -C build -t compdb > build/compile_commands.json
+
+# Defaults to build/ at the repo root; override if yours lives elsewhere:
+export MLIR_AIE_BUILD_DIR=/path/to/build
 ```
 
-The CI will check black formatting of Python and Notebook files; there is a also a commit hook installed
-by default in the `quick_setup.sh` process which will not allow you to push until it has scrubbed Jupyter
-notebooks of certain information.
+The pre-push hook then runs it automatically on enabled files you've
+touched, via `utils/run_clang_tidy.sh` — a pinned `clang-tidy==22.1.8`
+(via `python/requirements_dev.txt`)
+rather than a bare `apt install clang-tidy`, so the version doesn't silently
+drift between your machine and CI. If there's no compile database yet, the
+hook fails with the setup hint above instead of silently skipping. To run it
+by hand:
 
-### Documenting Python Code
+```shell
+utils/run_clang_tidy.sh <file>...
+```
 
-Please document your Python code with docstrings. For Visual Studio Code, we recommend using a plugin such as
-"autoDocstring - Python Docstring Generator" or similar.
+CI mirrors this exactly (see the `clang-tidy` step in
+`.github/workflows/lintAndFormat.yml`), scoped to whichever enabled files a
+given PR actually touched — not the full enabled list every time, the way
+`pyright`/`ruff check` operate below. A PR that doesn't touch any enabled
+file passes trivially.
 
-## Issues
+Growing the enabled file list is the same three-part motion as extending
+ruff/pyright coverage: add the path to `CLANG_TIDY_FILES` in
+`lintAndFormat.yml`'s clang-tidy step, add it to the `files:` regex on the
+`clang-tidy` pre-commit hook (`.pre-commit-config.yaml` — the two must stay
+in sync, same convention `ruff-check` uses for `ruff.toml`'s `include`), and
+fix that file's findings.
 
-GitHub issues are used to report bugs and questions. If you create an issue, please make sure it contains enough information to reproduce it.
+## Type checking Python
 
-## License
+The pure-Python package (`python/{iron,utils,helpers,compiler}`) and a growing
+set of `programming_examples/` directories (`pyrightconfig.json`'s `include`
+list at the repo root is the source of truth) are type-checked with
+[pyright](https://github.com/microsoft/pyright) in `standard` mode, and CI
+fails on any error. After a normal build/install you can run:
 
-By contributing, you agree that your contributions will be licensed
-under the LICENSE file in the root directory of this source tree.
+```shell
+pyright
+```
+
+When a diagnostic points at a symbol that genuinely exists at runtime but comes
+from a compiled extension (`aie._mlir_libs`) or a tablegen-generated op/enum
+wildcard (`from aie.dialects... import *`), suppress just that line, naming the
+exact rule:
+
+```python
+with Context() as ctx:  # pyright: ignore[reportUndefinedVariable]
+```
+
+Reserve suppressions for these binding gaps. Fix real type issues at the source
+(add a `None` guard or `raise`, tighten an annotation, initialize before a
+branch) rather than silencing them. Do not add blanket file-level ignores or
+disable rules.
+
+## Documenting your code
+
+- **Python** — document public functions, classes, and modules with
+  docstrings, using the Google convention (`Args:`/`Returns:`/`Raises:`
+  sections, one arg per line as `name (type[, optional]): description`).
+  These are rendered into the [API reference](docs/api/index.md) via
+  mkdocstrings, so a good docstring is also good published documentation. In
+  `python/{iron,utils,helpers,compiler}`, ruff's pydocstyle rules enforce the
+  *style* of a docstring once you've written one (blank-line placement,
+  imperative first line, terminal punctuation) — see
+  [Linting Python](#linting-python). Writing a docstring in the first place is
+  still expected for anything public-facing, just not yet machine-enforced.
+  Docstrings render as Markdown, not reStructuredText: write ``` ``Name`` ```
+  (or an mkdocstrings cross-reference) instead of `:class:`/`:meth:`/`:func:`
+  roles, fenced ```` ```python ```` blocks at the docstring's text indent
+  instead of `Example::` literal blocks, and a Google `Note:` section instead
+  of `.. note::`. `mkdocs build --strict` does not catch these, so check
+  them by eye.
+- **C++** — use Doxygen-style triple-slash comments (`///`, with `\brief`,
+  `\param`, `\returns` as needed) on public declarations in headers. These feed
+  the [C++ API reference](docs/api/cpp_doxygen.md).
+
+## Governance
+
+IRON / MLIR-AIE is led and managed by AMD, and we welcome community
+contributions. Maintainers (listed in the repository's
+[CODEOWNERS](https://github.com/Xilinx/mlir-aie/blob/main/.github/CODEOWNERS)
+file) review all proposed changes and can merge to the repository. Everyone else
+is a contributor — file issues, improve docs, submit PRs for contained changes,
+and propose larger features in Discussions.
+
+By contributing, you agree that your contributions will be licensed under the
+LICENSE file in the root of this source tree. Every file must carry an SPDX
+license header; the REUSE hook checks this on push.

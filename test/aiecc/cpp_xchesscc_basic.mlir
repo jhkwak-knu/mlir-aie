@@ -1,0 +1,66 @@
+//===- cpp_xchesscc_basic.mlir ----------------------------------*- MLIR -*-===//
+//
+// Copyright (C) 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+// Test basic xchesscc compilation path in aiecc.
+// Requesting --xchesscc --xbridge drives the full per-core Chess
+// path: the core is linked against the Chess intrinsic wrapper, compiled to an
+// object with xchesscc, then linked into an ELF with the xbridge (+l) linker.
+// Peano's llc must never be invoked on the Chess path.
+
+// REQUIRES: chess
+
+// Give this run private output/work dirs: Chess drops scratch and aiecc emits
+// the per-core elfs_<core> dir into the output dir, so concurrent runs sharing
+// a directory (as the lit suite does) would clobber each other.
+// RUN: aiecc --xchesscc --xbridge -v --output-dir=%t --tmpdir=%t.prj %s 2>&1 | FileCheck %s
+
+// CHECK-NOT: {{[^ ]*llc }}
+// CHECK: chess-llvm-link
+// CHECK-SAME: chess_intrinsic_wrapper
+// CHECK: xchesscc_wrapper aie2 {{.*}} -c {{.*}}-o {{.*}}objects_
+// CHECK: xchesscc_wrapper aie2 {{.*}}+l {{.*}}-o {{.*}}elfs_
+// CHECK-NOT: {{[^ ]*llc }}
+
+module {
+  aie.device(npu1_1col) {
+    %tile_0_0 = aie.tile(0, 0)
+    %tile_0_2 = aie.tile(0, 2)
+
+    aie.objectfifo @of_in(%tile_0_0, {%tile_0_2}, 2 : i32) : !aie.objectfifo<memref<16xi32>>
+    aie.objectfifo @of_out(%tile_0_2, {%tile_0_0}, 2 : i32) : !aie.objectfifo<memref<16xi32>>
+
+    %core_0_2 = aie.core(%tile_0_2) {
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      %c16 = arith.constant 16 : index
+      %c1_i32 = arith.constant 1 : i32
+
+      %elem_in = aie.objectfifo.acquire @of_in(Consume, 1) : memref<16xi32>
+
+      %elem_out = aie.objectfifo.acquire @of_out(Produce, 1) : memref<16xi32>
+
+      scf.for %i = %c0 to %c16 step %c1 {
+        %val = memref.load %elem_in[%i] : memref<16xi32>
+        %result = arith.addi %val, %c1_i32 : i32
+        memref.store %result, %elem_out[%i] : memref<16xi32>
+      }
+
+      aie.objectfifo.release @of_in(Consume, 1)
+      aie.objectfifo.release @of_out(Produce, 1)
+      aie.end
+    }
+
+    aie.runtime_sequence(%in : memref<16xi32>, %out : memref<16xi32>) {
+      %c0 = arith.constant 0 : i64
+      %c1 = arith.constant 1 : i64
+      %c16 = arith.constant 16 : i64
+      aiex.npu.dma_memcpy_nd(%out[%c0,%c0,%c0,%c0][%c1,%c1,%c1,%c16][%c0,%c0,%c0,%c1]) {metadata = @of_out, id = 1 : i64} : memref<16xi32>
+      aiex.npu.dma_memcpy_nd(%in[%c0,%c0,%c0,%c0][%c1,%c1,%c1,%c16][%c0,%c0,%c0,%c1]) {metadata = @of_in, id = 0 : i64, issue_token = true} : memref<16xi32>
+      aiex.npu.dma_wait {symbol = @of_out}
+    }
+  }
+}

@@ -1,14 +1,11 @@
 //===- test_error_shimdma_multi_state.mlir ---------------------*- MLIR -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2023-2024 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2023-2024 Advanced Micro Devices, Inc. or its affiliates
 //
 //===----------------------------------------------------------------------===//
 
-// RUN: (aie-translate --aie-generate-xaie %s 2>&1 || true) | FileCheck %s
+// RUN: not aie-translate --aie-generate-xaie %s 2>&1 | FileCheck %s
 // CHECK: acquires/releases the lock in a DMA block from/to multiple states.
 
 module @test_error_shimdma_multi_state {
@@ -18,11 +15,15 @@ module @test_error_shimdma_multi_state {
   aie.shim_dma(%t30) {
     aie.dma_start(MM2S, 0, ^bb1, ^end)
   ^bb1:
-    aie.use_lock(%l30_0, Acquire, 0)
+    %c0_ul0 = arith.constant 0 : i32
+    aie.use_lock(%l30_0, Acquire, %c0_ul0)
     // This should fail because only one lock can be used in a ShimBd
-    aie.use_lock(%l30_0, Acquire, 1)
-    aie.use_lock(%l30_0, Release, 0)
-    aie.use_lock(%l30_0, Release, 1)
+    %c1_ul1 = arith.constant 1 : i32
+    aie.use_lock(%l30_0, Acquire, %c1_ul1)
+    %c0_ul2 = arith.constant 0 : i32
+    aie.use_lock(%l30_0, Release, %c0_ul2)
+    %c1_ul3 = arith.constant 1 : i32
+    aie.use_lock(%l30_0, Release, %c1_ul3)
     aie.next_bd ^end
   ^end:
     aie.end

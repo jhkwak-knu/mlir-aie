@@ -1,10 +1,7 @@
 //===- AIETargetModel.h -----------------------------------------*- C++ -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2023 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2023 Advanced Micro Devices, Inc.
 //
 //===----------------------------------------------------------------------===//
 
@@ -12,10 +9,14 @@
 #define MLIR_AIE_DEVICEMODEL_H
 
 #include "aie/Dialect/AIE/IR/AIEEnums.h"
+#include "aie/Dialect/AIE/Util/AIERegisterDatabase.h"
 
 #include "llvm/ADT/DenseSet.h"
 
 #include <iostream>
+#include <memory>
+#include <mutex>
+#include <vector>
 
 namespace xilinx::AIE {
 
@@ -52,6 +53,35 @@ using TileID = struct TileID {
   int col, row;
 };
 
+/// Bits [shift, shift + width) of register `word` in a buffer descriptor's
+/// register block. A field a tile type does not have has width 0.
+struct DmaBdField {
+  uint8_t word = 0, shift = 0, width = 0;
+
+  bool exists() const { return width != 0; }
+  uint32_t mask() const {
+    return width >= 32 ? 0xFFFFFFFFu : (1u << width) - 1;
+  }
+  uint32_t place(uint64_t value) const {
+    return exists() ? (static_cast<uint32_t>(value) & mask()) << shift : 0;
+  }
+};
+
+/// The register layout of one tile type's DMA buffer descriptor. The static
+/// and runtime BD lowerings both pack through it, so the two cannot disagree.
+struct DmaBdLayout {
+  uint8_t numWords = 0;
+  DmaBdField bufferLength, bufferOffset;
+  DmaBdField enablePacket, packetType, packetId, outOfOrderId;
+  DmaBdField d0Size, d0Stride, d1Size, d1Stride, d2Stride;
+  DmaBdField iterationCurrent, iterationSize, iterationStride;
+  DmaBdField d0ZeroBefore, d1ZeroBefore, d2ZeroBefore;
+  DmaBdField d0ZeroAfter, d1ZeroAfter, d2ZeroAfter;
+  DmaBdField burstLength, axcache;
+  DmaBdField nextBd, useNextBd, validBd;
+  DmaBdField lockRelValue, lockRelId, lockAcqEnable, lockAcqValue, lockAcqId;
+};
+
 class AIETargetModel {
 
 public:
@@ -63,7 +93,7 @@ public:
     TK_AIE2_NPU1_1Col,
     TK_AIE2_NPU1_2Col,
     TK_AIE2_NPU1_3Col,
-    TK_AIE2_NPU1_4Col, // whole array must be last because of how we cast/initialize the VirtualizedNPU1TargetModel class
+    TK_AIE2_NPU1_4Col,
     TK_AIE2_NPU1_Last,
     TK_AIE2_NPU2 = TK_AIE2_NPU1_Last,
     TK_AIE2_NPU2_1Col,
@@ -74,7 +104,9 @@ public:
     TK_AIE2_NPU2_6Col,
     TK_AIE2_NPU2_7Col,
     TK_AIE2_NPU2_Last,
-    TK_AIE2_Last = TK_AIE2_NPU2_Last,
+    TK_AIE2PS_VE3858 = TK_AIE2_NPU2_Last,
+    TK_AIE2PS_Last,
+    TK_AIE2_Last = TK_AIE2PS_Last,
   };
 
   // One-hot encoded list of target model properties.
@@ -82,19 +114,38 @@ public:
     // Device uses semaphore locks.
     UsesSemaphoreLocks = 1U << 0,
     // Device is an NPU-based device.
-    // There are several special cases for handling the NPU at the moment.
     IsNPU = 1U << 1,
     // Device model is virtualized.
-    // This is used during CDO code generation to configure aie-rt properly.
+    // This is used during CDO code generation to configure aie-codegen
+    // properly.
     IsVirtualized = 1U << 2,
     // Device uses multi-dimensional buffer descriptors.
     UsesMultiDimensionalBDs = 1U << 3,
+    // Device supports BD per-execution base address advance.
+    UsesBDIteration = 1U << 4,
+    // Device supports out-of-order S2MM DMA.
+    SupportsOutOfOrderDMA = 1U << 5,
   };
 
 private:
   const TargetModelKind kind;
 
   uint32_t ModelProperties = 0;
+
+  // Register database (loaded lazily on first access)
+  // Thread-safe lazy initialization using std::call_once
+  mutable std::unique_ptr<RegisterDatabase> regDB;
+  mutable std::once_flag regDBInitFlag;
+
+protected:
+  /// Subclasses override to provide architecture-specific database loading.
+  /// Returns nullptr if register database is not available for this
+  /// architecture.
+  virtual std::unique_ptr<RegisterDatabase> loadRegisterDatabase() const;
+
+  /// Get the register database, loading it lazily on first access.
+  /// Throws fatal error if database is required but unavailable.
+  const RegisterDatabase *getRegisterDatabase() const;
 
 public:
   TargetModelKind getKind() const { return kind; }
@@ -112,30 +163,71 @@ public:
   /// Return the number of columns in the device.
   virtual int columns() const = 0;
 
+  /// Width of the physical array this (possibly virtualized) device is carved
+  /// from. This defaults to columns(), which is correct for devices that are
+  /// the whole array.
+  virtual int physicalColumns() const { return columns(); }
+
+  /// First physical column at which a partition may be anchored.
+  virtual int firstPlaceableColumn() const { return 0; }
+
+  /// Every physical column offset at which a numCols-wide partition still fits.
+  std::vector<int> partitionStartColumns(int numCols) const {
+    std::vector<int> starts;
+    for (int c = firstPlaceableColumn(); c + numCols <= physicalColumns(); ++c)
+      starts.push_back(c);
+    return starts;
+  }
+
   /// Return the number of rows in the device.
   virtual int rows() const = 0;
 
-  /// Return true if the given tile is a 'Core' tile.  These tiles
-  /// include a Core, TileDMA, tile memory, and stream connections.
-  virtual bool isCoreTile(int col, int row) const = 0;
+  /// Number of microcontrollers (uC) per column
+  virtual uint32_t getNumControllersPerColumn() const { return 0; }
 
-  /// Return true if the given tile is an AIE2 'Memory' tile.  These tiles
-  /// include a TileDMA, tile memory, and stream connections, but no core.
-  virtual bool isMemTile(int col, int row) const = 0;
+  /// Total number of microcontrollers (uC) in the device.
+  /// Defaults to columns() * getNumControllersPerColumn();
+  /// architectures with a single device-level uC (e.g. AIE2/AIE2P NPUs)
+  /// override this directly instead, since their controller count doesn't
+  /// scale with column count.
+  virtual uint32_t getNumControllers() const {
+    return static_cast<uint32_t>(columns()) * getNumControllersPerColumn();
+  }
 
-  /// Return true if the given tile is a Shim NOC tile.  These tiles include a
-  /// ShimDMA and a connection to the memory-mapped NOC.  They do not contain
-  /// any memory.
-  virtual bool isShimNOCTile(int col, int row) const = 0;
+  /// Return the tile type for the given tile coordinates.
+  /// - CoreTile: tiles with a Core, TileDMA, tile memory, and stream
+  /// connections.
+  /// - MemTile: tiles with TileDMA, tile memory, and stream connections,
+  /// but no core.
+  /// - ShimNOCTile: tiles with ShimDMA and connection to the memory-mapped NOC.
+  /// - ShimPLTile: tiles with connections to the PL, no ShimDMA.
+  virtual AIETileType getTileType(int col, int row) const = 0;
 
-  /// Return true if the given tile is a Shim PL interface tile.  These
-  /// tiles do not include a ShimDMA and instead include connections to the PL.
-  /// They do not contain any memory.
-  virtual bool isShimPLTile(int col, int row) const = 0;
+  /// Return true if the given tile is a Core tile.
+  bool isCoreTile(int col, int row) const {
+    return getTileType(col, row) == AIETileType::CoreTile;
+  }
 
-  /// Return true if the given tile is either a Shim NOC or a Shim PL interface
-  /// tile.
-  virtual bool isShimNOCorPLTile(int col, int row) const = 0;
+  /// Return true if the given tile is a Mem tile.
+  bool isMemTile(int col, int row) const {
+    return getTileType(col, row) == AIETileType::MemTile;
+  }
+
+  /// Return true if the given tile is a ShimNOC tile.
+  bool isShimNOCTile(int col, int row) const {
+    return getTileType(col, row) == AIETileType::ShimNOCTile;
+  }
+
+  /// Return true if the given tile is a ShimPL tile.
+  bool isShimPLTile(int col, int row) const {
+    return getTileType(col, row) == AIETileType::ShimPLTile;
+  }
+
+  /// Return true if the given tile is either a ShimNOC or ShimPL tile.
+  bool isShimNOCorPLTile(int col, int row) const {
+    AIETileType t = getTileType(col, row);
+    return t == AIETileType::ShimNOCTile || t == AIETileType::ShimPLTile;
+  }
 
   /// Return true if the given tile ID is valid.
   virtual bool isValidTile(TileID src) const {
@@ -198,6 +290,40 @@ public:
   virtual bool isLegalMemAffinity(int coreCol, int coreRow, int memCol,
                                   int memRow) const = 0;
 
+  /// Which of two tiles' memory modules both of them can address.
+  enum class SharedMemory {
+    /// Neither tile can address the other's memory module.
+    None,
+    /// Only the first tile's module.
+    First,
+    /// Only the second tile's module.
+    Second,
+    /// Either will do.
+    Either
+  };
+
+  /// Return the memory module `a` and `b` can both reach, if any.
+  SharedMemory getSharedMemory(TileID a, TileID b) const {
+    // A shim or mem tile's memory module is only ever reachable from its own
+    // kind, so tiles of different kinds share nothing.
+    if (isShimNOCorPLTile(a.col, a.row) != isShimNOCorPLTile(b.col, b.row) ||
+        isMemTile(a.col, a.row) != isMemTile(b.col, b.row)) {
+      return SharedMemory::None;
+    }
+    bool aReachesB = isLegalMemAffinity(a.col, a.row, b.col, b.row);
+    bool bReachesA = isLegalMemAffinity(b.col, b.row, a.col, a.row);
+    if (aReachesB && bReachesA) {
+      return SharedMemory::Either;
+    }
+    if (bReachesA) {
+      return SharedMemory::First;
+    }
+    if (aReachesB) {
+      return SharedMemory::Second;
+    }
+    return SharedMemory::None;
+  }
+
   /// Return the base address in the local address map for a core.
   virtual uint32_t getMemInternalBaseAddress(TileID src) const = 0;
   /// Return the base address in the local address map for a core.
@@ -225,11 +351,70 @@ public:
   /// Return the size (in bytes) of the local data memory of a core.
   virtual uint32_t getLocalMemorySize() const = 0;
 
+  /// Return the size (in bytes) of a core's program memory.
+  virtual uint32_t getProgramMemorySize() const = 0;
+
+  /// Return the size (in bytes) of the address space a core can issue data
+  /// accesses into. The neighbour memory windows sit at the bottom of it; the
+  /// span above them reaches no memory and is reserved so nothing is placed
+  /// there.
+  virtual uint32_t getCoreDataAddressSpaceSize() const = 0;
+
+  /// Return the default stack reservation (in bytes) for a core that does not
+  /// state one. It is also the floor when aiecc sizes the stack from its
+  /// measurement. The linker script places the stack directly below the
+  /// objectFIFO buffers with no clearance, so a design whose frames exceed its
+  /// reservation corrupts them instead of faulting.
+  virtual uint32_t getDefaultCoreStackSize() const { return 0x400; }
+
+  /// Stack-pointer alignment in bytes, matching Peano's AIE frame lowering:
+  /// AIE1/AIE2 require 32B; AIE2P/AIE2PS require 64B, not their 32B data bus.
+  uint32_t getCoreStackAlignment() const {
+    AIEArch arch = getTargetArch();
+    return arch == AIEArch::AIE2p || arch == AIEArch::AIE2ps ? 64 : 32;
+  }
+
+  /// Return the data bus width (in bits) for load/store operations of a compute
+  /// core.
+  virtual uint32_t getComputeTileLoadStoreBusWidth() const = 0;
+
+  /// Return the alignment (in bits) required by the widest vector load/store a
+  /// compute core can issue.
+  ///
+  /// This is NOT the load/store bus width. From AIE2P on, a full-width
+  /// (512-bit) vector access requires 512-bit alignment even though the bus is
+  /// 256 bits wide. Mirrors `vector_ldst_align` in aie_api
+  /// (aie_api/detail/ld_st.hpp), which is the contract kernels compile against:
+  ///   AIE1  (__AIE_ARCH__ 10):        16B
+  ///   AIE2  (__AIE_ARCH__ 20):        32B
+  ///   AIE2P/AIE2PS (__AIE_ARCH__ 21/22): 64B
+  /// A buffer a core may access with a full-width vector must be aligned to
+  /// this, or the access silently touches the wrong memory.
+  virtual uint32_t getComputeTileMaxVectorAlignBits() const {
+    return getComputeTileLoadStoreBusWidth();
+  }
+
+  // NOTE: Maybe this should be set to 4-byte alignment, since DMA on Memtile
+  // seems to handle unaligned access.
+  /// Return the data bus width (in bits) for load/store operations of a memory
+  /// tile.
+  virtual uint32_t getMemTileLoadStoreBusWidth() const {
+    return 4 * 8; // Simply have buffer to be 4 byte aligned.
+    // Since 4 byte is the minimum access size for DMA.
+    // See discussion in
+    // https://github.com/Xilinx/mlir-aie/pull/3037#discussion_r3176686935
+  }
+
   /// Return the size (in bits) of the accumulator/cascade.
   virtual uint32_t getAccumulatorCascadeSize() const = 0;
 
-  /// Return the number of lock objects
-  virtual uint32_t getNumLocks(int col, int row) const = 0;
+  /// Return the number of lock objects for a given tile type.
+  virtual uint32_t getNumLocks(AIETileType tileType) const = 0;
+
+  /// Return the number of lock objects for a tile at the given coordinates.
+  uint32_t getNumLocks(int col, int row) const {
+    return getNumLocks(getTileType(col, row));
+  }
 
   /// Return the maximum value that can be stored in a lock register
   virtual uint32_t getMaxLockValue() const = 0;
@@ -239,14 +424,110 @@ public:
   virtual std::optional<uint32_t> getLocalLockAddress(uint32_t lockId,
                                                       TileID tile) const = 0;
 
+  /// Return the number of buffer descriptors for a given tile type.
+  virtual uint32_t getNumBDs(AIETileType tileType) const = 0;
+
+  /// Return the maximum number of addressing dimensions (wraps/strides) a
+  /// single buffer descriptor supports for a given tile type. This is the
+  /// hardware ND access-pattern limit; it does not count the separate shim
+  /// iteration/repeat dimension that runtime-sequence BD tasks hoist the
+  /// leading tap dimension into.
+  virtual uint32_t getBDMaxDims(AIETileType tileType) const = 0;
+
+  /// Return the maximum transfer length, measured in address-generation
+  /// granules (see getAddressGenGranularity(), 32-bit words on AIE2), that fits
+  /// in the buffer_length field of a DMA buffer descriptor for the given tile
+  /// type. The field width is tile-type specific (e.g. on AIE2 the shim field
+  /// is 32 bits, the mem-tile field 17 bits and the core-tile field 14 bits).
+  virtual uint64_t getDmaBdMaxLen(AIETileType tileType) const = 0;
+
+  /// Return the bit width of the wrap (size) field in a DMA buffer descriptor
+  /// for the given tile type. Used to compute the maximum legal wrap value
+  /// per dimension.
+  virtual uint32_t getDmaBdWrapBits(AIETileType tileType) const = 0;
+
+  /// Return the bit width of the step (stride) field in a DMA buffer
+  /// descriptor for the given tile type.
+  virtual uint32_t getDmaBdStepBits(AIETileType tileType) const = 0;
+
+  /// Return the bit width of the iteration (repeat) wrap/stride fields in a
+  /// DMA buffer descriptor for the given tile type.
+  virtual uint32_t getDmaBdIterBits(AIETileType tileType) const = 0;
+
+  /// Get stream switch port index for a given port specification
+  /// Return port index for Stream_Switch_Event_Port_Selection register, or
+  /// nullopt if invalid
+  virtual std::optional<uint32_t>
+  getStreamSwitchPortIndex(int col, int row, WireBundle bundle,
+                           uint32_t channel, bool master) const = 0;
+
   /// Return the number of buffer descriptors supported by the DMA in the given
   /// tile.
-  virtual uint32_t getNumBDs(int col, int row) const = 0;
+  uint32_t getNumBDs(int col, int row) const {
+    return getNumBDs(getTileType(col, row));
+  }
+
+  /// Return the maximum number of BD addressing dimensions for the tile at
+  /// (`col`, `row`).
+  uint32_t getBDMaxDims(int col, int row) const {
+    return getBDMaxDims(getTileType(col, row));
+  }
+
+  uint64_t getDmaBdMaxLen(int col, int row) const {
+    return getDmaBdMaxLen(getTileType(col, row));
+  }
+
+  uint32_t getDmaBdWrapBits(int col, int row) const {
+    return getDmaBdWrapBits(getTileType(col, row));
+  }
+
+  uint32_t getDmaBdStepBits(int col, int row) const {
+    return getDmaBdStepBits(getTileType(col, row));
+  }
+
+  uint32_t getDmaBdIterBits(int col, int row) const {
+    return getDmaBdIterBits(getTileType(col, row));
+  }
+
+  /// Return the number of buffer descriptors accessible on channel `channel`
+  /// for the tile at (`col`, `row`). For tiles with no per-channel BD
+  /// partitioning this equals getNumBDs(col, row).
+  uint32_t getNumBDsForChannel(int col, int row, int channel) const {
+    uint32_t count = 0;
+    for (uint32_t bd = 0; bd < getNumBDs(col, row); ++bd)
+      if (isBdChannelAccessible(col, row, bd, channel))
+        ++count;
+    return count;
+  }
+
+  /// Return the half-open range [first, last) of buffer descriptor ids that
+  /// channel `channel` of the tile at (`col`, `row`) can submit.
+  std::pair<uint32_t, uint32_t> getBdIdRangeForChannel(int col, int row,
+                                                       int channel) const {
+    uint32_t numBds = getNumBDs(col, row);
+    uint32_t first = 0;
+    while (first < numBds && !isBdChannelAccessible(col, row, first, channel))
+      ++first;
+    uint32_t last = first;
+    while (last < numBds && isBdChannelAccessible(col, row, last, channel))
+      ++last;
+    return {first, last};
+  }
 
   /// Return true iff buffer descriptor `bd_id` on tile (`col`, `row`) can be
   /// submitted on channel `channel`.
   virtual bool isBdChannelAccessible(int col, int row, uint32_t bd_id,
                                      int channel) const = 0;
+
+  /// Return the register layout of a buffer descriptor on the given tile
+  /// type, or null if the target has none modeled for it.
+  virtual const DmaBdLayout *getDmaBdLayout(AIETileType tileType) const {
+    return nullptr;
+  }
+
+  const DmaBdLayout *getDmaBdLayout(int col, int row) const {
+    return getDmaBdLayout(getTileType(col, row));
+  }
 
   /// Return the array address of the dma buffer descriptor for the given
   /// col, row, buffer descriptor id, channel and direction. Not all
@@ -265,11 +546,43 @@ public:
   virtual uint32_t getDmaControlAddress(int col, int row, int channel,
                                         AIE::DMAChannelDir direction) const = 0;
 
+  /// Return the address of the DMA status register for a channel, or nullopt
+  /// when this target's layout has not been verified. The register carries the
+  /// live task-queue occupancy in getDmaTaskQueueSizeMask(), which is the only
+  /// way to observe queue space: the queue does not backpressure, so a push
+  /// onto a full queue is dropped rather than stalled.
+  virtual std::optional<uint32_t>
+  getDmaStatusAddress(int /*col*/, int /*row*/, int /*channel*/,
+                      AIE::DMAChannelDir /*direction*/) const {
+    return std::nullopt;
+  }
+
+  /// Return the mask selecting the live task-queue occupancy field within the
+  /// getDmaStatusAddress() register (0 when unsupported). The field does not
+  /// count the task the channel is running.
+  virtual uint32_t getDmaTaskQueueSizeMask() const { return 0; }
+
+  /// Return the bits of the getDmaStatusAddress() register that are all clear
+  /// exactly when the channel has finished every task pushed to it: nothing
+  /// queued, nothing running, nothing stalled (0 when unsupported).
+  virtual uint32_t getDmaChannelIdleMask() const { return 0; }
+
+  /// Return the DMA task-queue register address relative to its tile.
+  uint32_t getLocalDmaControlAddress(int col, int row, int channel,
+                                     AIE::DMAChannelDir direction) const {
+    return getDmaControlAddress(col, row, channel, direction) &
+           ((1u << getRowShift()) - 1);
+  }
+
   virtual uint32_t getNumMemTileRows() const = 0;
   /// Return the size (in bytes) of a MemTile.
   virtual uint32_t getMemTileSize() const = 0;
   /// Return the number of memory banks of a given tile.
   virtual uint32_t getNumBanks(int col, int row) const = 0;
+
+  virtual uint32_t getMaxChannelNumForAdjacentMemTile(int col,
+                                                      int row) const = 0;
+
   /// Return the number of destinations of connections inside a switchbox. These
   /// are the targets of connect operations in the switchbox.
   virtual uint32_t getNumDestSwitchboxConnections(int col, int row,
@@ -287,6 +600,42 @@ public:
   /// the origins of connect operations in the switchbox.
   virtual uint32_t getNumSourceShimMuxConnections(int col, int row,
                                                   WireBundle bundle) const = 0;
+  /// Return the number of DMA channels a tile has in one direction. An MM2S
+  /// channel feeds the stream switch, or the shim mux on a shim tile, so it is
+  /// counted by that switch's DMA sources; an S2MM channel by its DMA
+  /// destinations. Prefer this to the TileOp connection accessors, which are
+  /// named from the switch's side and so read the other way round.
+  uint32_t getNumDMAChannels(int col, int row, AIE::DMAChannelDir dir) const;
+
+  /// Return the number of packet-rule slots per stream-switch slave port.
+  virtual uint32_t getNumSlaveSlots() const = 0;
+  /// Return the number of arbiters per stream switch.
+  virtual uint32_t getNumArbiters() const = 0;
+  /// Return the number of master select values per stream-switch arbiter.
+  virtual uint32_t getNumMselsPerArbiter() const = 0;
+  /// Return the largest packet id the stream switch can route.
+  virtual uint32_t getMaxPacketId() const = 0;
+  /// Return the largest out-of-order BD id (unsupported = 0).
+  virtual uint32_t getMaxOutOfOrderId() const = 0;
+  /// Return the largest DMA task repeat count (unsupported = 0).
+  virtual uint32_t getMaxRepeatCount() const = 0;
+
+  /// Return how many DMA tasks a single channel's task queue holds
+  /// (unsupported = 0). Pushing to a full queue drops the push and sets the
+  /// channel's sticky Task_Queue_Overflow bit, stranding whoever waits on that
+  /// transfer. Flat rather than per-tile-type because aie-codegen's
+  /// XAie_DmaGetMaxQueueSize (XAIE_DMA_MAX_QUEUE_SIZE) returns the same depth
+  /// for every tile type and architecture.
+  virtual uint32_t getDmaTaskQueueDepth() const = 0;
+
+  /// Return the task-queue depth for one channel. The queue is a per-channel
+  /// resource in hardware, but no shipping target gives channels different
+  /// depths, so this forwards to the flat accessor; carrying the parameters
+  /// spares call sites churn if one ever does.
+  uint32_t getDmaTaskQueueDepth(int /*col*/, int /*row*/, int /*channel*/,
+                                AIE::DMAChannelDir /*direction*/) const {
+    return getDmaTaskQueueDepth();
+  }
 
   // Return true if the stream switch connection is legal, false otherwise.
   virtual bool isLegalTileConnection(int col, int row, WireBundle srcBundle,
@@ -318,18 +667,69 @@ public:
   virtual std::vector<std::pair<uint32_t, uint32_t>>
   getShimBurstEncodingsAndLengths() const = 0;
 
+  // Returns the default 4-bit AxCACHE value used for shim NOC DMA AXI-MM
+  // transfers when a `dma_bd`/`npu.writebd`'s `axcache` attribute is unset.
+  // Tuned to 2 to enable upsizing in the NoC. No target currently needs
+  // a different value, so this is a single non-pure-virtual default rather
+  // than a per-architecture override.
+  virtual uint32_t getDefaultAxCache() const { return 2; }
+
   // Returns true if the target model supports the given block format.
   virtual bool isSupportedBlockFormat(std::string const &format) const;
+
+  // Returns true if the target supports a constant pad value on MemTile MM2S
+  // DMA channels (register=CONSTANT_PAD_VALUE).
+  virtual bool isMemTilePadValueSupported() const { return false; }
+
+  /// Register Database API - provides access to register and event information
+  /// for trace configuration and low-level register access.
+
+  /// Lookup register information by name and tile.
+  /// Return pointer to register info, or nullptr if not found
+  const RegisterInfo *lookupRegister(llvm::StringRef name, TileID tile,
+                                     bool isMem = false) const;
+
+  /// Lookup event number by name and tile.
+  /// Return Event number if found, nullopt otherwise
+  std::optional<uint32_t> lookupEvent(llvm::StringRef name, TileID tile,
+                                      bool isMem = false) const;
+
+  /// Encode a field value with proper bit shifting.
+  /// Return nullopt if value does not fit in the field's bit width.
+  std::optional<uint32_t> encodeFieldValue(const BitFieldInfo &field,
+                                           uint32_t value) const;
+
+  /// Compute a 32-bit mask for a register field.
+  /// Return nullopt if the field does not fit in a 32-bit register.
+  std::optional<uint32_t> getFieldMask(const BitFieldInfo &field) const;
+
+  /// Return a mapping from tile coordinates to controller IDs.
+  /// When columnWiseUniqueIDs is true (default), IDs are unique within each
+  /// column. Otherwise they are globally unique across the device.
+  llvm::DenseMap<TileID, int>
+  getTileToControllerIdMap(bool columnWiseUniqueIDs = true) const;
+
+  /// Resolve stream switch port specification to port index.
+  /// Return Port index for stream switch register, or nullopt if invalid
+  std::optional<uint32_t> resolvePortValue(llvm::StringRef value, TileID tile,
+                                           bool master) const;
 };
 
 class AIE1TargetModel : public AIETargetModel {
 public:
   AIE1TargetModel(TargetModelKind k) : AIETargetModel(k) {}
 
-  bool isCoreTile(int col, int row) const override { return row > 0; }
-  bool isMemTile(int col, int row) const override { return false; }
-
   AIEArch getTargetArch() const override;
+
+  uint32_t getNumSlaveSlots() const override { return 4; }
+  uint32_t getNumArbiters() const override { return 6; }
+  uint32_t getNumMselsPerArbiter() const override { return 4; }
+  uint32_t getMaxPacketId() const override { return 31; }
+  uint32_t getMaxOutOfOrderId() const override { return 0; }
+  uint32_t getMaxRepeatCount() const override { return 0; }
+  // AIE1 has no queued DMA-task model (BDs are started directly), so there is
+  // no queue to overflow.
+  uint32_t getDmaTaskQueueDepth() const override { return 0; }
 
   std::optional<TileID> getMemWest(TileID src) const override;
   std::optional<TileID> getMemEast(TileID src) const override;
@@ -359,12 +759,46 @@ public:
   uint32_t getMemNorthBaseAddress() const override { return 0x00030000; }
   uint32_t getMemEastBaseAddress() const override { return 0x00038000; }
   uint32_t getLocalMemorySize() const override { return 0x00008000; }
+  uint32_t getProgramMemorySize() const override { return 0x00004000; }
+  uint32_t getCoreDataAddressSpaceSize() const override { return 0x00100000; }
   uint32_t getAccumulatorCascadeSize() const override { return 384; }
-  uint32_t getNumLocks(int col, int row) const override { return 16; }
+  uint32_t getComputeTileLoadStoreBusWidth() const override { return 128; }
+  uint32_t getComputeTileMaxVectorAlignBits() const override { return 128; }
+
+  using AIETargetModel::getNumLocks;
+  uint32_t getNumLocks(AIETileType tileType) const override {
+    return 16; // AIE1 has no MemTiles, always 16
+  }
   uint32_t getMaxLockValue() const override { return 1; }
   std::optional<uint32_t> getLocalLockAddress(uint32_t lockId,
                                               TileID tile) const override;
-  uint32_t getNumBDs(int col, int row) const override { return 16; }
+  uint32_t getNumBDs(AIETileType tileType) const override {
+    return 16; // AIE1 has no MemTiles, always 16
+  }
+  uint32_t getBDMaxDims(AIETileType tileType) const override {
+    // AIE1 has no MemTiles; preserve the historical BD dimension limit.
+    return 3;
+  }
+  uint64_t getDmaBdMaxLen(AIETileType tileType) const override {
+    // AIE1 has no mem tiles. Core tiles use a 13-bit length field with a +1
+    // hardware encoding (max 2^13 = 8192 32-bit words); shim tiles use a full
+    // 32-bit length register.
+    if (tileType == AIETileType::CoreTile)
+      return 1ull << 13;
+    return 0xFFFFFFFFull;
+  }
+  uint32_t getDmaBdWrapBits(AIETileType tileType) const override {
+    // AIE1 core tiles have 8-bit wrap fields; shim tiles have 10-bit.
+    return tileType == AIETileType::CoreTile ? 8 : 10;
+  }
+  uint32_t getDmaBdStepBits(AIETileType tileType) const override {
+    // AIE1 core tiles have 13-bit step fields; shim tiles have 20-bit.
+    return tileType == AIETileType::CoreTile ? 13 : 20;
+  }
+  uint32_t getDmaBdIterBits(AIETileType tileType) const override {
+    // AIE1 core and shim tiles both have a 6-bit Iteration_Wrap field.
+    return 6;
+  }
   bool isBdChannelAccessible(int col, int row, uint32_t bd_id,
                              int channel) const override {
     return true;
@@ -382,6 +816,10 @@ public:
   uint32_t getMemTileSize() const override { return 0; }
   uint32_t getNumBanks(int col, int row) const override { return 4; }
 
+  uint32_t getMaxChannelNumForAdjacentMemTile(int col, int row) const override {
+    return 0;
+  }
+
   uint32_t getNumDestSwitchboxConnections(int col, int row,
                                           WireBundle bundle) const override;
   uint32_t getNumSourceSwitchboxConnections(int col, int row,
@@ -393,6 +831,11 @@ public:
   bool isLegalTileConnection(int col, int row, WireBundle srcBundle,
                              int srcChan, WireBundle dstBundle,
                              int dstChan) const override;
+
+  std::optional<uint32_t> getStreamSwitchPortIndex(int col, int row,
+                                                   WireBundle bundle,
+                                                   uint32_t port_num,
+                                                   bool master) const override;
 
   uint32_t getColumnShift() const override { return 23; }
   uint32_t getRowShift() const override { return 18; }
@@ -407,16 +850,29 @@ public:
 };
 
 class AIE2TargetModel : public AIETargetModel {
+protected:
+  std::unique_ptr<RegisterDatabase> loadRegisterDatabase() const override;
+
 public:
   AIE2TargetModel(TargetModelKind k) : AIETargetModel(k) {
     // Device properties initialization
     addModelProperty(AIETargetModel::UsesSemaphoreLocks);
     addModelProperty(AIETargetModel::UsesMultiDimensionalBDs);
+    addModelProperty(AIETargetModel::UsesBDIteration);
+    addModelProperty(AIETargetModel::SupportsOutOfOrderDMA);
   }
 
   AIEArch getTargetArch() const override;
 
   uint32_t getAddressGenGranularity() const override { return 32; }
+
+  uint32_t getNumSlaveSlots() const override { return 4; }
+  uint32_t getNumArbiters() const override { return 6; }
+  uint32_t getNumMselsPerArbiter() const override { return 4; }
+  uint32_t getMaxPacketId() const override { return 31; }
+  uint32_t getMaxOutOfOrderId() const override { return 63; }
+  uint32_t getMaxRepeatCount() const override { return 255; }
+  uint32_t getDmaTaskQueueDepth() const override { return 4; }
 
   std::optional<TileID> getMemWest(TileID src) const override;
   std::optional<TileID> getMemEast(TileID src) const override;
@@ -442,10 +898,15 @@ public:
   uint32_t getMemNorthBaseAddress() const override { return 0x00060000; }
   uint32_t getMemEastBaseAddress() const override { return 0x00070000; }
   uint32_t getLocalMemorySize() const override { return 0x00010000; }
+  uint32_t getProgramMemorySize() const override { return 0x00004000; }
+  uint32_t getCoreDataAddressSpaceSize() const override { return 0x00100000; }
   uint32_t getAccumulatorCascadeSize() const override { return 512; }
+  uint32_t getComputeTileLoadStoreBusWidth() const override { return 256; }
+  uint32_t getComputeTileMaxVectorAlignBits() const override { return 256; }
 
-  uint32_t getNumLocks(int col, int row) const override {
-    return isMemTile(col, row) ? 64 : 16;
+  using AIETargetModel::getNumLocks;
+  uint32_t getNumLocks(AIETileType tileType) const override {
+    return tileType == AIETileType::MemTile ? 64 : 16;
   }
 
   uint32_t getMaxLockValue() const override { return 0x3F; }
@@ -453,13 +914,35 @@ public:
   std::optional<uint32_t> getLocalLockAddress(uint32_t lockId,
                                               TileID tile) const override;
 
-  uint32_t getNumBDs(int col, int row) const override {
-    return isMemTile(col, row) ? 48 : 16;
+  uint32_t getNumBDs(AIETileType tileType) const override {
+    return tileType == AIETileType::MemTile ? 48 : 16;
+  }
+  uint32_t getBDMaxDims(AIETileType tileType) const override {
+    // MemTile BDs support 4 ND dimensions; core and shim BDs support 3.
+    return tileType == AIETileType::MemTile ? 4 : 3;
+  }
+  // The field limits read off the BD layout the lowerings pack through, the
+  // shim's for tiles without one.
+  const DmaBdLayout &getDmaBdLimits(AIETileType tileType) const {
+    const DmaBdLayout *layout = getDmaBdLayout(tileType);
+    return layout ? *layout : *getDmaBdLayout(AIETileType::ShimNOCTile);
+  }
+  uint64_t getDmaBdMaxLen(AIETileType tileType) const override {
+    return getDmaBdLimits(tileType).bufferLength.mask();
+  }
+  uint32_t getDmaBdWrapBits(AIETileType tileType) const override {
+    return getDmaBdLimits(tileType).d0Size.width;
+  }
+  uint32_t getDmaBdStepBits(AIETileType tileType) const override {
+    return getDmaBdLimits(tileType).d0Stride.width;
+  }
+  uint32_t getDmaBdIterBits(AIETileType tileType) const override {
+    return getDmaBdLimits(tileType).iterationSize.width;
   }
 
   bool isBdChannelAccessible(int col, int row, uint32_t bd_id,
                              int channel) const override {
-    if (!isMemTile(col, row)) {
+    if (getTileType(col, row) != AIETileType::MemTile) {
       return true;
     } else {
       if ((channel & 1) == 0) { // even channel number
@@ -470,6 +953,9 @@ public:
     }
   }
 
+  using AIETargetModel::getDmaBdLayout;
+  const DmaBdLayout *getDmaBdLayout(AIETileType tileType) const override;
+
   uint64_t getDmaBdAddress(int col, int row, uint32_t bd_id, int channel,
                            AIE::DMAChannelDir direction) const override;
 
@@ -477,11 +963,27 @@ public:
 
   uint32_t getDmaControlAddress(int col, int row, int channel,
                                 AIE::DMAChannelDir direction) const override;
+  std::optional<uint32_t>
+  getDmaStatusAddress(int col, int row, int channel,
+                      AIE::DMAChannelDir direction) const override;
+  // Task_Queue_Size, bits 22:20 of the DMA_{MM2S,S2MM}_Status_N register.
+  uint32_t getDmaTaskQueueSizeMask() const override { return 0x7u << 20; }
+  // Task_Queue_Size, Channel_Running (bit 19) and the four Stalled_* bits
+  // (5:2): what aie-codegen's _XAieMl_DmaWaitForDone polls clear. aie-codegen's
+  // pending count adds one to Task_Queue_Size for Channel_Running or a stall,
+  // which is why the field alone does not cover the running task.
+  uint32_t getDmaChannelIdleMask() const override {
+    return getDmaTaskQueueSizeMask() | (1u << 19) | 0x3Cu;
+  }
 
   uint32_t getMemTileSize() const override { return 0x00080000; }
 
   uint32_t getNumBanks(int col, int row) const override {
-    return isMemTile(col, row) ? 8 : 4;
+    return getTileType(col, row) == AIETileType::MemTile ? 8 : 4;
+  }
+
+  uint32_t getMaxChannelNumForAdjacentMemTile(int col, int row) const override {
+    return 4;
   }
 
   uint32_t getNumDestSwitchboxConnections(int col, int row,
@@ -496,6 +998,11 @@ public:
                              int srcChan, WireBundle dstBundle,
                              int dstChan) const override;
 
+  std::optional<uint32_t> getStreamSwitchPortIndex(int col, int row,
+                                                   WireBundle bundle,
+                                                   uint32_t port_num,
+                                                   bool master) const override;
+
   uint32_t getColumnShift() const override { return 25; }
   uint32_t getRowShift() const override { return 20; }
 
@@ -506,6 +1013,83 @@ public:
 
   std::vector<std::pair<uint32_t, uint32_t>>
   getShimBurstEncodingsAndLengths() const override;
+};
+
+// AIE2PS base model
+class AIE2PSTargetModel : public AIE2TargetModel {
+public:
+  AIE2PSTargetModel(TargetModelKind k) : AIE2TargetModel(k) {
+    // AIE2PS is an NPU but uses CERT ELF, not CDO/xclbin.
+    addModelProperty(AIETargetModel::IsNPU);
+  }
+
+  AIEArch getTargetArch() const override { return AIEArch::AIE2ps; }
+  // AIE2P/AIE2PS: a full-width (512-bit) vector access requires 512-bit
+  // alignment, stricter than the 256-bit load/store bus. See aie_api's
+  // vector_ldst_align for __AIE_ARCH__ 21/22.
+  uint32_t getComputeTileMaxVectorAlignBits() const override { return 512; }
+
+  uint32_t getNumControllersPerColumn() const override { return 1; }
+
+  // AIE2PS supports 512B burst (same as AIE2P)
+  std::vector<std::pair<uint32_t, uint32_t>>
+  getShimBurstEncodingsAndLengths() const override {
+    return {std::pair(0, 64), std::pair(1, 128), std::pair(2, 256),
+            std::pair(3, 512)};
+  }
+
+  // TODO(aie2ps): AIE2PS changed block floating point from bfp16 to
+  // MX9/MX6/MX4. isSupportedBlockFormat() currently returns false (inherited).
+  // Override with correct MX format strings when ML kernels need it.
+
+  uint64_t getDmaBdAddress(int col, int row, uint32_t bd_id, int channel,
+                           AIE::DMAChannelDir direction) const override;
+  uint32_t getDmaControlAddress(int col, int row, int channel,
+                                AIE::DMAChannelDir direction) const override;
+  std::optional<uint32_t>
+  getDmaStatusAddress(int col, int row, int channel,
+                      AIE::DMAChannelDir direction) const override;
+
+  uint32_t getNumDestSwitchboxConnections(int col, int row,
+                                          WireBundle bundle) const override;
+  uint32_t getNumSourceSwitchboxConnections(int col, int row,
+                                            WireBundle bundle) const override;
+  std::optional<uint32_t> getStreamSwitchPortIndex(int col, int row,
+                                                   WireBundle bundle,
+                                                   uint32_t channel,
+                                                   bool master) const override;
+
+  static bool classof(const AIETargetModel *model) {
+    return model->getKind() >= TK_AIE2PS_VE3858 &&
+           model->getKind() < TK_AIE2PS_Last;
+  }
+};
+
+// VE3858 target model (AIE2PS, xc2ve3858 on VEK385)
+// 36 columns, 7 rows: 1 shim + 2 memtile + 4 core
+class VE3858TargetModel : public AIE2PSTargetModel {
+public:
+  VE3858TargetModel() : AIE2PSTargetModel(TK_AIE2PS_VE3858) {}
+
+  int columns() const override { return 36; }
+  int rows() const override { return 7; }
+
+  // AIE2PS Shim-South tiles (cols 1-23) have both NoC and PL.
+  // Shim-Global (col 0) has NoC only. Modeling all as ShimNOC is a working
+  // approximation for the CERT compilation path.
+  AIETileType getTileType(int col, int row) const override {
+    if (row == 0)
+      return AIETileType::ShimNOCTile;
+    if (row <= 2)
+      return AIETileType::MemTile;
+    return AIETileType::CoreTile;
+  }
+
+  uint32_t getNumMemTileRows() const override { return 2; }
+
+  static bool classof(const AIETargetModel *model) {
+    return model->getKind() == TK_AIE2PS_VE3858;
+  }
 };
 
 class VC1902TargetModel : public AIE1TargetModel {
@@ -521,16 +1105,12 @@ public:
 
   int rows() const override { return 9; /* One Shim row and 8 Core rows. */ }
 
-  bool isShimNOCTile(int col, int row) const override {
-    return row == 0 && nocColumns.contains(col);
-  }
-
-  bool isShimPLTile(int col, int row) const override {
-    return row == 0 && !nocColumns.contains(col);
-  }
-
-  bool isShimNOCorPLTile(int col, int row) const override {
-    return isShimNOCTile(col, row) || isShimPLTile(col, row);
+  AIETileType getTileType(int col, int row) const override {
+    if (row == 0) {
+      return nocColumns.contains(col) ? AIETileType::ShimNOCTile
+                                      : AIETileType::ShimPLTile;
+    }
+    return AIETileType::CoreTile; // AIE1 has no MemTiles
   }
 
   static bool classof(const AIETargetModel *model) {
@@ -550,19 +1130,14 @@ public:
     return 4; /* One Shim row, 1 memtile rows, and 2 Core rows. */
   }
 
-  bool isCoreTile(int col, int row) const override { return row > 1; }
-  bool isMemTile(int col, int row) const override { return row == 1; }
-
-  bool isShimNOCTile(int col, int row) const override {
-    return row == 0 && nocColumns.contains(col);
-  }
-
-  bool isShimPLTile(int col, int row) const override {
-    return row == 0 && !nocColumns.contains(col);
-  }
-
-  bool isShimNOCorPLTile(int col, int row) const override {
-    return isShimNOCTile(col, row) || isShimPLTile(col, row);
+  AIETileType getTileType(int col, int row) const override {
+    if (row == 0) {
+      return nocColumns.contains(col) ? AIETileType::ShimNOCTile
+                                      : AIETileType::ShimPLTile;
+    }
+    if (row == 1)
+      return AIETileType::MemTile;
+    return AIETileType::CoreTile;
   }
 
   uint32_t getNumMemTileRows() const override { return 1; }
@@ -585,22 +1160,14 @@ public:
     return 11; /* One Shim row, 2 memtile rows, and 8 Core rows. */
   }
 
-  bool isCoreTile(int col, int row) const override { return row > 2; }
-
-  bool isMemTile(int col, int row) const override {
-    return row == 1 || row == 2;
-  }
-
-  bool isShimNOCTile(int col, int row) const override {
-    return row == 0 && nocColumns.contains(col);
-  }
-
-  bool isShimPLTile(int col, int row) const override {
-    return row == 0 && !nocColumns.contains(col);
-  }
-
-  bool isShimNOCorPLTile(int col, int row) const override {
-    return isShimNOCTile(col, row) || isShimPLTile(col, row);
+  AIETileType getTileType(int col, int row) const override {
+    if (row == 0) {
+      return nocColumns.contains(col) ? AIETileType::ShimNOCTile
+                                      : AIETileType::ShimPLTile;
+    }
+    if (row == 1 || row == 2)
+      return AIETileType::MemTile;
+    return AIETileType::CoreTile;
   }
 
   uint32_t getNumMemTileRows() const override { return 2; }
@@ -613,7 +1180,6 @@ public:
 class BaseNPU1TargetModel : public AIE2TargetModel {
 public:
   BaseNPU1TargetModel(TargetModelKind k) : AIE2TargetModel(k) {
-    // Device properties initialization
     addModelProperty(AIETargetModel::IsNPU);
   }
 
@@ -621,18 +1187,11 @@ public:
     return 6; /* 1 Shim row, 1 memtile row, and 4 Core rows. */
   }
 
-  bool isCoreTile(int col, int row) const override { return row > 1; }
-  bool isMemTile(int col, int row) const override { return row == 1; }
-
-  bool isShimPLTile(int col, int row) const override {
-    return false; // No PL
-  }
-
-  bool isShimNOCorPLTile(int col, int row) const override {
-    return isShimNOCTile(col, row) || isShimPLTile(col, row);
-  }
+  int physicalColumns() const override { return 4; }
 
   uint32_t getNumMemTileRows() const override { return 1; }
+
+  uint32_t getNumControllers() const override { return 1; }
 
   static bool classof(const AIETargetModel *model) {
     return model->getKind() >= TK_AIE2_NPU1_1Col &&
@@ -647,7 +1206,8 @@ class VirtualizedNPU1TargetModel : public BaseNPU1TargetModel {
 public:
   VirtualizedNPU1TargetModel(int _cols)
       : BaseNPU1TargetModel(static_cast<TargetModelKind>(
-            static_cast<std::underlying_type_t<TargetModelKind>>(TK_AIE2_NPU1_1Col) +
+            static_cast<std::underlying_type_t<TargetModelKind>>(
+                TK_AIE2_NPU1_1Col) +
             _cols - 1)),
         cols(_cols) {
     // Device properties initialization
@@ -656,7 +1216,13 @@ public:
 
   int columns() const override { return cols; }
 
-  bool isShimNOCTile(int col, int row) const override { return row == 0; }
+  AIETileType getTileType(int col, int row) const override {
+    if (row == 0)
+      return AIETileType::ShimNOCTile; // NPU1 has no ShimPL tiles
+    if (row == 1)
+      return AIETileType::MemTile;
+    return AIETileType::CoreTile;
+  }
 
   static bool classof(const AIETargetModel *model) {
     return model->getKind() >= TK_AIE2_NPU1_1Col &&
@@ -667,27 +1233,27 @@ public:
 class BaseNPU2TargetModel : public AIE2TargetModel {
 public:
   BaseNPU2TargetModel(TargetModelKind k) : AIE2TargetModel(k) {
-    // Device properties initialization
     addModelProperty(AIETargetModel::IsNPU);
   }
 
   AIEArch getTargetArch() const override;
+  // AIE2P/AIE2PS: a full-width (512-bit) vector access requires 512-bit
+  // alignment, stricter than the 256-bit load/store bus. See aie_api's
+  // vector_ldst_align for __AIE_ARCH__ 21/22.
+  uint32_t getComputeTileMaxVectorAlignBits() const override { return 512; }
 
   int rows() const override {
     return 6; /* 1 Shim row, 1 memtile row, and 4 Core rows. */
   }
 
-  bool isCoreTile(int col, int row) const override { return row > 1; }
-  bool isMemTile(int col, int row) const override { return row == 1; }
+  int physicalColumns() const override { return 8; }
 
-  bool isShimPLTile(int col, int row) const override {
-    return false; // No PL tiles
-  }
-
-  bool isShimNOCTile(int col, int row) const override { return row == 0; }
-
-  bool isShimNOCorPLTile(int col, int row) const override {
-    return isShimNOCTile(col, row);
+  AIETileType getTileType(int col, int row) const override {
+    if (row == 0)
+      return AIETileType::ShimNOCTile;
+    if (row == 1)
+      return AIETileType::MemTile;
+    return AIETileType::CoreTile;
   }
 
   uint32_t getNumMemTileRows() const override { return 1; }
@@ -696,6 +1262,10 @@ public:
   getShimBurstEncodingsAndLengths() const override;
 
   bool isSupportedBlockFormat(std::string const &format) const override;
+
+  bool isMemTilePadValueSupported() const override { return true; }
+
+  uint32_t getNumControllers() const override { return 1; }
 
   static bool classof(const AIETargetModel *model) {
     return model->getKind() >= TK_AIE2_NPU2 &&
@@ -737,6 +1307,13 @@ public:
   }
 };
 
+/// \brief Device generation ID written into the TXN header
+/// (aie_runtime::TxnDeviceInfo::devGen). Both the static binary emitter and the
+/// generated-C++ builder read it from here, so a new device family is one edit.
+inline uint8_t txnDeviceGen(const AIETargetModel &tm) {
+  return llvm::isa<BaseNPU2TargetModel>(tm) ? 4 : 3;
+}
+
 } // namespace xilinx::AIE
 
 namespace llvm {
@@ -744,14 +1321,6 @@ template <>
 struct DenseMapInfo<xilinx::AIE::TileID> {
   using FirstInfo = DenseMapInfo<int>;
   using SecondInfo = DenseMapInfo<int>;
-
-  static xilinx::AIE::TileID getEmptyKey() {
-    return {FirstInfo::getEmptyKey(), SecondInfo::getEmptyKey()};
-  }
-
-  static xilinx::AIE::TileID getTombstoneKey() {
-    return {FirstInfo::getTombstoneKey(), SecondInfo::getTombstoneKey()};
-  }
 
   static unsigned getHashValue(const xilinx::AIE::TileID &t) {
     return detail::combineHashValue(FirstInfo::getHashValue(t.col),

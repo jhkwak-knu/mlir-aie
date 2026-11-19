@@ -1,15 +1,14 @@
 //===- aie.mlir ------------------------------------------------*- MLIR -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2021-2022 Xilinx, Inc.
+// Copyright (C) 2023 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2021 Xilinx Inc.
-// (c) Copyright 2023 Advanced Micro Devices, Inc.
 //
 //===----------------------------------------------------------------------===//
 
-// RUN: %PYTHON aiecc.py %VitisSysrootFlag% --host-target=%aieHostTargetTriplet% %link_against_hsa% %s %test_lib_flags %extraAieCcFlags% %S/test.cpp -o test.elf
+// REQUIRES: peano
+
+// RUN: %aiecc %VitisSysrootFlag% --host-target=%aieHostTargetTriplet% %link_against_hsa% %s %test_lib_flags %extraAieCcFlags% -o test.elf -- %S/test.cpp
 // RUN: %run_on_board ./test.elf
 
 
@@ -32,8 +31,10 @@ module @test04_shared_memory {
     %lock14_8 = aie.lock(%tile14, 8) { sym_name = "output_read_lock" } // output buffer lock
 
     %core13 = aie.core(%tile13) {
-      aie.use_lock(%lock13_4, AcquireGreaterEqual, 1) // acquire input for read(e.g. input ping)
-      aie.use_lock(%lock13_5, AcquireGreaterEqual, 1) // acquire input for write
+      %c1_ul0 = arith.constant 1 : i32
+      aie.use_lock(%lock13_4, AcquireGreaterEqual, %c1_ul0) // acquire input for read(e.g. input ping)
+      %c1_ul1 = arith.constant 1 : i32
+      aie.use_lock(%lock13_5, AcquireGreaterEqual, %c1_ul1) // acquire input for write
       %idx1 = arith.constant 3 : index
       %val1 = memref.load %buf13_0[%idx1] : memref<256xi32>
       %2    = arith.addi %val1, %val1 : i32
@@ -42,14 +43,18 @@ module @test04_shared_memory {
       %5 = arith.addi %4, %val1 : i32
       %idx2 = arith.constant 5 : index
       memref.store %5, %buf13_1[%idx2] : memref<256xi32>
-      aie.use_lock(%lock13_3, Release, 1) // release input for write
-      aie.use_lock(%lock13_6, Release, 1) // release output for read
+      %c1_ul2 = arith.constant 1 : i32
+      aie.use_lock(%lock13_3, Release, %c1_ul2) // release input for write
+      %c1_ul3 = arith.constant 1 : i32
+      aie.use_lock(%lock13_6, Release, %c1_ul3) // release output for read
       aie.end
     }
 
     %core14 = aie.core(%tile14) {
-      aie.use_lock(%lock13_6, AcquireGreaterEqual, 1) // acquire input for read(e.g. input ping)
-      aie.use_lock(%lock14_7, AcquireGreaterEqual, 1) // acquire output for write
+      %c1_ul4 = arith.constant 1 : i32
+      aie.use_lock(%lock13_6, AcquireGreaterEqual, %c1_ul4) // acquire input for read(e.g. input ping)
+      %c1_ul5 = arith.constant 1 : i32
+      aie.use_lock(%lock14_7, AcquireGreaterEqual, %c1_ul5) // acquire output for write
       %idx1 = arith.constant 5 : index
       %val1 = memref.load %buf13_1[%idx1] : memref<256xi32>
       %2    = arith.addi %val1, %val1 : i32
@@ -58,8 +63,10 @@ module @test04_shared_memory {
       %5 = arith.addi %4, %val1 : i32
       %idx2 = arith.constant 5 : index
       memref.store %5, %buf14_0[%idx2] : memref<256xi32>
-      aie.use_lock(%lock13_5, Release, 1) // release input for write
-      aie.use_lock(%lock14_8, Release, 1) // release output for read
+      %c1_ul6 = arith.constant 1 : i32
+      aie.use_lock(%lock13_5, Release, %c1_ul6) // release input for write
+      %c1_ul7 = arith.constant 1 : i32
+      aie.use_lock(%lock14_8, Release, %c1_ul7) // release output for read
       aie.end
     }
   }

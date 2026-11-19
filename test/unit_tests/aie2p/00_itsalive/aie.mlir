@@ -1,17 +1,14 @@
 //===- aie.mlir ------------------------------------------------*- MLIR -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2024 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2024 Advanced Micro Devices, Inc.
 //
 //===----------------------------------------------------------------------===//
 
-// REQUIRES: aiesimulator
+// REQUIRES: aiesimulator, aietools_aie2p
 
-// RUN: %python aiecc.py --no-compile --aiesim %s %S/test.cpp
-// RUN: aie.mlir.prj/aiesim.sh | FileCheck %s
+// RUN: %aiecc --get-aiesim --xchesscc --xbridge %s -- %S/test.cpp
+// RUN: ./aie.mlir.prj/aiesim.sh | FileCheck %s
 
 // CHECK: AIE2P ISS
 // CHECK: Hello, world.

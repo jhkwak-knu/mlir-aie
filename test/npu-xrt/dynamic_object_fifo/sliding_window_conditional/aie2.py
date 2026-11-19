@@ -1,0 +1,83 @@
+#
+# Copyright (C) 2022-2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+#
+
+# REQUIRES: ryzen_ai_npu1, peano
+#
+# RUN: %PEANO_INSTALL_DIR/bin/clang++ --target=aie2-none-unknown-elf -O2 \
+# RUN:   -std=c++20 -DNDEBUG -D__AIE_API_AIE_ADF_HPP__ \
+# RUN:   -I%S/../../../../include -I%S/../../../../third_party/aie_api/include \
+# RUN:   -c %S/kernel.cc -o ./kernel.o
+# RUN: %host_clang %S/test.cpp -o test.exe -std=c++17 -Wall %xrt_flags %host_link_flags %test_utils_flags
+# RUN: %python %S/aie2.py > ./aie2.mlir
+# RUN: %aiecc --get-npu-insts --get-xclbin --xclbin-name=final.xclbin --npu-insts-name=insts.bin ./aie2.mlir
+# RUN: %run_on_npu1% ./test.exe
+
+import numpy as np
+import os
+
+from aie.dialects.aie import *
+from aie.dialects.aiex import *
+from aie.iron.controlflow import range_
+from aie.extras.context import mlir_mod_ctx
+from aie.helpers.dialects.scf import if_, else_
+
+N = 100
+n_rows = 10
+dev = AIEDevice.npu1_1col
+col = 0
+
+
+def sliding_window():
+    with mlir_mod_ctx() as ctx:
+
+        @device(dev)
+        def device_body():
+            subtensor_ty = np.ndarray[(N // n_rows,), np.dtype[np.int32]]
+
+            # Tile declarations
+            ShimTile = tile(col, 0)
+            ComputeTile = tile(col, 2)
+
+            # AIE-array data movement with object fifos
+            of_in = object_fifo("in", ShimTile, ComputeTile, 2, subtensor_ty)
+            of_out = object_fifo("out", ComputeTile, ShimTile, 2, subtensor_ty)
+
+            # AIE Core Function declarations
+            add_10_i32 = external_func(
+                "add_10_i32",
+                inputs=[subtensor_ty, subtensor_ty, subtensor_ty],
+                link_with="kernel.o",
+            )
+
+            # Set up compute tiles
+            @core(ComputeTile)
+            def core_body():
+                for i in range_(10):
+                    elemOut = of_out.acquire(ObjectFifoPort.Produce, 1)
+                    with if_(i == 0) as if_op:
+                        elemInPre = of_in.acquire(ObjectFifoPort.Consume, 1)
+                        add_10_i32(elemInPre, elemInPre, elemOut)
+                    with else_(if_op):
+                        elemIn = of_in.acquire(ObjectFifoPort.Consume, 2)
+                        add_10_i32(elemIn[0], elemIn[1], elemOut)
+                        with if_(i == 9) as if_op1:
+                            of_in.release(ObjectFifoPort.Consume, 2)
+                        with else_(if_op1):
+                            of_in.release(ObjectFifoPort.Consume, 1)
+                    of_out.release(ObjectFifoPort.Produce, 1)
+
+            # To/from AIE-array data movement
+            tensor_ty = np.ndarray[(N,), np.dtype[np.int32]]
+
+            @runtime_sequence(tensor_ty, tensor_ty)
+            def sequence(A, C):
+                npu_dma_memcpy_nd(metadata="in", bd_id=1, mem=A, sizes=[1, 1, 1, N])
+                npu_dma_memcpy_nd(metadata="out", bd_id=0, mem=C, sizes=[1, 1, 1, N])
+                dma_wait(of_out)
+
+    print(ctx.module)
+
+
+sliding_window()

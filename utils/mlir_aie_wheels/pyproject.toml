@@ -1,15 +1,21 @@
+# Copyright (C) 2023-2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
 [tool.cibuildwheel]
 build-verbosity = 3
-build = "cp312-*"
+build = "cp312-* cp313-* cp314-*"
 skip = ["*-manylinux_i686", "*-musllinux*"]
 manylinux-aarch64-image = "manylinux_2_28"
 manylinux-x86_64-image = "manylinux_2_28"
+# Hash-required deps installed in before-build; --no-build-isolation makes
+# pip reuse them instead of re-fetching [build-system].requires fresh.
+build-frontend = { name = "pip", args = ["--no-build-isolation"] }
 
 [tool.cibuildwheel.linux]
 environment = { PATH = "/usr/lib/ccache:/usr/lib64/ccache:/usr/lib/ccache/bin:$PATH", PIP_NO_BUILD_ISOLATION = "false" }
 before-build = [
     "{project}/scripts/docker_prepare_ccache.sh",
-    "pip install -r requirements.txt",
+    "python -m pip install --require-hashes -r requirements.lock",
     "{project}/scripts/download_mlir.sh",
 ]
 environment-pass = [
@@ -19,6 +25,8 @@ environment-pass = [
     "DATETIME",
     "HOST_CCACHE_DIR",
     "AIE_PROJECT_COMMIT",
+    "AIE_WHEEL_KEEP_LOCAL",
+    "AIE_WHEEL_VERSION",
     "MATRIX_OS",
     "PARALLEL_LEVEL",
     "PIP_FIND_LINKS",
@@ -26,13 +34,13 @@ environment-pass = [
     "ENABLE_RTTI",
 ]
 repair-wheel-command = [
-    "auditwheel repair -w {dest_dir} {wheel} --exclude libmlir_float16_utils.so"
+    "auditwheel repair -w {dest_dir} {wheel} --exclude libmlir_async_runtime.so --exclude libmlir_c_runner_utils.so --exclude libmlir_float16_utils.so --exclude libmlir_runner_utils.so --exclude libmlir_apfloat_wrappers.so"
 ]
 
 [tool.cibuildwheel.macos]
 environment = { PATH = "/usr/local/opt/ccache/libexec:$PATH", PIP_NO_BUILD_ISOLATION = "false" }
 before-build = [
-    "pip install -r requirements.txt",
+    "python -m pip install --require-hashes -r requirements.lock",
     "{project}/scripts/download_mlir.sh",
 ]
 repair-wheel-command = [
@@ -42,10 +50,11 @@ repair-wheel-command = [
 [tool.cibuildwheel.windows]
 environment = { PIP_NO_BUILD_ISOLATION = "false" }
 before-build = [
-    "pip install delvewheel",
-    "pip install -r requirements.txt",
-    "bash {project}\\scripts\\download_mlir.sh",
+    "python -m pip install --require-hashes -r ci-tools.lock",
+    "python -m pip install --require-hashes -r requirements.lock",
+    'python "{project}/scripts/download_mlir.py"',
 ]
 
 [build-system]
-requires = ["setuptools", "nanobind"]
+requires = ["setuptools>=84.0.0", "nanobind", "pip>=26.2.1", "ninja!=1.13.0"]
+build-backend = "setuptools.build_meta"

@@ -1,0 +1,117 @@
+# Copyright (C) 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    # `/` covers .github/workflows. Composite actions are NOT covered by it --
+    # each one's own directory has to be listed, which is why the refs in
+    # .github/actions drifted unpinned and unbumped while every workflow file
+    # was kept current. Add a line here when a new composite action lands.
+    directories:
+      - "/"
+      - "/.github/actions/run_x86_container"
+      - "/.github/actions/setup_base"
+      - "/.github/actions/setup_ccache"
+    schedule:
+      interval: "cron"
+      cronjob: "0 6 8,22 * *"
+    # Wait for a release to age before proposing it: cuts churn from
+    # same-week point releases and blunts supply-chain risk from a freshly
+    # published (possibly compromised) version. The biweekly schedule bounds
+    # how stale a check can be but gives NO minimum age on what it adopts;
+    # cooldown adds that floor. Security-alert PRs bypass cooldown entirely.
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions-minor-patch:
+        update-types: ["minor", "patch"]
+      github-actions-major:
+        update-types: ["major"]
+
+  # All pip manifests share a build toolchain (nanobind, pybind11, cmake,
+  # setuptools, numpy, ...) that must resolve to the same version across every
+  # directory to stay ABI-compatible with the prebuilt distro wheels. They are
+  # covered by one entry using the plural `directories` key, combined with the
+  # `group-by` grouping below, so a shared-dependency bump is synchronized
+  # across all three directories rather than fanning out per directory.
+  - package-ecosystem: "pip"
+    directories:
+      - "/python"
+      - "/utils/mlir_wheels"
+      - "/utils/mlir_aie_wheels"
+    schedule:
+      interval: "cron"
+      cronjob: "0 6 8,22 * *"
+    # nanobind is held at 2.12.0: 2.13.0 rejects passing an OpResult where a
+    # Value is declared, breaking eudsl-python-extras' ArithValue path. Bumping
+    # requires a compatible eudsl/mlir-distro rebuild, so let dependabot skip it
+    # until that lands (revisit alongside the eudsl/llvm bump).
+    ignore:
+      - dependency-name: "nanobind"
+    cooldown:
+      default-days: 7
+    # `group-by: dependency-name` makes Dependabot open ONE pull request per
+    # dependency spanning ALL directories above, so a shared package (numpy,
+    # setuptools, ...) is bumped to the same version in /python and both wheel
+    # dirs in a single PR. Without it, `directories` (plural) runs a separate
+    # update job per directory and the same bump fans out into independent
+    # per-directory PRs that can merge at different times, leaving the shared
+    # ABI toolchain out of lockstep. The committed .lock files are regenerated
+    # and committed onto the same PR by the dependabot-sync-locks workflow.
+    groups:
+      cross-directory:
+        patterns: ["*"]
+        group-by: dependency-name
+
+  # docs/requirements-mkdocs.txt drives the docs-build job in lintAndFormat.yml
+  # and the mkdocs/mike deploy in generateDocs.yml. It gets its own entry rather
+  # than joining the `directories` list above: that list exists to hold one
+  # shared build toolchain in ABI lockstep, and the mkdocs set shares no package
+  # with it, so folding it in would group unrelated bumps under that rationale.
+  - package-ecosystem: "pip"
+    directory: "/docs"
+    schedule:
+      interval: "cron"
+      cronjob: "0 6 8,22 * *"
+    cooldown:
+      default-days: 7
+    # The mkdocs plugins track mkdocs and mkdocs-material closely enough that a
+    # split bump is usually the broken state, so ship them as one PR.
+    groups:
+      mkdocs:
+        patterns: ["*"]
+
+  # third_party/aie-codegen tracks upstream Xilinx/aie-codegen main (see
+  # .gitmodules) and is consumed unpatched. Its nested aie-regdb submodule is
+  # bumped together with it. third_party/bootgen isn't covered by this effort,
+  # so treat these as PRs to review and build, not to auto-merge.
+  # platforms/boards (XilinxBoardStore) is also excluded: it's pulled in for
+  # board support files only and isn't tracked for updates.
+  - package-ecosystem: "gitsubmodule"
+    directory: "/"
+    schedule:
+      interval: "cron"
+      cronjob: "0 6 8,22 * *"
+    cooldown:
+      default-days: 7
+    ignore:
+      - dependency-name: "third_party/bootgen"
+      - dependency-name: "platforms/boards"
+
+  # Dependabot only understands the hook revs in .pre-commit-config.yaml. To
+  # keep CI from drifting, workflows must invoke pre-commit-managed tools via
+  # the pre-commit hook itself (see lintAndFormat.yml) rather than duplicating
+  # a second tool/version contract in workflow-local config.
+  - package-ecosystem: "pre-commit"
+    directory: "/"
+    schedule:
+      interval: "cron"
+      cronjob: "0 6 8,22 * *"
+    cooldown:
+      default-days: 7
+    groups:
+      pre-commit-minor-patch:
+        update-types: ["minor", "patch"]
+      pre-commit-major:
+        update-types: ["major"]

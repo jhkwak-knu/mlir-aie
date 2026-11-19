@@ -1,0 +1,46 @@
+//===- cpp_f32_relu.mlir - Regression test for #2945 ------------*- MLIR -*-===//
+//
+// Copyright (C) 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+// Regression test for #2945: convert-to-llvm must use dynamic=true so that
+// DataLayoutAnalysis configures the type converter correctly. Without it,
+// modules with a data layout that sets index != 64 bits produce
+// unrealized_conversion_cast ops that fail LLVM translation.
+
+// REQUIRES: peano
+
+// RUN: aiecc --get-xclbin --verbose %s 2>&1 | FileCheck %s
+
+// Regression: without the fix, LLVM translation fails on unrealized casts.
+// Reaching routing and a successful xclbin write proves lowering succeeded.
+// CHECK: ({{[0-9]+}}/{{[0-9]+}}) input_physical.mlir
+// CHECK: wrote edge 'aie.xclbin'
+
+module attributes {dlti.dl_spec = #dlti.dl_spec<index = 32>} {
+  aie.device(npu1_1col) {
+    %tile_0_2 = aie.tile(0, 2)
+    %buf_in = aie.buffer(%tile_0_2) {sym_name = "buf_in"} : memref<256xf32>
+    %buf_out = aie.buffer(%tile_0_2) {sym_name = "buf_out"} : memref<256xf32>
+
+    %core_0_2 = aie.core(%tile_0_2) {
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      %c256 = arith.constant 256 : index
+      %cst = arith.constant 0.0 : f32
+
+      // ReLU with f32 data and index loop variable.
+      // Without convert-to-llvm{dynamic=true}, the index<->i64 mismatch
+      // from the 32-bit index data layout causes unrealized_conversion_cast.
+      scf.for %i = %c0 to %c256 step %c1 {
+        %val = memref.load %buf_in[%i] : memref<256xf32>
+        %gt = arith.cmpf ogt, %val, %cst : f32
+        %relu = arith.select %gt, %val, %cst : f32
+        memref.store %relu, %buf_out[%i] : memref<256xf32>
+      }
+      aie.end
+    }
+  }
+}

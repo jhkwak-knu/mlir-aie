@@ -1,0 +1,119 @@
+//===- bd_chain_on_memtile/broadcast_with_iterations.mlir --------------------------------*- MLIR -*-===//
+//
+// Copyright (C) 2025 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+// RUN: aie-opt --aie-objectFifo-stateful-transform="skip-verify=true" --aie-objectFifo-unroll %s | FileCheck %s
+
+// CHECK:     %memtile_dma_0_1 = aie.memtile_dma(%mem_tile_0_1) {
+// CHECK:       %0 = aie.dma_start(S2MM, 0, ^bb1, ^bb3)
+// CHECK:     ^bb1:  // 2 preds: ^bb0, ^bb2
+// CHECK:       aie.use_lock(%broadcast_input__cons__prodlock0, AcquireGreaterEqual, %{{.*}})
+// CHECK:       aie.dma_bd(%broadcast_input__cons__buf0 : memref<512xui8> offset = {{.*}} len = {{.*}})
+// CHECK:       aie.use_lock(%broadcast_input__cons__conslock0, Release, %{{.*}})
+// CHECK:       aie.next_bd ^bb2
+// CHECK:     ^bb2:  // pred: ^bb1
+// CHECK:       aie.use_lock(%broadcast_input__cons__prodlock0, AcquireGreaterEqual, %{{.*}})
+// CHECK:       aie.dma_bd(%broadcast_input__cons__buf1 : memref<512xui8> offset = {{.*}} len = {{.*}})
+// CHECK:       aie.use_lock(%broadcast_input__cons__conslock0, Release, %{{.*}})
+// CHECK:       aie.next_bd ^bb1
+// CHECK:     ^bb3:  // pred: ^bb0
+// CHECK:       %1 = aie.dma_start(MM2S, 0, ^bb4, ^bb7, repeat_count = 7)
+// CHECK:     ^bb4:  // pred: ^bb3
+// CHECK:       aie.use_lock(%broadcast_input__cons__conslock0, AcquireGreaterEqual, %{{.*}})
+// CHECK:       aie.dma_bd(%broadcast_input__cons__buf0 : memref<512xui8> offset = {{.*}} len = {{.*}})
+// CHECK:       aie.use_lock(%broadcast_input__cons__prodlock0, Release, %{{.*}})
+// CHECK:       aie.next_bd ^bb5
+// CHECK:     ^bb5:  // pred: ^bb4
+// CHECK:       aie.use_lock(%broadcast_input__cons__conslock0, AcquireGreaterEqual, %{{.*}})
+// CHECK:       aie.dma_bd(%broadcast_input__cons__buf1 : memref<512xui8> offset = {{.*}} len = {{.*}})
+// CHECK:       aie.use_lock(%broadcast_input__cons__prodlock0, Release, %{{.*}})
+// CHECK:       aie.next_bd ^bb6
+// CHECK:     ^bb6:  // pred: ^bb5
+// CHECK:       aie.end
+// CHECK:     ^bb7:  // pred: ^bb3
+// CHECK:       aie.end
+// CHECK:     }
+// CHECK:     %mem_0_2 = aie.mem(%tile_0_2) {
+// CHECK:       %0 = aie.dma_start(S2MM, 0, ^bb1, ^bb5, repeat_count = 7)
+// CHECK:     ^bb1:  // pred: ^bb0
+// CHECK:       aie.use_lock(%broadcast_output__cons0__prodlock0, AcquireGreaterEqual, %{{.*}})
+// CHECK:       aie.dma_bd(%broadcast_output__cons0__buf0 : memref<512xui8> offset = {{.*}} len = {{.*}})
+// CHECK:       aie.use_lock(%broadcast_output__cons0__conslock0, Release, %{{.*}})
+// CHECK:       aie.next_bd ^bb2
+// CHECK:     ^bb2:  // pred: ^bb1
+// CHECK:       aie.use_lock(%broadcast_output__cons0__prodlock0, AcquireGreaterEqual, %{{.*}})
+// CHECK:       aie.dma_bd(%broadcast_output__cons0__buf1 : memref<512xui8> offset = {{.*}} len = {{.*}})
+// CHECK:       aie.use_lock(%broadcast_output__cons0__conslock0, Release, %{{.*}})
+// CHECK:       aie.next_bd ^bb3
+// CHECK:     ^bb3:  // pred: ^bb2
+// CHECK:       aie.use_lock(%broadcast_output__cons0__prodlock0, AcquireGreaterEqual, %{{.*}})
+// CHECK:       aie.dma_bd(%broadcast_output__cons0__buf2 : memref<512xui8> offset = {{.*}} len = {{.*}})
+// CHECK:       aie.use_lock(%broadcast_output__cons0__conslock0, Release, %{{.*}})
+// CHECK:       aie.next_bd ^bb4
+// CHECK:     ^bb4:  // pred: ^bb3
+// CHECK:       aie.end
+// CHECK:     ^bb5:  // pred: ^bb0
+// CHECK:       aie.end
+// CHECK:     }
+// CHECK:     %mem_0_3 = aie.mem(%tile_0_3) {
+// CHECK:       %0 = aie.dma_start(S2MM, 0, ^bb1, ^bb5, repeat_count = 7)
+// CHECK:     ^bb1:  // pred: ^bb0
+// CHECK:       aie.use_lock(%broadcast_output__cons1__prodlock0, AcquireGreaterEqual, %{{.*}})
+// CHECK:       aie.dma_bd(%broadcast_output__cons1__buf0 : memref<512xui8> offset = {{.*}} len = {{.*}})
+// CHECK:       aie.use_lock(%broadcast_output__cons1__conslock0, Release, %{{.*}})
+// CHECK:       aie.next_bd ^bb2
+// CHECK:     ^bb2:  // pred: ^bb1
+// CHECK:       aie.use_lock(%broadcast_output__cons1__prodlock0, AcquireGreaterEqual, %{{.*}})
+// CHECK:       aie.dma_bd(%broadcast_output__cons1__buf1 : memref<512xui8> offset = {{.*}} len = {{.*}})
+// CHECK:       aie.use_lock(%broadcast_output__cons1__conslock0, Release, %{{.*}})
+// CHECK:       aie.next_bd ^bb3
+// CHECK:     ^bb3:  // pred: ^bb2
+// CHECK:       aie.use_lock(%broadcast_output__cons1__prodlock0, AcquireGreaterEqual, %{{.*}})
+// CHECK:       aie.dma_bd(%broadcast_output__cons1__buf2 : memref<512xui8> offset = {{.*}} len = {{.*}})
+// CHECK:       aie.use_lock(%broadcast_output__cons1__conslock0, Release, %{{.*}})
+// CHECK:       aie.next_bd ^bb4
+// CHECK:     ^bb4:  // pred: ^bb3
+// CHECK:       aie.end
+// CHECK:     ^bb5:  // pred: ^bb0
+// CHECK:       aie.end
+// CHECK:     }
+// CHECK:     %mem_0_4 = aie.mem(%tile_0_4) {
+// CHECK:       %0 = aie.dma_start(S2MM, 0, ^bb1, ^bb5, repeat_count = 7)
+// CHECK:     ^bb1:  // pred: ^bb0
+// CHECK:       aie.use_lock(%broadcast_output__cons2__prodlock0, AcquireGreaterEqual, %{{.*}})
+// CHECK:       aie.dma_bd(%broadcast_output__cons2__buf0 : memref<512xui8> offset = {{.*}} len = {{.*}})
+// CHECK:       aie.use_lock(%broadcast_output__cons2__conslock0, Release, %{{.*}})
+// CHECK:       aie.next_bd ^bb2
+// CHECK:     ^bb2:  // pred: ^bb1
+// CHECK:       aie.use_lock(%broadcast_output__cons2__prodlock0, AcquireGreaterEqual, %{{.*}})
+// CHECK:       aie.dma_bd(%broadcast_output__cons2__buf1 : memref<512xui8> offset = {{.*}} len = {{.*}})
+// CHECK:       aie.use_lock(%broadcast_output__cons2__conslock0, Release, %{{.*}})
+// CHECK:       aie.next_bd ^bb3
+// CHECK:     ^bb3:  // pred: ^bb2
+// CHECK:       aie.use_lock(%broadcast_output__cons2__prodlock0, AcquireGreaterEqual, %{{.*}})
+// CHECK:       aie.dma_bd(%broadcast_output__cons2__buf2 : memref<512xui8> offset = {{.*}} len = {{.*}})
+// CHECK:       aie.use_lock(%broadcast_output__cons2__conslock0, Release, %{{.*}})
+// CHECK:       aie.next_bd ^bb4
+// CHECK:     ^bb4:  // pred: ^bb3
+// CHECK:       aie.end
+// CHECK:     ^bb5:  // pred: ^bb0
+// CHECK:       aie.end
+// CHECK:     }
+
+module {
+  aie.device(npu1_1col) {
+    %tile_0_2 = aie.tile(0, 2)
+    %tile_0_3 = aie.tile(0, 3)
+    %tile_0_4 = aie.tile(0, 4)
+    %shim_noc_tile_0_0 = aie.tile(0, 0)
+    %mem_tile_0_1 = aie.tile(0, 1)
+
+    aie.objectfifo @broadcast_input(%shim_noc_tile_0_0, {%mem_tile_0_1}, 2 : i32) : !aie.objectfifo<memref<512xui8>>
+    aie.objectfifo @broadcast_output(%mem_tile_0_1, {%tile_0_2, %tile_0_3, %tile_0_4}, 3 : i32) {iter_count = 8 : i32} : !aie.objectfifo<memref<512xui8>>
+
+    aie.objectfifo.link [@broadcast_input] -> [@broadcast_output]([] [])
+  }
+}

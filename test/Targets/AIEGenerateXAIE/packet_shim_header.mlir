@@ -1,10 +1,7 @@
 //===- packet_shim_header.mlir ---------------------------------*- MLIR -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2023-2024 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2023-2024 Advanced Micro Devices, Inc. or its affiliates
 //
 //===----------------------------------------------------------------------===//
 
@@ -17,17 +14,17 @@
 // CHECK: mlir_aie_configure_switchboxes
 // CHECK: x = 7;
 // CHECK: y = 0;
-// CHECK: __mlir_aie_try(XAie_StrmPktSwMstrPortEnable(&(ctx->DevInst), XAie_TileLoc(x,y), NORTH, 0, {{.*}} XAIE_SS_PKT_DONOT_DROP_HEADER, {{.*}} 0, {{.*}} 0x1));
-// CHECK: __mlir_aie_try(XAie_StrmPktSwSlavePortEnable(&(ctx->DevInst), XAie_TileLoc(x,y), SOUTH, 3));
-// CHECK: __mlir_aie_try(XAie_StrmPktSwSlaveSlotEnable(&(ctx->DevInst), XAie_TileLoc(x,y), SOUTH, 3, {{.*}} 0, {{.*}} XAie_PacketInit(10,0), {{.*}} 0x1F, {{.*}} 0, {{.*}} 0));
+// CHECK: __mlir_aie_try(XAie_StrmPktSwMstrPortEnable(ctx->XAieDevInst, XAie_TileLoc(x,y), NORTH, 0, {{.*}} XAIE_SS_PKT_DONOT_DROP_HEADER, {{.*}} 0, {{.*}} 0x1));
+// CHECK: __mlir_aie_try(XAie_StrmPktSwSlavePortEnable(ctx->XAieDevInst, XAie_TileLoc(x,y), SOUTH, 3));
+// CHECK: __mlir_aie_try(XAie_StrmPktSwSlaveSlotEnable(ctx->XAieDevInst, XAie_TileLoc(x,y), SOUTH, 3, {{.*}} 0, {{.*}} XAie_PacketInit(10,0), {{.*}} 0x1F, {{.*}} 0, {{.*}} 0));
 // CHECK: x = 7;
 // CHECK: y = 1;
-// CHECK: __mlir_aie_try(XAie_StrmPktSwMstrPortEnable(&(ctx->DevInst), XAie_TileLoc(x,y), DMA, 0, {{.*}} XAIE_SS_PKT_DROP_HEADER, {{.*}} 0, {{.*}} 0x1));
-// CHECK: __mlir_aie_try(XAie_StrmPktSwSlavePortEnable(&(ctx->DevInst), XAie_TileLoc(x,y), SOUTH, 0));
-// CHECK: __mlir_aie_try(XAie_StrmPktSwSlaveSlotEnable(&(ctx->DevInst), XAie_TileLoc(x,y), SOUTH, 0, {{.*}} 0, {{.*}} XAie_PacketInit(10,0), {{.*}} 0x1F, {{.*}} 0, {{.*}} 0));
+// CHECK: __mlir_aie_try(XAie_StrmPktSwMstrPortEnable(ctx->XAieDevInst, XAie_TileLoc(x,y), DMA, 0, {{.*}} XAIE_SS_PKT_DROP_HEADER, {{.*}} 0, {{.*}} 0x1));
+// CHECK: __mlir_aie_try(XAie_StrmPktSwSlavePortEnable(ctx->XAieDevInst, XAie_TileLoc(x,y), SOUTH, 0));
+// CHECK: __mlir_aie_try(XAie_StrmPktSwSlaveSlotEnable(ctx->XAieDevInst, XAie_TileLoc(x,y), SOUTH, 0, {{.*}} 0, {{.*}} XAie_PacketInit(10,0), {{.*}} 0x1F, {{.*}} 0, {{.*}} 0));
 // CHECK: x = 7;
 // CHECK: y = 0;
-// CHECK: __mlir_aie_try(XAie_EnableShimDmaToAieStrmPort(&(ctx->DevInst), XAie_TileLoc(x,y), 3));
+// CHECK: __mlir_aie_try(XAie_EnableShimDmaToAieStrmPort(ctx->XAieDevInst, XAie_TileLoc(x,y), 3));
 
 //
 // This tests the shim DMA BD configuration lowering for packet switched routing
@@ -58,23 +55,31 @@ module @aie_module {
     %6 = aie.buffer(%3) {address = 3072 : i32, sym_name = "buf1"} : memref<32xi32, 2>
     %7 = aie.external_buffer {sym_name = "buf"} : memref<32xi32>
     %8 = aie.mem(%3) {
+      %c0_i32 = arith.constant 0 : i32
+      %c32_i32 = arith.constant 32 : i32
       %10 = aie.dma_start(S2MM, 0, ^bb1, ^bb2)
     ^bb1:  // 2 preds: ^bb0, ^bb1
-      aie.use_lock(%5, Acquire, 0)
-      aie.dma_bd(%6 : memref<32xi32, 2>, 0, 32)
-      aie.use_lock(%5, Release, 1)
+      %c0_ul1 = arith.constant 0 : i32
+      aie.use_lock(%5, Acquire, %c0_ul1)
+      aie.dma_bd(%6 : memref<32xi32, 2> offset = 0 len = 32)
+      %c1_ul2 = arith.constant 1 : i32
+      aie.use_lock(%5, Release, %c1_ul2)
       aie.next_bd ^bb1
     ^bb2:  // pred: ^bb0
       aie.end
     }
     %9 = aie.shim_dma(%0) {
+      %c0_i32 = arith.constant 0 : i32
+      %c32_i32 = arith.constant 32 : i32
       %10 = aie.lock(%0, 1)
       %11 = aie.dma_start(MM2S, 0, ^bb1, ^bb2)
     ^bb1:  // 2 preds: ^bb0, ^bb1
-      aie.use_lock(%10, Acquire, 1)
+      %c1_ul3 = arith.constant 1 : i32
+      aie.use_lock(%10, Acquire, %c1_ul3)
       aie.dma_bd_packet(6, 10)
-      aie.dma_bd(%7 : memref<32xi32>, 0, 32)
-      aie.use_lock(%10, Release, 0)
+      aie.dma_bd(%7 : memref<32xi32> offset = 0 len = 32)
+      %c0_ul4 = arith.constant 0 : i32
+      aie.use_lock(%10, Release, %c0_ul4)
       aie.next_bd ^bb1
     ^bb2:  // pred: ^bb0
       aie.end

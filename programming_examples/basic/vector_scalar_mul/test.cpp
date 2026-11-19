@@ -1,10 +1,7 @@
 //===- test.cpp -------------------------------------------------*- C++ -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2023 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// Copyright (C) 2023, Advanced Micro Devices, Inc.
 //
 //===----------------------------------------------------------------------===//
 
@@ -45,7 +42,7 @@ void initialize_bufIn2(DATATYPE_IN2 *bufIn2, int SIZE) {
 
 // Initialize Output buffer
 void initialize_bufOut(DATATYPE_OUT *bufOut, int SIZE) {
-  memset(bufOut, 0, SIZE);
+  memset(bufOut, 0, SIZE * sizeof(DATATYPE_OUT));
 }
 
 // Functional correctness verifyer
@@ -80,9 +77,15 @@ int main(int argc, const char *argv[]) {
 
   args myargs = parse_args(argc, argv);
 
-  int res = setup_and_run_aie<DATATYPE_IN1, DATATYPE_IN2, DATATYPE_OUT,
-                              initialize_bufIn1, initialize_bufIn2,
-                              initialize_bufOut, verify_vector_scalar_mul>(
-      IN1_VOLUME, IN2_VOLUME, OUT_VOLUME, myargs);
+  // The scale factor (IN2) is a scalar *param*: in the runtime_sequence host
+  // ABI it is ordered AFTER the output ([inputs, output, params]).  Declare it
+  // as a trailing param so it binds to the correct kernel arg slot; otherwise
+  // the output and factor buffers get swapped (corrupting results).
+  int res = setup_and_run_aie(
+      verify_vector_scalar_mul,
+      std::make_tuple(make_in<DATATYPE_IN1>(IN1_VOLUME, initialize_bufIn1),
+                      make_in<DATATYPE_IN2>(IN2_VOLUME, initialize_bufIn2)),
+      make_out<DATATYPE_OUT>(OUT_VOLUME, initialize_bufOut), myargs,
+      /*enable_ctrl_pkts=*/false, /*num_trailing_params=*/1);
   return res;
 }

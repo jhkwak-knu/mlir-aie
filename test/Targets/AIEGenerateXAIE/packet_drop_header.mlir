@@ -1,10 +1,7 @@
 //===- packet_drop_header.mlir ---------------------------------*- MLIR -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2023-2024 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2023-2024 Advanced Micro Devices, Inc. or its affiliates
 //
 //===----------------------------------------------------------------------===//
 
@@ -13,20 +10,20 @@
 // CHECK: mlir_aie_configure_switchboxes
 // CHECK: x = 7;
 // CHECK: y = 0;
-// CHECK: __mlir_aie_try(XAie_StrmPktSwMstrPortEnable(&(ctx->DevInst), XAie_TileLoc(x,y), SOUTH, 0, {{.*}} XAIE_SS_PKT_DONOT_DROP_HEADER, {{.*}} 0, {{.*}} 0x2));
-// CHECK: __mlir_aie_try(XAie_StrmPktSwMstrPortEnable(&(ctx->DevInst), XAie_TileLoc(x,y), NORTH, 0, {{.*}} XAIE_SS_PKT_DONOT_DROP_HEADER, {{.*}} 0, {{.*}} 0x1));
-// CHECK: __mlir_aie_try(XAie_StrmPktSwSlavePortEnable(&(ctx->DevInst), XAie_TileLoc(x,y), NORTH, 0));
-// CHECK: __mlir_aie_try(XAie_StrmPktSwSlaveSlotEnable(&(ctx->DevInst), XAie_TileLoc(x,y), NORTH, 0, {{.*}} 0, {{.*}} XAie_PacketInit(10,0), {{.*}} 0x1F, {{.*}} 1, {{.*}} 0));
-// CHECK: __mlir_aie_try(XAie_StrmPktSwSlavePortEnable(&(ctx->DevInst), XAie_TileLoc(x,y), SOUTH, 4));
-// CHECK: __mlir_aie_try(XAie_StrmPktSwSlaveSlotEnable(&(ctx->DevInst), XAie_TileLoc(x,y), SOUTH, 4, {{.*}} 0, {{.*}} XAie_PacketInit(3,0), {{.*}} 0x1F, {{.*}} 0, {{.*}} 0));
+// CHECK: __mlir_aie_try(XAie_StrmPktSwMstrPortEnable(ctx->XAieDevInst, XAie_TileLoc(x,y), SOUTH, 0, {{.*}} XAIE_SS_PKT_DONOT_DROP_HEADER, {{.*}} 0, {{.*}} 0x2));
+// CHECK: __mlir_aie_try(XAie_StrmPktSwMstrPortEnable(ctx->XAieDevInst, XAie_TileLoc(x,y), NORTH, 0, {{.*}} XAIE_SS_PKT_DONOT_DROP_HEADER, {{.*}} 0, {{.*}} 0x1));
+// CHECK: __mlir_aie_try(XAie_StrmPktSwSlavePortEnable(ctx->XAieDevInst, XAie_TileLoc(x,y), NORTH, 0));
+// CHECK: __mlir_aie_try(XAie_StrmPktSwSlaveSlotEnable(ctx->XAieDevInst, XAie_TileLoc(x,y), NORTH, 0, {{.*}} 0, {{.*}} XAie_PacketInit(10,0), {{.*}} 0x1F, {{.*}} 1, {{.*}} 0));
+// CHECK: __mlir_aie_try(XAie_StrmPktSwSlavePortEnable(ctx->XAieDevInst, XAie_TileLoc(x,y), SOUTH, 4));
+// CHECK: __mlir_aie_try(XAie_StrmPktSwSlaveSlotEnable(ctx->XAieDevInst, XAie_TileLoc(x,y), SOUTH, 4, {{.*}} 0, {{.*}} XAie_PacketInit(3,0), {{.*}} 0x1F, {{.*}} 0, {{.*}} 0));
 // CHECK: x = 7;
 // CHECK: y = 1;
-// CHECK: __mlir_aie_try(XAie_StrmPktSwMstrPortEnable(&(ctx->DevInst), XAie_TileLoc(x,y), DMA, 0, {{.*}} XAIE_SS_PKT_DROP_HEADER, {{.*}} 0, {{.*}} 0x1));
-// CHECK: __mlir_aie_try(XAie_StrmPktSwMstrPortEnable(&(ctx->DevInst), XAie_TileLoc(x,y), SOUTH, 0, {{.*}} XAIE_SS_PKT_DONOT_DROP_HEADER, {{.*}} 0, {{.*}} 0x2));
-// CHECK: __mlir_aie_try(XAie_StrmPktSwSlavePortEnable(&(ctx->DevInst), XAie_TileLoc(x,y), DMA, 0));
-// CHECK: __mlir_aie_try(XAie_StrmPktSwSlaveSlotEnable(&(ctx->DevInst), XAie_TileLoc(x,y), DMA, 0, {{.*}} 0, {{.*}} XAie_PacketInit(10,0), {{.*}} 0x1F, {{.*}} 1, {{.*}} 0));
-// CHECK: __mlir_aie_try(XAie_StrmPktSwSlavePortEnable(&(ctx->DevInst), XAie_TileLoc(x,y), SOUTH, 0));
-// CHECK: __mlir_aie_try(XAie_StrmPktSwSlaveSlotEnable(&(ctx->DevInst), XAie_TileLoc(x,y), SOUTH, 0, {{.*}} 0, {{.*}} XAie_PacketInit(3,0), {{.*}} 0x1F, {{.*}} 0, {{.*}} 0));
+// CHECK: __mlir_aie_try(XAie_StrmPktSwMstrPortEnable(ctx->XAieDevInst, XAie_TileLoc(x,y), DMA, 0, {{.*}} XAIE_SS_PKT_DROP_HEADER, {{.*}} 0, {{.*}} 0x1));
+// CHECK: __mlir_aie_try(XAie_StrmPktSwMstrPortEnable(ctx->XAieDevInst, XAie_TileLoc(x,y), SOUTH, 0, {{.*}} XAIE_SS_PKT_DONOT_DROP_HEADER, {{.*}} 0, {{.*}} 0x2));
+// CHECK: __mlir_aie_try(XAie_StrmPktSwSlavePortEnable(ctx->XAieDevInst, XAie_TileLoc(x,y), DMA, 0));
+// CHECK: __mlir_aie_try(XAie_StrmPktSwSlaveSlotEnable(ctx->XAieDevInst, XAie_TileLoc(x,y), DMA, 0, {{.*}} 0, {{.*}} XAie_PacketInit(10,0), {{.*}} 0x1F, {{.*}} 1, {{.*}} 0));
+// CHECK: __mlir_aie_try(XAie_StrmPktSwSlavePortEnable(ctx->XAieDevInst, XAie_TileLoc(x,y), SOUTH, 0));
+// CHECK: __mlir_aie_try(XAie_StrmPktSwSlaveSlotEnable(ctx->XAieDevInst, XAie_TileLoc(x,y), SOUTH, 0, {{.*}} 0, {{.*}} XAie_PacketInit(3,0), {{.*}} 0x1F, {{.*}} 0, {{.*}} 0));
 
 //
 // This tests the switchbox configuration lowering for packet switched routing
@@ -67,16 +64,20 @@ module @aie_module {
     ^bb1:  // pred: ^bb0
       %8 = aie.dma_start(MM2S, 0, ^bb3, ^bb4)
     ^bb2:  // 2 preds: ^bb0, ^bb2
-      aie.use_lock(%4, Acquire, 0)
+      %c0_ul1 = arith.constant 0 : i32
+      aie.use_lock(%4, Acquire, %c0_ul1)
       aie.dma_bd_packet(2, 3)
-      aie.dma_bd(%5 : memref<16xi32, 2>, 0, 16)
-      aie.use_lock(%4, Release, 1)
+      aie.dma_bd(%5 : memref<16xi32, 2> offset = 0 len = 16)
+      %c1_ul2 = arith.constant 1 : i32
+      aie.use_lock(%4, Release, %c1_ul2)
       aie.next_bd ^bb2
     ^bb3:  // 2 preds: ^bb1, ^bb3
-      aie.use_lock(%4, Acquire, 1)
+      %c1_ul3 = arith.constant 1 : i32
+      aie.use_lock(%4, Acquire, %c1_ul3)
       aie.dma_bd_packet(6, 10)
-      aie.dma_bd(%5 : memref<16xi32, 2>, 0, 16)
-      aie.use_lock(%4, Release, 0)
+      aie.dma_bd(%5 : memref<16xi32, 2> offset = 0 len = 16)
+      %c0_ul4 = arith.constant 0 : i32
+      aie.use_lock(%4, Release, %c0_ul4)
       aie.next_bd ^bb3
     ^bb4:  // pred: ^bb1
       aie.end

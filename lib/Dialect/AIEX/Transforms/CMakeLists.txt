@@ -1,26 +1,44 @@
 #
-# This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-# See https://llvm.org/LICENSE.txt for license information.
+# Copyright (C) 2021-2022 Xilinx, Inc.
+# Copyright (C) 2022-2026 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #
-# (c) Copyright 2021 Xilinx Inc.
 
 add_mlir_dialect_library(AIEXTransforms
+  AIEResourceStages.cpp
   AIEXToStandard.cpp
+  AIESCFToControlFlow.cpp
   AIECreateCores.cpp
   AIECreateLocks.cpp
-  AIEHerdRouting.cpp
   AIECreateBroadcastPacket.cpp
   AIELowerMulticast.cpp
   AIELowerMemcpy.cpp
   AIEDmaToNpu.cpp
+  AIEDecomposeLargeDmaBd.cpp
+  AIENpuToCert.cpp
+  AIECertVerify.cpp
   AIEMaterializeBDChains.cpp
+  AIEMaterializeRuntimeSequences.cpp
   AIEAssignRuntimeSequenceBDIDs.cpp
+  AIEReserveRuntimeBDIDs.cpp
+  AIESplitLongRepeats.cpp
+  AIEUnrollRuntimeSequenceLoops.cpp
+  AIELowerDynamicBDPool.cpp
   AIEDMATasksToNPU.cpp
   AIESubstituteShimDMAAllocations.cpp
   AIECtrlPacketToDma.cpp
   AIELowerSetLock.cpp
+  AIELowerDmaChannelReset.cpp
+  AIELowerCoreReset.cpp
+  AIEVerifyRuntimeRearm.cpp
+  AIELowerScratchpadParameters.cpp
   AIETransformBfpTypes.cpp
+  AIETxnToControlPacket.cpp
+  AIEExpandLoadPdi.cpp
+  AIEInlineTraceConfig.cpp
+  AIEFuseTraceBuffers.cpp
+  AIEResolveAddressPatchBuffers.cpp
+
   ADDITIONAL_HEADER_DIRS
   ${AIE_BINARY_DIR}/include
 
@@ -32,8 +50,18 @@ add_mlir_dialect_library(AIEXTransforms
 
   LINK_LIBS PUBLIC
   AIE
+  MLIRAffineToStandard
+  MLIRAnalysis
+  AIETransforms
+  MLIRAIEToConfiguration
+  AIEXUtils
+  MLIRControlFlowDialect
   MLIRIR
   MLIRPass
+  MLIRSCFToControlFlow
   MLIRSupport
+  MLIRTransforms
   MLIRTransformUtils
+  MLIRSCFUtils
+  MLIRUBDialect
   )

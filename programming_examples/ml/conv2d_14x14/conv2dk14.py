@@ -1,0 +1,448 @@
+# conv2d_14x14/conv2dk14.py -*- Python -*-
+#
+# Copyright (C) 2024-2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+#
+"""14x14 Conv2D — IRON API designs (single-core + 32-core) with @iron.jit.
+
+Two parallelism modes share the same conv2dk14 sub-kernel:
+
+  * single-core (default): one shim DMA in/out pair, one worker; processes
+    896x896x4 -> 1152 channels in ~20ms.
+  * 32-core (``--multi``):  8 cols x 4 rows, activations row-broadcast
+    across cols, weights col-broadcast across rows, output joined per
+    column; ~5ms.
+
+Both designs feed ``kernels.conv2dk14`` ``sub_tiles x sub_out_channels``
+bytes of output per call (one int8 per output channel and tile).
+
+Compile-only entrypoint:
+  ``python3 conv2dk14.py -d npu2 [--multi]
+            --xclbin-path build/final.xclbin --insts-path build/insts.bin``
+End-to-end verification lives in ``test.py``.
+"""
+
+import argparse
+import sys
+
+import aie.iron as iron
+import aie.iron.kernels as kernels
+import numpy as np
+import torch  # pyright: ignore[reportMissingImports]
+import torch.nn as nn  # pyright: ignore[reportMissingImports]
+from aie.helpers.taplib import TensorAccessPattern
+from aie.iron import (
+    CompileTime,
+    In,
+    ObjectFifo,
+    Out,
+    Program,
+    Runtime,
+    Worker,
+)
+from aie.iron.controlflow import range_
+from aie.iron.device import Tile
+from aie.utils.hostruntime.argparse import add_compile_args, device_from_args
+from aie.utils.hostruntime.cli import run_design_cli
+from aie.utils.ml import DataShaper
+
+# Sub-tile sizing baked into the conv2dk14 kernel.
+_SUB_OUT_CHANNELS = 16
+_SUB_TILES = 16
+_KERNEL_SIZE = 14
+_IN_CHANNELS = 4
+_OUT_CHANNELS = 1152
+_X_BLOCKS = 4
+
+# A tile-row of pixels arrives row by row and is stored block by block.
+_ACT_L3L2_WALK = TensorAccessPattern.full(
+    (64, _KERNEL_SIZE, _KERNEL_SIZE * _IN_CHANNELS)
+).permute((1, 0, 2))
+_ACT_L2L1_WALK = TensorAccessPattern.full(
+    (64 // 8, 8, _KERNEL_SIZE * _KERNEL_SIZE // 2, 2 * _IN_CHANNELS)
+).permute((0, 2, 1, 3))
+
+
+def _conv2dk14_kernel(act_in_ty, weights_ty, out_ty):
+    """The library kernel, sized for ``_SUB_TILES`` tiles x ``_SUB_OUT_CHANNELS``."""
+    fn = kernels.conv2dk14(
+        input_width=_SUB_TILES * _KERNEL_SIZE,
+        input_channels=_IN_CHANNELS,
+        output_channels=_SUB_OUT_CHANNELS,
+        kernel_width=_KERNEL_SIZE,
+    )
+    assert fn.arg_types()[:3] == [act_in_ty, weights_ty, out_ty]
+    return fn
+
+
+@iron.jit
+def conv2dk14(
+    a_in: In,
+    w_in: In,
+    b_out: Out,
+    *,
+    width: CompileTime[int] = 896,
+    height: CompileTime[int] = 896,
+    scale: CompileTime[int] = 14,
+):
+    if width % 8 != 0 or width < 8:
+        raise ValueError("width must be a multiple of 8 and >= 8")
+    if height % 8 != 0 or height < 8:
+        raise ValueError("height must be a multiple of 8 and >= 8")
+
+    act_in = _KERNEL_SIZE * _KERNEL_SIZE * _IN_CHANNELS * _SUB_TILES
+    weights = _KERNEL_SIZE * _KERNEL_SIZE * _IN_CHANNELS * _SUB_OUT_CHANNELS
+    act_out = _SUB_TILES * _SUB_OUT_CHANNELS
+
+    out_channels_group = _OUT_CHANNELS // _SUB_OUT_CHANNELS
+    width_out = width // _KERNEL_SIZE
+    height_out = height // _KERNEL_SIZE
+
+    tensor_in_size = width * height * _IN_CHANNELS * out_channels_group
+    tensor_wts_size = weights * out_channels_group
+    tensor_out_size = width_out * height_out * _SUB_OUT_CHANNELS * out_channels_group
+
+    buf_in = _KERNEL_SIZE * width * _IN_CHANNELS
+    buf_out = _SUB_OUT_CHANNELS * width_out * height_out
+
+    act_in_ty = np.ndarray[(act_in,), np.dtype[np.uint8]]
+    buf_in_ty = np.ndarray[(buf_in,), np.dtype[np.uint8]]
+    weights_ty = np.ndarray[(weights,), np.dtype[np.int8]]
+    out_ty = np.ndarray[(act_out,), np.dtype[np.int8]]
+    buf_out_ty = np.ndarray[(buf_out,), np.dtype[np.int8]]
+    tensor_in_ty = np.ndarray[(tensor_in_size,), np.dtype[np.uint8]]
+    tensor_wts_ty = np.ndarray[(tensor_wts_size,), np.dtype[np.int8]]
+    tensor_out_ty = np.ndarray[(tensor_out_size,), np.dtype[np.int8]]
+
+    conv_fn = _conv2dk14_kernel(act_in_ty, weights_ty, out_ty)
+
+    of_act_l3l2 = ObjectFifo(
+        buf_in_ty,
+        name="inOF_act_L3L2",
+        from_stream_per_cons=_ACT_L3L2_WALK,
+    )
+    of_act_l2 = of_act_l3l2.cons().forward(
+        obj_type=act_in_ty,
+        name="act_L2_02",
+        to_stream=_ACT_L2L1_WALK,
+    )
+
+    of_wts_l3l2 = ObjectFifo(weights_ty, depth=1, name="inOF_wts_0_L3L2")
+
+    of_out_l2 = ObjectFifo(out_ty, name="out_02_L2")
+    of_out_l3 = of_out_l2.cons().forward(
+        obj_type=buf_out_ty,
+        name="outOFL2L3",
+        to_stream=TensorAccessPattern.full((256, 2, 16, 8)).permute((0, 2, 1, 3)),
+    )
+
+    def core_fn(of_wts, of_act, of_out, kernel):
+        x_dim = width // _X_BLOCKS
+        elem_wts = of_wts.acquire(1)
+        for _ in range_(height // _KERNEL_SIZE):
+            for _ in range_(_X_BLOCKS):
+                elem_in = of_act.acquire(1)
+                elem_out = of_out.acquire(1)
+                kernel(
+                    elem_in,
+                    elem_wts,
+                    elem_out,
+                    x_dim,
+                    _IN_CHANNELS,
+                    _SUB_OUT_CHANNELS,
+                    _KERNEL_SIZE,
+                    scale,
+                )
+                of_act.release(1)
+                of_out.release(1)
+        of_wts.release(1)
+
+    worker = Worker(
+        core_fn,
+        [of_wts_l3l2.cons(), of_act_l2.cons(), of_out_l2.prod(), conv_fn],
+        stack_size=0x600,
+    )
+
+    def sequence(inp, W, out, act_prod, wts_prod, out_cons):
+        act_prod.fill(inp)
+        wts_prod.fill(W)
+        out_cons.drain(out, wait=True)
+
+    rt = Runtime(
+        sequence,
+        [
+            tensor_in_ty,
+            tensor_wts_ty,
+            tensor_out_ty,
+            of_act_l3l2.prod(),
+            of_wts_l3l2.prod(),
+            of_out_l3.cons(),
+        ],
+    )
+
+    return Program(iron.get_current_device(), rt, workers=[worker]).resolve_program()
+
+
+@iron.jit
+def conv2dk14_multi(
+    a_in: In,
+    w_in: In,
+    b_out: Out,
+    *,
+    width: CompileTime[int] = 896,
+    height: CompileTime[int] = 896,
+    scale: CompileTime[int] = 14,
+):
+    """32-core (8 cols x 4 rows) variant.
+
+    Activations are split across 4 rows (one shim DMA per row), with each
+    row's memtile broadcasting to all 8 cores in that row. Weights are
+    split across 8 cols (one shim DMA per col, no memtile), broadcasting
+    directly to the 4 cores in each col. Outputs are joined per column:
+    each col's 4 row-cores feed into its memtile, then out to its shim
+    DMA. Each core does 1/4 of the height work.
+    """
+    if width % 8 != 0 or width < 8:
+        raise ValueError("width must be a multiple of 8 and >= 8")
+    if height % 8 != 0 or height < 8:
+        raise ValueError("height must be a multiple of 8 and >= 8")
+
+    device = iron.get_current_device()
+    assert device is not None
+    n_cols, n_rows = 8, 4
+    if device.cols < n_cols:
+        raise ValueError(
+            f"multi-core variant needs {n_cols} columns; device has {device.cols}"
+        )
+
+    act_in = _KERNEL_SIZE * _KERNEL_SIZE * _IN_CHANNELS * _SUB_TILES
+    weights = _KERNEL_SIZE * _KERNEL_SIZE * _IN_CHANNELS * _SUB_OUT_CHANNELS
+    act_out = _SUB_TILES * _SUB_OUT_CHANNELS
+
+    act_repeat = (_OUT_CHANNELS // _SUB_OUT_CHANNELS) // n_cols  # 9
+
+    out_channels_group = _OUT_CHANNELS // _SUB_OUT_CHANNELS  # 72
+    width_out = width // _KERNEL_SIZE
+    height_out = height // _KERNEL_SIZE
+
+    tensor_in_size = (
+        width * height * _IN_CHANNELS
+    )  # one image, replayed via shim repeat
+    tensor_wts_size = weights * out_channels_group
+    tensor_out_size = width_out * height_out * _SUB_OUT_CHANNELS * out_channels_group
+
+    buf_in_row = _KERNEL_SIZE * width * _IN_CHANNELS  # one tile-row of pixels
+
+    act_in_ty = np.ndarray[(act_in,), np.dtype[np.uint8]]
+    buf_in_ty = np.ndarray[(buf_in_row,), np.dtype[np.uint8]]
+    weights_ty = np.ndarray[(weights,), np.dtype[np.int8]]
+    out_ty = np.ndarray[(act_out,), np.dtype[np.int8]]
+    out_mem_ty = np.ndarray[(act_out * 4 * 16 * n_rows,), np.dtype[np.int8]]
+    tensor_in_ty = np.ndarray[(tensor_in_size,), np.dtype[np.uint8]]
+    tensor_wts_ty = np.ndarray[(tensor_wts_size,), np.dtype[np.int8]]
+    tensor_out_ty = np.ndarray[(tensor_out_size,), np.dtype[np.int8]]
+
+    conv_fn = _conv2dk14_kernel(act_in_ty, weights_ty, out_ty)
+
+    # Activations: per-row shim -> per-row memtile -> broadcast to 8 cores
+    of_act_l3l2: list[ObjectFifo] = []
+    of_act_l2l1: list[ObjectFifo] = []
+    for j in range(n_rows):
+        act_l3l2 = ObjectFifo(
+            buf_in_ty,
+            name=f"of_act_L3L2_{j}",
+            from_stream_per_cons=_ACT_L3L2_WALK,
+        )
+        of_act_l3l2.append(act_l3l2)
+        of_act_l2l1.append(
+            act_l3l2.cons().forward(
+                obj_type=act_in_ty,
+                name=f"of_act_L2L1_{j}",
+                to_stream=_ACT_L2L1_WALK,
+                tile=Tile(j, 1),
+            )
+        )
+
+    # Weights: per-col shim -> broadcast directly to 4 row-cores in that col (no memtile)
+    of_wts = [ObjectFifo(weights_ty, name=f"of_wts_L3L1_{i}") for i in range(n_cols)]
+
+    # Outputs: per-col join across 4 rows in memtile, then to per-col shim
+    of_out_l2l3: list[ObjectFifo] = []
+    of_out_l1l2: list[list[ObjectFifo]] = [[] for _ in range(n_rows)]
+    out_offsets = [act_out * 4 * 16 * j for j in range(n_rows)]
+    out_l2l3_dims = TensorAccessPattern.full((64, 2, 16, 8)).permute((0, 2, 1, 3))
+    for i in range(n_cols):
+        out_l2l3 = ObjectFifo(
+            out_mem_ty,
+            name=f"of_out_L2L3_{i}",
+            to_stream=out_l2l3_dims,
+        )
+        of_out_l2l3.append(out_l2l3)
+        col_fifos = out_l2l3.prod().join(
+            out_offsets,
+            obj_types=[out_ty] * n_rows,
+            names=[f"of_out_L1L2_{j}_{i}" for j in range(n_rows)],
+            tile=Tile(i, 1),
+        )
+        for j in range(n_rows):
+            of_out_l1l2[j].append(col_fifos[j])
+
+    def core_fn(of_wts_in, of_act, of_out, kernel):
+        y_dim = height // (_KERNEL_SIZE * n_rows)
+        x_dim = width // _X_BLOCKS
+        elem_wts = of_wts_in.acquire(1)
+        for _ in range_(y_dim):
+            for _ in range_(_X_BLOCKS):
+                elem_in = of_act.acquire(1)
+                elem_out = of_out.acquire(1)
+                kernel(
+                    elem_in,
+                    elem_wts,
+                    elem_out,
+                    x_dim,
+                    _IN_CHANNELS,
+                    _SUB_OUT_CHANNELS,
+                    _KERNEL_SIZE,
+                    scale,
+                )
+                of_act.release(1)
+                of_out.release(1)
+        of_wts_in.release(1)
+
+    workers = Worker.grid(
+        n_rows,
+        n_cols,
+        lambda j, i: Worker(
+            core_fn,
+            [
+                of_wts[i].cons(),
+                of_act_l2l1[j].cons(),
+                of_out_l1l2[j][i].prod(),
+                conv_fn,
+            ],
+            tile=Tile(i, 2 + j),
+            stack_size=0xC00,
+        ),
+    )
+
+    def sequence(inp, W, out, act_prods, wts_prods, out_conses):
+        # Each row of workers reads its chunk of the activations act_repeat
+        # times; each column reads its chunk of the weights and writes its
+        # chunk of the output.
+        act_chunks = TensorAccessPattern.full((tensor_in_size,)).partition(n_rows)
+        wts_chunks = TensorAccessPattern.full((tensor_wts_size,)).partition(n_cols)
+        out_chunks = TensorAccessPattern.full((tensor_out_size,)).partition(n_cols)
+        for j in range(n_rows):
+            act_prods[j].fill(inp, act_chunks[j].repeat(act_repeat))
+        for i in range(n_cols):
+            wts_tap = wts_chunks[i]
+            out_tap = out_chunks[i]
+            wts_prods[i].fill(W, wts_tap)
+            out_conses[i].drain(out, out_tap, wait=True)
+
+    rt = Runtime(
+        sequence,
+        [
+            tensor_in_ty,
+            tensor_wts_ty,
+            tensor_out_ty,
+            [of_act_l3l2[j].prod() for j in range(n_rows)],
+            [of_wts[i].prod() for i in range(n_cols)],
+            [of_out_l2l3[i].cons() for i in range(n_cols)],
+        ],
+    )
+
+    return Program(
+        device, rt, workers=[w for row in workers for w in row]
+    ).resolve_program()
+
+
+def _make_argparser():
+    p = argparse.ArgumentParser(prog="AIE Conv2D 14x14 (aie2p)")
+    add_compile_args(p)
+    p.add_argument("-wd", "--width", type=int, default=896)
+    p.add_argument("-ht", "--height", type=int, default=896)
+    p.add_argument("--scale", type=int, default=14)
+    p.add_argument("--multi", action="store_true", help="32-core (8x4) variant")
+    return p
+
+
+def _compile_kwargs(opts):
+    return dict(width=opts.width, height=opts.height, scale=opts.scale)
+
+
+# Quantization scales used by the per-channel int8 conv reference.  Lifted
+# from test.py (kept in sync so this standalone path matches that harness).
+_CONV_SCALE = 1.9073e-06
+_INT8_SCALE = 0.03125
+
+
+def _run_and_verify(opts):
+    """CompileTime, run on NPU, and check against a torch Conv2d golden."""
+    design = conv2dk14_multi if opts.multi else conv2dk14
+    width, height, ksz = int(opts.width), int(opts.height), int(opts.scale)
+    ci, co = _IN_CHANNELS, _OUT_CHANNELS
+    height_out, width_out = height // ksz, width // ksz
+    co_group = co // _SUB_OUT_CHANNELS
+
+    # Single-core variant replicates the image co_group times in the input
+    # tensor; multi-core variant uses shim repeat and ships one image.
+    num_act = 1 if opts.multi else co_group
+
+    torch.manual_seed(0)
+    int_inp = torch.randint(0, 255, (1, ci, height, width)).float()
+    int_weight = torch.randint(2, 20, (co, ci, ksz, ksz)).float()
+
+    model = nn.Conv2d(ci, co, kernel_size=ksz, stride=ksz, padding=0, bias=False)
+    with torch.no_grad():
+        model.weight.copy_(int_weight)
+        out_int = model(int_inp)
+    out_quant = out_int * _CONV_SCALE
+    golden = (
+        (_INT8_SCALE * torch.clamp(torch.round(out_quant / _INT8_SCALE), -128, 127))
+        .squeeze(0)
+        .numpy()
+    )
+
+    ds = DataShaper()
+    int_inp_np = int_inp.squeeze(0).numpy().astype(np.uint8)
+    ifm_aie = ds.reorder_mat(int_inp_np, "YXC", "CYX")
+    ifm_flat = np.tile(ifm_aie, num_act).flatten()
+
+    int_weight_np = int_weight.numpy().astype(np.int8)
+    wts_aie = ds.reorder_mat(int_weight_np, "OYXIO8", "OIYX")
+    wts_flat = np.concatenate(wts_aie, axis=None).flatten()
+
+    in_t = iron.tensor(ifm_flat, dtype=np.uint8)
+    w_t = iron.tensor(wts_flat, dtype=np.int8)
+    out_size = co_group * height_out * width_out * _SUB_OUT_CHANNELS
+    o_t = iron.zeros(out_size, dtype=np.int8)
+
+    design(in_t, w_t, o_t, width=width, height=height, scale=ksz)
+
+    aie_raw = o_t.numpy().reshape(co_group, height_out, width_out, _SUB_OUT_CHANNELS)
+    aie_cyxd = ds.reorder_mat(aie_raw, "CDYX", "CYXD")
+    aie_out = aie_cyxd.reshape(co, height_out, width_out) * _INT8_SCALE
+
+    max_diff = float(np.max(np.abs(aie_out - golden)))
+    if np.allclose(aie_out, golden, rtol=0, atol=2 * _INT8_SCALE):
+        print(f"\nPASS! (max_abs_diff={max_diff:.4f})\n")
+    else:
+        print(f"\nFAILED (max_abs_diff={max_diff:.4f}, tol={2 * _INT8_SCALE:.4f})\n")
+        sys.exit(-1)
+
+
+def main():
+    opts = _make_argparser().parse_args()
+    design = conv2dk14_multi if opts.multi else conv2dk14
+    run_design_cli(
+        design,
+        opts,
+        compile_kwargs=_compile_kwargs,
+        run_and_verify=_run_and_verify,
+        device=lambda o: device_from_args(o, n_cols=8 if opts.multi else 1),
+    )
+
+
+if __name__ == "__main__":
+    main()

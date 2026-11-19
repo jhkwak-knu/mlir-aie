@@ -1,95 +1,188 @@
 #!/usr/bin/env bash
 ##===- utils/build-mlir-aie-from-wheels.sh - Build mlir-aie --*- Script -*-===##
-# 
-# This file licensed under the Apache License v2.0 with LLVM Exceptions.
-# See https://llvm.org/LICENSE.txt for license information.
+#
+# Copyright (C) 2022-2026 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 ##===----------------------------------------------------------------------===##
 #
 # This script builds mlir-aie given wheels installed <llvm mlir dir>.
-# which is usually ./my_install/mlir if installed from the 
-# ./utils/quick_setup.sh script.
+# which is usually ./my_install/mlir if installed from the
+# ./utils/env_install.sh script.
 # Assuming they are all in the same subfolder, it would look like:
 #
 # build-mlir-aie.sh <llvm mlir dir> <build dir> <install dir>
 #
-# e.g. build-mlir-aie-from-wheels.sh ./my_install/mlir 
+# e.g. build-mlir-aie-from-wheels.sh ./my_install/mlir
 #
 # <build dir>    - optional, mlir-aie/build dir name, default is 'build'
 # <install dir>  - optional, mlir-aie/install dir name, default is 'install'
 #
+# Optional 4th positional arg / environment:
+#
+# <peano dir>              - optional 4th arg, Peano (llvm-aie) install dir;
+#                           default: located via 'pip show llvm-aie'
+#
+# Environment variables picked up by this script:
+#
+#   BUILD_TYPE                    CMake build type. Default: Release
+#   LLVM_ENABLE_RTTI              ON/OFF. Default: OFF
+#   COMPILE_JOBS=N                Cap parallel compiles (job pool, generation).
+#   LINK_JOBS=N                   Cap parallel links (job pool, generation).
+#   CMAKE_BUILD_PARALLEL_LEVEL=N  Overall -j at build time (cmake --build).
+#   EXTRA_CMAKE_ARGS="..."        Extra -D options appended last for overrides.
+#
 ##===----------------------------------------------------------------------===##
 
-if [ "$#" -lt 1 ]; then
+# Windows (Git-for-Windows/MSYS) bash: gate off Linux-only assumptions.
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) IS_WINDOWS=1 ;;
+  *) IS_WINDOWS=0 ;;
+esac
+
+# On Windows rewrite MSYS /c/... to CMake's C:/... form; pass through on Linux.
+winpath() {
+  if [ "$IS_WINDOWS" = "1" ] && [ -n "$1" ]; then cygpath -m "$1"; else printf '%s' "$1"; fi
+}
+
+# Stamp unpacked wheel files to a fixed past time (see below).
+stamp_mlir_past() {
+  if [ "$IS_WINDOWS" = "1" ]; then
+    # find -exec touch blows MSYS's env-block limit; one python pass instead.
+    python -c "import os, pathlib; ts = 1314108314; [os.utime(p, (ts, ts)) for p in pathlib.Path('mlir').rglob('*')]"
+  else
+    find mlir -exec touch -a -m -t 201108231405.14 {} \;
+  fi
+}
+
+if [ "$#" -lt 1 ] || [ -z "$1" ]; then
     VERSION=$(utils/clone-llvm.sh --get-wheel-version)
 
     mkdir -p my_install
     pushd my_install
-    pip -q download mlir==$VERSION \
+    python3 -m pip -q download mlir==$VERSION \
       -f https://github.com/Xilinx/mlir-aie/releases/expanded_assets/mlir-distro
     unzip -q -u mlir-*.whl
+    # The system clock on GHA containers is sometimes ~12 hours ahead, so the
+    # freshly unzipped wheel ends up with files whose timestamps are in the
+    # future. That makes ninja loop forever when configuring. Stamp them to an
+    # arbitrary time in the past to be safe.
+    stamp_mlir_past
     popd
-    WHL_MLIR_DIR=`realpath my_install/mlir`
+    WHL_MLIR_DIR=$(winpath "$(realpath my_install/mlir)")
     echo "WHL_MLIR DIR: $WHL_MLIR_DIR"
-else 
-    WHL_MLIR_DIR=`realpath $1`
+else
+    WHL_MLIR_DIR=$(winpath "$(realpath "$1")")
     echo "WHL_MLIR DIR: $WHL_MLIR_DIR"
 fi
 
 BASE_DIR=`realpath $(dirname $0)/..`
-CMAKEMODULES_DIR=$BASE_DIR/cmake
+CMAKEMODULES_DIR=$(winpath "$BASE_DIR/cmake")
 echo "CMAKEMODULES_DIR: $CMAKEMODULES_DIR"
 
 BUILD_DIR=${2:-"build"}
 INSTALL_DIR=${3:-"install"}
-LLVM_ENABLE_RTTI=${LLVM_ENABLE_RTTI:OFF}
+LLVM_ENABLE_RTTI=${LLVM_ENABLE_RTTI:-OFF}
 
 if [ "$#" -ge 4 ]; then
-  PEANO_INSTALL_DIR=`realpath $4`
+  PEANO_INSTALL_DIR=$(winpath "$(realpath "$4")")
   echo "PEANO_INSTALL_DIR DIR: $PEANO_INSTALL_DIR"
   export PEANO_INSTALL_DIR=${PEANO_INSTALL_DIR}
 else
-  python3 -m pip install llvm-aie -f https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly
-  export PEANO_INSTALL_DIR="$(pip show llvm-aie | grep ^Location: | awk '{print $2}')/llvm-aie"
+  PEANO_LOCATION=$(pip show llvm-aie 2>/dev/null | awk '/^Location:/ {print $2}')
+  if [ -z "$PEANO_LOCATION" ]; then
+    echo "ERROR: llvm-aie (Peano) is not installed; the Python environment isn't set up." >&2
+    echo "       Install it first with: source utils/env_install.sh <venv-dir> [--dev]" >&2
+    echo "       Or pass an existing Peano install dir as the 4th argument to this script." >&2
+    exit 1
+  fi
+  export PEANO_INSTALL_DIR=$(winpath "${PEANO_LOCATION}/llvm-aie")
   echo "PEANO_INSTALL_DIR DIR: $PEANO_INSTALL_DIR"
-  export PEANO_INSTALL_DIR=${PEANO_INSTALL_DIR}
 fi
+
+BUILD_TYPE="${BUILD_TYPE:-Release}"
 
 mkdir -p $BUILD_DIR
 mkdir -p $INSTALL_DIR
 cd $BUILD_DIR
-#set -o pipefail
+set -o pipefail
 #set -e
 
-CMAKE_CONFIGS="\
-    -GNinja \
-    -DCMAKE_PREFIX_PATH=${WHL_MLIR_DIR} \
-    -DVITIS_VPP=$(which  v++) \
-    -DCMAKE_MODULE_PATH=${CMAKEMODULES_DIR}/modulesXilinx \
-    -DLLVM_EXTERNAL_LIT=$(which lit) \
-    -DCMAKE_INSTALL_PREFIX="../${INSTALL_DIR}" \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DLLVM_ENABLE_ASSERTIONS=ON \
-    -DAIE_ENABLE_BINDINGS_PYTHON=ON \
-    -DLLVM_ENABLE_RTTI=$LLVM_ENABLE_RTTI \
-    -DAIE_VITIS_COMPONENTS=AIE2;AIE2P \
-    -DAIE_RUNTIME_TARGETS=x86_64 \
-    -DAIE_RUNTIME_TEST_TARGET=x86_64 "
+# Build the -D list as an array so paths with spaces survive as single args.
+CMAKE_CONFIGS=(
+    -GNinja
+    -DCMAKE_PREFIX_PATH="${WHL_MLIR_DIR}"
+    -DCMAKE_MODULE_PATH="${CMAKEMODULES_DIR}/modulesXilinx"
+    -DLLVM_EXTERNAL_LIT="$(winpath "$(which lit)")"
+    -DCMAKE_INSTALL_PREFIX="../${INSTALL_DIR}"
+    -DCMAKE_BUILD_TYPE="${BUILD_TYPE}"
+    -DLLVM_ENABLE_ASSERTIONS=ON
+    -DAIE_ENABLE_BINDINGS_PYTHON=ON
+    -DLLVM_ENABLE_RTTI="$LLVM_ENABLE_RTTI"
+    "-DAIE_VITIS_COMPONENTS=AIE2;AIE2P"
+    -DAIE_RUNTIME_TARGETS=x86_64
+    -DAIE_RUNTIME_TEST_TARGET=x86_64
+    -DPEANO_INSTALL_DIR="${PEANO_INSTALL_DIR}"
+)
 
-CMAKE_CONFIGS="${CMAKE_CONFIGS} -DPEANO_INSTALL_DIR=${PEANO_INSTALL_DIR}"
+# Vitis (v++) is Linux-only; skip the flag when it's absent (e.g. Windows).
+if command -v v++ >/dev/null 2>&1; then
+  CMAKE_CONFIGS+=(-DVITIS_VPP="$(winpath "$(which v++)")")
+fi
 
 if [ -x "$(command -v lld)" ]; then
-  CMAKE_CONFIGS="${CMAKE_CONFIGS} -DLLVM_USE_LINKER=lld"
+  CMAKE_CONFIGS+=(-DLLVM_USE_LINKER=lld)
 fi
 
+# LLVM_CCACHE_BUILD is declared and acted on in llvm/CMakeLists.txt, LLVM's
+# top-level project file, not in HandleLLVMOptions.cmake, which is what a
+# standalone consumer includes.  Building mlir-aie against the MLIR wheels never
+# reaches that file, so the option was silently dropped and CMake said so on
+# every build ("Manually-specified variables were not used by the project:
+# LLVM_CCACHE_BUILD").  Set the launcher directly, which is the portable
+# spelling and the one this repo's own workflows already use.
 if [ -x "$(command -v ccache)" ]; then
-  CMAKE_CONFIGS="${CMAKE_CONFIGS} -DLLVM_CCACHE_BUILD=ON"
+  CMAKE_CONFIGS+=(-DCMAKE_C_COMPILER_LAUNCHER=ccache)
+  CMAKE_CONFIGS+=(-DCMAKE_CXX_COMPILER_LAUNCHER=ccache)
+  echo "ccache: using $(command -v ccache)"
+else
+  # Say so. A runner missing ccache recompiles every object on every build and
+  # nothing in the log distinguishes that from a cold cache.
+  echo "ccache: not found on PATH, building without a compiler cache"
 fi
 
-cmake $CMAKE_CONFIGS .. 2>&1 | tee cmake.log
-ninja 2>&1 | tee mlir-aie-ninja.log
-ninja install 2>&1 | tee mlir-aie-ninja-install.log
+# Do not use LLVM_PARALLEL_{COMPILE,LINK}_JOBS: HandleLLVMOptions is included
+# several times in this tree, so those append duplicate pools.
+POOLS=""
+if [ -n "${COMPILE_JOBS}" ]; then
+  POOLS="compile=${COMPILE_JOBS}"
+  CMAKE_CONFIGS+=(-DCMAKE_JOB_POOL_COMPILE=compile)
+fi
+if [ -n "${LINK_JOBS}" ]; then
+  POOLS="${POOLS:+${POOLS};}link=${LINK_JOBS}"
+  CMAKE_CONFIGS+=(-DCMAKE_JOB_POOL_LINK=link)
+fi
+if [ -n "${POOLS}" ]; then
+  CMAKE_CONFIGS+=("-DCMAKE_JOB_POOLS=${POOLS}")
+fi
+
+# Allow callers (e.g. CI) to inject additional -D options without editing this
+# script. Appended last so they can override the defaults above. Values with
+# spaces can't survive this flat env var; callers must pass space-free paths.
+if [ -n "${EXTRA_CMAKE_ARGS}" ]; then
+  read -ra _extra_cmake_args <<< "${EXTRA_CMAKE_ARGS}"
+  CMAKE_CONFIGS+=("${_extra_cmake_args[@]}")
+fi
+
+cmake "${CMAKE_CONFIGS[@]}" .. 2>&1 | tee cmake.log
 success=$?
+if [ ${success} -eq 0 ]; then
+    cmake --build . 2>&1 | tee cmake-build.log
+    success=$?
+fi
+if [ ${success} -eq 0 ]; then
+    cmake --build . --target install 2>&1 | tee cmake-install.log
+    success=$?
+fi
 
 if [ ${success} -ne 0 ]
 then
@@ -97,5 +190,5 @@ then
     rm -rf ${BUILD_DIR}/*
     popd; exit 4
 fi
- 
+
 exit 0

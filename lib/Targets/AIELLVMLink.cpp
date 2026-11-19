@@ -1,10 +1,8 @@
 //===- LLVMLink.cpp ---------------------------------------------*- C++ -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2021-2022 Xilinx, Inc.
+// Copyright (C) 2022-2023 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2021 Xilinx Inc.
 //
 //===----------------------------------------------------------------------===//
 
@@ -63,10 +61,11 @@ static std::unique_ptr<Module> loadFile(std::unique_ptr<MemoryBuffer> Buffer,
   return Result;
 }
 
-mlir::LogicalResult linkFiles(std::vector<std::string> Files,
-                              LLVMContext &Context, Linker &L, unsigned Flags,
-                              bool DisableDITypeMap, bool NoVerify,
-                              bool Internalize, bool Verbose) {
+static mlir::LogicalResult linkFiles(const std::vector<std::string> &Files,
+                                     LLVMContext &Context, Linker &L,
+                                     unsigned Flags, bool DisableDITypeMap,
+                                     bool NoVerify, bool Internalize,
+                                     bool Verbose) {
   // Filter out flags that don't apply to the first file we load.
   unsigned ApplicableFlags = Flags & Linker::Flags::OverrideFromSrc;
   // Similar to some flags, internalization doesn't apply to the first file.
@@ -119,11 +118,10 @@ mlir::LogicalResult linkFiles(std::vector<std::string> Files,
   return mlir::success();
 }
 
-mlir::LogicalResult
-xilinx::AIE::AIELLVMLink(llvm::raw_ostream &output,
-                         std::vector<std::string> Files, bool DisableDITypeMap,
-                         bool NoVerify, bool Internalize, bool OnlyNeeded,
-                         bool PreserveAssemblyUseListOrder, bool Verbose) {
+mlir::LogicalResult xilinx::AIE::AIELLVMLink(
+    llvm::raw_ostream &output, const std::vector<std::string> &Files,
+    bool DisableDITypeMap, bool NoVerify, bool Internalize, bool OnlyNeeded,
+    bool PreserveAssemblyUseListOrder, bool Verbose) {
   LLVMContext Context;
 
   if (!DisableDITypeMap)

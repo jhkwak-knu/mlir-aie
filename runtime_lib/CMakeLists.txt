@@ -1,13 +1,11 @@
 #
-# This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-# See https://llvm.org/LICENSE.txt for license information.
+# Copyright (C) 2021-2022 Xilinx, Inc.
+# Copyright (C) 2022-2026 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #
-# (c) Copyright 2021 Xilinx Inc.
 
 # cmake needs this line
-cmake_minimum_required(VERSION 3.20.1)
-
+cmake_minimum_required(VERSION 3.30)
 set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -15,13 +13,11 @@ include(ExternalProject)
 
 project("runtime-libs")
 
+include("xaiengine/aiert.cmake")
+
 set(AIE_RUNTIME_TEST_TARGET_VAL ${AIR_RUNTIME_TEST_TARGET})
 if(NOT x86_64_TOOLCHAIN_FILE)
   set(x86_64_TOOLCHAIN_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/toolchainFiles/toolchain_x86_64.cmake")
-endif()
-# For now, using the same toolchain file for x86_64 and HSA, can seperate if needed
-if(NOT x86_64-hsa_TOOLCHAIN_FILE)
-  set(x86_64-hsa_TOOLCHAIN_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/toolchainFiles/toolchain_x86_64.cmake")
 endif()
 if(NOT aarch64_TOOLCHAIN_FILE)
   if(SysrootAarch64)
@@ -45,23 +41,29 @@ foreach(target ${AIE_RUNTIME_TARGETS})
   message("Building AIE runtime for ${target} with TOOLCHAIN=${${target}_TOOLCHAIN_FILE}")
 
   # xaiengine
+  set(testLibDependsOnXaiengine)
   if (DEFINED LibXAIE_${target}_DIR)
     message("Using xaiengine from LibXAIE_${target}_DIR=${LibXAIE_${target}_DIR}.")
     set(LibXAIE_ROOT ${LibXAIE_${target}_DIR})
     find_package(LibXAIE REQUIRED)
     message(STATUS "FOUND LibXAIE: ${LibXAIE_FOUND}, XILINX_XAIE_LIB_DIR: ${XILINX_XAIE_LIB_DIR}, XILINX_XAIE_INCLUDE_DIR: ${XILINX_XAIE_INCLUDE_DIR}")
 
-  elseif (DEFINED VITIS_AIETOOLS_DIR)
-  
-    # if no LibXAIE_{target}_DIR specified, build xaiengine_${target} from Vitis
-    message("LibXAIE_${target}_DIR not specified: Building xaiengine for ${target} from aietools at ${VITIS_AIETOOLS_DIR}.") 
-    set(LibXAIE_FOUND TRUE)
-    set(XILINX_XAIE_INCLUDE_DIR ${VITIS_AIETOOLS_DIR}/include/drivers/aiengine)
-    set(XILINX_XAIE_LIBS ${VITIS_AIETOOLS_DIR}/lib/lnx64.o/libxaiengine.so)
+  else()
+    if (WIN32)
+      message("LibXAIE_${target}_DIR not specified: building bundled xaiengine for ${target}.")
+      set(LibXAIE_FOUND TRUE)
+      set(XILINX_XAIE_INCLUDE_DIR ${CMAKE_CURRENT_BINARY_DIR}/${target}/xaiengine/include)
+      set(XILINX_XAIE_LIBS ${CMAKE_CURRENT_BINARY_DIR}/${target}/xaiengine/lib/xaiengine.lib)
+    else()
+      message("LibXAIE_${target}_DIR not specified: Building xaiengine for ${target} from aietools at ${VITIS_AIETOOLS_DIR}.")
+      set(LibXAIE_FOUND TRUE)
+      set(XILINX_XAIE_INCLUDE_DIR ${CMAKE_CURRENT_BINARY_DIR}/${target}/xaiengine/include)
+      set(XILINX_XAIE_LIBS ${CMAKE_CURRENT_BINARY_DIR}/${target}/xaiengine/lib/libxaienginecdo.so)
+    endif()
 
   endif()
 
-  if (LibXAIE_FOUND)
+  if ((NOT WIN32 AND LibXAIE_FOUND) OR (WIN32 AND NOT DEFINED LibXAIE_${target}_DIR AND LibXAIE_FOUND))
     set(testLibDependsOnXaiengine xaiengine_${target}-build)
     ExternalProject_Add(xaiengine_${target}
       PREFIX ${CMAKE_CURRENT_BINARY_DIR}/xaiengineTmp/${target}
@@ -74,8 +76,6 @@ foreach(target ${AIE_RUNTIME_TARGETS})
           -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
           -DCMAKE_INSTALL_PREFIX=${CMAKE_INSTALL_PREFIX}
           -DAIE_RUNTIME_TARGET=${target}
-          -DAIERT_INCLUDE_DIR=${XILINX_XAIE_INCLUDE_DIR}
-          -DAIERT_LIBS=${XILINX_XAIE_LIBS}
           -DVITIS_ROOT=${VITIS_ROOT}
           -DVITIS_AIETOOLS_DIR=${VITIS_AIETOOLS_DIR}
           -DVitis_VERSION_MAJOR=${Vitis_VERSION_MAJOR}
@@ -95,7 +95,18 @@ foreach(target ${AIE_RUNTIME_TARGETS})
   endif()
 
   # test_lib
+  # On Windows, only stage the test_utils interface payload.
+  set(enableTestLibProject OFF)
   if (DEFINED VITIS_ROOT OR DEFINED LibXAIE_${target}_DIR)
+    set(enableTestLibProject ON)
+  elseif (NOT WIN32 AND TARGET xaiengine_${target})
+    # test_lib's dependency is xaiengine, not Vitis.
+    set(enableTestLibProject ON)
+  elseif (WIN32 AND ${target} STREQUAL "x86_64" AND NOT DEFINED LibXAIE_${target}_DIR AND LibXAIE_FOUND)
+    set(enableTestLibProject ON)
+  endif()
+
+  if (enableTestLibProject)
     message(STATUS "setting up test_lib")
     ExternalProject_Add(test_lib_${target}
       PREFIX ${CMAKE_CURRENT_BINARY_DIR}/test_libTmp/${target}
@@ -103,18 +114,17 @@ foreach(target ${AIE_RUNTIME_TARGETS})
       BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/${target}/test_lib/lib
       CMAKE_CACHE_ARGS
           -DCMAKE_MODULE_PATH:STRING=${CMAKE_MODULE_PATH}
+          # test_lib's find_package(XRT) is optional, but a broken system XRT
+          # package raises FATAL_ERROR from inside its own config file, which
+          # QUIET does not suppress.
+          -DCMAKE_DISABLE_FIND_PACKAGE_XRT:BOOL=${CMAKE_DISABLE_FIND_PACKAGE_XRT}
       CMAKE_ARGS
           -DCMAKE_TOOLCHAIN_FILE=${${target}_TOOLCHAIN_FILE}
           -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
           -DCMAKE_INSTALL_PREFIX=${CMAKE_INSTALL_PREFIX}
           -DAIE_RUNTIME_TARGET=${target}
           -DLibXAIE_INC_DIR=${XILINX_XAIE_INCLUDE_DIR}
-          -DVITIS_ROOT=${VITIS_ROOT}
-          -DVITIS_AIETOOLS_DIR=${VITIS_AIETOOLS_DIR}
           -DXRT_ROOT=${XRT_ROOT}
-          -DSysroot=${Sysroot}
-          -Dhsa-runtime64_DIR=${hsa-runtime64_DIR}
-          -Dhsakmt_DIR=${hsakmt_DIR}
       DEPENDS ${testLibDependsOnXaiengine}
       BUILD_ALWAYS true
       STEP_TARGETS clean build install test
@@ -128,30 +138,36 @@ foreach(target ${AIE_RUNTIME_TARGETS})
   endif()
 endforeach()
 
-include("xaiengine/aiert.cmake")
-set(XAIE_SOURCE_DIR "../third_party/aie-rt/driver/src")
+set(XAIE_SOURCE_DIR "../third_party/aie-codegen/src")
 set(BOOTGEN_SOURCE_DIR ${PROJECT_SOURCE_DIR}/../third_party/bootgen)
 
 add_aiert_headers(xaienginecdo_static
         ${XAIE_SOURCE_DIR}
-        ${AIE_BINARY_DIR}/include
-        ${CMAKE_INSTALL_PREFIX}/include/xaiengine
+        ${AIE_BINARY_DIR}/include/xaienginecdo_static
+        ${CMAKE_INSTALL_PREFIX}/include/xaienginecdo_static
 )
 add_aiert_library(xaienginecdo_static ${XAIE_SOURCE_DIR} STATIC)
 
 target_link_libraries(xaienginecdo_static PRIVATE cdo_driver_mlir_aie)
-target_compile_definitions(xaienginecdo_static PRIVATE -D__AIECDO__ -D__AIEDEBUG__)
+if(WIN32)
+  # The Windows bundled aie-codegen path excludes xaie_sim.c
+  # Avoid pulling in SimBackend via __AIEDEBUG__
+  target_compile_definitions(xaienginecdo_static PRIVATE -D__AIECDO__)
+else()
+  target_compile_definitions(xaienginecdo_static PRIVATE -D__AIECDO__ -D__AIEDEBUG__)
+endif()
 
 # just to make cmake happy since AIETargets will need to re-export
 # make sure not abs path...
 # https://github.com/Kitware/CMake/blob/16b1f0c3e99023316b12fdabd1980a18b738d942/Source/cmExportInstallFileGenerator.cxx#L224
 install(TARGETS xaienginecdo_static DESTINATION lib EXPORT xaienginecdo_static)
 install(EXPORT xaienginecdo_static DESTINATION lib/cmake/aie)
+target_include_directories(xaienginecdo_static SYSTEM PRIVATE ${BOOTGEN_SOURCE_DIR}/cdo-driver)
 
-include("aie_api/aieapi.cmake")
-set(AIEAPI_SOURCE_DIR "../third_party/aie_api/include/aie_api")
-add_aie_api_headers(${AIEAPI_SOURCE_DIR}
+include("${AIE_SOURCE_DIR}/cmake/install_headers.cmake")
+set(AIEAPI_SOURCE_DIR "${AIE_SOURCE_DIR}/third_party/aie_api/include/aie_api")
+install_headers(${AIEAPI_SOURCE_DIR}
         ${AIE_BINARY_DIR}/include
         ${CMAKE_INSTALL_PREFIX}/include
+        "aie_api"
 )
-

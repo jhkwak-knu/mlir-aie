@@ -1,11 +1,8 @@
 //===- memory_allocator.h ---------------------------------------*- C++ -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2020-2022 Xilinx, Inc.
+// Copyright (C) 2023 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2020 Xilinx Inc.
-// (c) Copyright 2023 Advanced Micro Devices, Inc.
 //
 //===----------------------------------------------------------------------===//
 
@@ -34,14 +31,7 @@
 /***************************** Macro Definitions *****************************/
 #define XAIE_128BIT_ALIGN_MASK 0xFF
 
-/**
- * This is the memory function to allocate a memory
- *
- * @param	handle: Device Instance
- * @param	size: Size of the memory
- *
- * @return	Pointer to the allocated memory instance.
- *******************************************************************************/
+// Allocate memory for the AIE device
 int *mlir_aie_mem_alloc(struct aie_libxaie_ctx_t *ctx, ext_mem_model_t &handle,
                         int size) {
   int RC;
@@ -106,7 +96,7 @@ int *mlir_aie_mem_alloc(struct aie_libxaie_ctx_t *ctx, ext_mem_model_t &handle,
 
   Ret = ioctl(Fd, ION_IOC_ALLOC, &AllocArgs);
   if (Ret != 0) {
-    XAIE_ERROR("Failed to allocate memory of %lu bytes\n");
+    XAIE_ERROR("Failed to allocate memory of %d bytes\n", size);
     goto error_ion;
   }
 
@@ -121,7 +111,7 @@ int *mlir_aie_mem_alloc(struct aie_libxaie_ctx_t *ctx, ext_mem_model_t &handle,
   handle.size = size;
 
   // Map the memory
-  if (XAie_MemAttach(&(ctx->DevInst), &(handle.MemInst), DevAddr, (u64)VAddr,
+  if (XAie_MemAttach(ctx->XAieDevInst, &(handle.MemInst), DevAddr, (u64)VAddr,
                      size, XAIE_MEM_NONCACHEABLE, handle.fd) != XAIE_OK) {
     XAIE_ERROR("dmabuf map failed\n");
     goto error_map;
@@ -139,19 +129,20 @@ error_ion:
   return NULL;
 }
 
-/*****************************************************************************/
-/**
- *
- * This is function to attach the allocated memory descriptor to kernel driver
- *
- * @param	IOInst: Linux IO instance pointer
- * @param	MemInst: Linux Memory instance pointer.
- *
- * @return	XAIE_OK on success, Error code on failure.
- *
- * @note		Internal only.
- *
- *******************************************************************************/
+// /*****************************************************************************/
+// /**
+//  *
+//  * This is function to attach the allocated memory descriptor to kernel
+//  driver
+//  *
+//  * @param	IOInst: Linux IO instance pointer
+//  * @param	MemInst: Linux Memory instance pointer.
+//  *
+//  * @return	XAIE_OK on success, Error code on failure.
+//  *
+//  * @note		Internal only.
+//  *
+//  *******************************************************************************/
 // static int _XAie_LinuxMemDetach(XAie_LinuxIO *IOInst, XAie_LinuxMem *MemInst)
 // {
 // 	int Ret;
@@ -166,18 +157,18 @@ error_ion:
 // 	return XAIE_OK;
 // }
 
-/*****************************************************************************/
-/**
- *
- * This is the memory function to free the memory
- *
- * @param	MemInst: Memory instance pointer.
- *
- * @return	XAIE_OK on success, Error code on failure.
- *
- * @note		Internal only.
- *
- *******************************************************************************/
+// /*****************************************************************************/
+// /**
+//  *
+//  * This is the memory function to free the memory
+//  *
+//  * @param	MemInst: Memory instance pointer.
+//  *
+//  * @return	XAIE_OK on success, Error code on failure.
+//  *
+//  * @note		Internal only.
+//  *
+//  *******************************************************************************/
 // static int XAie_LinuxMemFree(XAie_MemInst *MemInst)
 // {
 // 	int RC;
@@ -198,18 +189,7 @@ error_ion:
 // 	return XAIE_OK;
 // }
 
-/*****************************************************************************/
-/**
- *
- * This is the memory function to sync the memory for CPU.
- *
- * @param	MemInst: Memory instance pointer.
- *
- * @return	XAIE_OK on success, Error code on failure.
- *
- * @note		Internal only.
- *
- *******************************************************************************/
+// Sync the memory for CPU
 void mlir_aie_sync_mem_cpu(ext_mem_model_t &handle) {
   struct dma_buf_sync Sync;
   int Ret;
@@ -225,18 +205,7 @@ void mlir_aie_sync_mem_cpu(ext_mem_model_t &handle) {
   // return XAIE_OK;
 }
 
-/*****************************************************************************/
-/**
- *
- * This is the memory function to sync the memory for Device.
- *
- * @param	MemInst: Memory instance pointer.
- *
- * @return	XAIE_OK on success, Error code on failure.
- *
- * @note		Internal only.
- *
- *******************************************************************************/
+// Sync the memory for Device
 void mlir_aie_sync_mem_dev(ext_mem_model_t &handle) {
   struct dma_buf_sync Sync;
   int Ret;

@@ -1,10 +1,8 @@
 //===- AIEAssignLockIDs.cpp -------------------------------------*- C++ -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2022 Xilinx, Inc.
+// Copyright (C) 2022-2026 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2022 Xilinx Inc.
 //
 //===----------------------------------------------------------------------===//
 
@@ -21,13 +19,19 @@
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/DenseMap.h"
 
+namespace xilinx::AIE {
+#define GEN_PASS_DEF_AIEASSIGNLOCKIDS
+#include "aie/Dialect/AIE/Transforms/AIEPasses.h.inc"
+} // namespace xilinx::AIE
+
 #define DEBUG_TYPE "aie-assign-lock-ids"
 
 using namespace mlir;
 using namespace xilinx;
 using namespace xilinx::AIE;
 
-struct AIEAssignLockIDsPass : AIEAssignLockIDsBase<AIEAssignLockIDsPass> {
+struct AIEAssignLockIDsPass
+    : xilinx::AIE::impl::AIEAssignLockIDsBase<AIEAssignLockIDsPass> {
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<func::FuncDialect>();
     registry.insert<AIEDialect>();

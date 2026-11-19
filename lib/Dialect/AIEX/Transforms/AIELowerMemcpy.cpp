@@ -1,10 +1,8 @@
 //===- AIELowerMemcpy.cpp ---------------------------------------*- C++ -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2019-2022 Xilinx, Inc.
+// Copyright (C) 2022-2026 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2019 Xilinx Inc.
 //
 //===----------------------------------------------------------------------===//
 
@@ -13,6 +11,7 @@
 #include "aie/Dialect/AIEX/IR/AIEXDialect.h"
 #include "aie/Dialect/AIEX/Transforms/AIEXPasses.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Attributes.h"
@@ -22,6 +21,11 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Tools/mlir-translate/MlirTranslateMain.h"
 #include "mlir/Transforms/DialectConversion.h"
+
+namespace xilinx::AIEX {
+#define GEN_PASS_DEF_AIELOWERMEMCPY
+#include "aie/Dialect/AIEX/Transforms/AIEXPasses.h.inc"
+} // namespace xilinx::AIEX
 
 using namespace mlir;
 using namespace xilinx;
@@ -41,9 +45,10 @@ struct LowerAIEMemcpy : public OpConversionPattern<MemcpyOp> {
   LowerAIEMemcpy(MLIRContext *context, PatternBenefit benefit = 1)
       : OpConversionPattern<MemcpyOp>(context, benefit) {}
 
-  void createDMABlocksAndOps(MemOp &mem, StringRef tokenName, int acquireTknVal,
-                             int releaseTknVal, Value buf, int offset, int len,
-                             DMAChannelDir dmaDir, int channelIndex,
+  void createDMABlocksAndOps(MemOp &mem, Location loc, StringRef tokenName,
+                             int acquireTknVal, int releaseTknVal, Value buf,
+                             int offset, int len, DMAChannelDir dmaDir,
+                             int channelIndex,
                              ConversionPatternRewriter &rewriter) const {
 
     Region &r = mem.getBody();
@@ -52,20 +57,21 @@ struct LowerAIEMemcpy : public OpConversionPattern<MemcpyOp> {
     Block *bdBlock = rewriter.createBlock(&endBlock);
 
     rewriter.setInsertionPointToStart(dmaBlock);
-    rewriter.create<DMAStartOp>(rewriter.getUnknownLoc(), dmaDir, channelIndex,
-                                /*repeatCount*/ 0, bdBlock, &endBlock);
+    DMAStartOp::create(rewriter, loc, dmaDir, channelIndex,
+                       /*repeat_count*/ 0, /*pad_value*/ 0,
+                       /*out_of_order*/ false, bdBlock, &endBlock);
 
     // Setup bd Block
     // It should contain locking operations (lock or token) as well as DMABD op
     // for specifying DMA Block description (which buffer type (A/B), transfer
     // length/address, etc.)
     rewriter.setInsertionPointToStart(bdBlock);
-    rewriter.create<UseTokenOp>(rewriter.getUnknownLoc(), tokenName,
-                                acquireTknVal, LockAction::Acquire);
-    rewriter.create<DMABDOp>(rewriter.getUnknownLoc(), buf, offset, len);
-    rewriter.create<UseTokenOp>(rewriter.getUnknownLoc(), tokenName,
-                                releaseTknVal, LockAction::Release);
-    rewriter.create<NextBDOp>(rewriter.getUnknownLoc(), &endBlock);
+    UseTokenOp::create(rewriter, loc, tokenName, acquireTknVal,
+                       LockAction::Acquire);
+    DMABDOp::create(rewriter, loc, buf, offset, len);
+    UseTokenOp::create(rewriter, loc, tokenName, releaseTknVal,
+                       LockAction::Release);
+    NextBDOp::create(rewriter, loc, &endBlock);
   }
 
   LogicalResult
@@ -85,19 +91,20 @@ struct LowerAIEMemcpy : public OpConversionPattern<MemcpyOp> {
     MemOp srcMem = srcTileOp(op).getMemOp();
     MemOp dstMem = dstTileOp(op).getMemOp();
 
-    createDMABlocksAndOps(srcMem, tokenName, acquireTknVal, releaseTknVal,
-                          srcBuf, srcOffset, srcLen, DMAChannelDir::MM2S, 0,
-                          rewriter);
-    createDMABlocksAndOps(dstMem, tokenName, acquireTknVal, releaseTknVal,
-                          dstBuf, dstOffset, dstLen, DMAChannelDir::S2MM, 0,
-                          rewriter);
+    createDMABlocksAndOps(srcMem, op.getLoc(), tokenName, acquireTknVal,
+                          releaseTknVal, srcBuf, srcOffset, srcLen,
+                          DMAChannelDir::MM2S, 0, rewriter);
+    createDMABlocksAndOps(dstMem, op.getLoc(), tokenName, acquireTknVal,
+                          releaseTknVal, dstBuf, dstOffset, dstLen,
+                          DMAChannelDir::S2MM, 0, rewriter);
 
     rewriter.eraseOp(op);
     return success();
   }
 };
 
-struct AIELowerMemcpyPass : public AIELowerMemcpyBase<AIELowerMemcpyPass> {
+struct AIELowerMemcpyPass
+    : public xilinx::AIEX::impl::AIELowerMemcpyBase<AIELowerMemcpyPass> {
   void runOnOperation() override {
 
     DeviceOp device = getOperation();
@@ -113,21 +120,21 @@ struct AIELowerMemcpyPass : public AIELowerMemcpyBase<AIELowerMemcpyPass> {
     DenseMap<Value, int> destChannel;
     for (auto op : device.getOps<MemcpyOp>()) {
       builder.setInsertionPoint(op);
-      TileOp srcTile = dyn_cast<TileOp>(op.getSrcTile().getDefiningOp());
-      TileOp dstTile = dyn_cast<TileOp>(op.getDstTile().getDefiningOp());
+      TileOp srcTile = cast<TileOp>(op.getSrcTile().getDefiningOp());
+      TileOp dstTile = cast<TileOp>(op.getDstTile().getDefiningOp());
       // TODO: perhaps a better approach is to not assert here, but rather have
       // a subsequent pass that legally relocates the ports
       assert(destChannel[op.getDstTile()] <= 2 &&
              "Could not allocate more than two dest. channel when creating "
              "FlowOp");
-      builder.create<FlowOp>(builder.getUnknownLoc(), srcTile, WireBundle::DMA,
-                             0, dstTile, WireBundle::DMA,
-                             destChannel[op.getDstTile()]);
+      FlowOp::create(builder, op.getLoc(), srcTile, WireBundle::DMA, 0, dstTile,
+                     WireBundle::DMA, destChannel[op.getDstTile()]);
       destChannel[op.getDstTile()]++;
     }
 
     ConversionTarget target(getContext());
     RewritePatternSet patterns(&getContext());
+    target.addLegalDialect<arith::ArithDialect>();
     target.addLegalOp<DMAStartOp>();
     target.addLegalOp<DMABDOp>();
     target.addLegalOp<UseTokenOp>();

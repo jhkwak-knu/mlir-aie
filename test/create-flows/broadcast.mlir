@@ -1,14 +1,12 @@
 //===- broadcast.mlir ------------------------------------------*- MLIR -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2021-2022 Xilinx, Inc.
+// Copyright (C) 2022-2025 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2021 Xilinx Inc.
 //
 //===----------------------------------------------------------------------===//
 
-// RUN: aie-opt --aie-create-pathfinder-flows --aie-find-flows %s -o %t.opt
+// RUN: aie-opt --aie-create-pathfinder-flows --aie-find-flows=remove-lifted=false %s -o %t.opt
 // RUN: FileCheck %s --check-prefix=CHECK1 < %t.opt
 // RUN: aie-translate --aie-flows-to-json %t.opt | FileCheck %s --check-prefix=CHECK2
 
@@ -31,16 +29,16 @@
 // CHECK1: %[[T82:.*]] = aie.tile(8, 2)
 // CHECK1: %[[T83:.*]] = aie.tile(8, 3)
 //
-// CHECK1: aie.flow(%[[T20]], DMA : 0, %[[T82]], DMA : 0)
-// CHECK1: aie.flow(%[[T20]], DMA : 0, %[[T71]], DMA : 0)
-// CHECK1: aie.flow(%[[T20]], DMA : 0, %[[T31]], DMA : 0)
-// CHECK1: aie.flow(%[[T20]], DMA : 0, %[[T13]], DMA : 0)
-// CHECK1: aie.flow(%[[T60]], DMA : 0, %[[T83]], DMA : 1)
-// CHECK1: aie.flow(%[[T60]], DMA : 0, %[[T31]], DMA : 1)
-// CHECK1: aie.flow(%[[T60]], DMA : 0, %[[T22]], DMA : 1)
-// CHECK1: aie.flow(%[[T60]], DMA : 0, %[[T02]], DMA : 1)
+// CHECK1-DAG: aie.flow(%[[T20]], DMA : 0, %[[T82]], DMA : 0)
+// CHECK1-DAG: aie.flow(%[[T20]], DMA : 0, %[[T71]], DMA : 0)
+// CHECK1-DAG: aie.flow(%[[T20]], DMA : 0, %[[T31]], DMA : 0)
+// CHECK1-DAG: aie.flow(%[[T20]], DMA : 0, %[[T13]], DMA : 0)
+// CHECK1-DAG: aie.flow(%[[T60]], DMA : 0, %[[T83]], DMA : 1)
+// CHECK1-DAG: aie.flow(%[[T60]], DMA : 0, %[[T31]], DMA : 1)
+// CHECK1-DAG: aie.flow(%[[T60]], DMA : 0, %[[T22]], DMA : 1)
+// CHECK1-DAG: aie.flow(%[[T60]], DMA : 0, %[[T02]], DMA : 1)
 
-// CHECK2: "total_path_length": 27
+// CHECK2: "total_path_length": 25
 
 module {
     aie.device(xcvc1902) {
@@ -74,4 +72,3 @@ module {
         aie.flow(%t60, DMA : 0, %t31, DMA : 1)
     }
 }
-

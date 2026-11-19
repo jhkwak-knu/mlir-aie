@@ -1,22 +1,26 @@
 //===- AIECtrlPacketToDma.cpp -----------------------------------*- C++ -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2024 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2024 Advanced Micro Devices Inc.
 //
 //===----------------------------------------------------------------------===//
 
 #include "aie/Dialect/AIE/IR/AIEDialect.h"
-#include "aie/Dialect/AIE/Transforms/AIEGenerateColumnControlOverlay.h"
 #include "aie/Dialect/AIEX/IR/AIEXDialect.h"
 #include "aie/Dialect/AIEX/Transforms/AIEXPasses.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/Attributes.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/Pass/Pass.h"
 
 #include "llvm/ADT/TypeSwitch.h"
+
+namespace xilinx::AIEX {
+#define GEN_PASS_DEF_AIECTRLPACKETTODMA
+#define GEN_PASS_DEF_AIECTRLPACKETINFERTILES
+#include "aie/Dialect/AIEX/Transforms/AIEXPasses.h.inc"
+} // namespace xilinx::AIEX
 
 #define DEBUG_TYPE "aie-ctrl-packet-to-dma"
 
@@ -25,14 +29,25 @@ using namespace xilinx;
 using namespace xilinx::AIE;
 using namespace xilinx::AIEX;
 
+static ShimDMAAllocationOp getCtrlPktShimAlloc(DeviceOp device, int col) {
+  AIEDialect::IsCtrlPktOverlayAttrHelper overlay(device.getContext());
+  for (auto alloc : device.getOps<AIE::ShimDMAAllocationOp>())
+    if (overlay.isAttrPresent(alloc) &&
+        alloc.getChannelDir() == AIE::DMAChannelDir::MM2S &&
+        alloc.getTileOp().colIndex() == col)
+      return alloc;
+  return {};
+}
+
 struct AIECtrlPacketInferTilesPass
-    : AIECtrlPacketInferTilesBase<AIECtrlPacketInferTilesPass> {
+    : xilinx::AIEX::impl::AIECtrlPacketInferTilesBase<
+          AIECtrlPacketInferTilesPass> {
   void runOnOperation() override {
     DeviceOp device = getOperation();
     const auto &targetModel = device.getTargetModel();
     OpBuilder devBuilder = OpBuilder::atBlockBegin(device.getBody());
 
-    auto sequenceOps = device.getOps<AIEX::RuntimeSequenceOp>();
+    auto sequenceOps = device.getOps<AIE::RuntimeSequenceOp>();
     for (auto f : sequenceOps) {
       auto ctrlPktOps = f.getOps<AIEX::NpuControlPacketOp>();
       for (auto ctrlPktOp : ctrlPktOps) {
@@ -40,7 +55,7 @@ struct AIECtrlPacketInferTilesPass
                                        (int)ctrlPktOp.getColumnFromAddr(),
                                        (int)ctrlPktOp.getRowFromAddr());
         // Assign controller id
-        auto tileIDMap = getTileToControllerIdMap(true, targetModel);
+        auto tileIDMap = targetModel.getTileToControllerIdMap(true);
         if (tOp->hasAttr("controller_id"))
           continue;
         auto pktInfoAttr = AIE::PacketInfoAttr::get(
@@ -52,19 +67,19 @@ struct AIECtrlPacketInferTilesPass
   }
 };
 
-struct AIECtrlPacketToDmaPass : AIECtrlPacketToDmaBase<AIECtrlPacketToDmaPass> {
+struct AIECtrlPacketToDmaPass
+    : xilinx::AIEX::impl::AIECtrlPacketToDmaBase<AIECtrlPacketToDmaPass> {
   void runOnOperation() override {
     DeviceOp device = getOperation();
     const auto &targetModel = device.getTargetModel();
-    auto ctx = device->getContext();
+    auto *ctx = device->getContext();
     auto loc = device->getLoc();
-    OpBuilder devBuilder = OpBuilder::atBlockBegin(device.getBody());
 
     if (targetModel.getTargetArch() == AIEArch::AIE1)
       return; // Disable this pass for AIE1; AIE1 support NYI.
 
     SmallVector<Operation *> erased;
-    auto sequenceOps = device.getOps<AIEX::RuntimeSequenceOp>();
+    auto sequenceOps = device.getOps<AIE::RuntimeSequenceOp>();
     for (auto f : sequenceOps) {
 
       auto controlPacketOps = f.getOps<AIEX::NpuControlPacketOp>();
@@ -73,79 +88,134 @@ struct AIECtrlPacketToDmaPass : AIECtrlPacketToDmaBase<AIECtrlPacketToDmaPass> {
 
       OpBuilder builder(f);
 
-      auto newSeq =
-          builder.create<AIEX::RuntimeSequenceOp>(loc, f.getSymNameAttr());
+      IRMapping mapping;
+
+      auto newSeq = AIE::RuntimeSequenceOp::create(
+          builder, loc, f.getSymNameAttr(), BoolAttr{}, f.getTraceBufferAttr(),
+          f.getTraceSlicesAttr(), f.getScratchpadParametersAttr());
       newSeq.getBody().push_back(new Block);
+
+      // Copy the arguments from the old sequence to the new one.
+      for (auto arg : f.getBody().getArguments()) {
+        // Add the argument to the new sequence.
+        auto newArg = newSeq.getBody().addArgument(arg.getType(), arg.getLoc());
+        // Replace all uses of the old argument with the new one.
+        arg.replaceAllUsesWith(newArg);
+        // Add the mapping for the argument.
+        mapping.map(arg, newArg);
+      }
 
       // Using dynamic shape for ctrl pkt stream.
       auto ctrlPktMemrefType = MemRefType::get(
-          ShapedType::kDynamic, IntegerType::get(ctx, 32), nullptr, 0);
+          ShapedType::kDynamic, IntegerType::get(ctx, 32), nullptr, nullptr);
       auto newBlockArg = newSeq.getBody().addArgument(ctrlPktMemrefType, loc);
+
       builder.setInsertionPointToStart(&newSeq.getBody().front());
 
-      int ddrOffset = 0;
+      // Collect all npu.control_packet ops, grouped by location in 'batches'
+      struct BatchInfo {
+        TileID tileId;
+        int64_t startOffset;
+        int64_t totalSize;
+        std::string shimDmaAllocName;
+        int shimChan;
+        Operation *first;
+      };
+      std::vector<BatchInfo> batches;
+
+      int64_t ddrOffset = 0;
       Block &entry = f.getBody().front();
-      for (auto &o : entry) {
-        llvm::TypeSwitch<Operation *>(&o).Case<NpuControlPacketOp>(
-            [&](auto op) {
-              // Destination tile info
-              int col = op.getColumnFromAddr();
-              int row = op.getRowFromAddr();
-              AIE::TileOp destTileOp =
-                  TileOp::getOrCreate(devBuilder, device, col, row);
-              assert(destTileOp->hasAttr("controller_id"));
-              auto controllerIdPkt =
-                  destTileOp->getAttrOfType<AIE::PacketInfoAttr>(
-                      "controller_id");
 
-              // Control packet offset (to raw data at ddr) and size
-              uint32_t ctrlPktSize = 0;
-              auto data = op.getData();
-              auto length = op.getLength();
-              if (data)
-                ctrlPktSize = data->size();
-              if (!data && length)
-                ctrlPktSize = *length;
-              ctrlPktSize++; // Ctrl info word
+      // First pass: collect and batch control packet operations
+      bool new_batch = true;
+      for (Operation &o : entry) {
+        auto ctrlPktOp = dyn_cast<NpuControlPacketOp>(&o);
 
-              const std::vector<int64_t> staticOffsets = {0, 0, 0, ddrOffset};
-              ddrOffset += ctrlPktSize;
-              const std::vector<int64_t> staticSizes = {1, 1, 1,
-                                                        (int64_t)ctrlPktSize};
-              const std::vector<int64_t> staticStrides = {0, 0, 0, 1};
+        // A non-control_packet op ends the current batch
+        if (!ctrlPktOp) {
+          new_batch = true;
+          continue;
+        }
+        int col = ctrlPktOp.getColumnFromAddr();
+        int row = ctrlPktOp.getRowFromAddr();
 
-              // Shim dma alloc symbol name
-              std::string shimDmaAllocName = "ctrlpkt";
-              shimDmaAllocName += "_col" + std::to_string(col);
-              shimDmaAllocName += "_mm2s";
-              auto rowToShimChanMap =
-                  getRowToShimChanMap(targetModel, WireBundle::DMA);
-              int shimChan = rowToShimChanMap[destTileOp.rowIndex()];
-              shimDmaAllocName += "_chan" + std::to_string(shimChan);
+        // A read's length describes its response, not an outgoing payload.
+        int64_t ctrlPktSize = 2; // ctrl info word + packet header
+        if (auto data = ctrlPktOp.getData())
+          ctrlPktSize += data->size();
 
-              StringRef metadata = builder.getStringAttr(shimDmaAllocName);
-              builder.create<NpuDmaMemcpyNdOp>(
-                  builder.getUnknownLoc(), newBlockArg, SmallVector<Value>{},
-                  SmallVector<Value>{}, SmallVector<Value>{},
-                  ArrayRef(staticOffsets), ArrayRef(staticSizes),
-                  ArrayRef(staticStrides), controllerIdPkt, metadata, 0, true,
-                  0, 0, 0, 0, 0, 0);
+        // Read requests must end their DMA transfer.
+        bool batchable = ctrlPktOp.getOpcode() == 0;
+        if (targetModel.getTargetArch() == AIEArch::AIE2p && batchable &&
+            !new_batch && batches.back().tileId == TileID{col, row}) {
+          // Add to existing batch
+          batches.back().totalSize += ctrlPktSize;
+        } else {
+          // Start new batch
+          ShimDMAAllocationOp alloc = getCtrlPktShimAlloc(device, col);
+          if (!alloc) {
+            ctrlPktOp.emitOpError("column ")
+                << col
+                << " has no control packet shim DMA allocation; run "
+                   "-aie-generate-column-control-overlay with "
+                   "configuration=true, then -aie-import-overlay first";
+            return signalPassFailure();
+          }
+          batches.push_back({TileID{col, row}, ddrOffset, ctrlPktSize,
+                             alloc.getSymName().str(),
+                             static_cast<int>(alloc.getChannelIndex()), &o});
+        }
+        new_batch = !batchable;
+        ddrOffset += ctrlPktSize;
+      }
 
-              auto shimRow = builder.getI32IntegerAttr(0);
-              auto shimCol = builder.getI32IntegerAttr(col);
-              auto dir = builder.getI32IntegerAttr(1); // MM2S
-              auto chan = builder.getI32IntegerAttr(shimChan);
-              auto col_num = builder.getI32IntegerAttr(1);
-              auto row_num = builder.getI32IntegerAttr(1);
-              builder.create<AIEX::NpuSyncOp>(loc, shimCol, shimRow, dir, chan,
-                                              col_num, row_num);
-            });
+      // Second pass: emit batched operations in original order
+      auto batchIt = batches.begin();
+
+      for (Operation &o : entry) {
+        auto ctrlPktOp = dyn_cast<NpuControlPacketOp>(&o);
+        if (!ctrlPktOp) {
+          builder.clone(o, mapping);
+          continue;
+        }
+
+        // There are no more control packet batches to emit
+        if (batchIt == batches.end())
+          continue;
+
+        // Check if this is the first packet of a new batch, otherwise skip it.
+        if (batchIt->first != &o)
+          continue;
+
+        int col = ctrlPktOp.getColumnFromAddr();
+
+        // Emit the batched DMA operation for this (col, row) pair
+        const std::vector<int64_t> staticOffsets = {0, 0, 0,
+                                                    batchIt->startOffset};
+        const std::vector<int64_t> staticSizes = {1, 1, 1, batchIt->totalSize};
+        const std::vector<int64_t> staticStrides = {0, 0, 0, 1};
+
+        SymbolRefAttr metadata =
+            SymbolRefAttr::get(builder.getContext(), batchIt->shimDmaAllocName);
+        NpuDmaMemcpyNdOp::create(builder, loc, newBlockArg, staticOffsets,
+                                 staticSizes, staticStrides, metadata,
+                                 /*id=*/0, /*issue_token=*/true);
+
+        Value shimRow = AIEX::createConstantI32(builder, loc, 0);
+        Value shimCol = AIEX::createConstantI32(builder, loc, col);
+        Value dir = AIEX::createConstantI32(builder, loc, 1); // MM2S
+        Value chan = AIEX::createConstantI32(builder, loc, batchIt->shimChan);
+        Value col_num = AIEX::createConstantI32(builder, loc, 1);
+        Value row_num = AIEX::createConstantI32(builder, loc, 1);
+        AIEX::NpuSyncOp::create(builder, loc, shimCol, shimRow, dir, chan,
+                                col_num, row_num);
+        ++batchIt;
       }
 
       erased.push_back(f);
     }
 
-    for (auto e : erased)
+    for (auto *e : erased)
       e->erase();
   }
 };

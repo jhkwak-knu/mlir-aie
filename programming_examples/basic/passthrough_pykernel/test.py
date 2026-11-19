@@ -1,14 +1,16 @@
 # test.py -*- Python -*-
 #
-# This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-# See https://llvm.org/LICENSE.txt for license information.
+# Copyright (C) 2024-2026 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #
-# (c) Copyright 2024 Advanced Micro Devices, Inc. or its affiliates
-import numpy as np
+import argparse
 import sys
-from aie.utils.xrt import setup_aie, execute
-import aie.utils.test as test_utils
+
+import aie.iron as iron
+import numpy as np
+from aie.utils import DefaultNPURuntime
+from aie.utils.hostruntime.argparse import add_runtime_args
+from aie.utils.test import create_npu_kernel
 
 
 def main(opts):
@@ -17,38 +19,26 @@ def main(opts):
     data_size = int(opts.size)
     dtype = np.uint8
 
-    app = setup_aie(
-        opts.xclbin,
-        opts.instr,
-        data_size,
-        dtype,
-        None,
-        None,
-        data_size,
-        dtype,
+    in1 = iron.arange(data_size, dtype=dtype)
+    out = iron.zeros(data_size, dtype=dtype)
+    input_data = in1.numpy()
+
+    npu_opts = create_npu_kernel(opts)
+    res = DefaultNPURuntime.run_test(
+        npu_opts.npu_kernel,
+        [in1, out],
+        {1: input_data},
+        verify=npu_opts.verify,
+        verbosity=npu_opts.verbosity,
     )
-    input = np.arange(1, data_size + 1, dtype=dtype)
-    aie_output = execute(app, input)
-
-    # Copy output results and verify they are correct
-    errors = 0
-    if opts.verify:
-        if opts.verbosity >= 1:
-            print("Verifying results ...")
-        e = np.equal(input, aie_output)
-        errors = np.size(e) - np.count_nonzero(e)
-
-    if not errors:
+    if res == 0:
         print("\nPASS!\n")
-        exit(0)
-    else:
-        print("\nError count: ", errors)
-        print("\nFailed.\n")
-        exit(-1)
+    sys.exit(res)
 
 
 if __name__ == "__main__":
-    p = test_utils.create_default_argparser()
+    p = argparse.ArgumentParser()
+    add_runtime_args(p, with_io_sizes=True)
     p.add_argument(
         "-s", "--size", required=True, dest="size", help="Passthrough kernel size"
     )

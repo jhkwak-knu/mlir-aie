@@ -1,12 +1,17 @@
+# Copyright (C) 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 from collections import defaultdict
+from typing import Any, Sequence, get_args, get_origin
+
 import numpy as np
-import sys
-from typing import Sequence, get_args, get_origin, TypeVar
+from aie._mlir_libs import (
+    _aie as CustomTypes,  # pyright: ignore[reportAttributeAccessIssue]
+)
+from ml_dtypes import bfloat16
 
-from aie._mlir_libs import _aie as CustomTypes
-
-from ..extras import types as T
-from ..ir import (
+from ..dialects.arith import ConstantOp  # pyright: ignore[reportMissingImports]
+from ..extras import types as T  # pyright: ignore[reportMissingImports]
+from ..ir import (  # pyright: ignore[reportMissingImports]
     F32Type,
     F64Type,
     IntegerType,
@@ -16,33 +21,13 @@ from ..ir import (
     Value,
     VectorType,
 )
-from ml_dtypes import bfloat16
-
-
-# Custom types
-class v8bfp16ebs8(np.generic):
-    """
-    Custom type to be used in IRON that is translated to a generic blockFloatType.
-    Represents a vector of 8 scalar elements that share exponent with a total
-    bitwidth of 16 bits for each element (8 bits for the exponent and 8 bits for the mantissa).
-    """
-
-    @staticmethod
-    def get():
-        return CustomTypes.blockFloatType.get("v8bfp16ebs8")
-
-
-class v16bfp16ebs16(np.generic):
-    """
-    Custom type to be used in IRON that is translated to a generic blockFloatType
-    Represents a vector of 16 scalar elements that share exponent with a total
-    bitwidth of 16 bits for each element (8 bits for the exponent and 8 bits for the mantissa).
-    """
-
-    @staticmethod
-    def get():
-        return CustomTypes.blockFloatType.get("v16bfp16ebs16")
-
+from .npdtypes import (
+    NpuDType,
+    np_ndarray_type_get_dtype,
+    np_ndarray_type_get_shape,
+    v8bfp16ebs8,
+    v16bfp16ebs16,
+)
 
 _np_dtype_to_mlir_type_ctor = defaultdict(
     lambda: None,
@@ -64,39 +49,18 @@ _np_dtype_to_mlir_type_ctor = defaultdict(
         np.float64: T.f64,
         bfloat16: T.bf16,
         # Block floating point types
-        v8bfp16ebs8: v8bfp16ebs8.get,
-        v16bfp16ebs16: v16bfp16ebs16.get,
+        v8bfp16ebs8: lambda: CustomTypes.blockFloatType.get("v8bfp16ebs8"),
+        v16bfp16ebs16: lambda: CustomTypes.blockFloatType.get("v16bfp16ebs16"),
         # Index Types
-        # this is technically wrong i guess but numpy by default casts python scalars to this
-        # so to support passing lists of ints we map to index type
-        np.longlong: T.index,
+        # Not strictly correct, but numpy casts Python scalars to these types by
+        # default, so we map them to index type to support passing lists of ints.
         np.uintp: T.index,
     },
 )
 
-NpuDType = (
-    np.int8
-    | np.int16
-    | np.int32
-    | np.intc
-    | np.int64
-    | np.uint8
-    | np.uint16
-    | np.uint32
-    | np.uint64
-    | np.float16
-    | np.float32
-    | np.float64
-    | np.longlong
-    | np.uintp
-    | bfloat16
-    | v8bfp16ebs8
-    | v16bfp16ebs16
-)
-
-_mlir_type_ctor_to_np_dtype = lambda: {
-    v: k for k, v in _np_dtype_to_mlir_type_ctor.items()
-}
+# np.longlong aliases np.int64 on Windows. Keep the explicit i64 mapping
+# authoritative there while preserving the distinct index mapping elsewhere.
+_np_dtype_to_mlir_type_ctor.setdefault(np.longlong, T.index)
 
 
 def np_dtype_to_mlir_type(np_dtype):
@@ -132,6 +96,8 @@ def infer_mlir_type(
 
     Args:
       py_val: Python value that's either a numerical value or numpy array.
+      memref: If True, map a numpy array to a MemRefType. Defaults to False.
+      vector: If True, map a numpy array to a VectorType. Defaults to False.
 
     Returns:
       MLIR type corresponding to py_val.
@@ -189,18 +155,6 @@ def memref_type_to_np_dtype(memref_type):
     return _memref_type_to_np_dtype.get(memref_type)
 
 
-def np_ndarray_type_get_shape(ndarray_type: type[np.ndarray]) -> tuple[int, ...]:
-    shape = get_args(ndarray_type)[0]
-    assert isinstance(shape, tuple), "np.ndarray shape must be a tuple of integers"
-    for elem in shape:
-        assert isinstance(elem, int), "np.ndarray shape must be a tuple of integers"
-    return shape
-
-
-def np_ndarray_type_get_dtype(ndarray_type: type[np.ndarray]) -> NpuDType:
-    return get_args(get_args(ndarray_type)[1])[0]
-
-
 def np_ndarray_type_to_memref_type(ndarray_type: type[np.ndarray]):
     shape = np_ndarray_type_get_shape(ndarray_type)
     dtype = np_ndarray_type_get_dtype(ndarray_type)
@@ -217,21 +171,59 @@ def try_convert_np_type_to_mlir_type(input_type):
     return output_type
 
 
+def flatten_fn_args(args):
+    """Yield each leaf of ``args``, recursing into nested lists/tuples.
+
+    Worker and Runtime accept fn_args that may nest lists (e.g. one fifo handle
+    per column). The body receives the structured arguments, but registration and
+    resolution iterate the flattened leaves through this helper so a nested list
+    is handled the same as a flat one.
+    """
+    for arg in args:
+        if isinstance(arg, (list, tuple)):
+            yield from flatten_fn_args(arg)
+        else:
+            yield arg
+
+
 def get_arg_types(objs: Sequence[int | float | Value | OpView]):
     my_types = []
     for o in objs:
+        op: Any = o
         if isinstance(o, Value):
-            my_types.append(o.type)
+            my_types.append(op.type)
         elif isinstance(o, OpView):
-            if len(o.results.types) != 1:
+            if len(op.results.types) != 1:
                 raise AttributeError(
                     f"Operation given to a region op as a parameter ({o}) has more "
                     "than one return type ({o.results.types}), which would lead to a mismatch "
                     "between number of operands and number of operand types"
                 )
-            my_types += o.results.types
+            my_types += op.results.types
         elif isinstance(o, (int, float)):
             my_types.append(type(o))
         else:
             return None
     return my_types
+
+
+def fold_constant_operand(operand):
+    """Fold an npu scalar op's SSA i32 operand back to its compile-time integer.
+
+    npu scalar ops (write32/maskwrite32/sync/address_patch/rtp_write) carry their
+    integer fields as SSA operands materialized from arith.constant; consumers
+    such as trace parsing and register annotation need the underlying value.
+    Returns the int, or None if the operand is not an arith.constant (e.g. a
+    block argument or a runtime-sequence value); callers decide whether that is
+    an error in their context. This is the Python analog of the AIEX dialect's
+    getConstantIntOperand.
+    """
+    defining = operand.owner
+    if defining is None:
+        return None
+    # Value.owner is an Operation; the generated attribute accessors live on the
+    # opview. (Some binding versions return the opview directly, so normalize.)
+    opview = getattr(defining, "opview", defining)
+    if not isinstance(opview, ConstantOp):
+        return None
+    return int(opview.value.value)

@@ -1,0 +1,8 @@
+// Copyright (C) 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+// REQUIRES: ryzen_ai_npu1, peano
+//
+// RUN: %run_on_npu1% %python %S/eltwise_unary.py -d npu -o relu
+// RUN: %run_on_npu1% %python %S/eltwise_unary.py -d npu -o silu
+// RUN: %run_on_npu1% %python %S/eltwise_unary.py -d npu -o gelu

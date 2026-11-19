@@ -1,14 +1,13 @@
-# This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-# See https://llvm.org/LICENSE.txt for license information.
+# Copyright (C) 2024-2025 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #
-# (c) Copyright 2024 AMD Inc.
 
 get_property(dialect_libs GLOBAL PROPERTY MLIR_DIALECT_LIBS)
 
 set(AIE_LSP_LIBS
   ${dialect_libs}
   MLIRLspServerLib
+  MLIRRegisterAllDialects
 )
 
 add_llvm_tool(aie-lsp-server

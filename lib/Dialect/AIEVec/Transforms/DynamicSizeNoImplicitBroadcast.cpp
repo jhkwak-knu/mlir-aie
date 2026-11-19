@@ -1,10 +1,7 @@
 //===- DynamicSizeNoImplicitBroadcast.cpp -=====================-*- C++ -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2023 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2023, Advanced Micro Devices, Inc.
 //
 //===----------------------------------------------------------------------===//
 // This file contains rewrites to the arith dialect to enable the support of
@@ -55,8 +52,8 @@ struct DynamicSizeNoImplicitBroadcastPattern : RewritePattern {
     if (cmpiOp.getPredicate() != arith::CmpIPredicate::eq)
       return failure();
 
-    auto lhsOp = cmpiOp.getLhs().getDefiningOp();
-    auto rhsOp = cmpiOp.getRhs().getDefiningOp();
+    auto *lhsOp = cmpiOp.getLhs().getDefiningOp();
+    auto *rhsOp = cmpiOp.getRhs().getDefiningOp();
     if (!((isa<memref::DimOp>(lhsOp) || isa<tensor::DimOp>(lhsOp)) &&
           isa<arith::ConstantOp>(rhsOp)) &&
         !((isa<memref::DimOp>(rhsOp) || isa<tensor::DimOp>(rhsOp)) &&
@@ -107,7 +104,7 @@ struct DynamicSizeNoImplicitBroadcastPass
   }
 
   void runOnOperation() override {
-    auto op = getOperation();
+    auto *op = getOperation();
     MLIRContext *context = &getContext();
     RewritePatternSet patterns(context);
 

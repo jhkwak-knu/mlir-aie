@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+
+# Copyright (C) 2023-2024 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
 set -xe
 
 # manylinux prep
@@ -32,7 +36,7 @@ elif [[ -f "/etc/alpine-release" ]]; then
   export PATH="/usr/lib/ccache/bin:$PATH"
 fi
 
-# hack until https://github.com/pypa/cibuildwheel/issues/1030 is fixed
+# Workaround until https://github.com/pypa/cibuildwheel/issues/1030 is fixed
 # Place ccache folder in /outputs
 HOST_CCACHE_DIR="/host${HOST_CCACHE_DIR:-/home/runner/work/mlir-wheels/mlir-wheels/.ccache}"
 if [ -d "$HOST_CCACHE_DIR" ]; then

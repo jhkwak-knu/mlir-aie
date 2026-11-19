@@ -1,0 +1,817 @@
+# Copyright (C) 2022-2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+#
+
+# RUN: %run_on_npu1% %pytest %s
+# RUN: %run_on_npu2% %pytest %s
+# REQUIRES: xrt_python_bindings
+
+import pytest
+import numpy as np
+import time
+import os
+import aie.iron as iron
+from aie.iron import CompileTime, In, Out, ObjectFifo, Worker, Runtime, Program
+from aie.iron.controlflow import range_
+import aie.utils
+from aie.utils.hostruntime.hostruntime import HostRuntimeError
+from aie.utils.hostruntime.xrtruntime.hostruntime import (
+    CachedXRTRuntime,
+    XRTHostRuntime,
+)
+from aie.utils.hostruntime.xrtruntime.tensor import XRTTensor
+from aie.utils.npukernel import NPUKernel
+
+
+@pytest.fixture
+def runtime():
+    # Create new runtime instance
+    rt = CachedXRTRuntime()
+
+    # Save old values
+    old_utils_runtime = aie.utils.DefaultNPURuntime
+    # These tests count hardware contexts, so free the ones earlier tests left
+    # open in the outgoing runtime; it recreates them on its next run.
+    if old_utils_runtime is not None:
+        old_utils_runtime.cleanup()
+
+    # Set new values
+    aie.utils.DefaultNPURuntime = rt
+
+    yield rt
+
+    # Restore
+    aie.utils.DefaultNPURuntime = old_utils_runtime
+    rt.cleanup()
+
+
+@iron.jit
+def transform(
+    input: In,
+    output: Out,
+    *,
+    func: CompileTime[object],
+    num_elements: CompileTime[int],
+    dtype: CompileTime[object] = np.int32,
+):
+    """Transform kernel that applies a function to input tensor and stores result in output tensor."""
+    if isinstance(func, iron.ExternalFunction):
+        tile_size = func.tile_size(0)
+    else:
+        tile_size = 16 if num_elements >= 16 else 1
+
+    if num_elements % tile_size != 0:
+        raise ValueError(
+            f"num_elements ({num_elements}) must be divisible by tile_size ({tile_size})"
+        )
+    num_tiles = num_elements // tile_size
+
+    tensor_ty = np.ndarray[(num_elements,), np.dtype[dtype]]
+    tile_ty = np.ndarray[(tile_size,), np.dtype[dtype]]
+
+    # AIE-array data movement with object fifos
+    of_in = ObjectFifo(tile_ty, name="in")
+    of_out = ObjectFifo(tile_ty, name="out")
+
+    # Define a task that will run on a compute tile
+    def core_body(of_in, of_out, func_to_apply):
+        for _ in range_(num_tiles):
+            elem_in = of_in.acquire(1)
+            elem_out = of_out.acquire(1)
+            if isinstance(func_to_apply, iron.ExternalFunction):
+                func_to_apply(elem_in, elem_out, tile_size)
+            else:
+                for j in range_(tile_size):
+                    elem_out[j] = func_to_apply(elem_in[j])
+            of_in.release(1)
+            of_out.release(1)
+
+    # Create a worker to run the task on a compute tile
+    worker = Worker(core_body, fn_args=[of_in.cons(), of_out.prod(), func])
+
+    # Runtime operations to move data to/from the AIE-array
+    def sequence(A, B, in_h, out_h):
+        in_h.fill(A)
+        out_h.drain(B, wait=True)
+
+    rt = Runtime(
+        sequence,
+        [tensor_ty, tensor_ty, of_in.prod(), of_out.cons()],
+    )
+
+    # Place program components (assign them resources on the device) and generate an MLIR module
+    return Program(iron.get_current_device(), rt, workers=[worker]).resolve_program()
+
+
+def test_runtime_caching_reuse(runtime):
+    """Test that CachedXRTRuntime reuses contexts for the same kernel."""
+
+    input_tensor = iron.arange(32, dtype=np.int32)
+
+    # First run with lambda
+    transform(input_tensor, input_tensor, func=lambda x: x + 1, num_elements=32)
+
+    assert len(runtime._context_cache) == 1
+
+    # Get the context from the cache
+    key1 = list(runtime._context_cache.keys())[0]
+    entry1 = runtime._context_cache[key1]
+    context1 = entry1["context"]
+
+    # Second run with same lambda (jit cache should hit, returning same NPUKernel)
+    transform(input_tensor, input_tensor, func=lambda x: x + 1, num_elements=32)
+
+    assert len(runtime._context_cache) == 1
+
+    # Verify it's the same context
+    key2 = list(runtime._context_cache.keys())[0]
+    entry2 = runtime._context_cache[key2]
+    context2 = entry2["context"]
+
+    assert key1 == key2
+    assert context1 is context2
+
+
+def test_runtime_caching_multiple_kernels(runtime):
+    """Test that CachedXRTRuntime caches multiple different kernels."""
+
+    input_tensor = iron.arange(32, dtype=np.int32)
+
+    # Run first kernel (add 1)
+    transform(input_tensor, input_tensor, func=lambda x: x + 1, num_elements=32)
+    assert len(runtime._context_cache) == 1
+
+    # Run second kernel (multiply by 2)
+    transform(input_tensor, input_tensor, func=lambda x: x * 2, num_elements=32)
+
+    # Should have 2 entries now
+    assert len(runtime._context_cache) == 2
+
+
+def test_interleaved_tensor_allocations_preserve_distinct_context_results(runtime):
+    """Interleaving new tensors between distinct contexts keeps later runs correct."""
+
+    transform._kernel_cache.clear()
+    scratch_tensors = []
+    expected_input = np.arange(32, dtype=np.int32)
+
+    input_tensor = iron.arange(32, dtype=np.int32)
+    transform(input_tensor, input_tensor, func=lambda x: x + 1, num_elements=32)
+    np.testing.assert_array_equal(input_tensor.numpy(), expected_input + 1)
+
+    scratch_tensors.append(XRTTensor((32,), dtype=np.int32))
+    assert scratch_tensors[-1].xrt_device is runtime._device
+
+    input_tensor = iron.arange(32, dtype=np.int32)
+    transform(input_tensor, input_tensor, func=lambda x: x * 2, num_elements=32)
+    np.testing.assert_array_equal(input_tensor.numpy(), expected_input * 2)
+
+    scratch_tensors.append(XRTTensor((32,), dtype=np.int32))
+    assert scratch_tensors[-1].xrt_device is runtime._device
+
+    input_tensor = iron.arange(32, dtype=np.int32)
+    transform(input_tensor, input_tensor, func=lambda x: x - 3, num_elements=32)
+    np.testing.assert_array_equal(input_tensor.numpy(), expected_input - 3)
+
+    assert len(runtime._context_cache) == 3
+
+
+def test_runtime_eviction_logic(runtime):
+    """Test eviction logic by artificially lowering cache size."""
+
+    original_size = runtime._cache_size
+    runtime._cache_size = 1  # Set small cache size
+
+    try:
+        input_tensor = iron.arange(32, dtype=np.int32)
+
+        # Run first kernel
+        transform(input_tensor, input_tensor, func=lambda x: x + 1, num_elements=32)
+        assert len(runtime._context_cache) == 1
+        key1 = list(runtime._context_cache.keys())[0]
+
+        # Run second kernel (different lambda -> different xclbin)
+        transform(input_tensor, input_tensor, func=lambda x: x * 2, num_elements=32)
+
+        assert len(runtime._context_cache) == 1
+        key2 = list(runtime._context_cache.keys())[0]
+
+        # Verify key changed (eviction happened)
+        assert key1 != key2
+
+    finally:
+        runtime._cache_size = original_size
+
+
+def test_runtime_cache_fill(runtime):
+    """Test filling the Python-side cache to its configured capacity."""
+
+    # Use a deliberately small artificial capacity. On Windows, reserved
+    # resources make the practical limit lower than the nominal cache size.
+    original_size = runtime._cache_size
+    runtime._cache_size = min(original_size, 8)
+    # Clear the per-instance kernel cache so every transform() call triggers a
+    # fresh compile() and populates _context_cache, regardless of prior tests.
+    transform._kernel_cache.clear()
+
+    # Ensure cache is empty
+    runtime.cleanup()
+
+    try:
+        runtime.cleanup()
+
+        input_tensor = iron.arange(32, dtype=np.int32)
+
+        # Load kernels up to the artificial capacity + 1.
+        limit = runtime._cache_size
+        first_key = None
+
+        for i in range(runtime._cache_size + 1):
+            transform(
+                input_tensor,
+                input_tensor,
+                func=lambda x, val=i: x + val,
+                num_elements=32,
+            )
+
+            if i == 0:
+                first_key = next(iter(runtime._context_cache))
+
+            if runtime.npu_str == "npu1":
+                expected_size = (i + 1) if i < runtime._cache_size else 1
+            else:
+                expected_size = min(i + 1, runtime._cache_size)
+            assert len(runtime._context_cache) == expected_size
+
+        assert first_key not in runtime._context_cache
+    finally:
+        runtime.cleanup()
+        runtime._cache_size = original_size
+
+
+def test_context_creation_retry_after_capacity_error(runtime):
+    """A context the driver refuses at its limit is made after evicting one."""
+
+    limit = CachedXRTRuntime.NPU_CONTEXT_CACHE_SIZE[runtime.npu_str]
+    original_size = runtime._cache_size
+    # Past the driver's limit, so the driver refuses before the cache evicts.
+    runtime._cache_size = limit + 1
+
+    try:
+        runtime.cleanup()
+        input_tensor = iron.arange(32, dtype=np.int32)
+        for i in range(limit + 1):
+            kernel = NPUKernel(
+                *transform.specialize(
+                    func=lambda x, val=i: x + val, num_elements=32
+                ).compile()
+            )
+            output_tensor = iron.zeros(32, dtype=np.int32)
+            kernel(input_tensor, output_tensor)
+            np.testing.assert_array_equal(
+                output_tensor.numpy(), np.arange(32, dtype=np.int32) + i
+            )
+
+        # A driver that refuses the extra context forces an eviction down to the
+        # limit; one that accepts it (e.g. the Windows driver) keeps all of them.
+        assert len(runtime._context_cache) <= limit + 1
+    finally:
+        runtime.cleanup()
+        runtime._cache_size = original_size
+
+
+def test_runtime_mtime_sensitivity(runtime):
+    """Test that updating the file (changing mtime) causes a reload."""
+
+    kernel = NPUKernel(
+        *transform.specialize(func=lambda x: x + 1, num_elements=32).compile()
+    )
+    input_tensor = iron.arange(32, dtype=np.int32)
+
+    kernel(input_tensor, input_tensor)
+    assert len(runtime._context_cache) == 1
+
+    # Wait a bit to ensure mtime changes
+    time.sleep(0.01)
+
+    # Touch the xclbin file
+    os.utime(kernel.xclbin_path, None)
+
+    kernel(input_tensor, input_tensor)
+    np.testing.assert_array_equal(
+        input_tensor.numpy(), np.arange(32, dtype=np.int32) + 2
+    )
+
+    # Should have 2 entries now (old one and new one with new mtime)
+    # Because CachedXRTRuntime keys include mtime, and it doesn't automatically evict old mtime entries for same path unless LRU kicks in.
+    assert len(runtime._context_cache) == 2
+
+    keys = list(runtime._context_cache.keys())
+    assert keys[0][:2] == keys[1][:2]  # Same file
+    assert keys[0][2] != keys[1][2]  # Different mtime
+
+
+def test_runtime_handle_invalidation(runtime):
+    """Test that handles are invalidated when context is evicted."""
+
+    original_size = runtime._cache_size
+    runtime._cache_size = 1
+
+    try:
+        input_tensor = iron.arange(32, dtype=np.int32)
+
+        # Load to get a strong reference to the handle
+        npu_kernel = NPUKernel(
+            *transform.specialize(func=lambda x: x + 1, num_elements=32).compile()
+        )
+        handle = runtime.load(npu_kernel)
+
+        assert handle is not None
+        assert handle._is_valid
+
+        # Load second kernel to force eviction
+        transform(input_tensor, input_tensor, func=lambda x: x * 2, num_elements=32)
+
+        # Verify handle is invalidated
+        assert not handle._is_valid
+
+    finally:
+        runtime._cache_size = original_size
+
+
+def test_runtime_cleanup(runtime):
+    """Test that cleanup clears the cache and invalidates handles."""
+
+    # Load to get a strong reference to the handle
+    npu_kernel = NPUKernel(
+        *transform.specialize(func=lambda x: x + 1, num_elements=32).compile()
+    )
+    handle = runtime.load(npu_kernel)
+
+    assert handle is not None
+    assert handle._is_valid
+
+    # Cleanup
+    runtime.cleanup()
+
+    assert len(runtime._context_cache) == 0
+    assert not handle._is_valid
+
+
+def test_base_runtime_load_run(runtime):
+    """Test that the base XRTHostRuntime works correctly (no caching)."""
+
+    input_tensor = iron.arange(32, dtype=np.int32)
+
+    # Run transform using the cached runtime (fixture)
+    transform(input_tensor, input_tensor, func=lambda x: x + 1, num_elements=32)
+
+    # Verify result
+    res = input_tensor.numpy()
+    expected = np.arange(32, dtype=np.int32) + 1
+    np.testing.assert_array_equal(res, expected)
+
+    npu_kernel = NPUKernel(
+        *transform.specialize(func=lambda x: x + 1, num_elements=32).compile()
+    )
+
+    # Create base runtime
+    base_runtime = XRTHostRuntime()
+
+    # Load
+    handle = base_runtime.load(npu_kernel)
+    assert handle is not None
+
+    # Run
+    base_runtime.run(handle, [input_tensor, input_tensor])
+
+    # Verify result
+    res = input_tensor.numpy()
+    expected = expected + 1
+    np.testing.assert_array_equal(res, expected)
+
+    # Verify no caching in base runtime
+    assert not hasattr(base_runtime, "_context_cache")
+
+
+def test_run_refuses_more_buffers_than_the_kernel_declares(runtime):
+    """Both runtimes check a run's buffers against the loaded kernel's ABI."""
+
+    npu_kernel = NPUKernel(
+        *transform.specialize(func=lambda x: x + 1, num_elements=32).compile()
+    )
+    for host_runtime in (runtime, XRTHostRuntime()):
+        handle = host_runtime.load(npu_kernel)
+        assert handle.name is not None
+        input_tensor = iron.arange(32, dtype=np.int32)
+        output_tensor = iron.zeros(32, dtype=np.int32)
+        host_runtime.run(handle, [input_tensor, output_tensor])
+        np.testing.assert_array_equal(
+            output_tensor.numpy(), np.arange(32, dtype=np.int32) + 1
+        )
+
+        declared = handle.num_args - 3
+        extra = [iron.zeros(32, dtype=np.int32) for _ in range(declared + 1)]
+        with pytest.raises(HostRuntimeError, match="host buffer"):
+            host_runtime.run(handle, extra)
+
+
+def test_cache_size_limit(runtime):
+    """Test that cache size is set correctly based on device."""
+    cache_sizes = CachedXRTRuntime.NPU_CONTEXT_CACHE_SIZE
+    npu1_size = cache_sizes["npu1"]
+    npu2_size = cache_sizes["npu2"]
+
+    expected_size = npu1_size if runtime.npu_str == "npu1" else npu2_size
+
+    env_cache_size = os.environ.get("XRT_CONTEXT_CACHE_SIZE")
+    if env_cache_size is not None:
+        expected_size = min(expected_size, int(env_cache_size))
+
+    assert runtime._cache_size == expected_size
+
+
+@pytest.mark.parametrize("name", ["XRT_CONTEXT_CACHE_SIZE", "XRT_INSTS_CACHE_SIZE"])
+def test_cache_size_must_be_positive(monkeypatch, name):
+    """A cache that holds nothing is refused up front, not on the first load."""
+    monkeypatch.setenv(name, "0")
+    with pytest.raises(HostRuntimeError, match=name):
+        CachedXRTRuntime()
+
+
+def test_runtime_retry_disable(runtime):
+    """Test that retry=False is accepted."""
+    npu_kernel = NPUKernel(
+        *transform.specialize(func=lambda x: x + 1, num_elements=32).compile()
+    )
+
+    # Load with retry=False
+    handle = runtime.load(npu_kernel, retry=False)
+    assert handle is not None
+
+
+def test_runtime_run_only_if_loaded(runtime):
+    """Test that run with only_if_loaded=True fails if kernel is evicted."""
+    input_tensor = iron.arange(32, dtype=np.int32)
+    npu_kernel = NPUKernel(
+        *transform.specialize(func=lambda x: x + 1, num_elements=32).compile()
+    )
+
+    # Load
+    handle = runtime.load(npu_kernel)
+    assert handle is not None
+    assert handle._is_valid
+
+    # Run with only_if_loaded=True (should succeed)
+    runtime.run(handle, [input_tensor, input_tensor], only_if_loaded=True)
+
+    # Invalidate handle (simulate eviction)
+    handle.invalidate()
+    assert not handle._is_valid
+
+    # Run with only_if_loaded=True (should fail)
+    from aie.utils.hostruntime.hostruntime import HostRuntimeError
+
+    with pytest.raises(HostRuntimeError, match="Kernel not loaded"):
+        runtime.run(handle, [input_tensor, input_tensor], only_if_loaded=True)
+
+
+# ---------------------------------------------------------------------------
+# Kernel cache: pyxrt.kernel is cached per context entry to avoid
+# reconstructing it on every load() call (implicit NPU context activation).
+# ---------------------------------------------------------------------------
+
+
+def test_kernel_cache_populated_after_first_load(runtime):
+    """load() populates entry['kernels'] so subsequent calls skip pyxrt.kernel()."""
+    input_tensor = iron.arange(32, dtype=np.int32)
+    transform(input_tensor, input_tensor, func=lambda x: x + 1, num_elements=32)
+
+    assert len(runtime._context_cache) >= 1
+    entry = list(runtime._context_cache.values())[0]
+    assert len(entry["kernels"]) >= 1
+
+
+def test_kernel_cache_returns_same_kernel(runtime):
+    """load() with the same kernel twice returns the same pyxrt.kernel object (no re-construction)."""
+    input_tensor = iron.arange(32, dtype=np.int32)
+
+    # First call: compiles and caches pyxrt.kernel in entry["kernels"]
+    transform(input_tensor, input_tensor, func=lambda x: x + 1, num_elements=32)
+    assert len(runtime._context_cache) >= 1
+    entry = list(runtime._context_cache.values())[0]
+    kernel_name = list(entry["kernels"].keys())[0]
+    kernel_first = entry["kernels"][kernel_name]
+    assert kernel_first is not None
+
+    # Second call with same kernel: must return the cached pyxrt.kernel (identity)
+    transform(input_tensor, input_tensor, func=lambda x: x + 1, num_elements=32)
+    kernel_second = entry["kernels"][kernel_name]
+
+    assert kernel_first is kernel_second, (
+        "Expected kernel cache to return the same pyxrt.kernel object on repeated "
+        "load(), but got a different object (new pyxrt.kernel was constructed)"
+    )
+
+
+def test_kernel_cache_cleared_on_eviction(runtime):
+    """entry['kernels'] is cleared when the context is evicted."""
+    original_size = runtime._cache_size
+    runtime._cache_size = 1
+
+    try:
+        input_tensor = iron.arange(32, dtype=np.int32)
+
+        # Load first kernel -> populates kernels sub-cache
+        transform(input_tensor, input_tensor, func=lambda x: x + 1, num_elements=32)
+        assert len(runtime._context_cache) == 1
+        first_context_key = list(runtime._context_cache.keys())[0]
+        first_entry = runtime._context_cache[first_context_key]
+        assert len(first_entry["kernels"]) >= 1
+
+        # Load a different kernel -> forces eviction of first context
+        transform(input_tensor, input_tensor, func=lambda x: x * 2, num_elements=32)
+
+        # First context entry must be gone
+        assert first_context_key not in runtime._context_cache
+        # Its kernels dict must be cleared (pyxrt.kernel objects released)
+        assert len(first_entry["kernels"]) == 0
+    finally:
+        runtime._cache_size = original_size
+
+
+def test_kernel_cache_cleared_on_cleanup(runtime):
+    """cleanup() evicts all contexts, clearing their kernel sub-caches."""
+    input_tensor = iron.arange(32, dtype=np.int32)
+    transform(input_tensor, input_tensor, func=lambda x: x + 1, num_elements=32)
+
+    entry = list(runtime._context_cache.values())[0]
+    assert len(entry["kernels"]) >= 1
+
+    runtime.cleanup()
+
+    assert len(runtime._context_cache) == 0
+    assert len(runtime._insts_cache) == 0
+    # After eviction the kernel dict is cleared
+    assert len(entry["kernels"]) == 0
+
+
+def test_kernel_released_when_context_evicted(runtime):
+    """
+    When a context is evicted, its cached pyxrt.kernel objects are released.
+    Use a weakref on the kernel to verify GC after eviction.
+    """
+    import gc
+    import weakref
+
+    original_size = runtime._cache_size
+    runtime._cache_size = 1
+
+    try:
+        input_tensor = iron.arange(32, dtype=np.int32)
+        transform(input_tensor, input_tensor, func=lambda x: x + 1, num_elements=32)
+
+        entry = list(runtime._context_cache.values())[0]
+        kernel_name = list(entry["kernels"].keys())[0]
+        kernel_ref = weakref.ref(entry["kernels"][kernel_name])
+        assert kernel_ref() is not None
+
+        # Force eviction by loading a different kernel
+        transform(input_tensor, input_tensor, func=lambda x: x * 2, num_elements=32)
+        gc.collect()
+
+        # The kernel weakref should be dead (strong ref released with context)
+        assert kernel_ref() is None, (
+            "pyxrt.kernel survived context eviction. " "Leaking kernel resources."
+        )
+    finally:
+        runtime._cache_size = original_size
+
+
+def test_load_returns_fresh_handle_each_call(runtime):
+    """
+    Each load() call returns a fresh CachedXRTKernelHandle (not the same object),
+    but the underlying pyxrt.kernel is shared.
+    """
+    real_kernel = NPUKernel(
+        *transform.specialize(func=lambda x: x + 1, num_elements=32).compile()
+    )
+
+    handle1 = runtime.load(real_kernel)
+    handle2 = runtime.load(real_kernel)
+
+    # Handles are different objects (safe for concurrent use)
+    assert handle1 is not handle2
+
+    # But they share the same underlying pyxrt.kernel
+    assert handle1.kernel is handle2.kernel
+
+
+# ---------------------------------------------------------------------------
+# insts_bo release tests
+#
+# The insts buffer object must be freed when its cache entry is evicted or
+# when cleanup() is called.  Previously _cleanup_insts_entry did
+# `del insts_bo` (local name only), leaving entry["insts_bo"] alive.
+# ---------------------------------------------------------------------------
+
+
+def test_insts_bo_released_when_evicted(runtime):
+    """
+    The insts buffer object is released when its cache entry is evicted.
+    """
+    import gc
+    import weakref
+
+    original_size = runtime._cache_size
+    runtime._cache_size = 1
+
+    try:
+        input_tensor = iron.arange(32, dtype=np.int32)
+        transform(input_tensor, input_tensor, func=lambda x: x + 1, num_elements=32)
+
+        assert len(runtime._insts_cache) >= 1
+        insts_entry = list(runtime._insts_cache.values())[0]
+        insts_ref = weakref.ref(insts_entry["insts_bo"])
+        assert insts_ref() is not None
+
+        del insts_entry  # don't let the test keep the object alive
+
+        # Force eviction of the insts entry by loading a different kernel.
+        transform(input_tensor, input_tensor, func=lambda x: x * 2, num_elements=32)
+        gc.collect()
+
+        assert insts_ref() is None, (
+            "insts_bo was not released after cache eviction. "
+            "Buffer memory is leaked."
+        )
+    finally:
+        runtime._cache_size = original_size
+
+
+def test_insts_bo_released_on_cleanup(runtime):
+    """
+    The insts buffer object is released when cleanup() is called.
+    """
+    import gc
+    import weakref
+
+    input_tensor = iron.arange(32, dtype=np.int32)
+    transform(input_tensor, input_tensor, func=lambda x: x + 1, num_elements=32)
+
+    assert len(runtime._insts_cache) >= 1
+    insts_entry = list(runtime._insts_cache.values())[0]
+    insts_ref = weakref.ref(insts_entry["insts_bo"])
+    assert insts_ref() is not None
+
+    del insts_entry  # don't let the test keep the object alive
+
+    runtime.cleanup()
+    gc.collect()
+
+    assert insts_ref() is None, (
+        "insts_bo was not released after cleanup(). "
+        "Buffer memory is leaked for the lifetime of the process."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Context lifetime / hardware-slot leak tests
+#
+# The machine has a finite number of hw_context slots.  These tests verify
+# that pyxrt.hw_context objects are *actually* released (refcount → 0) in
+# every eviction / cleanup / exception path, not merely removed from the
+# Python-side dict while still kept alive by a lingering reference.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def kernel_paths():
+    """The (xclbin_path, insts_path) of one compiled transform()."""
+    return transform.specialize(func=lambda x: x + 1, num_elements=32).compile()
+
+
+def test_context_released_when_evicted(runtime):
+    """
+    pyxrt.hw_context is released from memory when its cache entry is evicted.
+    This is the most critical correctness check: a leaked context consumes a
+    hardware slot that is a finite system-wide resource.
+    """
+    import gc
+    import weakref
+
+    original_size = runtime._cache_size
+    runtime._cache_size = 1
+
+    try:
+        input_tensor = iron.arange(32, dtype=np.int32)
+        transform(input_tensor, input_tensor, func=lambda x: x + 1, num_elements=32)
+
+        entry = list(runtime._context_cache.values())[0]
+        ctx_ref = weakref.ref(entry["context"])
+        assert ctx_ref() is not None
+
+        # Drop our reference to the entry dict so it isn't the thing keeping
+        # the context alive after eviction.
+        del entry
+
+        # Force eviction of the first context by loading a different kernel.
+        transform(input_tensor, input_tensor, func=lambda x: x * 2, num_elements=32)
+        gc.collect()
+
+        assert ctx_ref() is None, (
+            "pyxrt.hw_context was not released after cache eviction. "
+            "The hardware context slot is leaked."
+        )
+    finally:
+        runtime._cache_size = original_size
+
+
+def test_context_released_on_cleanup(runtime):
+    """
+    pyxrt.hw_context is released from memory when cleanup() is called.
+    cleanup() is called at process exit via atexit; a leak here means
+    contexts are held for the lifetime of the process.
+    """
+    import gc
+    import weakref
+
+    input_tensor = iron.arange(32, dtype=np.int32)
+    transform(input_tensor, input_tensor, func=lambda x: x + 1, num_elements=32)
+
+    entry = list(runtime._context_cache.values())[0]
+    ctx_ref = weakref.ref(entry["context"])
+    assert ctx_ref() is not None
+
+    del entry  # don't let the test itself keep the context alive
+
+    runtime.cleanup()
+    gc.collect()
+
+    assert ctx_ref() is None, (
+        "pyxrt.hw_context was not released after cleanup(). "
+        "The hardware context slot is leaked for the lifetime of the process."
+    )
+
+
+def test_load_exception_cleans_up_new_context(runtime, kernel_paths):
+    """
+    If load() raises after creating a new context (but before appending any
+    handle), the exception handler must evict the context so the hardware
+    slot is freed immediately — not left stranded in the cache.
+    """
+    from aie.utils.hostruntime.hostruntime import HostRuntimeError
+
+    xclbin_path, insts_path = kernel_paths
+
+    # Clear cache so the next load() definitely creates a fresh context.
+    runtime.cleanup()
+    assert len(runtime._context_cache) == 0
+
+    bad_kernel = NPUKernel(xclbin_path, insts_path, kernel_name="BAD_KERNEL_NAME")
+
+    # load() will create a new hw_context, add it to the cache, then raise
+    # HostRuntimeError at kernel-name validation (before any handle is appended).
+    with pytest.raises(HostRuntimeError, match="not found in xclbin"):
+        runtime.load(bad_kernel)
+
+    # The failed context must have been evicted — no leaked hardware slot.
+    assert len(runtime._context_cache) == 0, (
+        "Context created during a failed load() was not evicted. "
+        "Hardware context slot leaked."
+    )
+
+
+def test_load_exception_preserves_cached_context_with_live_handle(
+    runtime, kernel_paths
+):
+    """
+    If load() raises on a *cached* context while a prior handle is still alive,
+    the context must NOT be evicted — the live handle is still using it and
+    evicting would invalidate an in-flight operation.
+    """
+    from aie.utils.hostruntime.hostruntime import HostRuntimeError
+
+    xclbin_path, insts_path = kernel_paths
+
+    # First: a successful load that returns a handle we hold strongly.
+    good_kernel = NPUKernel(xclbin_path, insts_path, kernel_name="MLIR_AIE")
+    handle = runtime.load(good_kernel)
+    assert handle is not None and handle._is_valid
+
+    assert len(runtime._context_cache) == 1
+    context_key = list(runtime._context_cache.keys())[0]
+
+    # Second: a failing load on the *same* xclbin (context cache hit),
+    # bad kernel name causes HostRuntimeError after the cache-hit branch.
+    bad_kernel = NPUKernel(xclbin_path, insts_path, kernel_name="BAD_KERNEL_NAME")
+    with pytest.raises(HostRuntimeError, match="not found in xclbin"):
+        runtime.load(bad_kernel)
+
+    # The context must still be cached — the live handle depends on it.
+    assert len(runtime._context_cache) == 1, (
+        "Cached context was evicted by a failed load() even though a live "
+        "handle was still referencing it."
+    )
+    assert context_key in runtime._context_cache
+    assert handle._is_valid, "Live handle was invalidated by a failed load()"

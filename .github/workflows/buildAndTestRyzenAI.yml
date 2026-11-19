@@ -1,28 +1,25 @@
+# Copyright (C) 2023-2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
 name: Build and Test with AIE tools on Ryzen AI
 
+permissions:
+  contents: read
+
 on:
+  # No `push` on main: see buildAndTestRyzenAIWindows.yml. The merge queue tests
+  # the exact commit that merging pushes to main, and main is admin-enforced
+  # with a required merge queue and no force pushes, so the postsubmit run only
+  # ever re-tests an already-tested SHA. The nightly schedule still covers main.
   push:
     branches:
-      - main
       - test-ryzen-ai
   pull_request:
+    types: [opened, synchronize, reopened]
   merge_group:
-
-  # Allows you to run this workflow manually from the Actions tab by
-  # selecting CI and then "Run workflow" menu on the right branch
-  # and clicking on "launch_tmate_terminal_for_debug".
-  # Unfortunately this works only for the default branch.
-  # So you can either
-  # - change the default branch of the PR on the GitHub repository owning the PR
-  #   and launching in Actions tab;
-  # - or edit directly the step below which runs tmate and push to the
-  #   PR, ignoring the manual workflow launch.
-  workflow_dispatch:
-      launch_tmate_terminal_for_debug:
-        type: boolean
-        description: 'Run the build with tmate debugging enabled (https://github.com/marketplace/actions/debugging-with-tmate)'
-        required: false
-        default: false
+  schedule:
+    # Runs at midnight (00:00) every day
+    - cron: '0 0 * * *'
 
 defaults:
   run:
@@ -39,145 +36,497 @@ env:
   DEBIAN_FRONTEND: noninteractive
   XILINXD_LICENSE_FILE: /opt/xilinx/Xilinx.lic
   VITIS: /opt/ryzen_ai-1.3.0.1/vitis_aie_essentials
+  # ccache and lld are auto-detected and enabled by
+  # utils/build-mlir-aie-from-wheels.sh (CMAKE_<LANG>_COMPILER_LAUNCHER /
+  # LLVM_USE_LINKER), so only the options the script does not set itself are
+  # listed here.
   CMAKE_ARGS: |
-            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_EXE_LINKER_FLAGS_INIT="-fuse-ld=lld" \
-            -DCMAKE_MODULE_LINKER_FLAGS_INIT="-fuse-ld=lld" \
-            -DCMAKE_SHARED_LINKER_FLAGS_INIT="-fuse-ld=lld" \
             -DXRT_ROOT=/opt/xilinx/xrt \
-            -DAIE_VITIS_COMPONENTS=AIE2;AIE2P \
             -DAIE_ENABLE_PYTHON_PASSES=OFF \
             -DAIE_ENABLE_XRT_PYTHON_BINDINGS=ON \
-            -DAIE_INCLUDE_INTEGRATION_TESTS=OFF
-  LIT_OPTS: -sv --time-tests --timeout 600 --show-unsupported --show-excluded
+  LIT_OPTS: -sv --time-tests --show-unsupported --show-excluded
 
 jobs:
-  build-tests:
-    name: Run Tests on Ryzen AI
+
+  build-and-test-from-source:
+    name: Run Tests and Examples on Ryzen AI (Built from Source) (${{ matrix.runner_type }})
+    # The goal for this job is to run the full test suite, including programming guide and examples, on a freshly built-from-source MLIR-AIE.
+    # This also exercises the build-mlir-aie-from-wheels.sh script, which is the most common developer-facing way to rebuild MLIR-AIE from source.
     runs-on: ${{ matrix.runner_type }}
+    # Normal exec is 20-40 min; cap a hang well below GitHub's 360-min default.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        runner_type: [ amd7940hs, amdhx370 ]
+        include:
+          - runner_type: aie2-4col
+            expected_npu: npu1
+          - runner_type: aie2p-8col
+            expected_npu: npu2
+    env:
+      AIE_EXPECTED_NPU: ${{ matrix.expected_npu }}
+      NPU_CACHE_HOME: ${{ github.workspace }}/iron-cache-${{ matrix.runner_type }}-${{ github.run_id }}
+      PIP_CACHE_DIR: ${{ github.workspace }}/.pip-cache-${{ matrix.runner_type }}-${{ github.run_id }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
-          submodules: "true"
+          submodules: "recursive"
 
-      # Launch an ssh session via a proxy server if there is a need
-      # for debug. This seems to live for 35 min max
-      # https://github.com/mxschmitt/action-tmate
-      - name: Setup tmate session
-        uses: mxschmitt/action-tmate@v3
-        # To run this, launch it manually on the default branch and
-        # click on "launch_tmate_terminal_for_debug"
-        if: github.event_name == 'workflow_dispatch'
-                && inputs.launch_tmate_terminal_for_debug
+      - name: Print hostname
+        run: hostname
 
-      - name: Run commands
+      - name: ccache stats before the build
         run: |
-          sudo prlimit -lunlimited --pid $$
-          pip cache purge
-          source /opt/xilinx/xrt/setup.sh
-          python -m venv aie-venv
-          source aie-venv/bin/activate
-          pip install -r python/requirements.txt
-          HOST_MLIR_PYTHON_PACKAGE_PREFIX=aie pip install -r python/requirements_extras.txt
-          pip install -r python/requirements_ml.txt
-          pip install jupyter pytest
+          # These runners are long-lived and shared, so the ccache directory
+          # survives between runs while actions/checkout wipes the workspace.
+          # Deliberately read-only: no `ccache -z` and no `ccache -M`, because
+          # both write global state on a machine other jobs also build on.
+          # Print before and after instead; the delta is the per-job figure.
+          command -v ccache >/dev/null && ccache -s || echo "ccache not installed"
+
+      - name: Setup virtual environment / prerequisites
+        run: |
+          source ./utils/env_install.sh aie-venv --dev --extras
+
           sed -i.bak 's/OUTPUT_TIMEOUT = 10/OUTPUT_TIMEOUT = 100/g' \
             $(python -c 'import site; print(site.getsitepackages()[0])')/jupyter_client/runapp.py
 
-          VERSION=$(utils/clone-llvm.sh --get-wheel-version)
-          pip -q download mlir==$VERSION \
-            -f https://github.com/Xilinx/mlir-aie/releases/expanded_assets/mlir-distro
-          unzip -q mlir-*.whl
-          # I have no clue why but the system clock on GHA containers is like 12 hours ahead.
-          # That means wheels have file with time stamps in the future which makes ninja loop
-          # forever when configuring. Set the time to some arbitrary stamp in the past just to be safe.
-          find mlir -exec touch -a -m -t 201108231405.14 {} \;
-
-          mkdir build
-          pushd build
-
-          # -j here to reduce the number of parallel chess jobs.
-          # -j4 for 32GB RAM, -j12 for 64GB RAM
-          if [ x"${{ matrix.runner_type }}" == x"amdhx370" ]; then
-            LIT_OPTS="-j4 $LIT_OPTS"
-          else
-            LIT_OPTS="-j12 $LIT_OPTS"
+      - name: Check OpenCV availability
+        run: |
+          if ! pkg-config --exists opencv4; then
+            echo "::error::OpenCV not found on runner. Vision tests require OpenCV."
+            echo "Install libopencv-dev or ensure pkg-config can find opencv4."
+            exit 1
           fi
-
-          export PATH=$VITIS/bin:$VITIS/aietools/bin:$PATH
-          cmake .. -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DPython3_EXECUTABLE=$(which python) \
-            -DLLVM_EXTERNAL_LIT=$(which lit) \
-            -DCMAKE_INSTALL_PREFIX=$PWD/../mlir_aie \
-            -DCMAKE_MODULE_PATH=$PWD/../cmake/modulesXilinx \
-            -DMLIR_DIR=$PWD/../mlir/lib/cmake/mlir \
-            $CMAKE_ARGS
-
-          ninja install
-          ninja check-aie
-
-          popd
-
-  build-quick-setup:
-    name: Run Examples on Ryzen AI
-    runs-on: ${{ matrix.runner_type }}
-    strategy:
-      fail-fast: false
-      matrix:
-        runner_type: [ amd7940hs, amdhx370 ]
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: "true"
-
-      # Launch an ssh session via a proxy server if there is a need
-      # for debug. This seems to live for 35 min max
-      # https://github.com/mxschmitt/action-tmate
-      - name: Setup tmate session
-        uses: mxschmitt/action-tmate@v3
-        # To run this, launch it manually on the default branch and
-        # click on "launch_tmate_terminal_for_debug"
-        if: github.event_name == 'workflow_dispatch'
-                && inputs.launch_tmate_terminal_for_debug
+          echo "OpenCV found: $(pkg-config --modversion opencv4)"
 
       - name: Run commands
         run: |
           sudo prlimit -lunlimited --pid $$
-          pip cache purge
-          source /opt/xilinx/xrt/setup.sh
-          export PATH=$VITIS/bin:$VITIS/aietools/bin:$PATH
-          source utils/quick_setup.sh
-          # quick_setup changes directory to programming_examples, so we need to return to mlir-aie
-          cd ..
-
-          ./utils/build-mlir-aie-from-wheels.sh
-
-          # I have no clue why but the system clock on GHA containers is like 12 hours ahead.
-          # That means wheels have file with time stamps in the future which makes ninja loop
-          # forever when configuring. Set the time to some arbitrary stamp in the past just to be safe.
-          pushd my_install
-          find mlir -exec touch -a -m -t 201108231405.14 {} \;
-          popd
-
-          # build is created by the build-mlir-aie-from-wheels.sh script
-          pushd build
+          # Newer XRT/amdxdna packages no longer ship setup.sh; source it
+          # only when present so the job works on both old and new XRT.
+          [ -f /opt/xilinx/xrt/setup.sh ] && source /opt/xilinx/xrt/setup.sh
+          source aie-venv/bin/activate
 
           # -j here to reduce the number of parallel chess jobs.
-          # -j4 for 32GB RAM, -j12 for 64GB RAM
-          if [ x"${{ matrix.runner_type }}" == x"amdhx370" ]; then
+          # Pick parallelism from the runner's actual RAM rather than its
+          # label, so backup runners that share a label but have less memory
+          # don't OOM: -j4 for <48GB RAM, -j12 otherwise.
+          TOTAL_MEM_GB=$(free -g | awk '/^Mem:/ {print $2}')
+          if [ "$TOTAL_MEM_GB" -lt 48 ]; then
             LIT_OPTS="-j4 $LIT_OPTS"
           else
             LIT_OPTS="-j12 $LIT_OPTS"
           fi
 
-          ninja install
-          ninja check-reference-designs
-          ninja check-programming-guide
+          # Cap aiecc's internal per-design scheduler independently of lit's
+          # test-level -j setting to stay within this runner's memory limit.
+          export AIECC_JOBS=1
+
+          export PATH=$VITIS/bin:$VITIS/aietools/bin:$PATH
+
+          OPENCV_CMAKE="-DOpenCV_DIR=$(pkg-config --variable=prefix opencv4)/lib/cmake/opencv4"
+          export EXTRA_CMAKE_ARGS="-DPython3_EXECUTABLE=$(which python) $CMAKE_ARGS $OPENCV_CMAKE"
+          ./utils/build-mlir-aie-from-wheels.sh "" build mlir_aie
+
+          pushd build
+
+          # Create runner-specific cache directory
+          rm -rf $NPU_CACHE_HOME
+          mkdir $NPU_CACHE_HOME
+
+          # Set number of contexts to maintain in cache per process
+          export XRT_CONTEXT_CACHE_SIZE=2
+
+          # check-aie discovers the same corpus on every runner in the repo,
+          # hosted included, so the tests that don't require npu-xrt/npu-hrx
+          # (REQUIRES: ryzen_ai*/xrt_python_bindings*/hrx_*, or %run_on_npu*%)
+          # already ran on the hosted legs before reaching this scarce runner.
+          DEVICE_ONLY_LIT_FILTER='npu-xrt|npu-hrx|python/npu/'
+
+          run_suite() {
+            case "$1" in
+              check-aie)   LIT_FILTER="$DEVICE_ONLY_LIT_FILTER" ninja check-aie ;;
+              concurrency) ninja check-aie-concurrency ;;
+              refs)        ninja check-reference-designs ;;
+              guide)       ninja check-programming-guide ;;
+            esac
+          }
+
+          SUITES="check-aie concurrency refs guide"
+          for s in $SUITES; do
+            echo "===== suite: $s ====="
+            run_suite "$s"
+          done
 
           popd
+      - name: ccache stats after the build
+        if: always()
+        run: |
+          command -v ccache >/dev/null && ccache -s || echo "ccache not installed"
+
+      - name: Cleanup NPU_CACHE_HOME
+        if: always()
+        run: |
+          rm -rf $NPU_CACHE_HOME
+          rm -rf $PIP_CACHE_DIR
+
+  build-and-test-peano-only:
+    name: Peano-Only Build and Test, no Vitis/chess
+    # Smoke test for the configuration open-source Ryzen AI users rely on:
+    # Peano (llvm-aie) as the only AIE backend compiler, with Vitis AIE
+    # Essentials never on PATH. find_package(Vitis) (FindVitis.cmake) only
+    # probes PATH for `v++`, so this reproduces that configuration on the same
+    # runners the job above uses, without needing a separate no-Vitis runner.
+    # Scheduled only, not on every PR/merge: this exercises a second build
+    # configuration end-to-end on the same scarce self-hosted NPUs the job
+    # above already saturates per PR.
+    if: github.event_name == 'schedule'
+    runs-on: ${{ matrix.runner_type }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner_type: aie2-4col
+            expected_npu: npu1
+          - runner_type: aie2p-8col
+            expected_npu: npu2
+    env:
+      AIE_EXPECTED_NPU: ${{ matrix.expected_npu }}
+      NPU_CACHE_HOME: ${{ github.workspace }}/iron-cache-peano-only-${{ matrix.runner_type }}-${{ github.run_id }}
+      PIP_CACHE_DIR: ${{ github.workspace }}/.pip-cache-peano-only-${{ matrix.runner_type }}-${{ github.run_id }}
+      # Override the workflow-level Vitis env for this job only.
+      VITIS: ""
+      XILINXD_LICENSE_FILE: ""
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          submodules: "recursive"
+
+      - name: Print hostname
+        run: hostname
+
+      - name: Setup virtual environment / prerequisites
+        run: source ./utils/env_install.sh aie-venv --dev --extras
+
+      - name: Build from source (no Vitis on PATH, chess-clang off)
+        run: |
+          sudo prlimit -lunlimited --pid $$
+          [ -f /opt/xilinx/xrt/setup.sh ] && source /opt/xilinx/xrt/setup.sh
+          source aie-venv/bin/activate
+
+          # This runner also hosts the Vitis-based job above, so strip any
+          # Vitis/AIETools bin dirs a login profile might add to PATH and
+          # unset the env vars some runners export globally. The real gate is
+          # AIE_BUILD_CHESS_CLANG=OFF below plus the check that v++/xchesscc
+          # are unreachable.
+          unset AIETOOLS_ROOT VITIS_ROOT XILINX_VITIS XILINX_LOC
+          export PATH="$(echo "$PATH" | tr ':' '\n' | grep -v -i 'vitis\|aietools' | paste -sd:)"
+          if command -v v++ >/dev/null 2>&1 || command -v xchesscc >/dev/null 2>&1; then
+            echo "::error::Vitis/chess tools are still on PATH; this job must build without them"
+            exit 1
+          fi
+
+          export EXTRA_CMAKE_ARGS="-DPython3_EXECUTABLE=$(which python) -DXRT_ROOT=/opt/xilinx/xrt -DAIE_BUILD_CHESS_CLANG=OFF"
+          ./utils/build-mlir-aie-from-wheels.sh "" build install
+
+      - name: Run NPU smoke tests (no Vitis/chess)
+        run: |
+          sudo prlimit -lunlimited --pid $$
+          [ -f /opt/xilinx/xrt/setup.sh ] && source /opt/xilinx/xrt/setup.sh
+          source aie-venv/bin/activate
+
+          # Each step starts with the runner environment, so sanitize it again.
+          unset AIETOOLS_ROOT VITIS_ROOT XILINX_VITIS XILINX_LOC
+          export PATH="$(echo "$PATH" | tr ':' '\n' | grep -v -i 'vitis\|aietools' | paste -sd:)"
+          if command -v v++ >/dev/null 2>&1 || command -v xchesscc >/dev/null 2>&1; then
+            echo "::error::Vitis/chess tools are still on PATH; this job must test without them"
+            exit 1
+          fi
+
+          rm -rf "$NPU_CACHE_HOME" && mkdir -p "$NPU_CACHE_HOME"
+          export XRT_CONTEXT_CACHE_SIZE=2
+
+          pushd build
+          # REQUIRES: chess tests (e.g. cascade flows) are expected to show up
+          # as Unsupported here, not silently absent -- --show-unsupported
+          # makes a regression that filtered out this whole job's coverage
+          # visible in the log instead of a quiet, all-green no-op.
+          LIT_FILTER='npu-xrt' ninja check-aie
+          popd
+
+          export PATH="$PWD/install/bin:$PATH"
+          export PYTHONPATH="$PWD/install/python:$PYTHONPATH"
+          pushd programming_examples/basic/vector_scalar_add
+          make clean
+          if [ "${{ matrix.expected_npu }}" = "npu2" ]; then
+            NPU2=1 python3 "$GITHUB_WORKSPACE/utils/run_on_npu.py" npu2 make run
+          else
+            python3 "$GITHUB_WORKSPACE/utils/run_on_npu.py" npu1 make run
+          fi
+          popd
+
+      - name: Cleanup NPU_CACHE_HOME
+        if: always()
+        run: |
+          rm -rf $NPU_CACHE_HOME
+          rm -rf $PIP_CACHE_DIR
+
+  build-and-test-pure-hrx:
+    name: Pure HRX Build and Run (XRT-free packaging + libhrx dispatch)
+    # This job exercises the XRT-free flow end to end on XDNA2 hardware:
+    #   * builds MLIR-AIE from source with the bundled hrx-xclbinutil
+    #     (-DAIE_BUILD_HRXXCLBINUTIL=ON) instead of relying on XRT's xclbinutil,
+    #   * packages a real NPU .xclbin with that bundled tool
+    #     (the aiecc NPU_RUNTIME=hrx path via AIE_XCLBINUTIL), and
+    #   * dispatches it on the NPU through libhrx from a pinned HRX release
+    #     (no XRT runtime SDK), for both the Python (IRON) and C++ paths -
+    #     covering the multi-dispatch chain/runlist path (vector_scalar_add) and
+    #     the normal single-dispatch path (vector_vector_add IRON +
+    #     vector_reduce_max C++).
+    runs-on: aie2p-8col
+    timeout-minutes: 60
+    env:
+      LIT_OPTS: -v --time-tests --timeout 600
+      NPU_CACHE_HOME: ${{ github.workspace }}/iron-cache-hrx-${{ github.run_id }}
+      PIP_CACHE_DIR: ${{ github.workspace }}/.pip-cache-hrx-${{ github.run_id }}
+      # Token for the (private) HRX release repo. fetch-hrx-release.sh passes it
+      # to gh / curl; the runner's own gh auth is used when this is empty.
+      GH_TOKEN: ${{ secrets.HRX_RELEASE_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          submodules: "recursive"
+
+      - name: Print hostname
+        run: hostname
+
+      - name: Setup virtual environment / prerequisites
+        run: |
+          source ./utils/env_install.sh aie-venv --dev --extras
+
+      - name: ccache stats before the build
+        run: |
+          # These runners are long-lived and shared, so the ccache directory
+          # survives between runs while actions/checkout wipes the workspace.
+          # Deliberately read-only: no `ccache -z` and no `ccache -M`, because
+          # both write global state on a machine other jobs also build on.
+          # Print before and after instead; the delta is the per-job figure.
+          command -v ccache >/dev/null && ccache -s || echo "ccache not installed"
+
+      - name: Fetch pinned HRX release
+        run: |
+          # Downloads + checksum-verifies + extracts the pinned libhrx release
+          # and writes its env.sh path to $GITHUB_ENV for later steps.
+          env_sh=$(bash utils/fetch-hrx-release.sh)
+          echo "HRX_RELEASE_ENV=$env_sh" >> "$GITHUB_ENV"
+
+      - name: Build from source (bundled hrx-xclbinutil, no XRT bindings)
+        run: |
+          sudo prlimit -lunlimited --pid $$
+          source aie-venv/bin/activate
+          # Pure-HRX build: enable the bundled XRT-free packaging tool and skip
+          # the XRT python bindings. find_package(XRT) stays optional, so no XRT
+          # SDK is required to configure or build.
+          export EXTRA_CMAKE_ARGS="-DPython3_EXECUTABLE=$(which python) \
+            -DAIE_ENABLE_PYTHON_PASSES=OFF \
+            -DAIE_BUILD_HRXXCLBINUTIL=ON"
+          # Installs the built aie tree (bin/python/lib) into ./install so the
+          # make-driven examples below can `import aie` and find aiecc.
+          ./utils/build-mlir-aie-from-wheels.sh "" build install
+          # Sanity: the bundled tool must be installed as `xclbinutil` next to
+          # aiecc (that is what the NPU_RUNTIME=hrx packaging path resolves to).
+          test -x install/bin/xclbinutil
+
+      - name: Run pure-HRX tests and example on NPU
+        run: |
+          sudo prlimit -lunlimited --pid $$
+          source aie-venv/bin/activate
+          # libhrx + HRX_DIR/HRX_BUILD for both the C++ testbench (FindHRX.cmake)
+          # and the Python runtime (hrxruntime/discovery.py).
+          source "$HRX_RELEASE_ENV"
+          # Expose the installed aie tree (mirrors utils/env_setup.sh without
+          # depending on xrt-smi) so the make-driven examples can `import aie`
+          # and resolve aiecc + the bundled xclbinutil. libhrx stays on
+          # LD_LIBRARY_PATH from the sourced release env.sh above.
+          export PATH="$PWD/install/bin:$PATH"
+          export PYTHONPATH="$PWD/install/python:$PYTHONPATH"
+          export LD_LIBRARY_PATH="$PWD/install/lib:$LD_LIBRARY_PATH"
+          # aiecc uses the bundled XRT-free xclbinutil; NPU2=1 selects npu2 so the
+          # .xclbin matches this runner.
+          export AIE_XCLBINUTIL="$PWD/install/bin/xclbinutil"
+          export NPU2=1
+          # Per-process share of the device's hardware contexts, matching
+          # XRT_CONTEXT_CACHE_SIZE in the XRT jobs -- this box runs several of
+          # these concurrently against one 16-context pool.
+          export HRX_EXE_CACHE_SIZE=2
+
+          rm -rf "$NPU_CACHE_HOME" && mkdir -p "$NPU_CACHE_HOME"
+
+          run_suite() {
+            case "$1" in
+              xclbin_sections)
+                pushd build
+                LIT_FILTER='hrx_xclbin_sections' ninja check-aie
+                popd ;;
+              hrx_python)
+                pushd build
+                AIE_HRX_NPU=npu2 LIT_FILTER='python/npu/|npu-hrx|test_hrx_runtime_selection' ninja check-aie
+                popd ;;
+              vector_scalar_add)
+                pushd programming_examples/basic/vector_scalar_add
+                NPU_RUNTIME=hrx make clean
+                NPU_RUNTIME=hrx make all
+                NPU_RUNTIME=hrx python3 "$GITHUB_WORKSPACE/utils/run_on_npu.py" npu2 make run_runlist_hrx
+                popd ;;
+              vector_vector_add)
+                pushd programming_examples/basic/vector_vector_add
+                NPU_RUNTIME=hrx python3 "$GITHUB_WORKSPACE/utils/run_on_npu.py" npu2 python3 vector_vector_add.py
+                popd ;;
+              vector_reduce_max)
+                pushd programming_examples/basic/vector_reduce_max/single_core_designs
+                NPU_RUNTIME=hrx make clean
+                NPU_RUNTIME=hrx make all
+                NPU_RUNTIME=hrx python3 "$GITHUB_WORKSPACE/utils/run_on_npu.py" npu2 make run
+                popd ;;
+            esac
+          }
+
+          SUITES="xclbin_sections hrx_python vector_scalar_add vector_vector_add vector_reduce_max"
+          for s in $SUITES; do
+            echo "===== suite: $s ====="
+            run_suite "$s"
+          done
+
+      - name: ccache stats after the build
+        if: always()
+        run: |
+          command -v ccache >/dev/null && ccache -s || echo "ccache not installed"
+
+      - name: Cleanup NPU_CACHE_HOME
+        if: always()
+        run: |
+          rm -rf $NPU_CACHE_HOME
+          rm -rf $PIP_CACHE_DIR
+
+  build-pure-hrx-windows:
+    name: Pure HRX Build-Only (Windows, XRT-free packaging + HRX C++ compile)
+    # Windows counterpart of build-and-test-pure-hrx, but BUILD-ONLY (no NPU):
+    # GitHub-hosted windows-2022 has no XDNA2 device, so this proves the HRX path
+    # *compiles* on Windows rather than dispatching:
+    #   * the bundled XRT-free hrx-xclbinutil builds + passes its smoke test,
+    #   * the pinned HRX Windows release headers (hrx_runtime.h + hrx_amdxdna.h)
+    #     compile under MSVC (libhrx now owns the amdxdna XADX packaging, so there
+    #     is no separate helper to compile-check), and
+    #   * the HRX Python modules import/parse under the Windows interpreter.
+    # On-device dispatch stays on the Linux aie2p-8col job above.
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      # Token for the (private) HRX release repo; empty falls back to anonymous.
+      GH_TOKEN: ${{ secrets.HRX_RELEASE_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          submodules: "recursive"
+
+      - name: Set up MSVC dev environment
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1
+        with:
+          arch: x64
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Build and test the bundled hrx-xclbinutil (XRT-free packaging)
+        run: |
+          # The XRT-free / Boost-free packaging tool aiecc uses on the NPU_RUNTIME=hrx
+          # path. Building it here proves the pure-HRX packaging tool compiles on
+          # Windows in this tree (the dedicated buildAndTestHrxXclbinutil.yml workflow
+          # covers the standalone build/test matrix in more detail).
+          #
+          # Build-only on a GitHub-hosted runner with no NPU, so the on-device
+          # retry signatures don't apply; retry once on any failure to ride out a
+          # network/toolchain hiccup during configure or a flaky ctest. A
+          # deterministic break fails both runs; wipe the build dir first so a
+          # half-written CMake cache can't make the retry a deterministic failure.
+          $build = {
+            cmake -B build-hrxxclbinutil -S third_party/hrx-xclbinutil -A x64
+            if ($LASTEXITCODE -ne 0) { throw "cmake configure failed ($LASTEXITCODE)" }
+            cmake --build build-hrxxclbinutil --config Release --parallel
+            if ($LASTEXITCODE -ne 0) { throw "cmake build failed ($LASTEXITCODE)" }
+            ctest --test-dir build-hrxxclbinutil -C Release --output-on-failure
+            if ($LASTEXITCODE -ne 0) { throw "ctest failed ($LASTEXITCODE)" }
+          }
+          try {
+            & $build
+          } catch {
+            Write-Host "::warning::Transient Windows build/test failure ($_); retrying once"
+            Remove-Item -Recurse -Force build-hrxxclbinutil -ErrorAction SilentlyContinue
+            & $build
+          }
+
+      - name: Fetch pinned HRX Windows release
+        run: |
+          # Parse the pinned coordinates (Windows asset) from the shared env file.
+          $envmap = @{}
+          Get-Content utils/hrx-release.env | ForEach-Object {
+            if ($_ -match '^\s*([A-Za-z0-9_]+)\s*=\s*"?([^"]*)"?\s*$') {
+              $envmap[$matches[1]] = $matches[2]
+            }
+          }
+          $repo  = $envmap['HRX_RELEASE_REPO']
+          $tag   = $envmap['HRX_RELEASE_TAG']
+          $asset = $envmap['HRX_RELEASE_ASSET_WINDOWS']
+          $sha   = $envmap['HRX_RELEASE_SHA256_WINDOWS'].ToLower()
+          if (-not $asset) { throw "HRX_RELEASE_ASSET_WINDOWS not set in hrx-release.env" }
+          $url = "https://github.com/$repo/releases/download/$tag/$asset"
+          Write-Host "Downloading $url"
+
+          $headers = @{}
+          if ($env:GH_TOKEN) { $headers['Authorization'] = "Bearer $($env:GH_TOKEN)" }
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            try { Invoke-WebRequest -Uri $url -Headers $headers -OutFile $asset; break }
+            catch { if ($attempt -eq 3) { throw }; Start-Sleep -Seconds ($attempt * 5) }
+          }
+
+          $actual = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $sha) {
+            throw "checksum mismatch for ${asset}: got $actual, expected $sha"
+          }
+          Write-Host "Checksum OK ($sha)"
+
+          Expand-Archive -Path $asset -DestinationPath hrx-win -Force
+          $hdr = Get-ChildItem -Recurse hrx-win -Filter hrx_runtime.h | Select-Object -First 1
+          if (-not $hdr) { throw "hrx_runtime.h not found in the extracted HRX Windows release" }
+          "HRX_WIN_INCLUDE=$($hdr.Directory.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "HRX_WIN_ROOT=$((Resolve-Path hrx-win).Path)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Compile-check the HRX C ABI headers under MSVC
+        shell: cmd
+        run: |
+          echo #include "hrx_runtime.h"> hrx_probe.c
+          echo #include "hrx_amdxdna.h">> hrx_probe.c
+          echo int main(void){return 0;}>> hrx_probe.c
+          cl /nologo /c /I "%HRX_WIN_INCLUDE%" hrx_probe.c
+
+      - name: Python HRX modules parse under Windows Python
+        shell: bash
+        run: |
+          # Build-only Python proof: the HRX runtime sources parse under the
+          # Windows interpreter. (Full import/selection needs the built aie wheel
+          # and libhrx discovery, which is exercised on the Linux job.)
+          python -m py_compile \
+            python/utils/__init__.py \
+            python/utils/hostruntime/hrxruntime/__init__.py \
+            python/utils/hostruntime/hrxruntime/_bindings.py \
+            python/utils/hostruntime/hrxruntime/context.py \
+            python/utils/hostruntime/hrxruntime/hostruntime.py \
+            python/utils/hostruntime/hrxruntime/discovery.py \
+            python/utils/hostruntime/hrxruntime/tensor.py
+          echo "HRX Python sources compiled OK on Windows"

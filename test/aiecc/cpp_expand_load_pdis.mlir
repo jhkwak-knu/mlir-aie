@@ -1,0 +1,107 @@
+//===- cpp_expand_load_pdis.mlir -------------------------------*- MLIR -*-===//
+//
+// Copyright (C) 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+// Test full ELF generation with --expand-load-pdis.
+// This verifies that the expand-load-pdis path correctly:
+//   1. Creates empty device PDIs for device reset
+//   2. Assigns PDI IDs in module iteration order (empties first)
+//   3. Generates CDO/PDI for ALL devices (empties + originals)
+//   4. Generates NPU instructions from the same expanded module
+//   5. Produces a valid full ELF with all PDIs
+
+// REQUIRES: peano
+
+// RUN: rm -rf %t && mkdir -p %t
+// RUN: cd %t && aiecc --get-full-elf --expand-load-pdis --tmpdir=%t --verbose %s > %t/aiecc.log 2>&1
+// RUN: ls %t | FileCheck %s
+// RUN: FileCheck %s --check-prefix=OWN < %t/aiecc.log
+
+// Empty reset device gets its own CDO and PDI (empties first in module order).
+// CHECK-DAG: cdo_empty_0
+// CHECK-DAG: empty_0.pdi
+
+// Original devices are lowered from the same expanded module.
+// CHECK-DAG: cdo_main
+// CHECK-DAG: main.pdi
+// CHECK-DAG: cdo_add_one
+// CHECK-DAG: add_one.pdi
+
+// Full ELF and its config are produced.
+// CHECK-DAG: full_elf_config.json
+// CHECK-DAG: aie.elf
+
+// The three splits of the expanded module read it in place. Resumed from a
+// checkpoint at those splits, each reads its own copy, and the ELF is
+// unchanged.
+// RUN: cd %t && aiecc --get-full-elf --expand-load-pdis --tmpdir=%t/ckpt.prj --full-elf-name=%t/ckpt.elf --cut='perDevice_{0}.mlir,perDeviceNPULoweredFullElf_{0}.mlir,npu_seq_full_elf_{0}.mlir' --checkpoint=%t/ckpt %s
+// RUN: aiecc --resume=%t/ckpt/manifest.json
+// RUN: cmp %t/aie.elf %t/ckpt.elf
+
+// Each step of the NPU chain is the one reader of the module before it, so it
+// lowers that module in place rather than a copy. A kept intermediate is
+// never taken, and the ELF is unchanged.
+// OWN-DAG: edge 'npu_materialized.mlir' takes its input
+// OWN-DAG: edge 'npu_dma_lowered.mlir' takes its input
+// OWN-DAG: edge 'npu_expanded.mlir' takes its input
+// OWN-DAG: edge 'npu_lowered.mlir' takes its input
+// RUN: cd %t && aiecc --get-full-elf --expand-load-pdis --tmpdir=%t/dump.prj --full-elf-name=%t/dump.elf --dump-intermediates --verbose %s 2>&1 | FileCheck %s --check-prefix=DUMP
+// DUMP-NOT: takes its input
+// RUN: cmp %t/aie.elf %t/dump.elf
+
+module {
+
+    aie.device(npu2) @main {
+        aie.runtime_sequence @sequence(%arg : memref<16xi32>) {
+            aiex.configure @add_one {
+                aiex.run @add_one_seq (%arg) : (memref<16xi32>)
+            }
+        }
+    }
+
+    aie.device(npu2) @add_one {
+        %t00 = aie.tile(0, 0)
+        %t02 = aie.tile(0, 2)
+
+        aie.objectfifo @of_in (%t00, {%t02}, 1 : i32) : !aie.objectfifo<memref<16xi32>>
+        aie.objectfifo @of_out(%t02, {%t00}, 1 : i32) : !aie.objectfifo<memref<16xi32>>
+
+        aie.core(%t02) {
+            %c0 = arith.constant 0 : index
+            %c1 = arith.constant 1 : index
+            %c16 = arith.constant 16 : index
+            %c1_i32 = arith.constant 1 : i32
+            %c_intmax = arith.constant 0xFFFFFE : index
+
+            scf.for %niter = %c0 to %c_intmax step %c1 {
+                %elem_in = aie.objectfifo.acquire @of_in (Consume, 1) : memref<16xi32>
+                %elem_out = aie.objectfifo.acquire @of_out(Produce, 1) : memref<16xi32>
+                scf.for %i = %c0 to %c16 step %c1 {
+                    %0 = memref.load %elem_in[%i] : memref<16xi32>
+                    %1 = arith.addi %0, %c1_i32 : i32
+                    memref.store %1, %elem_out[%i] : memref<16xi32>
+                }
+                aie.objectfifo.release @of_in (Consume, 1)
+                aie.objectfifo.release @of_out(Produce, 1)
+            }
+            aie.end
+        }
+
+        aie.runtime_sequence @add_one_seq(%a : memref<16xi32>) {
+            %t_in = aiex.dma_configure_task_for @of_in {
+                aie.dma_bd(%a : memref<16xi32> offset = 0 len = 16)
+                aie.end
+            }
+            %t_out = aiex.dma_configure_task_for @of_out {
+                aie.dma_bd(%a : memref<16xi32> offset = 0 len = 16)
+                aie.end
+            } {issue_token = true}
+            aiex.dma_start_task(%t_in)
+            aiex.dma_start_task(%t_out)
+            aiex.dma_await_task(%t_out)
+        }
+    }
+}

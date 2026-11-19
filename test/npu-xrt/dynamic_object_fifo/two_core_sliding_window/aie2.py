@@ -1,23 +1,24 @@
 #
-# This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-# See https://llvm.org/LICENSE.txt for license information.
+# Copyright (C) 2022-2026 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #
-# (c) Copyright 2024 AMD Inc.
 
-# REQUIRES: ryzen_ai_npu1, valid_xchess_license
+# REQUIRES: ryzen_ai_npu1, peano
 #
-# RUN: xchesscc_wrapper aie2 -I %aietools/include -c %S/kernel.cc -o ./kernel.o
+# RUN: %PEANO_INSTALL_DIR/bin/clang++ --target=aie2-none-unknown-elf -O2 \
+# RUN:   -std=c++20 -DNDEBUG -D__AIE_API_AIE_ADF_HPP__ \
+# RUN:   -I%S/../../../../include -I%S/../../../../third_party/aie_api/include \
+# RUN:   -c %S/kernel.cc -o ./kernel.o
 # RUN: %python %S/aie2.py > ./aie2.mlir
-# RUN: %python aiecc.py --no-aiesim --aie-generate-npu-insts --aie-generate-xclbin --no-compile-host --dynamic-objFifos --xclbin-name=final.xclbin --npu-insts-name=insts.bin ./aie2.mlir
-# RUN: clang %S/test.cpp -o test.exe -std=c++17 -Wall %xrt_flags -lrt -lstdc++ %test_utils_flags
+# RUN: %aiecc --get-npu-insts --get-xclbin --xclbin-name=final.xclbin --npu-insts-name=insts.bin ./aie2.mlir
+# RUN: %host_clang %S/test.cpp -o test.exe -std=c++17 -Wall %xrt_flags %host_link_flags %test_utils_flags
 # RUN: %run_on_npu1% ./test.exe
 
 import numpy as np
 
 from aie.dialects.aie import *
 from aie.dialects.aiex import *
-from aie.helpers.dialects.ext.scf import _for as range_
+from aie.iron.controlflow import range_
 from aie.extras.context import mlir_mod_ctx
 
 N = 100
@@ -45,15 +46,19 @@ def two_core_sliding_window():
 
             # AIE Core Function declarations
             passthrough_10_i32 = external_func(
-                "passthrough_10_i32", inputs=[subtensor_ty, subtensor_ty]
+                "passthrough_10_i32",
+                inputs=[subtensor_ty, subtensor_ty],
+                link_with="kernel.o",
             )
             add_10_i32 = external_func(
-                "add_10_i32", inputs=[subtensor_ty, subtensor_ty, subtensor_ty]
+                "add_10_i32",
+                inputs=[subtensor_ty, subtensor_ty, subtensor_ty],
+                link_with="kernel.o",
             )
 
             # Set up compute tiles
 
-            @core(ComputeTile, "kernel.o")
+            @core(ComputeTile)
             def core_body():
                 for _ in range_(10):
                     elemOut = of_in2.acquire(ObjectFifoPort.Produce, 1)
@@ -62,7 +67,7 @@ def two_core_sliding_window():
                     of_in.release(ObjectFifoPort.Consume, 1)
                     of_in2.release(ObjectFifoPort.Produce, 1)
 
-            @core(ComputeTile2, "kernel.o")
+            @core(ComputeTile2)
             def core_body():
                 elemOutPre = of_out.acquire(ObjectFifoPort.Produce, 1)
                 elemInPre = of_in2.acquire(ObjectFifoPort.Consume, 1)

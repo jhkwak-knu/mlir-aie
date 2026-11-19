@@ -1,0 +1,63 @@
+//===- test_trace_host_config_verify.mlir ---------------------*- MLIR -*-===//
+//
+// Copyright (C) 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+// RUN: aie-opt %s -split-input-file -verify-diagnostics
+
+// Test: buffer_size must be positive
+module @invalid_buffer_size {
+  aie.device(npu1_1col) {
+    %tile02 = aie.tile(0, 2)
+    aie.runtime_sequence(%arg0: memref<16xi32>) {
+      // expected-error@+1 {{'aie.trace.host_config' op buffer_size must be positive}}
+      aie.trace.host_config {buffer_size = 0 : i32}
+    }
+  }
+}
+
+// -----
+
+// Test: unknown routing strategy parse error
+module @invalid_routing {
+  aie.device(npu1_1col) {
+    aie.runtime_sequence() {
+      // expected-error@+1 {{attribute 'routing' failed to satisfy constraint}}
+      aie.trace.host_config {buffer_size = 8192 : i32, routing = "invalid_routing"}
+    }
+  }
+}
+
+// -----
+
+// Test: reuse_output_buffer requires routing=single (default is single, so
+// test with non-single). Note: Currently only 'single' routing exists, so this
+// test validates the verifier would catch it if other routing strategies were
+// added.
+
+// -----
+
+// Test: buffer_size must be positive (negative)
+module @invalid_buffer_size_negative {
+  aie.device(npu1_1col) {
+    %tile02 = aie.tile(0, 2)
+    aie.runtime_sequence(%arg0: memref<16xi32>) {
+      // expected-error@+1 {{'aie.trace.host_config' op buffer_size must be positive}}
+      aie.trace.host_config {buffer_size = -1 : i32, reuse_output_buffer = true}
+    }
+  }
+}
+
+// -----
+
+// Test: egress_shim_col cannot be negative.
+module @invalid_egress_shim_col_negative {
+  aie.device(npu1_1col) {
+    aie.runtime_sequence(%arg0: memref<16xi32>) {
+      // expected-error@+1 {{'aie.trace.host_config' op egress_shim_col must be >= 0}}
+      aie.trace.host_config {buffer_size = 8192 : i32, egress_shim_col = -1 : i32}
+    }
+  }
+}

@@ -1,17 +1,14 @@
 <!---//===- README.md --------------------------*- Markdown -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2024-2026 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Copyright (C) 2024, Advanced Micro Devices, Inc.
-// 
 //===----------------------------------------------------------------------===//-->
 
 # <ins>ResNet with Offloaded Conv2_x Layers</ins>
 
 ## Introduction
-ResNet [[1]](#1) is a convolutional neural network architecture that has gained significant popularity for various computer vision tasks, including image classification, object detection, and image segmentation. It is renowned for its depth and efficiency in training very deep networks. This README focuses on our implementation of the conv2_x layers of the ResNet architecture using three columns of NPU. 
+ResNet [[1]](#1) is a convolutional neural network architecture that has gained significant popularity for various computer vision tasks, including image classification, object detection, and image segmentation. It is renowned for its depth and efficiency in training very deep networks. This README focuses on our implementation of the conv2_x layers of the ResNet architecture using three columns of NPU.
 
 ## ResNet Architecture Overview
 ResNet consists of the following key components:
@@ -31,10 +28,10 @@ ResNet consists of the following key components:
 .
 +-- layers_conv2_x                  # Implementation of ResNet conv2_x layers on NPU
 |   +-- resnet.py                   # A Python script that defines the AIE array structural design using MLIR-AIE operations.
-|   +-- resnet_placed.py               # A Python script that defines the AIE array structural design using MLIR-AIE operations using a lower-level version of IRON
 |   +-- Makefile                    # Contains instructions for building and compiling software projects.
 |   +-- resnet_conv2x_pipeline.png  # Figure describing our implementation of conv2_x layers on NPU.
-|   +-- run.lit                     # For LLVM Integrated Tester (LIT) of the design.
+|   +-- run_makefile.lit            # For LLVM Integrated Tester (LIT) of the design.
+|   +-- run_strix_makefile.lit      # For LIT on Strix (npu2) devices.
 |   +-- test.py                     # Python code testbench for the design example.
 +-- README.md                       # This file.
 
@@ -56,22 +53,20 @@ The below figures shows our implementation of the conv2_x layers of the ResNet a
  </h3>
 </p>
 
-Similar to our [bottleneck](../../bottleneck) design, we implement conv2_x layers depth-first. Our implementation connects the output of one bottleneck block on an NPU column to another on a separate column, all without the necessity of transferring intermediate results off-chip. Compared to [bottleneck](../../bottleneck) design, the first bottleneck block in the conv2_x stage requires an additional 1x1 convolution on the `AIE (0,4)` tile to handle channel mismatch for the skip addition between the input from the skip path and the input from the non-skip path. This mismatch arises because the initial input activation transferred from the skip path possesses fewer input channels compared to the output on the non-skip path. To overcome this issue, an additional 1x1 convolution is introduced in the skip path that the increases the number of channels.
+Similar to our [bottleneck](../bottleneck) design, we implement conv2_x layers depth-first. Our implementation connects the output of one bottleneck block on an NPU column to another on a separate column, all without the necessity of transferring intermediate results off-chip. Compared to [bottleneck](../bottleneck) design, the first bottleneck block in the conv2_x stage requires an additional 1x1 convolution on the `AIE (0,4)` tile to handle channel mismatch for the skip addition between the input from the skip path and the input from the non-skip path. This mismatch arises because the initial input activation transferred from the skip path possesses fewer input channels compared to the output on the non-skip path. To overcome this issue, an additional 1x1 convolution is introduced in the skip path that the increases the number of channels.
 
-After the initial processing in the first bottleneck block, the output is sent directly to the second bottleneck block on a separate NPU column. The output activation is broadcasted to both `AIE (1,5)` and `AIE (1,3)` via `Mem Tile (1,1)`. The second bottleneck's processing proceeds as described in [bottleneck](../../bottleneck) design. Similarly, the subsequent bottleneck block requires the output from the second bottleneck, avoiding any need to send intermediate activations off-chip. Upon processing in the third bottleneck block, the final output is transmitted from tile `AIE (2,4)` back to the output via `Shim tile (2,0)`, completing the seamless flow of computation within the NPU architecture. Thus, our depth-first implementation avoids any unnecessary off-chip data movement for intermediate tensors.
+After the initial processing in the first bottleneck block, the output is sent directly to the second bottleneck block on a separate NPU column. The output activation is broadcasted to both `AIE (1,5)` and `AIE (1,3)` via `Mem Tile (1,1)`. The second bottleneck's processing proceeds as described in [bottleneck](../bottleneck) design. Similarly, the subsequent bottleneck block requires the output from the second bottleneck, avoiding any need to send intermediate activations off-chip. Upon processing in the third bottleneck block, the final output is transmitted from tile `AIE (2,4)` back to the output via `Shim tile (2,0)`, completing the seamless flow of computation within the NPU architecture. Thus, our depth-first implementation avoids any unnecessary off-chip data movement for intermediate tensors.
 
 
 
 
 ## Compilation
+The Makefile lives in `layers_conv2_x/`, so `cd` there first.
+
 To compile the design:
 ```shell
+cd layers_conv2_x
 make
-```
-
-To compile the placed design:
-```shell
-env use_placed=1 make
 ```
 
 To run the design:
@@ -80,6 +75,5 @@ make run_py
 ```
 
 ## References
-<a id="1">[1]</a> 
+<a id="1">[1]</a>
 He, K., Zhang, X., Ren, S., & Sun, J. (2016). Deep residual learning for image recognition. In Proceedings of the IEEE conference on computer vision and pattern recognition (pp. 770-778).
-

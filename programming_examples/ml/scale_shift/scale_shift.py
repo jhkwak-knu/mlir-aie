@@ -1,149 +1,112 @@
+# scale_shift/scale_shift.py -*- Python -*-
 #
-# This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-# See https://llvm.org/LICENSE.txt for license information.
+# Copyright (C) 2025-2026 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #
-# (c) Copyright 2025 AMD Inc.
+"""Time-multiplexed bf16 scale-and-shift — IRON API design with ``@iron.jit``.
 
-from ml_dtypes import bfloat16
-import numpy as np
+Two cores compute ``D = A * B + C`` in two passes over the same workers:
+
+  1. Phase 1: ``rtp = 1`` (multiply) — workers compute ``D = A * B``.
+  2. Phase 2: ``rtp = 0`` (add)      — workers compute ``D = D + C``.
+
+A per-worker ``Buffer(..., use_write_rtp=True)`` carries the runtime
+parameter; a ``WorkerRuntimeBarrier`` synchronizes the runtime sequence
+with the worker so the new ``rtp`` value is visible before the worker
+starts the next phase.
+"""
+
 import argparse
-import sys
 
-from aie.extras.dialects.ext import arith
-from aie.dialects.aie import T
+import aie.iron as iron
+import aie.iron.kernels as kernels
+import numpy as np
+from aie.helpers.npdtypes import np_ndarray_type_get_shape
 from aie.iron import (
-    Kernel,
+    Buffer,
+    CompileTime,
+    In,
     ObjectFifo,
+    Out,
     Program,
-    GlobalBuffer,
     Runtime,
+    TaskGroup,
     Worker,
     WorkerRuntimeBarrier,
 )
-from aie.iron.placers import SequentialPlacer
-from aie.iron.device import NPU1Col1, NPU2Col1
 from aie.iron.controlflow import range_
-from aie.helpers.util import np_ndarray_type_get_shape
-
-#
-# Scale Shift is a multi-core example that time-multiplexes the
-# cores to perform first a scale, followed by a bias addition
-# to shift: A * B + C = D, where each is a vector of bfloat16
-# values. A "Runtime Parameter" rtp is used to switch between
-#  * and + in each core at runtime. WorkerRuntimeBarriers are
-# used to synchronize between the runtime sequence and each Worker.
-#
+from aie.utils.hostruntime.argparse import add_compile_args, device_from_args
+from aie.utils.hostruntime.cli import run_design_cli
+from aie.utils.verify import assert_pass
+from ml_dtypes import bfloat16
 
 
-def my_scale_shift(dev, in1_size, in2_size, in3_size, out_size, trace_size):
-    in1_dtype = bfloat16
-    in2_dtype = bfloat16
-    in3_dtype = bfloat16
-    out_dtype = bfloat16
-
-    tensor_size = in1_size // in1_dtype(0).nbytes
-
-    # Tile sizes
-    tile_size = 1024
-    tensor_div_tile = tensor_size // tile_size
-
-    # This example 2 cores to paralelize the scale and
-    # shift operations one after another.
-    # The number of cores can be changed to 1 or 4.
+@iron.jit
+def scale_shift(
+    a_in: In,
+    b_in: In,
+    c_in: In,
+    d_out: Out,
+    *,
+    size: CompileTime[int] = 65536,
+):
     n_cores = 2
-    tiles = tensor_div_tile // n_cores
+    tile_size = 1024
 
-    assert in2_size == in1_size, "input2 buffer size must match input1 buffer size."
-    assert in3_size == in1_size, "input3 buffer size must match input1 buffer size."
-    assert out_size == in1_size, "Output buffer size must match input1 buffer size."
+    if size % (tile_size * n_cores) != 0:
+        raise ValueError(f"size ({size}) must be a multiple of {tile_size * n_cores}")
 
-    # The trace size is the size of the trace buffer.
-    # The trace buffer is used to store the trace of the
-    # operations performed by the AIE array.
-    enable_trace = 1 if trace_size > 0 else 0
+    tiles_per_core = size // tile_size // n_cores
 
-    # Type used in the external memory
-    tensor_ty = np.ndarray[(tensor_size,), np.dtype[out_dtype]]
-    # Type used in the tile memory
-    tile_ty = np.ndarray[(tile_size,), np.dtype[out_dtype]]
+    tensor_ty = np.ndarray[(size,), np.dtype[bfloat16]]
+    tile_ty = np.ndarray[(tile_size,), np.dtype[bfloat16]]
+    memtile_ty = np.ndarray[(tile_size * n_cores,), np.dtype[bfloat16]]
 
-    # Type used in the tile memory
-    A_ty = np.ndarray[(tile_size,), np.dtype[in1_dtype]]
-    B_ty = np.ndarray[(tile_size,), np.dtype[in2_dtype]]
-    C_ty = np.ndarray[(tile_size,), np.dtype[out_dtype]]
+    # Split each input across n_cores via a memtile FIFO.
+    def _split(of, name):
+        offsets = [
+            (np.prod(np_ndarray_type_get_shape(memtile_ty)) // n_cores) * i
+            for i in range(n_cores)
+        ]
+        return of.cons().split(
+            offsets,
+            obj_types=[tile_ty] * n_cores,
+            names=[f"{name}{i}" for i in range(n_cores)],
+        )
 
-    # Type used in the memory tile which aggregates across the 2 cores
-    A_memTile_ty = np.ndarray[(tile_size * n_cores,), np.dtype[in1_dtype]]
-    B_memTile_ty = np.ndarray[(tile_size * n_cores,), np.dtype[in2_dtype]]
-    C_memTile_ty = np.ndarray[(tile_size * n_cores,), np.dtype[out_dtype]]
+    inA = ObjectFifo(memtile_ty, name="inA")
+    inB = ObjectFifo(memtile_ty, name="inB")
+    inA_fifos = _split(inA, "memA")
+    inB_fifos = _split(inB, "memB")
 
-    # AIE Core Function declarations
-    scale_shift_bf16 = Kernel(
-        "eltwise_mul_add_bf16_vector",
-        "scale_shift.o",
-        [tile_ty, tile_ty, tile_ty, np.int32],
-    )
-
-    # AIE-array data movement with object fifos
-    # Input A
-    inA = ObjectFifo(A_memTile_ty, name="inA")
-    of_offsets = [
-        (np.prod(np_ndarray_type_get_shape(A_memTile_ty)) // n_cores) * i
-        for i in range(n_cores)
-    ]
-    inA_fifos = inA.cons().split(
-        of_offsets,
-        obj_types=[A_ty] * n_cores,
-        names=[f"memA{i}" for i in range(n_cores)],
-    )
-
-    # Input B
-    inB = ObjectFifo(B_memTile_ty, name="inB")
-    of_offsets = [
-        (np.prod(np_ndarray_type_get_shape(B_memTile_ty)) // n_cores) * i
-        for i in range(n_cores)
-    ]
-    inB_fifos = inB.cons().split(
-        of_offsets,
-        obj_types=[B_ty] * n_cores,
-        names=[f"memB{i}" for i in range(n_cores)],
-    )
-
-    # Output C
-    outC = ObjectFifo(C_memTile_ty, name="outC")
-    of_offsets = [
-        (np.prod(np_ndarray_type_get_shape(C_memTile_ty)) // n_cores) * i
+    outC = ObjectFifo(memtile_ty, name="outC")
+    join_offsets = [
+        int(np.prod(np_ndarray_type_get_shape(memtile_ty)) // n_cores) * i
         for i in range(n_cores)
     ]
     outC_fifos = outC.prod().join(
-        of_offsets,
-        obj_types=[C_ty] * n_cores,
+        join_offsets,
+        obj_types=[tile_ty] * n_cores,
         names=[f"memC{i}" for i in range(n_cores)],
     )
 
-    # Runtime parameters
-    rtps = []
-    for i in range(n_cores):
-        rtps.append(
-            GlobalBuffer(
-                np.ndarray[(1,), np.dtype[np.int32]],
-                name=f"rtp{i}",
-                initial_value=np.array([1], dtype=np.int32),
-                use_write_rtp=True,
-            )
+    mul_add_fn = kernels.mul_add(tile_size=tile_size)
+
+    rtps = [
+        Buffer(
+            np.ndarray[(1,), np.dtype[np.int32]],
+            name=f"rtp{i}",
+            initial_value=np.array([1], dtype=np.int32),
+            use_write_rtp=True,
         )
+        for i in range(n_cores)
+    ]
+    barriers = [WorkerRuntimeBarrier() for _ in range(n_cores)]
 
-    # Create barriers to synchronize individual workers with the runtime sequence
-    workerBarriers = []
-    for i in range(n_cores):
-        workerBarriers.append(WorkerRuntimeBarrier())
-
-    # Task for the cores to perform
     def core_fn(of_a, of_b, of_c, mul_add, my_rtp, barrier):
         barrier.wait_for_value(1)
         is_mul = my_rtp[0]
-        for _ in range_(tiles):
+        for _ in range_(tiles_per_core):
             elem_out = of_c.acquire(1)
             elem_in_a = of_a.acquire(1)
             elem_in_b = of_b.acquire(1)
@@ -153,122 +116,99 @@ def my_scale_shift(dev, in1_size, in2_size, in3_size, out_size, trace_size):
             of_c.release(1)
         barrier.release_with_value(1)
 
-    # Set up workers to perform the tasks
-    workers = []
-    for i in range(n_cores):
-        workers.append(
-            Worker(
-                core_fn,
-                fn_args=[
-                    inA_fifos[i].cons(),
-                    inB_fifos[i].cons(),
-                    outC_fifos[i].prod(),
-                    scale_shift_bf16,
-                    rtps[i],
-                    workerBarriers[i],
-                ],
-                # trace=enable_trace,
-            )
+    workers = [
+        Worker(
+            core_fn,
+            fn_args=[
+                inA_fifos[i].cons(),
+                inB_fifos[i].cons(),
+                outC_fifos[i].prod(),
+                mul_add_fn,
+                rtps[i],
+                barriers[i],
+            ],
         )
+        for i in range(n_cores)
+    ]
 
-    # Runtime operations to move data to/from the AIE-array
-    rt = Runtime()
-    with rt.sequence(tensor_ty, tensor_ty, tensor_ty, tensor_ty) as (A, B, C, D):
-        if enable_trace:
-            rt.enable_trace(trace_size, workers=workers)
+    def _set_rtps_to(value):
+        for rtp in rtps:
+            rtp[0] = value
 
-        rt.start(*workers)
-
-        # Set runtime parameters
-        # 1 == multiply
-        def set_rtps(*args):
-            for rtp in args:
-                rtp[0] = 1
-
-        rt.inline_ops(set_rtps, rtps)
-
-        # Set the barriers to 1 to allow the worker to read the
-        # runtime parameters and start the computation
+    def sequence(A, B, C, D, inA_h, inB_h, outC_h):
+        # Phase 1: multiply (rtp=1).
+        _set_rtps_to(1)
         for i in range(n_cores):
-            rt.set_barrier(workerBarriers[i], 1)
+            barriers[i].set(1)
+        tg1 = TaskGroup()
+        inA_h.fill(A, group=tg1)
+        inB_h.fill(B, group=tg1)
+        outC_h.drain(D, wait=True, group=tg1)
+        tg1.finish()
 
-        # Fill the input objectFIFOs with data
-        rt.fill(inA.prod(), A)
-        rt.fill(inB.prod(), B)
-        # Drain the output objectFIFOs to the external memory
-        # Wait for the data to be drained before continuing
-        rt.drain(outC.cons(), D, wait=True)
-
-        # Set runtime parameters
-        # 0 == add
-        def set_rtps(*args):
-            for rtp in args:
-                rtp[0] = 0
-
-        rt.inline_ops(set_rtps, rtps)
-
-        # Set the barriers to 1 to allow the worker to read the
-        # runtime parameters and start the computation
+        # Phase 2: add (rtp=0).  D = (A*B) feeds back as the lhs.
+        _set_rtps_to(0)
         for i in range(n_cores):
-            rt.set_barrier(workerBarriers[i], 1)
+            barriers[i].set(1)
+        tg2 = TaskGroup()
+        inA_h.fill(D, group=tg2)
+        inB_h.fill(C, group=tg2)
+        outC_h.drain(D, wait=True, group=tg2)
+        tg2.finish()
 
-        # Fill the input objectFIFOs with data
-        # The input D is the output of the previous operation
-        rt.fill(inA.prod(), D)
-        rt.fill(inB.prod(), C)
-        # Drain the output objectFIFOs to the external memory
-        # Wait for the data to be drained before continuing
-        rt.drain(outC.cons(), D, wait=True)
+    rt = Runtime(
+        sequence,
+        [
+            tensor_ty,
+            tensor_ty,
+            tensor_ty,
+            tensor_ty,
+            inA.prod(),
+            inB.prod(),
+            outC.cons(),
+        ],
+    )
 
-    # Place components (assign them resources on the device) and generate an MLIR module
-    return Program(dev, rt).resolve_program(SequentialPlacer())
+    return Program(iron.get_current_device(), rt, workers=workers).resolve_program()
 
 
-p = argparse.ArgumentParser()
-## Parse command line arguments
+def _make_argparser():
+    p = argparse.ArgumentParser(prog="AIE Scale Shift")
+    add_compile_args(p, with_elf=True)
+    p.add_argument("-l", "--length", type=int, default=65536, help="elements")
+    return p
 
-## The device name is used to select the device to use
-## The device name can be either npu or npu2
-p.add_argument("-d", "--dev", required=True, dest="device", help="AIE Device")
-## The input and output buffer sizes are used to set the size of the buffers
-## The input and output buffer sizes:
-##     * are in bytes
-##     * must be a multiple of the tile size
-##     * must have matching sizes
-p.add_argument(
-    "-i1s", "--in1_size", required=True, dest="in1_size", help="Input 1 size"
-)
-p.add_argument(
-    "-i2s", "--in2_size", required=True, dest="in2_size", help="Input 2 size"
-)
-p.add_argument(
-    "-i3s", "--in3_size", required=True, dest="in3_size", help="Input 3 size"
-)
-p.add_argument("-os", "--out_size", required=True, dest="out_size", help="Output size")
-## The trace size is used to set the size of the trace buffer
-p.add_argument(
-    "-t",
-    "--trace_size",
-    required=False,
-    dest="trace_size",
-    default=0,
-    help="Trace buffer size",
-)
-opts = p.parse_args(sys.argv[1:])
 
-if opts.device == "npu":
-    dev = NPU1Col1()
-elif opts.device == "npu2":
-    dev = NPU2Col1()
-else:
-    raise ValueError("[ERROR] Device name {} is unknown".format(opts.device))
+def _compile_kwargs(opts):
+    return dict(size=opts.length)
 
-in1_size = int(opts.in1_size)
-in2_size = int(opts.in2_size)
-in3_size = int(opts.in3_size)
-out_size = int(opts.out_size)
-trace_size = int(opts.trace_size)
 
-module = my_scale_shift(dev, in1_size, in2_size, in3_size, out_size, trace_size)
-# Print the MLIR module to stdout
-print(module)
+def _run_and_verify(opts):
+    # Each pass rounds its fp32 result to the nearest bf16, as numpy's cast
+    # does, so the product is stored to bf16 before the add.
+    rng = np.random.default_rng(0)
+    a, b, c = (rng.uniform(-4, 4, opts.length).astype(bfloat16) for _ in range(3))
+    a_t, b_t, c_t = (iron.tensor(x, dtype=bfloat16, device="npu") for x in (a, b, c))
+    d_t = iron.zeros_like(a_t)
+
+    scale_shift(a_t, b_t, c_t, d_t, **_compile_kwargs(opts))
+
+    f32 = np.float32
+    product = (a.astype(f32) * b.astype(f32)).astype(bfloat16)
+    expected = (product.astype(f32) + c.astype(f32)).astype(bfloat16)
+    assert_pass(d_t.numpy(), expected, fail_msg="scale_shift output mismatch")
+
+
+def main():
+    opts = _make_argparser().parse_args()
+    run_design_cli(
+        scale_shift,
+        opts,
+        compile_kwargs=_compile_kwargs,
+        run_and_verify=_run_and_verify,
+        device=lambda o: device_from_args(o, n_cols=1),
+    )
+
+
+if __name__ == "__main__":
+    main()

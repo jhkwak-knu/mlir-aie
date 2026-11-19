@@ -1,7 +1,13 @@
-name: Build wheels for Ryzen AI
+# Copyright (C) 2024-2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+name: Publish Ryzen AI wheels
+
+permissions:
+  contents: read
+  packages: read
 
 on:
-  pull_request:
   workflow_dispatch:
     inputs:
       AIE_COMMIT:
@@ -9,162 +15,163 @@ on:
         type: string
         required: false
         default: ''
-  merge_group:
-
+  push:
+    tags:
+      - 'v*.*.*'
   schedule:
     # At 04:00. (see https://crontab.guru)
     - cron: '0 4 * * *'
-    
+
+concurrency:
+  # A workflow_dispatch/schedule event serializes by event type; tag pushes
+  # serialize by tag commit. PR checks run in the per-OS workflows.
+  group: ci-publish-ryzenai-wheels-${{ github.event_name == 'push' && github.sha || github.event_name }}
+  cancel-in-progress: true
+
 defaults:
   run:
     shell: bash
-    
-concurrency:
-  # A PR number if a pull request and otherwise the commit hash. This cancels
-  # queued and in-progress runs for the same PR (presubmit) or commit
-  # (postsubmit).
-  group: ci-build-test-ryzenai-experimental-${{ github.event.number || github.sha }}
-  cancel-in-progress: true
 
 env:
   DEBIAN_FRONTEND: noninteractive
   VITIS: /opt/ryzen_ai-1.3.0/vitis_aie_essentials
   XILINXD_LICENSE_FILE: /opt/xilinx/Xilinx.lic
+  PIP_RETRIES: "3"
+  PIP_RESUME_RETRIES: "3"
+  PIP_TIMEOUT: "60"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
 jobs:
-  build-repo:
-    name: Build and upload mlir_aie wheels
-
-    runs-on: ubuntu-latest
-
+  linux-wheels:
+    name: Build Linux wheels
+    uses: ./.github/workflows/buildRyzenWheelsLinux.yml
     permissions:
       id-token: write
       contents: write
       packages: read
+      attestations: write
+    with:
+      AIE_COMMIT: ${{ inputs.AIE_COMMIT || '' }}
 
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - python_version: "3.10"
-            ENABLE_RTTI: ON
+  windows-wheels:
+    name: Build Windows wheels
+    uses: ./.github/workflows/buildRyzenWheelsWindows.yml
+    permissions:
+      id-token: write
+      contents: write
+      packages: read
+      attestations: write
+    with:
+      AIE_COMMIT: ${{ inputs.AIE_COMMIT || '' }}
 
-          - python_version: "3.10"
-            ENABLE_RTTI: OFF
-
-          - python_version: "3.12"
-            ENABLE_RTTI: ON
-
-          - python_version: "3.12"
-            ENABLE_RTTI: OFF
-
-          - python_version: "3.13"
-            ENABLE_RTTI: ON
-
-          - python_version: "3.13"
-            ENABLE_RTTI: OFF
-
+  publish:
+    name: Publish wheels
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule' ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
+    runs-on: ubuntu-26.04
+    needs: [linux-wheels, windows-wheels]
+    permissions:
+      contents: write
+      actions: read
     steps:
-      - name: Free disk space
-        uses: descriptinc/free-disk-space@main
+      - name: Checkout rehearsal script + ci-tools.lock
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          swap-storage: false
+          sparse-checkout: |
+            utils/mlir_aie_wheels/scripts/pypi_rehearsal.sh
+            utils/mlir_aie_wheels/ci-tools.lock
 
-      - uses: actions/checkout@v4
+      - name: Download wheels (RTTI ON)
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8
         with:
-          submodules: "true"
+          pattern: mlir_aie*_rtti_ON-*
+          path: wheels_on
+          merge-multiple: true
 
-      - uses: uraimo/run-on-arch-action@v2.7.0
-        name: Build mlir-aie
-        id: runcmd
+      - name: Download wheels (RTTI OFF)
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8
         with:
-          distro: none
-          arch: none
-          base_image: ghcr.io/xilinx/mlir-aie/ubuntu22-ryzenai-1.3.0ea:1.1
-          githubToken: ${{ github.token }}
-          dockerRunArgs: |
-            --mac-address 02:42:ac:11:00:02
-          env: |
-            VITIS: ${{ env.VITIS }}
-            XILINXD_LICENSE_FILE: ${{ env.XILINXD_LICENSE_FILE }}
-          run: |
-            git config --global --add safe.directory $PWD
-            MLIR_VERSION=$(git rev-parse --short HEAD)
-            echo "Building mlir-aie version $MLIR_VERSION"
+          pattern: mlir_aie*_rtti_OFF-*
+          path: wheels_off
+          merge-multiple: true
 
-            python${{ matrix.python_version }} -m venv ${{ github.workspace }}/aie-venv
-            source ${{ github.workspace }}/aie-venv/bin/activate
+      - name: Flatten wheels (RTTI ON)
+        run: |
+          set -euo pipefail
+          mkdir -p wheels_on_flat
+          find wheels_on -name 'mlir_aie*whl' -exec cp -f {} wheels_on_flat/ \;
 
-            echo "Installing vitis_aie_essentials ..."
-            pushd /opt
-            tar xfz /workspace/vaie.tgz
-            popd
+      - name: Flatten wheels (RTTI OFF)
+        run: |
+          set -euo pipefail
+          mkdir -p wheels_off_flat
+          find wheels_off -name 'mlir_aie*whl' -exec cp -f {} wheels_off_flat/ \;
 
-            pip install -r python/requirements.txt
-            pip install -r python/requirements_ml.txt
-            HOST_MLIR_PYTHON_PACKAGE_PREFIX=aie pip install -r python/requirements_extras.txt
-
-            export ENABLE_RTTI=${{ matrix.ENABLE_RTTI }}
-
-            NO_RTTI=""  # Set a default value
-            NO_RTTI_UNDERSCORE=""  # Set a default value
-            if [ x"$ENABLE_RTTI" == x"OFF" ]; then
-              NO_RTTI="-no-rtti"
-              NO_RTTI_UNDERSCORE="_no_rtti"
-            fi
-            VERSION=$(utils/clone-llvm.sh --get-wheel-version)
-            pip -q download mlir$NO_RTTI==$VERSION \
-              -f https://github.com/Xilinx/mlir-aie/releases/expanded_assets/mlir-distro
-            unzip -q mlir*.whl
-            # I have no clue why but the system clock on GHA containers is like 12 hours ahead.
-            # That means wheels have file with time stamps in the future which makes ninja loop
-            # forever when configuring. Set the time to some arbitrary stamp in the past just to be safe.
-            find mlir$NO_RTTI_UNDERSCORE -exec touch -a -m -t 201108231405.14 {} \;
-
-            export PATH=$VITIS/bin:$VITIS/aietools/bin:$PATH
-            export MLIR_INSTALL_ABS_PATH=$PWD/mlir$NO_RTTI_UNDERSCORE
-            export MLIR_AIE_SOURCE_DIR=$PWD
-            export WHEELHOUSE_DIR=$PWD/wheelhouse
-            export CMAKE_MODULE_PATH=$PWD/cmake/modulesXilinx
-            export XRT_ROOT=/opt/xilinx/xrt
-            if [ x"${{ inputs.AIE_COMMIT }}" == x"" ]; then
-              export AIE_PROJECT_COMMIT=$MLIR_VERSION
-            else
-              MLIR_VERSION = "${{ inputs.AIE_COMMIT }}"
-              export AIE_PROJECT_COMMIT=${MLIR_VERSION:0:7}
-            fi
-            export AIE_VITIS_COMPONENTS='AIE2;AIE2P'
-            export DATETIME=$(date +"%Y%m%d%H")
-
-            pushd utils/mlir_aie_wheels
-
-            pip install wheel auditwheel patchelf importlib_metadata
-            CIBW_ARCHS=x86_64 pip wheel . -v -w $WHEELHOUSE_DIR --no-build-isolation
-
-            popd
-
-            auditwheel repair -w $WHEELHOUSE_DIR/repaired_wheel $WHEELHOUSE_DIR/mlir_aie*.whl --plat manylinux_2_35_x86_64 --exclude libcdo_driver.so --exclude libmlir_float16_utils.so
-
-      - name: Upload mlir_aie
-        uses: actions/upload-artifact@v4
+      - name: Set up Python (host) for rehearsal
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
-          path: wheelhouse/repaired_wheel/mlir_aie*whl
-          name: mlir_aie_rtti_${{ matrix.ENABLE_RTTI }}-${{ matrix.python_version }}
+          python-version: '3.12'
 
-      - name: Release current commit
-        if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
-        uses: ncipollo/release-action@v1.12.0
+      - name: PyPI publish rehearsal (RTTI ON)
+        shell: bash
+        run: |
+          python -m pip install --require-hashes -r utils/mlir_aie_wheels/ci-tools.lock
+          bash utils/mlir_aie_wheels/scripts/pypi_rehearsal.sh wheels_on_flat wheels_on_stripped 'buildRyzenWheels / RTTI ON'
+
+      - name: PyPI publish rehearsal (RTTI OFF)
+        shell: bash
+        run: |
+          bash utils/mlir_aie_wheels/scripts/pypi_rehearsal.sh wheels_off_flat wheels_off_stripped 'buildRyzenWheels / RTTI OFF'
+
+      - name: Combine wheels
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -euo pipefail
+          mkdir -p wheels_all
+          cp wheels_on_flat/mlir_aie*whl wheels_all/
+          cp wheels_off_flat/mlir_aie*whl wheels_all/
+
+      - name: Release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd  # v1.21.0
         with:
-          artifacts: wheelhouse/repaired_wheel/mlir_aie*whl
+          artifacts: wheels_all/mlir_aie*whl
           token: "${{ secrets.GITHUB_TOKEN }}"
-          tag: 'latest-wheels-2'
-          name: 'latest-wheels-2'
-          removeArtifacts: false
+          tag: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
           allowUpdates: true
           replacesArtifacts: true
+          omitBodyDuringUpdate: true
+          prerelease: ${{ contains(github.ref_name, 'rc') || contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') }}
+          makeLatest: ${{ !(contains(github.ref_name, 'rc') || contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta')) }}
+
+      - name: Release latest wheels (RTTI ON)
+        # Only publish from the nightly schedule or an intentional manual
+        # refresh. Excludes pull_request so PRs no longer overwrite the shared
+        # rolling tag with unmerged branch content.
+        if: ${{ contains(fromJSON('["schedule","workflow_dispatch"]'), github.event_name) }}
+        uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd  # v1.21.0
+        with:
+          artifacts: wheels_on_flat/mlir_aie*whl
+          token: "${{ secrets.GITHUB_TOKEN }}"
+          tag: latest-wheels-5
+          name: latest-wheels-5
+          allowUpdates: true
+          replacesArtifacts: false
+          omitBodyDuringUpdate: true
+          makeLatest: false
+
+      - name: Release latest wheels (RTTI OFF)
+        if: ${{ contains(fromJSON('["schedule","workflow_dispatch"]'), github.event_name) }}
+        uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd  # v1.21.0
+        with:
+          artifacts: wheels_off_flat/mlir_aie*whl
+          token: "${{ secrets.GITHUB_TOKEN }}"
+          tag: latest-wheels-no-rtti-3
+          name: latest-wheels-no-rtti-3
+          allowUpdates: true
+          replacesArtifacts: false
+          omitBodyDuringUpdate: true
           makeLatest: false

@@ -1,27 +1,23 @@
-# Copyright (C) 2023, Advanced Micro Devices, Inc.
+# Copyright (C) 2023 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 # RUN: %PYTHON %s | FileCheck %s
 
 from aie.dialects.aiex import *
-from aie.dialects.aie import device, AIEDevice, object_fifo, tile
-from aie.extras.dialects.ext import arith
-from aie.extras import types as T
+from aie.dialects.aie import (
+    device,
+    AIEDevice,
+    DMAChannelDir,
+    object_fifo,
+    shim_dma_allocation,
+    tile,
+)
 from util import construct_and_print_module
 
 
-# CHECK-LABEL: getTileOp
-# CHECK: aiex.getTile
-@construct_and_print_module
-def getTileOp():
-    four = arith.constant(4, index=True)
-    two = arith.constant(2, index=True)
-    GetTileOp(T.index(), four, two)
-
-
 # CHECK-LABEL: runtimeSeq
-# CHECK: aiex.runtime_sequence @sequence0()
-# CHECK: aiex.runtime_sequence @seq1()
+# CHECK: aie.runtime_sequence @sequence0()
+# CHECK: aie.runtime_sequence @seq1()
 @construct_and_print_module
 def runtimeSeq():
     @device(AIEDevice.npu1)
@@ -36,7 +32,7 @@ def runtimeSeq():
 
 
 # CHECK-LABEL: NpuDmaMemcpyNdOp
-# CHECK: aiex.runtime_sequence @sequence(%arg0: memref<100xi8>)
+# CHECK: aie.runtime_sequence(%arg0: memref<100xi8>)
 @construct_and_print_module
 def NpuDmaMemcpyNdOp():
     @device(AIEDevice.npu1)
@@ -56,6 +52,27 @@ def NpuDmaMemcpyNdOp():
             )
 
 
+# CHECK-LABEL: NpuDmaMemcpyNdOpI32Dims
+# CHECK: aie.runtime_sequence(%arg0: memref<4096xi8>, %arg1: i32)
+# CHECK-NOT: arith.extsi
+# CHECK: aiex.npu.dma_memcpy_nd(%arg0[0, 0, 0, 0][1, 1, %arg1 : i32, 64][0, 0, 64, 1])
+@construct_and_print_module
+def NpuDmaMemcpyNdOpI32Dims():
+    @device(AIEDevice.npu1)
+    def device_body():
+        shim_dma_allocation("objFifo_out0", tile(0, 0), DMAChannelDir.S2MM, 0)
+
+        @runtime_sequence(np.ndarray[(4096,), np.dtype[np.int8]], np.int32)
+        def sequence(B, rows):
+            npu_dma_memcpy_nd(
+                metadata="objFifo_out0",
+                bd_id=1,
+                mem=B,
+                sizes=[1, 1, rows, 64],
+                strides=[0, 0, 64, 1],
+            )
+
+
 # CHECK-LABEL: v8bfp16ebs8Binding
 # CHECK: !aie.objectfifo<memref<256x!aiex.bfp<"v8bfp16ebs8">>>
 @construct_and_print_module
@@ -65,7 +82,9 @@ def v8bfp16ebs8Binding():
         P = tile(0, 0)
         C = tile(1, 2)
 
-        object_fifo("dummy", P, C, 1, datatype=np.ndarray[(256,), np.dtype[v8bfp16ebs8]])
+        object_fifo(
+            "dummy", P, C, 1, datatype=np.ndarray[(256,), np.dtype[v8bfp16ebs8]]
+        )
 
 
 # CHECK-LABEL: v16bfp16ebs16Binding
@@ -77,4 +96,6 @@ def v16bfp16ebs16Binding():
         P = tile(0, 0)
         C = tile(1, 2)
 
-        object_fifo("dummy", P, C, 1, datatype=np.ndarray[(256,), np.dtype[v16bfp16ebs16]])
+        object_fifo(
+            "dummy", P, C, 1, datatype=np.ndarray[(256,), np.dtype[v16bfp16ebs16]]
+        )

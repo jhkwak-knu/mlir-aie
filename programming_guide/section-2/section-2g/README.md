@@ -1,40 +1,469 @@
 <!---//===- README.md ---------------------------------------*- Markdown -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2024-2026 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Copyright (C) 2024, Advanced Micro Devices, Inc.
-// 
 //===----------------------------------------------------------------------===//-->
 
-# <ins>Section 2g - Data Movement Without Object FIFOs</ins>
+# Section 2g - Data Movement Without ObjectFifos
 
-* [Section 2 - Data Movement (Object FIFOs)](../../section-2/)
+* [Section 2 - Data Movement (ObjectFifos)](../../section-2/)
     * [Section 2a - Introduction](../section-2a/)
-    * [Section 2b - Key Object FIFO Patterns](../section-2b/)
+    * [Section 2b - Key ObjectFifo Patterns](../section-2b/)
     * [Section 2c - Data Layout Transformations](../section-2c/)
     * [Section 2d - Runtime Data Movement](../section-2d/)
     * [Section 2e - Programming for multiple cores](../section-2e/)
     * [Section 2f - Practical Examples](../section-2f/)
-    * Section 2g - Data Movement Without Object FIFOs
+    * Section 2g - Data Movement Without ObjectFifos
+    * [Section 2h - Advanced ObjectFifo + Cross-Tile Buffer](../section-2h/)
 
 -----
 
-Not all data movement patterns can be described with Object FIFOs. This **advanced** section goes into detail about how a user can express data movement using the Direct Memory Access channels (or `DMA`) on AIE tiles. To better understand the code and concepts introduced in this section it is recommended to first read the [Advanced Topic of Section - 2a on DMAs](../section-2a/README.md/#advanced-topic--data-movement-accelerators).
+Not all data movement patterns fit cleanly into ObjectFifos.  This
+**advanced** section goes into detail about how to express data
+movement directly in terms of the underlying hardware pieces: per-tile
+Direct Memory Access (DMA) channels, buffer descriptors, hardware
+locks, and the AXI-stream routes between them.  To better understand
+the code and concepts here, it is recommended to first read the
+[Advanced Topic of Section 2a on DMAs](../section-2a/README.md#advanced-topic-direct-memory-access-channels).
 
-**Please note that this part of the guide is described at the explicitly placed IRON level.**
+IRON exposes the same surface in two tiers — both fully supported,
+both lower into the same `aie.flow` / `aie.lock` / `aie.mem` /
+`aie.memtile_dma` / `aie.shim_dma` ops:
 
-The AIE architecture currently has three different types of tiles: compute tiles, referred to as "tile", memory tiles referred to as "Mem tiles", and external memory interface tiles referred to as "Shim tiles". Each of these tiles has its own attributes regarding compute capabilities and memory capacity, but the base design of their DMAs is the same. The different types of DMAs can be intialized using the constructors in [aie.py](../../../python/dialects/aie.py):
+* **IRON Python primitives** (the rest of this section).  First-class
+  Python classes — `Flow`, `Lock`, `TileDma`, `DmaChannel`, `Bd`,
+  `Acquire`, `Release` — that compose into a regular `@iron.jit`
+  design alongside `Worker` and `Runtime`.  Use this tier when you
+  want to hand-wire DMA programs but still get the `@iron.jit`
+  lifecycle (content-addressed caching, `iron.tensor` host I/O,
+  `aiecc` lowering).
+* **AIE dialect Python** ([§Lowered-equivalent dialect](#lowered-equivalent-dialect-aie-dialect-python)
+  at the end).  Raw `@mem` / `@memtile_dma` / `@shim_mem` /
+  `aie.flow` / `aie.lock` decorators from
+  [`python/dialects/aie.py`](../../../python/dialects/aie.py).
+  Useful for pure-dialect lit tests and for the rare design that
+  needs an op the IRON primitives don't expose yet.
+
+## <u>Hardware background</u>
+
+The AIE architecture has three types of tiles — compute tiles, mem
+tiles, and shim tiles (external memory interface).  Each has its own
+compute and memory characteristics, but the DMAs share a common
+design.  Each tile's DMA exposes some number of input (`S2MM`) and
+output (`MM2S`) channels — compute and shim tiles have two of each;
+mem tiles have six of each.
+
+The data movement on each channel is described by a chain of *buffer
+descriptors* (BDs).  Each BD says which buffer is being moved and how
+it synchronizes — locks acquired before the transfer starts and
+released after it completes.  BDs in a chain link to a `next` BD,
+forming a loop that keeps streaming as long as the lock protocol
+permits.
+
+A *flow* connects two channels (or a channel to another endpoint kind)
+across the AXI stream switch fabric.  Flows are direction-agnostic at
+the API level — the lowering reads direction off the source and
+destination tiles.
+
+## <u>IRON Python: structural primitives</u>
+
+These classes live under `aie.iron`:
+
+| Class | What it lowers to | Defined in |
+|-------|-------------------|-----------|
+| `Buffer(tile, type, initial_value=None, name)` | `aie.buffer` on the given tile | [`python/iron/buffer.py`](../../../python/iron/buffer.py) |
+| `Lock(tile, lock_id=None, init=0, name)` | `aie.lock` with explicit id + init count | [`python/iron/lock.py`](../../../python/iron/lock.py) |
+| `Flow(src, dst \| [dsts], *, src_port=DMA, src_channel=None, dst_port=DMA, dst_channel=None, name=None)` | `aie.flow` when both channels are given; otherwise `aie.route_endpoint`s joined by an `aie.route`, whose DMA channels the compiler assigns.  A list of `dst`s broadcasts | [`python/iron/dataflow/flow.py`](../../../python/iron/dataflow/flow.py) |
+| `PacketFlow(pkt_id, src, dst, *, src_channel=0, dst_channel=0, extra_dsts=[PacketDest(...)], keep_pkt_header=False, name=None)` | `aie.packetflow` tagged with `pkt_id`.  With a shim end it has `fill` / `drain` like a `Flow`, and `fill(a, pkt_type=0)` stamps the packet header on the input | same file |
+| `DmaEndpoint(tile, direction, channel)` | One DMA channel of one tile.  `flow.endpoint(tile)` is the end of a `Flow` on `tile`, whose channel the compiler may assign | [`python/iron/dataflow/tile_dma.py`](../../../python/iron/dataflow/tile_dma.py) |
+| `TileDma(tile, channels=[DmaChannel(...)])` | `aie.mem` (compute), `aie.memtile_dma` (memtile), or `aie.shim_dma` (shim) — picked by tile type | [`python/iron/dataflow/tile_dma.py`](../../../python/iron/dataflow/tile_dma.py) |
+| `DmaChannel(direction, channel, bds=[Bd(...)], pad_value=0, repeat_count=0, out_of_order=False, loop=True)` | One `@dma(dir, ch)` chain inside the TileDma's region.  `channel` is an index or a `DmaEndpoint` such as `flow.endpoint(tile)` | same |
+| `Bd(buffer, tap=None, acquires=[...], releases=[...], next=None\|"self"\|int, packet=None, bd_id=None, iteration=None, out_of_order_id=None)` | One BD block: acquires + `aie.dma_bd` + releases + `aie.next_bd`.  `tap` is a `TensorAccessPattern` over `buffer` (default: the whole buffer) | same |
+| `BdIteration(size, stride, current=0)` | The `iteration` state of one `aie.dma_bd`: the BD's base advances by `stride` elements per execution and wraps after `size` | [`python/dialects/aie.py`](../../../python/dialects/aie.py) |
+| `Acquire(lock, value=1, greater_equal=True)` | `aie.use_lock(..., AcquireGreaterEqual\|Acquire)` at BD start | same |
+| `Release(lock, value=1)` | `aie.use_lock(..., Release)` at BD end | same |
+
+`Bd.next` mirrors the dialect's `aie.next_bd` chain wiring:
+
+* `None` (default) — follow the channel.  The BD points at the next entry
+  in `bds`, and the last entry either loops back to the first or leaves the
+  chain, per `DmaChannel.loop`.  This is the common case, so most BDs say
+  nothing about `next` at all.
+* `"self"` — loop back to this BD regardless of what the channel says.
+* an `int` `i` — point at the i-th BD in this `DmaChannel`'s `bds` list
+  (zero-based).  Useful for explicit cycles in multi-BD chains.
+
+`DmaChannel.loop` decides what the end of the chain does:
+
+* `True` (default) — the last BD chains back to the first, so the channel
+  streams forever.  A single-BD channel therefore self-chains, which is the
+  "keep streaming" pattern.
+* `False` — the last BD chains to the region's `aie.end`, which the dialect
+  reads as "the chain ends here".  Only then is the chain a task the channel
+  can finish, which is what makes a queue-push `repeat_count` mean anything:
+  an endless chain never completes, so there is nothing to repeat.
+
+`Bd.packet = (pkt_type, pkt_id)` stamps a packet header on every
+transfer this BD emits — pair it with a `PacketFlow` carrying the same
+`pkt_id` so the routing fabric dispatches correctly.  From the shim,
+`packet_flow.fill(a)` stamps the header itself, so several `PacketFlow`s
+leaving one shim channel are told apart by which one you fill (see
+[`packet_switch`](../../../programming_examples/basic/packet_switch/)).  `Bd.bd_id` pins
+the descriptor's hardware id; the others are allocated around it.
+
+A few more `Bd` fields cover hardware features that would otherwise need
+extra descriptors:
+
+* `iteration=BdIteration(size, stride)` lets one BD walk `size`
+  sub-buffers, advancing its base by `stride` elements on each execution,
+  where an unrolled chain would need `size` BDs.  Values are in elements;
+  the lowering applies the hardware's `-1` bias.  It takes the BD's
+  outermost dimension, so in a runtime-sequence `task` its `tap` gets one
+  dimension fewer.  See
+  [`test/npu-xrt/bd_iteration`](../../../test/npu-xrt/bd_iteration/bd_iteration.py).
+* A padded `tap` (`tap.pad([(before, after), ...])`, mem tile only) pads
+  each dimension of the access pattern with `DmaChannel.pad_value`.  See
+  [`dma_padding`](../../../programming_examples/basic/dma_padding/).
+* `DmaChannel(..., out_of_order=True)` on an S2MM channel places each
+  arriving packet in the BD whose `bd_id` matches the out-of-order id in
+  its header.  The sender stamps that id with `Bd.out_of_order_id`.  See
+  [`test/npu-xrt/dma_s2mm_ooo`](../../../test/npu-xrt/dma_s2mm_ooo/).
+
+### Wiring everything into the `Runtime`
+
+Two registrations on the `Runtime` object pull the structural
+primitives into the resolved program.  Both accept one object per
+call.  The `Buffer`s and `Lock`s a `TileDma`'s `Bd`s use are found from
+them; `rt.add_lock` is only needed for a lock nothing else reaches:
+
 ```python
-@mem(tile) # compute tile DMA
-@shim_dma(tile) # Shim tile DMA
-@memtile_dma(tile) # Mem tile DMA
+def sequence(a, b):
+    ...                     # host-side data movement (or raw npu_* ops)
+
+rt = Runtime(sequence, [in_ty, out_ty])
+rt.add_flow(my_flow)        # one call per Flow / PacketFlow
+rt.add_tile_dma(my_dma)     # one call per TileDma program
 ```
 
-The DMA hardware component has a certain number of input and output `channels`, and each one has a direction and a port index. Input channels are denoted with the keyword `S2MM` and output ones with `MM2S`. Port indices vary per tile. For example, compute and Shim tiles have two input and two output ports, whereas Mem tiles have six input and six output ports.
+The sequence body can also program mem and compute tile DMAs itself
+(see [Tasks on Mem and Compute Tiles](../section-2d/DMATasks.md#tasks-on-mem-and-compute-tiles)).
+If even that is too high a level, drop into raw `npu_*` ops
+(`npu_writebd`, `npu_address_patch`, `npu_push_queue`, `npu_sync`,
+`npu_write32`) directly.  Setting a lock doesn't need a raw register
+write: `lock.set(value)` resolves the lock's address for you.
 
-A channel in any tile's DMA can be initialized using the unified `dma` constructor:
+```python
+def sequence(a, b):
+    memtile_lock.set(1)
+    npu_writebd(bd_id=0, buffer_length=..., column=col, row=0, ...)
+    npu_address_patch(...)
+    npu_push_queue(...)
+    npu_sync(column=col, row=0, ...)
+
+rt = Runtime(sequence, [in_ty, out_ty])
+
+Program(device, rt, workers=[worker]).resolve_program()
+```
+
+The sequence body runs inside the runtime sequence's MLIR region with
+the host-side tensor handles already in scope — writing raw `npu_*` ops
+directly is exactly what `fill` / `drain` are built on top of, but with
+no protocol assumptions baked in.
+
+### Worked example: tile-to-tile copy
+
+The dialect example we will mirror has `tile_a` (compute) streaming
+256 `int32`s to `tile_b` (compute) on `tile_a`'s output channel 0 →
+`tile_b`'s input channel 1.  In IRON Python:
+
+```python
+import numpy as np
+import aie.iron as iron
+from aie.iron import (
+    Acquire, Bd, Buffer, DmaChannel, Flow, Lock, Release, TileDma,
+    Worker, Runtime, Program,
+)
+from aie.iron.device import Tile
+from aie.dialects._aie_enum_gen import AIETileType, DMAChannelDir, WireBundle
+
+tile_a = Tile(col=1, row=2, tile_type=AIETileType.CoreTile)
+tile_b = Tile(col=1, row=3, tile_type=AIETileType.CoreTile)
+vec_ty = np.ndarray[(256,), np.dtype[np.int32]]
+
+prod_lock_a = Lock(tile=tile_a, lock_id=0, init=1, name="prod_a")
+cons_lock_a = Lock(tile=tile_a, lock_id=1, init=0, name="cons_a")
+buff_a      = Buffer(tile=tile_a, type=vec_ty, name="buff_a")
+
+prod_lock_b = Lock(tile=tile_b, lock_id=0, init=1, name="prod_b")
+cons_lock_b = Lock(tile=tile_b, lock_id=1, init=0, name="cons_b")
+buff_b      = Buffer(tile=tile_b, type=vec_ty, name="buff_b")
+
+# One AXI-stream route, source-to-destination, direction inferred.
+a_to_b = Flow(
+    src=tile_a, dst=tile_b,
+    src_port=WireBundle.DMA, src_channel=0,
+    dst_port=WireBundle.DMA, dst_channel=1,
+)
+
+# Per-tile DMA programs.  Each has one channel with one BD, which the
+# default loop=True chains back to itself so it keeps streaming.
+dma_a = TileDma(tile=tile_a, channels=[
+    DmaChannel(
+        direction=DMAChannelDir.MM2S, channel=0,
+        bds=[Bd(
+            buffer=buff_a,
+            acquires=[Acquire(cons_lock_a)],   # wait for "data ready"
+            releases=[Release(prod_lock_a)],   # signal "buffer free"
+        )],
+    ),
+])
+dma_b = TileDma(tile=tile_b, channels=[
+    DmaChannel(
+        direction=DMAChannelDir.S2MM, channel=1,
+        bds=[Bd(
+            buffer=buff_b,
+            acquires=[Acquire(prod_lock_b)],   # wait for "buffer free"
+            releases=[Release(cons_lock_b)],   # signal "data ready"
+        )],
+    ),
+])
+
+def sequence(a, b):
+    pass  # data flow is driven entirely by the tile DMA programs below
+
+rt = Runtime(sequence, [vec_ty, vec_ty])
+rt.add_flow(a_to_b)
+rt.add_tile_dma(dma_a)
+rt.add_tile_dma(dma_b)
+```
+
+The locks follow AIE-ML semantics: each `Lock` starts at `init`, an
+`Acquire` waits until the value is `>= value` (default 1) and
+decrements it on success, `Release` increments by `value` (default 1).
+With `prod_a = 1` and `cons_a = 0`, `tile_a`'s DMA blocks on
+`cons_lock_a` until the compute core fills `buff_a` and releases it
+— matching the protocol the dialect example expressed with
+`AcquireGreaterEqual` / `Release`.
+
+### Multi-BD chains (ping-pong)
+
+Extending the channel above to a ping-pong pair is two BDs with two
+buffers, chained to each other rather than to themselves, plus a second
+producer-lock token so both buffers can be in flight at once:
+
+```python
+buff_ping = Buffer(tile=tile_a, type=vec_ty, name="buff_ping")
+buff_pong = Buffer(tile=tile_a, type=vec_ty, name="buff_pong")
+prod_lock = Lock(tile=tile_a, lock_id=0, init=2, name="prod_pp")  # 2 tokens
+cons_lock = Lock(tile=tile_a, lock_id=1, init=0, name="cons_pp")
+
+ping_pong = TileDma(tile=tile_a, channels=[
+    DmaChannel(
+        direction=DMAChannelDir.S2MM, channel=0,
+        bds=[
+            Bd(buffer=buff_ping,
+               acquires=[Acquire(prod_lock)],
+               releases=[Release(cons_lock)],
+               next=1),                        # point at the next BD
+            Bd(buffer=buff_pong,
+               acquires=[Acquire(prod_lock)],
+               releases=[Release(cons_lock)],
+               next=0),                        # close the loop
+        ],
+    ),
+])
+```
+
+`Bd.next=1` points the first BD at the second; `next=0` on the second
+points back at the first.  The pair behaves the same way as the
+ObjectFifo lowering for a double-buffered fifo.
+
+Both are spelled out here to show the wiring, but this particular chain is
+what the defaults already do: leaving `next` off each BD walks `bds` in
+order, and `loop=True` closes the cycle.  Reach for explicit indices when
+the cycle is not simply "in order, then back to the start".
+
+<img src="../../assets/DMA_BDs.png" height=300 width="400">
+
+### Letting the compiler pick channels
+
+The worked example names a channel at both ends of its `Flow` and
+repeats each index in the matching `DmaChannel`.  Leave the channels
+off the `Flow` and the compiler assigns them; each DMA program then
+names the end of the flow it runs on with `flow.endpoint(tile)` instead
+of an index:
+
+```python
+a_to_b = Flow(tile_a, tile_b)          # no channels: the compiler picks
+
+dma_a = TileDma(tile=tile_a, channels=[
+    DmaChannel(direction=DMAChannelDir.MM2S, channel=a_to_b.endpoint(tile_a),
+               bds=[...]),
+])
+dma_b = TileDma(tile=tile_b, channels=[
+    DmaChannel(direction=DMAChannelDir.S2MM, channel=a_to_b.endpoint(tile_b),
+               bds=[...]),
+])
+```
+
+The endpoints lower to `aie.route_endpoint`s, and
+`--aie-objectfifo-allocate` gives each one a channel that no ObjectFifo
+and no explicitly numbered channel on that tile uses.  The tiles need not be
+pinned either: `Tile(tile_type=AIETileType.MemTile)` and friends are
+placed alongside everything else.  A list of destinations,
+`Flow(mem, [core0, core1])`, is a circuit-switched broadcast with one
+endpoint per destination.  A flow with a shim end still supports
+`flow.fill(...)` / `flow.drain(...)` from the sequence.
+
+[`test/npu-xrt/flow_endpoints`](../../../test/npu-xrt/flow_endpoints/flow_endpoints.py)
+is a hardware-tested design built this way, with no tile or channel
+pinned anywhere.
+
+### Tile DMAs from the runtime sequence
+
+A `TileDma` is configured once, when the design loads.  To configure a
+mem or compute tile DMA from the runtime sequence instead, so that its
+descriptors can change from one call to the next, build a task on the
+endpoint: `flow.endpoint(tile).task(Bd(...), ...)`.  The `Bd`s are the
+ones above.  See
+[Tasks on Mem and Compute Tiles](../section-2d/DMATasks.md#tasks-on-mem-and-compute-tiles).
+The device limits these programs work within are available from the
+device itself — `dev.max_lock_value`, `dev.max_repeat_count`,
+`dev.dma_task_queue_depth` and `dev.get_num_bds(tile_type)` — rather
+than being hardcoded.
+
+### CascadeFlow — direct cascade-stream link between two Workers
+
+For designs that chain compute across adjacent tiles' cascade interconnect (e.g. an
+accumulator passed core-to-core) rather than through an ObjectFifo, connect two `Worker`s
+directly:
+
+```python
+from aie.iron import CascadeFlow
+
+cf = CascadeFlow(src=worker_a, dst=worker_b)   # registers on worker_a; resolved when tiles are placed
+```
+
+The kernels on both sides must drive the stream themselves via the AIE API's
+`put_mcd`/`get_scd` intrinsics — `CascadeFlow` only declares the topology edge, not the data
+movement. Unlike `Flow`/`PacketFlow` above, constructing a `CascadeFlow` self-registers it on
+`src`'s outgoing-cascade list — there's no separate `rt.add_flow(...)` call needed.
+
+Hardware constraints, all checked at lowering rather than construction (so a bad chain surfaces
+as an `aie.cascade_flow` verifier error, not a Python exception):
+
+* **Direction is fixed.** On AIE2/AIE2P the cascade input must come from **North or West** and
+  the output must go **South or East**. A chain therefore has to descend in row or advance east
+  — you cannot run it upward or westward. In practice this means pinning tiles (e.g. head at row
+  5 down to tail at row 2 within a column) rather than leaving the chain to `--aie-place-tiles`.
+* **Adjacency**: `src`/`dst` tiles must end up cardinally adjacent after placement.
+* **Fan-in/out**: each compute tile has at most one cascade input and one cascade output.
+* **No shim/mem participation**: ShimTiles and MemTiles have no cascade interface, so the last
+  core in a chain must land its result in L1 for a normal ObjectFifo DMA — the cascade cannot
+  itself reach the host.
+* **Width**: the accumulator cascade is 512 bits on AIE2/AIE2P (384 on AIE1, where cascade isn't
+  supported by this API anyway) — e.g. a `v16int32` payload. See
+  [`programming_examples/basic/matrix_multiplication/cascade/`](../../../programming_examples/basic/matrix_multiplication/cascade/)
+  for a worked example (a row-accumulator chain across 4 cores).
+
+Like `Flow` and `PacketFlow`, `CascadeFlow` implements the `Resolvable` protocol described above.
+
+### Canonical end-to-end demo
+
+The runnable example for this whole surface is
+[`programming_examples/basic/chaining_channels/chaining_channels.py`](../../../programming_examples/basic/chaining_channels/chaining_channels.py)
+— an `@iron.jit` design that chains MemTile MM2S → shim DMA → compute
+tile S2MM with:
+
+* explicit `Buffer` + `Lock` on each tile;
+* two `Flow`s (memtile → shim, shim → compute);
+* two `TileDma`s with self-looping `Bd` chains and the
+  acquire/release lock-protocol pairs;
+* a `Worker` running a tiny lock-flipping spinner on the compute
+  tile;
+* a runtime sequence whose body sets the MemTile lock with `lock.set`
+  and opens the data flow with `npu_writebd` /
+  `npu_address_patch` / `npu_push_queue` / `npu_sync` written directly
+  — the *teaching point* of the example, because the manual BD writes
+  are exactly what `fill` / `drain` normally hide.
+
+That design is the right starting place when copying this pattern.
+
+## <u>Lowered-equivalent dialect (AIE dialect Python)</u>
+
+The same hardware concepts are also exposed as raw decorators in the
+`aie` dialect Python API
+([`python/dialects/aie.py`](../../../python/dialects/aie.py)).  Reach
+for them when you need an op the IRON primitives above don't surface,
+or when writing pure-dialect lit tests that bypass the IRON runtime.
+Reaching for this tier is genuinely rare: all current examples in this
+repo are written against the IRON primitives above, and custom DMA
+access patterns are already possible there without a hand-scripted
+`@mem(tile)` body.
+
+The pieces shown throughout this section (`@core`, `object_fifo`,
+`object_fifo_link`) assemble into a complete design under `@device` /
+`@runtime_sequence`, wrapped in `mlir_mod_ctx()` rather than
+`@iron.jit`:
+
+```python
+import numpy as np
+from aie.dialects.aie import *
+from aie.dialects.aiex import *
+from aie.extras.context import mlir_mod_ctx
+from aie.helpers.dialects.scf import _for as range_, forever_
+
+def design():
+    @device(AIEDevice.npu2)              # or AIEDevice.npu1
+    def device_body():
+        ShimTile    = tile(0, 0)
+        ComputeTile = tile(0, 2)
+
+        tile_ty = np.ndarray[(1024,), np.dtype[np.int32]]
+
+        of_in  = object_fifo("in",  ShimTile,    ComputeTile, 2, tile_ty)
+        of_out = object_fifo("out", ComputeTile, ShimTile,    2, tile_ty)
+
+        @core(ComputeTile)
+        def core_body():
+            for _ in forever_():                               # while (true)
+                e_in  = of_in.acquire(ObjectFifoPort.Consume, 1)
+                e_out = of_out.acquire(ObjectFifoPort.Produce, 1)
+                for i in range_(1024):
+                    e_out[i] = e_in[i] + 1
+                of_in.release(ObjectFifoPort.Consume, 1)
+                of_out.release(ObjectFifoPort.Produce, 1)
+
+        @runtime_sequence(tile_ty, tile_ty)
+        def sequence(a_in, c_out):
+            npu_dma_memcpy_nd(metadata=of_in,  bd_id=0, mem=a_in,  sizes=[1, 1, 1, 1024])
+            npu_dma_memcpy_nd(metadata=of_out, bd_id=1, mem=c_out, sizes=[1, 1, 1, 1024])
+            dma_wait(of_out)
+
+with mlir_mod_ctx() as ctx:
+    design()
+    assert ctx.module.operation.verify() == True
+    print(ctx.module)
+```
+
+The two tiers otherwise line up directly: `tile(col, row)` in place of implicit placement,
+`of.acquire(ObjectFifoPort.Consume/Produce, n)` in place of `of.acquire(n)`,
+`npu_dma_memcpy_nd` + `dma_wait` in place of `fill`/`drain`, and an explicit
+`ctx.module.operation.verify()` call in place of the verification `@iron.jit` runs for you. Reach
+for this tier when porting an *external*, pre-existing MLIR-AIE example 1:1, or when you need an
+op the IRON primitives don't expose yet — in which case, also consider raising it upstream.
+
+The three DMA region decorators pick by tile type:
+
+```python
+@mem(tile)          # compute tile DMA region
+@memtile_dma(tile)  # mem tile DMA region
+@shim_mem(tile)     # shim tile DMA region
+```
+
+A channel inside a region uses the unified `dma` constructor:
+
 ```python
 def dma(
     channel_dir,
@@ -49,43 +478,48 @@ def dma(
 )
 ```
 
-The data movement on each channel is described by a chain of Buffer Descriptors (or "BDs"), where each BD describes what data is being moved and configures its synchornization mechanism. The `dma` constructor already creates space for one such BD as can be seen by its `num_blocks=1` default valued input.
+The same `tile_a → tile_b` flow as the IRON example above, written at
+the dialect level:
 
-The code snippet below shows how to configure the DMA on `tile_a` such that data coming in on input channel 0 is written into `buff_in`:
 ```python
-tile_a = tile(1, 3)
+tile_a = tile(1, 2)
+tile_b = tile(1, 3)
 
-prod_lock = lock(tile_a, lock_id=0, init=1)
-cons_lock = lock(tile_a, lock_id=1, init=0)
-buff_in = buffer(tile=tile_a, datatype=np.ndarray[(256,), np.dtype[np.int32]]) # 256xi32
+prod_lock_a = lock(tile_a, lock_id=0, init=1)
+cons_lock_a = lock(tile_a, lock_id=1, init=0)
+buff_a = buffer(tile=tile_a, datatype=np.ndarray[(256,), np.dtype[np.int32]])
+
+prod_lock_b = lock(tile_b, lock_id=0, init=1)
+cons_lock_b = lock(tile_b, lock_id=1, init=0)
+buff_b = buffer(tile=tile_b, datatype=np.ndarray[(256,), np.dtype[np.int32]])
+
+aie.flow(tile_a, WireBundle.DMA, 0, tile_b, WireBundle.DMA, 1)
 
 @mem(tile_a)
 def mem_body():
-    @dma(S2MM, 0) # input channel, port 0
-    def dma_in_0():
-        use_lock(prod_lock, AcquireGreaterEqual)
-        dma_bd(buff_in)
-        use_lock(cons_lock, Release)
+    @dma(MM2S, 0)
+    def dma_out_0():
+        use_lock(cons_lock_a, AcquireGreaterEqual)
+        dma_bd(buff_a)
+        use_lock(prod_lock_a, Release)
+
+@mem(tile_b)
+def mem_body():
+    @dma(S2MM, 1)
+    def dma_in_1():
+        use_lock(prod_lock_b, AcquireGreaterEqual)
+        dma_bd(buff_b)
+        use_lock(cons_lock_b, Release)
 ```
-The locks `prod_lock` and `cons_lock` follow AIE-ML architecture semantics. Their task is to mark synchronization points in the tile's and its DMA's execution: for example, if the tile is currently using `buff_in`, it will only release the `prod_lock` when it is done, and that is when the DMA will be allowed to overwrite the data in `buff_in` with new input. Similarly, the tile's core can query the `cons_lock` to know when the new data is ready to be read (i.e., when the DMA releases the lock so the core can acquire it).
 
-In the previous code, the channel only had one BD in its chain. To add additional BDs to the chain, users can use the following constructor, which takes as input what would be the previous BD in the chain it should be added to:
+Extending a channel's BD chain at the dialect level uses
+`@another_bd(prev_bd)` (the IRON-Python equivalent is just appending
+to `DmaChannel.bds=[...]`):
+
 ```python
-@another_bd(dma_bd)
-```
-
-This next code snippet shows how to extend the previous input channel with a double, or ping-pong, buffer using the previous constructor:
-```python
-tile_a = tile(1, 3)
-
-prod_lock = lock(tile_a, lock_id=0, init=2) # note that the producer lock now has 2 tokens
-cons_lock = lock(tile_a, lock_id=1, init=0)
-buff_ping = buffer(tile=tile_a, datatype=np.ndarray[(256,), np.dtype[np.int32]]) # 256xi32
-buff_pong = buffer(tile=tile_a, datatype=np.ndarray[(256,), np.dtype[np.int32]]) # 256xi32
-
 @mem(tile_a)
 def mem_body():
-    @dma(S2MM, 0, num_blocks=2) # note the additional BD
+    @dma(S2MM, 0, num_blocks=2)
     def dma_in_0():
         use_lock(prod_lock, AcquireGreaterEqual)
         dma_bd(buff_ping)
@@ -97,65 +531,106 @@ def mem_body():
         dma_bd(buff_pong)
         use_lock(cons_lock, Release)
 ```
-> **NOTE:**  This DMA configuration is equivalent to what the Object FIFO lowering looks like for double buffers.
 
-The code above can be visualized like in the following figure, where the two BDs ping-pong to each other:
+> **NOTE:** This DMA configuration is equivalent to what the Object
+> FIFO lowering looks like for double buffers.
 
-<img src="../../assets/DMA_BDs.png" height=300 width="400">
+`flow(source, source_bundle, source_channel, dest, dest_bundle, dest_channel)`
+takes both tiles + their `WireBundle` (typically `WireBundle.DMA`) +
+channel indices; the lowering infers direction from `source` vs
+`dest`.
 
-The last step to configure the data movement is to establish its endpoints, similar to how the Object FIFO has producer and consumer tiles. To do this, users should use the `flow` constructor:
+### Manual stream routing (`switchbox` / `connect`)
+
+Almost always, `Flow` (IRON) or `flow` (dialect) is the right tool: you
+name the two *endpoints* and the `--aie-create-pathfinder-flows` pass
+picks the switchbox connections in between.  The rare exception is when
+you need to pin the *exact* path — reproducing a specific hardware
+configuration, or steering around a resource the router would otherwise
+take.
+
+There is no dedicated IRON class for this, and none is needed.  A
+`switchbox` region hangs off a tile and holds `connect` ops, each wiring
+one input port to one output port of that tile's stream switch (a full
+crossbar); a shim endpoint also needs a `shim_mux` translating its DMA
+ports to the stream switch.  Both are ordinary `aie` dialect ops, and
+IRON already has a generic way to emit device-level ops: any object with
+`tiles()` and `resolve()` (the `Resolvable` protocol) handed to a
+`Worker` via `fn_args` is resolved at device scope, with its tiles
+placed first.  So a small user-side class emits the configuration with
+no new API:
+
 ```python
-def flow(
-    source,
-    source_bundle=None,
-    source_channel=None,
-    dest=None,
-    dest_bundle=None,
-    dest_channel=None,
-)
+from aie.dialects.aie import switchbox, connect, EndOp
+from aie.dialects._aie_enum_gen import WireBundle
+
+class PinnedSwitchbox:
+    def __init__(self, tile, conns):
+        self._tile, self._conns = tile, conns
+
+    def tiles(self):                       # placed before resolve()
+        return [self._tile]
+
+    def resolve(self, loc=None, ip=None):
+        @switchbox(self._tile.op)
+        def _sb():
+            for sb, sc, db, dc in self._conns:
+                connect(sb, sc, db, dc)
+            EndOp()                        # aie.switchbox needs an explicit terminator
+
+# pin one hop; hand it to a Worker in fn_args (the core_fn ignores it):
+sb = PinnedSwitchbox(compute_tile, [(WireBundle.South, 1, WireBundle.DMA, 0)])
+worker = Worker(core_fn, [..., sb], tile=compute_tile)
 ```
-The `flow` is established between channels of two DMAs (other endpoints are available, but they are beyond the scope of this section) and as such it requires:
-* its `source` and `dest` tiles,
-* its `source_bundle` and `dest_bundle`, which represent the type of endpoints (for our scope, these will be `WireBundle.DMA`),
-* and its `source_channel` and `dest_channel`, which represent the index of the channel.
 
-For example, to create a flow between tile `tile_a` and tile `tile_b`, where `tile_a` is sending data on its output channel 0 to `tile_b`'s input channel 1, the user can write:
-```python
-aie.flow(tile_a, WireBundle.DMA, 0, tile_b, WireBundle.DMA, 1)
-```
-Note how the direction of the two channels is not required by the flow, only the indices. This is because the flow lowering can infer the direction based on the `source` and `dest` inputs.
+`connect` takes `(source_bundle, source_channel, dest_bundle,
+dest_channel)`, and a single `switchbox` may hold as many `connect` ops
+as the hardware has ports.
 
-The following code snippet shows a full example of two tiles where `tile_a` is sending data to `tile_b`:
-```python
-tile_a = tile(1, 2)
-tile_b = tile(1, 3)
+Two things to know before reaching for this:
 
-prod_lock_a = lock(tile_a, lock_id=0, init=1)
-cons_lock_a = lock(tile_a, lock_id=1, init=0)
-buff_a = buffer(tile=tile_a, np.ndarray[(256,), np.dtype[np.int32]]) # 256xi32
+* **The ports must match what the router would pick.**  A hand-written
+  connection only carries data if its source/destination ports (and the
+  matching DMA channels) line up with the rest of the path.  The
+  reliable way to get them right is to build the equivalent `Flow`/
+  `ObjectFifo` design first and dump the connections the pass generates
+  (`aie-opt --aie-place-tiles --aie-objectFifo-stateful-transform
+  --aie-create-pathfinder-flows`), then reproduce those exact ports.
 
-prod_lock_b = lock(tile_b, lock_id=0, init=1)
-cons_lock_b = lock(tile_b, lock_id=1, init=0)
-buff_b = buffer(tile=tile_b, np.ndarray[(256,), np.dtype[np.int32]]) # 256xi32
+* **Manual and automatic routing don't share a hop.**  If a pinned
+  `connect` competes with a `flow` the pathfinder is also trying to
+  route through the same ports, routing fails ("Unable to find a legal
+  routing").  Pin connections on a *disjoint* segment (the pathfinder
+  augments the rest of that tile's switchbox around them), or pin the
+  whole path and use no `flow` at all.
 
-aie.flow(tile_a, WireBundle.DMA, 0, tile_b, WireBundle.DMA, 1)
+A complete, hardware-verified example that pins every hop of a
+shim → compute → shim passthrough by hand lives in
+[`programming_examples/basic/manual_switchbox`](../../../programming_examples/basic/manual_switchbox/).
 
-@mem(tile_a)
-def mem_body():
-    @dma(MM2S, 0) # output channel, port 0
-    def dma_in_0():
-        use_lock(cons_lock_a, AcquireGreaterEqual)
-        dma_bd(buff_a)
-        use_lock(prod_lock_a, Release)
+### MLIR ↔ C kernel ABI
 
-@mem(tile_b)
-def mem_body():
-    @dma(SS2M, 1) # input channel, port 1
-    def dma_in_0():
-        use_lock(prod_lock_b, AcquireGreaterEqual)
-        dma_bd(buff_b)
-        use_lock(cons_lock_b, Release)
-```
+External kernels are bound through
+[`external_func` / `ExternalFunction`](../../kernels_library.md), which
+hides the calling convention.  At the dialect tier the binding is a
+`func.func` whose argument types follow the MLIR
+[bare-pointer calling convention](https://mlir.llvm.org/docs/TargetLLVMIR/#bare-pointer-calling-convention-for-ranked-memref)
+— a `memref` becomes a plain C pointer (no descriptor struct), and C++
+name mangling is not applied, so the C function must be `extern "C"` or
+a plain C symbol:
+
+| MLIR type | C type    |
+| --------- | --------- |
+| `i32`     | `int32_t` |
+| `f32`     | `float`   |
+| `memref`  | C pointer |
+| `index`   | `int64_t` |
+
+The dialect tier is what `@iron.jit` ultimately lowers into.  For
+designs you intend to ship as part of the IRON examples, prefer the
+IRON Python primitives at the top of this page — they give you the
+caching, host-side tensor surface, and `--emit-mlir` introspection
+for free.
 
 -----
-[[Prev - Section 2f](../section-2f/)] [[Up](..)] [[Next - Section 3](../../section-3/)]
+[Prev](../section-2f/) &middot; [Top](..) &middot; [Next](../section-2h/)

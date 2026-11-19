@@ -1,0 +1,84 @@
+# Copyright (C) 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+#
+# IRON design: generates the MLIR for the scratchpad parameter test.
+#
+# Core computes: output = foo * bar (bf16 parameters set at runtime).
+#
+# Usage:
+#   python3 aie_design.py > aie.mlir
+#
+# test.py also builds program() through iron.jit.
+
+import numpy as np
+from ml_dtypes import bfloat16
+
+from aie.iron import (
+    DeviceConfiguration,
+    ObjectFifo,
+    Program,
+    Runtime,
+    Worker,
+    sync_parameters,
+)
+from aie.iron.device import NPU2Col1
+from aie.iron.scratchpad_parameter import ScratchpadParameter
+from aie.dialects.aiex import npu_load_pdi
+from aie.dialects.arith import ConstantOp, mulf
+from aie.dialects.memref import store
+from aie.ir import IndexType, IntegerAttr
+
+
+def program() -> Program:
+    device_name = "test"
+
+    # Output type: 2 x bf16
+    # Note: We only calculate 1 bf16 value, but DMAs operate at 4-byte granularity so this is the smallest possible size
+    out_ty = np.ndarray[(2,), np.dtype[bfloat16]]
+
+    # Parameters
+    foo = ScratchpadParameter("foo", bfloat16)
+    bar = ScratchpadParameter("bar", bfloat16)
+
+    # ObjectFIFO for output
+    of_out = ObjectFifo(out_ty, name="objfifo_out")
+
+    # Core function: read parameters, multiply, write to output
+    def core_fn(of_out, foo, bar):
+        val_foo = foo.read()
+        val_bar = bar.read()
+
+        elem = of_out.acquire(1)
+        result = val_foo * val_bar
+        elem[0] = result
+        of_out.release(1)
+
+    worker = Worker(
+        core_fn,
+        [of_out.prod(), foo, bar],
+        while_true=False,
+    )
+
+    # Runtime sequence: load empty device first to force PDI reconfiguration
+    def sequence(out_tensor, out_h):
+        npu_load_pdi(device_ref="empty")
+        npu_load_pdi(device_ref=device_name)
+        sync_parameters()
+        out_h.drain(out_tensor, wait=True)
+
+    rt = Runtime(
+        sequence,
+        [out_ty, of_out.cons()],
+        name="sequence",
+        implicit_configure=False,
+    )
+
+    config = DeviceConfiguration(
+        device_name, NPU2Col1(), workers=[worker], runtimes=[rt]
+    )
+    empty = DeviceConfiguration("empty", NPU2Col1())
+    return Program.compose([empty, config], entry=rt)
+
+
+if __name__ == "__main__":
+    print(program().resolve_program())

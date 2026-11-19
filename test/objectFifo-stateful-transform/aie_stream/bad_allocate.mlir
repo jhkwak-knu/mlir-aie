@@ -1,0 +1,21 @@
+//===- bad_allocate.mlir ----------------------------------------*- MLIR -*-===//
+//
+// Copyright (C) 2025 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+// RUN: aie-opt --verify-diagnostics %s
+
+module @bad_allocate {
+ aie.device(xcve2302) {
+    %tile12 = aie.tile(1, 2)
+    %tile13 = aie.tile(1, 3)
+
+    aie.objectfifo @of_stream (%tile12, {%tile13}, 1 : i32)
+                              {prod_port = #aie.end_port<Core : 0>}
+                              : !aie.objectfifo<memref<3xi32>>
+    // expected-error@+1 {{cannot allocate a shared memory module to objectfifo using stream port}}
+    aie.objectfifo.allocate @of_stream (%tile13)
+  }
+}

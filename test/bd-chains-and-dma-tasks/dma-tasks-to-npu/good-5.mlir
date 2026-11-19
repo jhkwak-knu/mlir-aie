@@ -1,11 +1,9 @@
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2022-2026 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// (c) Copyright 2024 AMD Inc.
 
-// RUN: aie-opt --aie-assign-buffer-addresses --aie-dma-tasks-to-npu %s | FileCheck %s
+// RUN: aie-opt --aie-prepare-buffers --aie-assign-buffer-addresses --aie-dma-tasks-to-npu %s | FileCheck %s
 
 // This test ensures that a chained buffer descriptor configuration in the runtime
 // sequence gets lowered to the correct NPU instruction sequence register write
@@ -22,14 +20,22 @@ module {
     // CHECK: %{{.*}} = aie.buffer(%{{.*}}tile_0_1) {address = [[ADDR2:[0-9]+]] {{.*}}}
     %buf1 = aie.buffer(%tile_0_1) : memref<32xi8>
 
-    aiex.runtime_sequence(%arg0: memref<32xi8>) {
+    aie.runtime_sequence(%arg0: memref<32xi8>) {
       %t1 = aiex.dma_configure_task(%tile_0_1, MM2S, 0) {
-          // CHECK: aiex.npu.write32 {address = 1703940 : ui32, value = [[ADDR1]] : ui32}
-          aie.dma_bd(%buf0 : memref<32xi8>, 4, 16) {bd_id = 0 : i32}
+          // maskwrite32 operands: address=1703940, value=131073, mask=524287
+          // CHECK-DAG: %[[MW1MASK:.*]] = arith.constant 524287 : i32
+          // CHECK-DAG: %[[MW1VAL:.*]] = arith.constant 131073 : i32
+          // CHECK-DAG: %[[MW1ADDR:.*]] = arith.constant 1703940 : i32
+          // CHECK: aiex.npu.maskwrite32(%[[MW1ADDR]], %[[MW1VAL]], %[[MW1MASK]]) : i32, i32, i32
+          aie.dma_bd(%buf0 : memref<32xi8> offset = 4 len = 16) {bd_id = 0 : i32}
           aie.next_bd ^bd2
         ^bd2:
-          // CHECK: aiex.npu.write32 {address = 1703972 : ui32, value = [[ADDR2]] : ui32}
-          aie.dma_bd(%buf1 : memref<32xi8>, 4, 16) {bd_id = 1 : i32}
+          // maskwrite32 operands: address=1703972, value=147457, mask=524287
+          // CHECK-DAG: %[[MW2MASK:.*]] = arith.constant 524287 : i32
+          // CHECK-DAG: %[[MW2VAL:.*]] = arith.constant 147457 : i32
+          // CHECK-DAG: %[[MW2ADDR:.*]] = arith.constant 1703972 : i32
+          // CHECK: aiex.npu.maskwrite32(%[[MW2ADDR]], %[[MW2VAL]], %[[MW2MASK]]) : i32, i32, i32
+          aie.dma_bd(%buf1 : memref<32xi8> offset = 4 len = 16) {bd_id = 1 : i32}
           aie.end
       }
     }

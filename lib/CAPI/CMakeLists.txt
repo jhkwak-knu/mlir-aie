@@ -1,4 +1,4 @@
-# Copyright (C) 2022, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2022-2024 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 add_mlir_public_c_api_library(AIECAPI
@@ -8,7 +8,6 @@ add_mlir_public_c_api_library(AIECAPI
   Translation.cpp
 
   LINK_LIBS PUBLIC
-  ADF
   AIE
   AIETargets
   AIETransforms
@@ -21,7 +20,6 @@ add_mlir_public_c_api_library(AIECAPI
   MLIRAIEVecToLLVM
   MLIRAIEVecTransforms
   MLIRAIEVecUtils
-  MLIRTargetAIEVecCpp
   MLIRXLLVMToLLVMIRTranslation
 )
 

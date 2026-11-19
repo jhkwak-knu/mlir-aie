@@ -1,14 +1,13 @@
 //===- test.cpp -------------------------------------------------*- C++ -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2020-2022 Xilinx, Inc.
+// Copyright (C) 2022-2025 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2020 Xilinx Inc.
 //
 //===----------------------------------------------------------------------===//
 
 #include "test_library.h"
+#include <aie_codegen.h>
 #include <cassert>
 #include <cmath>
 #include <cstdio>
@@ -18,7 +17,6 @@
 #include <sys/mman.h>
 #include <thread>
 #include <unistd.h>
-#include <xaiengine.h>
 
 #include "aie_inc.cpp"
 
@@ -34,10 +32,10 @@ int main(int argc, char *argv[]) {
   mlir_aie_initialize_locks(_xaie);
 
   // FIXME: model in MLIR
-  XAie_CoreConfigAccumulatorControl(&(_xaie->DevInst), XAie_TileLoc(1, 3), WEST,
-                                    EAST);
-  XAie_CoreConfigAccumulatorControl(&(_xaie->DevInst), XAie_TileLoc(2, 3), WEST,
-                                    EAST);
+  XAie_CoreConfigAccumulatorControl(_xaie->XAieDevInst, XAie_TileLoc(1, 3),
+                                    WEST, EAST);
+  XAie_CoreConfigAccumulatorControl(_xaie->XAieDevInst, XAie_TileLoc(2, 3),
+                                    WEST, EAST);
   int errors = 0;
 
   mlir_aie_write_buffer_a(_xaie, 3, 7);

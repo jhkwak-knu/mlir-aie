@@ -1,10 +1,7 @@
 //===- matrix_multiplication.h ----------------------------000---*- C++ -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2024 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// Copyright (C) 2024, Advanced Micro Devices, Inc.
 //
 //===----------------------------------------------------------------------===//
 
@@ -15,12 +12,25 @@
 #define MATRIX_MULTIPLICATION_H
 
 #include <algorithm>
-#include <bits/stdc++.h>
+#include <cassert>
+#include <cfloat>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <limits>
 #include <optional>
 #include <ostream>
-#include <stdfloat>
+#include <random>
+#include <ranges>
+#include <string>
+#include <tuple>
+#include <type_traits>
+#include <vector>
 
 #include "test_utils.h"
 
@@ -54,6 +64,8 @@ void add_default_options(cxxopts::Options &options) {
       "trace_file", "where to store trace output",
       cxxopts::value<std::string>()->default_value("trace.txt"))(
       "b_col_maj", "Is B matrix in colum-major format?",
+      cxxopts::value<int>()->default_value("0"))(
+      "c_col_maj", "Is C matrix in colum-major format?",
       cxxopts::value<int>()->default_value("0"));
 }
 
@@ -89,37 +101,91 @@ void parse_options(int argc, const char *argv[], cxxopts::Options &options,
 template <typename T>
 static inline T get_random();
 
+template <typename T>
+static inline auto scalar_to_arithmetic(T value) {
+  if constexpr (std::is_same_v<T, test_utils::bfloat16_t>) {
+    return test_utils::bfloat16_to_float(value);
+  } else {
+    return value;
+  }
+}
+
+template <typename T>
+static inline float scalar_to_float(T value) {
+  return static_cast<float>(scalar_to_arithmetic(value));
+}
+
+template <typename T, typename Tacc>
+static inline T scalar_from_accum(Tacc value) {
+  auto arithmetic_value = scalar_to_arithmetic(value);
+  if constexpr (std::is_same_v<T, test_utils::bfloat16_t>) {
+    return test_utils::bfloat16_from_float(
+        static_cast<float>(arithmetic_value));
+  } else {
+    return static_cast<T>(arithmetic_value);
+  }
+}
+
+template <typename Tacc>
+static inline Tacc zero_accum() {
+  if constexpr (std::is_same_v<Tacc, test_utils::bfloat16_t>) {
+    return test_utils::bfloat16_from_float(0.0f);
+  } else {
+    return Tacc(0);
+  }
+}
+
+template <typename Tacc, typename Tin>
+static inline Tacc accum_add_product(Tacc running_sum, Tin lhs, Tin rhs) {
+  auto product = scalar_to_arithmetic(lhs) * scalar_to_arithmetic(rhs);
+  if constexpr (std::is_same_v<Tacc, test_utils::bfloat16_t>) {
+    return test_utils::bfloat16_add(
+        running_sum,
+        test_utils::bfloat16_from_float(static_cast<float>(product)));
+  } else {
+    return running_sum + Tacc(product);
+  }
+}
+
 template <>
 std::int16_t get_random<std::int16_t>() {
-  return (std::int16_t)rand() % 0x10000;
+  return static_cast<std::int16_t>(std::rand()) % 0x10000;
 }
 
 template <>
-int8_t get_random<int8_t>() {
-  return (int8_t)rand() % 0x100;
+std::int8_t get_random<std::int8_t>() {
+  return static_cast<std::int8_t>(std::rand()) % 0x100;
 }
 
 template <>
-std::bfloat16_t get_random<std::bfloat16_t>() {
+test_utils::bfloat16_t get_random<test_utils::bfloat16_t>() {
   // Random numbers should NOT be uniformly between 0 and 1, because that
   // would make the matrix product AB always close to 1.
-  return std::bfloat16_t(4.0 * (float)rand() / (float)(RAND_MAX));
+  return test_utils::bfloat16_from_float(
+      4.0f * static_cast<float>(std::rand()) / static_cast<float>(RAND_MAX));
 }
 
 template <typename Tin, typename Tout, typename Tacc>
 void matmul(int M, int N, int K, const std::vector<Tin> A,
-            const std::vector<Tin> B, std::vector<Tout> &C, int b_col_maj) {
+            const std::vector<Tin> B, std::vector<Tout> &C, int b_col_maj,
+            int c_col_maj) {
   for (int row = 0; row < M; row++) {
     for (int col = 0; col < N; col++) {
-      Tacc running_sum = 0;
+      Tacc running_sum = zero_accum<Tacc>();
       for (int k = 0; k < K; k++) {
         if (!b_col_maj) {
-          running_sum += Tacc(A[row * K + k] * B[k * N + col]);
+          running_sum = accum_add_product<Tacc>(running_sum, A[row * K + k],
+                                                B[k * N + col]);
         } else {
-          running_sum += Tacc(A[row * K + k] * B[k + col * K]);
+          running_sum = accum_add_product<Tacc>(running_sum, A[row * K + k],
+                                                B[k + col * K]);
         }
       }
-      C[row * N + col] = Tout(running_sum);
+      if (!c_col_maj) {
+        C[row * N + col] = scalar_from_accum<Tout>(running_sum);
+      } else {
+        C[row + col * M] = scalar_from_accum<Tout>(running_sum);
+      }
     }
   }
 }
@@ -127,15 +193,17 @@ void matmul(int M, int N, int K, const std::vector<Tin> A,
 template <typename Tin, typename Tout, typename Tacc>
 Tout mul_acc(int M, int N, int K, int row, int col, const std::vector<Tin> A,
              const std::vector<Tin> B, int b_col_maj) {
-  Tacc running_sum = 0;
+  Tacc running_sum = zero_accum<Tacc>();
   for (int k = 0; k < K; k++) {
     if (!b_col_maj) {
-      running_sum += Tacc(A[row * K + k] * B[k * N + col]);
+      running_sum =
+          accum_add_product<Tacc>(running_sum, A[row * K + k], B[k * N + col]);
     } else {
-      running_sum += Tacc(A[row * K + k] * B[k + col * K]);
+      running_sum =
+          accum_add_product<Tacc>(running_sum, A[row * K + k], B[k + col * K]);
     }
   }
-  return (Tout)running_sum;
+  return scalar_from_accum<Tout>(running_sum);
 }
 
 // nearly_equal function adapted from Stack Overflow, License CC BY-SA 4.0
@@ -176,7 +244,7 @@ float get_abs_tol<std::int32_t>() {
 }
 
 template <>
-float get_abs_tol<std::bfloat16_t>() {
+float get_abs_tol<test_utils::bfloat16_t>() {
   return 0.5;
 }
 
@@ -186,7 +254,7 @@ float get_abs_tol<float>() {
 }
 
 template <>
-float get_abs_tol<int8_t>() {
+float get_abs_tol<std::int8_t>() {
   return 0;
 }
 
@@ -201,7 +269,7 @@ float get_rel_tol<std::int32_t>() {
 }
 
 template <>
-float get_rel_tol<std::bfloat16_t>() {
+float get_rel_tol<test_utils::bfloat16_t>() {
   return 0.05;
 }
 
@@ -211,7 +279,7 @@ float get_rel_tol<float>() {
 }
 
 template <>
-float get_rel_tol<int8_t>() {
+float get_rel_tol<std::int8_t>() {
   return 0;
 }
 
@@ -225,7 +293,7 @@ void print_matrix(const std::vector<T> matrix, int n_cols,
 
   auto maxima = std::minmax_element(matrix.begin(), matrix.end());
   T max_val = std::max(*maxima.first, (T)std::abs(*maxima.second));
-  size_t n_digits = log10(max_val);
+  std::size_t n_digits = std::log10(max_val);
   if (w == -1) {
     w = n_digits;
   }
@@ -238,7 +306,7 @@ void print_matrix(const std::vector<T> matrix, int n_cols,
   const bool elide_cols = n_printable_cols < n_cols;
 
   if (elide_rows || elide_cols) {
-    w = std::max((int)w, (int)strlen(elide_sym));
+    w = std::max((int)w, (int)std::strlen(elide_sym));
   }
 
   w += 3; // for decimal point and two decimal digits
@@ -275,16 +343,16 @@ void print_matrix(const std::vector<T> matrix, int n_cols,
 #undef print_row
 }
 
-// int8_t aka char will not print as a number but as a character; specialize
-// print_matrix<int8_t> to cast to int16_t first so everything prints as numbers
+// std::int8_t streams as a character. Cast to std::int16_t so matrix
+// entries print numerically.
 template <>
-void print_matrix(const std::vector<int8_t> matrix, int n_cols,
+void print_matrix(const std::vector<std::int8_t> matrix, int n_cols,
                   int n_printable_rows, int n_printable_cols,
                   std::ostream &ostream, const char col_sep[],
                   const char elide_sym[], int w) {
-  std::vector<int16_t> cast_matrix(matrix.size());
-  for (int i = 0; i < matrix.size(); i++) {
-    cast_matrix[i] = (int16_t)matrix[i];
+  std::vector<std::int16_t> cast_matrix(matrix.size());
+  for (std::size_t i = 0; i < matrix.size(); i++) {
+    cast_matrix[i] = static_cast<std::int16_t>(matrix[i]);
   }
   print_matrix(cast_matrix, n_cols, n_printable_rows, n_printable_cols, ostream,
                col_sep, elide_sym, w);
@@ -306,8 +374,9 @@ verify_single(std::ostream &os, int row, int col, Tout expected, Tout actual,
               float abs_tol, float rel_tol) {
   bool match = expected == actual;
   if (abs_tol > 0 || rel_tol > 0) {
-    // Allow for some tolerance for float data types
-    match = nearly_equal(expected, actual, rel_tol, abs_tol);
+    // Allow for some tolerance for float and host-side bfloat16 data types.
+    match = nearly_equal(scalar_to_float(expected), scalar_to_float(actual),
+                         rel_tol, abs_tol);
   }
   if (!match) {
     return (struct error<Tout>){row, col, expected, actual};
@@ -318,12 +387,13 @@ verify_single(std::ostream &os, int row, int col, Tout expected, Tout actual,
 template <typename Tout>
 void print_error_summary(std::ostream &os, int n_errors,
                          std::vector<struct error<Tout>> &errors,
-                         Tout max_rel_error) {
+                         float max_rel_error) {
   for (struct error<Tout> &err : errors) {
     os << "[" << std::setw(5) << err.row << ", " << std::setw(5) << err.col
        << "] " << std::setw(4) << std::setprecision(2) << std::fixed
-       << (float)err.actual << " =!= " << std::setw(4) << std::setprecision(2)
-       << std::fixed << (float)err.expected << std::endl;
+       << scalar_to_float(err.actual) << " =!= " << std::setw(4)
+       << std::setprecision(2) << std::fixed << scalar_to_float(err.expected)
+       << std::endl;
   }
   if (n_errors > max_printable_errors) {
     os << "...and " << std::setw(0) << n_errors - max_printable_errors
@@ -331,7 +401,8 @@ void print_error_summary(std::ostream &os, int n_errors,
   }
   if (n_errors > 0) {
     os << "Maximum relative error: " << std::setw(3) << std::setprecision(0)
-       << max_rel_error * 100 << "%" << std::endl;
+       << max_rel_error * 100 << "%"
+       << " (last above)" << std::endl;
   }
 }
 
@@ -345,13 +416,14 @@ void print_progress_bar(std::ostream &os, double progress, int len = 75) {
 template <typename Tin, typename Tout, typename Tacc>
 int verify(int M, int N, int K, std::vector<Tin> A, std::vector<Tin> B,
            std::vector<Tout> C, int verbosity = 0, float abs_tol = 0.5,
-           float rel_tol = 0.05, int b_col_maj = 0) {
+           float rel_tol = 0.05, int b_col_maj = 0, int c_col_maj = 0) {
   int n_errors = 0;
   std::vector<struct error<Tout>> errors;
-  Tout max_rel_error = (Tout)0.0f;
+  float max_rel_error = 0.0f;
+  struct error<Tout> max_error;
 
   std::vector<Tout> CRef(M * N);
-  matmul<Tin, Tout, Tacc>(M, N, K, A, B, CRef, b_col_maj);
+  matmul<Tin, Tout, Tacc>(M, N, K, A, B, CRef, b_col_maj, c_col_maj);
 
   for (int row = 0; row < M; row++) {
     for (int col = 0; col < N; col++) {
@@ -362,16 +434,21 @@ int verify(int M, int N, int K, std::vector<Tin> A, std::vector<Tin> B,
         if (n_errors < max_printable_errors) {
           errors.push_back(*error);
         }
-        Tout rel_error =
-            std::abs(error->actual - error->expected) /
-            std::max(std::abs(error->actual), std::abs(error->expected));
+        float actual_value = scalar_to_float(error->actual);
+        float expected_value = scalar_to_float(error->expected);
+        float rel_error =
+            std::abs(actual_value - expected_value) /
+            std::max(std::abs(actual_value), std::abs(expected_value));
         if (rel_error > max_rel_error) {
           max_rel_error = rel_error;
+          max_error = *error;
         }
         n_errors++;
       }
     }
   }
+  if (n_errors)
+    errors.push_back(max_error);
   print_error_summary(std::cout, n_errors, errors, max_rel_error);
 
   if (n_errors > 0) {
@@ -388,7 +465,8 @@ template <typename Tin, typename Tout, typename Tacc>
 int verify_stochastic(int M, int N, int K, std::vector<Tin> A,
                       std::vector<Tin> B, std::vector<Tout> C, int n_samples,
                       int verbosity = 0, float abs_tol = 0.5,
-                      float rel_tol = 0.05, int b_col_maj = 0) {
+                      float rel_tol = 0.05, int b_col_maj = 0,
+                      int c_col_maj = 0) {
   std::mt19937 rng;
   auto rows = std::views::iota(0, M);
   auto cols = std::views::iota(0, N);
@@ -400,9 +478,9 @@ int verify_stochastic(int M, int N, int K, std::vector<Tin> A,
 
   int n_errors = 0;
   std::vector<struct error<Tout>> errors;
-  Tout max_rel_error = (Tout)0.0f;
+  float max_rel_error = 0.0f;
   double progress = 0;
-  for (std::tuple<size_t, std::tuple<int &, int &>> cell :
+  for (std::tuple<std::size_t, std::tuple<int &, int &>> cell :
        std::views::enumerate(std::views::zip(sampled_rows, sampled_cols))) {
     int i = std::get<0>(cell);
     int row = std::get<0>(std::get<1>(cell));
@@ -414,15 +492,23 @@ int verify_stochastic(int M, int N, int K, std::vector<Tin> A,
       print_progress_bar(std::cerr, progress);
     }
     Tout ref = mul_acc<Tin, Tout, Tacc>(M, N, K, row, col, A, B, b_col_maj);
-    std::optional<struct error<Tout>> error = verify_single(
-        std::cout, row, col, ref, C[row * N + col], abs_tol, rel_tol);
+    Tout observed;
+    if (!c_col_maj) {
+      observed = C[row * N + col];
+    } else {
+      observed = C[row + col * M];
+    }
+    std::optional<struct error<Tout>> error =
+        verify_single(std::cout, row, col, ref, observed, abs_tol, rel_tol);
     if (error.has_value()) {
       if (n_errors < max_printable_errors) {
         errors.push_back(*error);
       }
-      Tout rel_error =
-          std::abs(error->actual - error->expected) /
-          std::max(std::abs(error->actual), std::abs(error->expected));
+      float actual_value = scalar_to_float(error->actual);
+      float expected_value = scalar_to_float(error->expected);
+      float rel_error =
+          std::abs(actual_value - expected_value) /
+          std::max(std::abs(actual_value), std::abs(expected_value));
       if (rel_error > max_rel_error) {
         max_rel_error = rel_error;
       }
@@ -438,9 +524,10 @@ int verify_stochastic(int M, int N, int K, std::vector<Tin> A,
 // --------------------------------------------------------------------------
 // Tracing
 // --------------------------------------------------------------------------
-void write_out_trace(char *traceOutPtr, size_t trace_size, std::string path) {
+void write_out_trace(char *traceOutPtr, std::size_t trace_size,
+                     std::string path) {
   std::ofstream fout(path);
-  uint32_t *traceOut = (uint32_t *)traceOutPtr;
+  auto *traceOut = reinterpret_cast<std::uint32_t *>(traceOutPtr);
   for (int i = 0; i < trace_size / sizeof(traceOut[0]); i++) {
     fout << std::setfill('0') << std::setw(8) << std::hex << (int)traceOut[i];
     fout << std::endl;

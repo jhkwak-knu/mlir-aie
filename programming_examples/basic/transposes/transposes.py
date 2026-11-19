@@ -1,0 +1,529 @@
+# transposes/transposes.py -*- Python -*-
+#
+# Copyright (C) 2024-2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+#
+"""Five transpose strategies on a single AIE column, ``@iron.jit``-compiled.
+
+All five strategies produce the same end result: a full ``M x K`` →
+``K x M`` transpose.  Only the on-device mechanism differs, and each
+mechanism has its own (dtype, size) support envelope:
+
+  * ``dma``         — pure shim-DMA stride; no compute core.
+                      ``ObjectFifo.forward()`` with a transpose TAP at
+                      the input.  Shim DMA stride-1 must be ≥ 4 bytes,
+                      so the element type must be 4 bytes
+                      (``int32`` / ``uint32``).
+  * ``dma_packet``  — same body as ``dma`` but lowered with
+                      ``--packet-sw-objFifos`` so the data flows packet-
+                      switched.  Same 4-byte-element constraint.
+  * ``shuffle``     — per-tile VSHUFFLE on a compute core.  The kernel
+                      (``aie_kernels/shuffle_16x16.cc``) is hand-written
+                      for ``uint8`` ``16 x 16``; constrained to that
+                      exact ``(dtype, M, K) = (uint8, 16, 16)``.
+  * ``combined``    — hybrid: shim DMA does the outer-block reshuffle
+                      (L3→L2→L1 TAP chain), and a VSHUFFLE kernel
+                      (``kernels.transpose``, i.e. ``transpose_4x4`` or
+                      ``transpose_8x8`` in the library's
+                      ``aie_kernels/datamovement/transpose.cc``) transposes each
+                      inner ``s x s`` sub-tile.  Supports
+                      ``i8`` / ``i16`` / ``i32`` and any sizes with
+                      ``m | M``, ``n | N``, ``s | m``, ``s | n``.
+  * ``dyn``         — scalar transpose on a compute core
+                      (``aie_kernels/transpose_dyn.cc``). ``M``/``K`` are
+                      ``DispatchTime`` scalars, delivered to the core as
+                      ``mb``/``nb`` RTP values rather than baked in at
+                      compile time, so one compiled object serves any
+                      ``M``/``K``/``i8``/``i16``/``i32`` combination — no
+                      recompile, no divisibility or minimum-size
+                      constraint — up to the host buffer's capacity. One
+                      element per cycle, and the whole ``M x K`` tile must
+                      fit one core's L1.
+
+Each strategy raises ``ValueError`` if asked for a combo outside its
+support envelope.
+
+Standalone:    ``python3 transposes.py --strategy <s> [--M ... --K ... ...]``
+Compile-only:  ``... --xclbin-path=PATH --insts-path=PATH``    (Makefile)
+"""
+
+import argparse
+from pathlib import Path
+
+import aie.iron as iron
+import aie.iron.kernels as kernels
+import numpy as np
+from aie.helpers.npdtypes import np_ndarray_type_get_dtype, np_ndarray_type_get_shape
+from aie.helpers.taplib import TensorAccessPattern
+from aie.iron import (
+    Buffer,
+    CompileTime,
+    DispatchTime,
+    In,
+    ObjectFifo,
+    Out,
+    Program,
+    Runtime,
+    Worker,
+    WorkerRuntimeBarrier,
+    require,
+)
+from aie.iron.controlflow import range_
+from aie.iron.device import AnyComputeTile
+from aie.iron.kernel import ExternalFunction
+from aie.utils.hostruntime.argparse import add_compile_args
+from aie.utils.hostruntime.cli import run_design_cli
+from aie.utils.verify import assert_pass
+
+_KERNELS_DIR = Path(__file__).parent / "aie_kernels"
+_SHUFFLE_SRC = str(_KERNELS_DIR / "shuffle_16x16.cc")
+_COMBINED_SRC = str(_KERNELS_DIR / "transpose.cc")
+_DYN_SRC = str(_KERNELS_DIR / "transpose_dyn.cc")
+
+_BYTES_TO_DTYPE = {1: np.uint8, 2: np.uint16, 4: np.uint32}
+_COMBINED_DTYPE_MACRO = {1: "DTYPE_i8", 2: "DTYPE_i16", 4: "DTYPE_i32"}
+
+
+# ---------------------------------------------------------------------------
+# Strategy 1 / 2: pure shim-DMA stride.  4-byte element only.
+# ---------------------------------------------------------------------------
+
+
+@iron.jit
+def _transpose_dma(
+    A: In,
+    C: Out,
+    *,
+    M: CompileTime[int] = 64,
+    K: CompileTime[int] = 64,
+    dtype_bytes: CompileTime[int] = 4,
+):
+    if dtype_bytes != 4:
+        raise ValueError(
+            f"--strategy=dma requires 4-byte elements (shim DMA stride-1 "
+            f"must be ≥ 4 bytes); got dtype_bytes={dtype_bytes}."
+        )
+    dtype = _BYTES_TO_DTYPE[dtype_bytes]
+    tensor_ty = np.ndarray[(M, K), np.dtype[dtype]]
+    tap_in = TensorAccessPattern.full((M, K)).T
+    of_in = ObjectFifo(tensor_ty)
+    of_out = of_in.cons().forward(AnyComputeTile)
+
+    def sequence(a, c, in_h, out_h):
+        in_h.fill(a, tap_in)
+        out_h.drain(c, wait=True)
+
+    rt = Runtime(
+        sequence,
+        [tensor_ty, tensor_ty, of_in.prod(), of_out.cons()],
+    )
+    return Program(iron.get_current_device(), rt).resolve_program()
+
+
+@iron.jit(aiecc_flags=["--packet-sw-objFifos"])
+def _transpose_dma_packet(
+    A: In,
+    C: Out,
+    *,
+    M: CompileTime[int] = 64,
+    K: CompileTime[int] = 64,
+    dtype_bytes: CompileTime[int] = 4,
+):
+    if dtype_bytes != 4:
+        raise ValueError(
+            f"--strategy=dma_packet requires 4-byte elements (shim DMA "
+            f"stride-1 must be ≥ 4 bytes); got dtype_bytes={dtype_bytes}."
+        )
+    dtype = _BYTES_TO_DTYPE[dtype_bytes]
+    tensor_ty = np.ndarray[(M, K), np.dtype[dtype]]
+    tap_in = TensorAccessPattern.full((M, K)).T
+    of_in = ObjectFifo(tensor_ty, name="in")
+    of_out = of_in.cons().forward()
+
+    def sequence(a, c, in_h, out_h):
+        in_h.fill(a, tap_in)
+        out_h.drain(c, wait=True)
+
+    rt = Runtime(
+        sequence,
+        [tensor_ty, tensor_ty, of_in.prod(), of_out.cons()],
+    )
+    return Program(iron.get_current_device(), rt).resolve_program()
+
+
+# ---------------------------------------------------------------------------
+# Strategy 3: VSHUFFLE-only, hand-coded uint8 16x16 kernel.
+# ---------------------------------------------------------------------------
+
+
+@iron.jit
+def _transpose_shuffle(
+    A: In,
+    C: Out,
+    *,
+    M: CompileTime[int] = 16,
+    K: CompileTime[int] = 16,
+    dtype_bytes: CompileTime[int] = 1,
+):
+    if (dtype_bytes, M, K) != (1, 16, 16):
+        raise ValueError(
+            f"--strategy=shuffle is limited to (dtype_bytes, M, K) = (1, 16, 16) "
+            f"because shuffle_16x16.cc is hand-coded for uint8 16x16; got "
+            f"(dtype_bytes={dtype_bytes}, M={M}, K={K})."
+        )
+    tile_ty = np.ndarray[(M * K,), np.dtype[np.uint8]]
+
+    kernel_func = ExternalFunction(
+        "transpose_16x16",
+        source_file=_SHUFFLE_SRC,
+        arg_types=[tile_ty, tile_ty],
+    )
+
+    in_fifo = ObjectFifo(tile_ty, name="in_fifo")
+    out_fifo = ObjectFifo(tile_ty, name="out_fifo")
+
+    def core_fn(in_fifo, out_fifo, kernel_func):
+        elem_in = in_fifo.acquire(1)
+        elem_out = out_fifo.acquire(1)
+        kernel_func(elem_in, elem_out)
+        out_fifo.release(1)
+        in_fifo.release(1)
+
+    worker = Worker(core_fn, fn_args=[in_fifo.cons(), out_fifo.prod(), kernel_func])
+
+    def sequence(a, c, in_h, out_h):
+        in_h.fill(a)
+        out_h.drain(c, wait=True)
+
+    rt = Runtime(
+        sequence,
+        [tile_ty, tile_ty, in_fifo.prod(), out_fifo.cons()],
+    )
+    return Program(iron.get_current_device(), rt, workers=[worker]).resolve_program()
+
+
+# ---------------------------------------------------------------------------
+# Strategy 4: hybrid shim-DMA outer + VSHUFFLE inner.
+# ---------------------------------------------------------------------------
+
+
+@iron.jit
+def _transpose_combined(
+    A: In,
+    C: Out,
+    *,
+    M: CompileTime[int] = 64,
+    K: CompileTime[int] = 64,
+    m: CompileTime[int] = 16,
+    n: CompileTime[int] = 16,
+    s: CompileTime[int] = 8,
+    dtype_bytes: CompileTime[int] = 4,
+):
+    if dtype_bytes not in (1, 2, 4):
+        raise ValueError(
+            f"--strategy=combined supports dtype_bytes in {{1, 2, 4}}; "
+            f"got {dtype_bytes}."
+        )
+    if s not in (4, 8):
+        raise ValueError(f"--strategy=combined requires s in {{4, 8}}; got {s}.")
+    if M % m or K % n or m % s or n % s:
+        raise ValueError(
+            f"combined requires m | M, n | K, s | m, s | n; got "
+            f"M={M}, K={K}, m={m}, n={n}, s={s}."
+        )
+    dtype = _BYTES_TO_DTYPE[dtype_bytes]
+    matrix_ty = np.ndarray[(M, K), np.dtype[dtype]]
+    tile_ty = np.ndarray[(m, n), np.dtype[dtype]]
+
+    # The library's blocked transpose (aie_kernels/datamovement/transpose.cc), which
+    # takes any 1-, 2- or 4-byte element type.
+    kernel_func = kernels.transpose(dim_m=m, dim_n=n, subtile=s, dtype=dtype)
+
+    # A is read one (m, n) tile at a time, row-major over the tile grid.
+    tap_in_L3L2 = TensorAccessPattern.full((M, K)).tile((m, n))
+    # The memtile hands each tile to the core as (s, s) sub-tiles in the
+    # order that leaves only an in-place s x s transpose for the kernel:
+    # sub-tile columns outermost, then rows within a sub-tile, then sub-tile
+    # rows, then columns within it.
+    tap_in_L2L1 = TensorAccessPattern.full((n, m)).tile((s, s)).permute((1, 2, 0, 3))
+    # The transposed (n, m) tiles land in C column-major over the tile grid,
+    # so tile (i, j) of A becomes tile (j, i) of C.
+    tap_out_L1L3 = TensorAccessPattern.full((K, M)).tile((n, m)).permute((1, 0, 2, 3))
+
+    in_L3L2_fifo = ObjectFifo(tile_ty, name="in_L3L2_fifo")
+    in_L2L1_fifo = in_L3L2_fifo.cons(from_stream=tap_in_L2L1).forward(
+        obj_type=tile_ty, name="in_L2L1_fifo"
+    )
+    out_fifo = ObjectFifo(tile_ty, name="out_fifo")
+
+    def core_fn(in_fifo, out_fifo, kernel_func):
+        for _ in range_(K // n):
+            for _ in range_(M // m):
+                elem_in = in_fifo.acquire(1)
+                elem_out = out_fifo.acquire(1)
+                kernel_func(elem_in, elem_out)
+                out_fifo.release(1)
+                in_fifo.release(1)
+
+    worker = Worker(
+        core_fn, fn_args=[in_L2L1_fifo.cons(), out_fifo.prod(), kernel_func]
+    )
+
+    def sequence(a, c, in_h, out_h):
+        in_h.fill(a, tap_in_L3L2)
+        out_h.drain(c, tap_out_L1L3, wait=True)
+
+    rt = Runtime(
+        sequence,
+        [matrix_ty, matrix_ty, in_L3L2_fifo.prod(), out_fifo.cons()],
+    )
+    return Program(iron.get_current_device(), rt, workers=[worker]).resolve_program()
+
+
+# ---------------------------------------------------------------------------
+# Strategy 5: scalar transpose, mb/nb as runtime kernel args (no macros).
+# ---------------------------------------------------------------------------
+
+
+@iron.jit
+def _transpose_dyn(
+    A: In,
+    C: Out,
+    *,
+    M: DispatchTime[np.int32],
+    K: DispatchTime[np.int32],
+    dtype_bytes: CompileTime[int] = 4,
+):
+    if dtype_bytes not in _BYTES_TO_DTYPE:
+        raise ValueError(
+            f"--strategy=dyn supports {sorted(_BYTES_TO_DTYPE)}-byte elements; "
+            f"got dtype_bytes={dtype_bytes}."
+        )
+    # A's compiled buffer bounds every dispatch's M * K.
+    max_elems = int(np.prod(np_ndarray_type_get_shape(A)))
+    # in_fifo/out_fifo share one flat_ty derived from A alone, so a C that
+    # doesn't match A's element count or width would starve or overrun drain.
+    for name, arr_ty in (("A", A), ("C", C)):
+        elems = int(np.prod(np_ndarray_type_get_shape(arr_ty)))
+        itemsize = np.dtype(np_ndarray_type_get_dtype(arr_ty)).itemsize
+        if elems != max_elems or itemsize != dtype_bytes:
+            raise ValueError(
+                f"--strategy=dyn requires A and C to both hold {max_elems} "
+                f"elements of {dtype_bytes} bytes; got {name} with {elems} "
+                f"elements of {itemsize} bytes."
+            )
+    dtype = _BYTES_TO_DTYPE[dtype_bytes]
+    flat_ty = np.ndarray[(max_elems,), np.dtype[dtype]]
+
+    kernel_func = ExternalFunction(
+        "transpose_dyn",
+        source_file=_DYN_SRC,
+        arg_types=[flat_ty, flat_ty, np.dtype(np.int32), np.dtype(np.int32)],
+        compile_flags=[f"-D{_COMBINED_DTYPE_MACRO[dtype_bytes]}"],
+    )
+
+    in_fifo = ObjectFifo(flat_ty, name="in_fifo")
+    out_fifo = ObjectFifo(flat_ty, name="out_fifo")
+
+    # Only the runtime sequence sees dispatch-time M, K; the core reads them as RTP.
+    mk_rtp = Buffer(
+        np.ndarray[(2,), np.dtype[np.int32]], name="mk_rtp", use_write_rtp=True
+    )
+    barrier = WorkerRuntimeBarrier()
+
+    def core_fn(in_fifo, out_fifo, kernel_func, rtp, barrier):
+        barrier.wait_for_value(1)
+        mb = rtp[0]
+        nb = rtp[1]
+        # The wait leaves the barrier at 1; step it off so the next dispatch
+        # blocks until that dispatch's own set(1) instead of reusing these.
+        barrier.release_with_value(1)
+        elem_in = in_fifo.acquire(1)
+        elem_out = out_fifo.acquire(1)
+        kernel_func(elem_in, elem_out, mb, nb)
+        out_fifo.release(1)
+        in_fifo.release(1)
+
+    worker = Worker(
+        core_fn,
+        fn_args=[in_fifo.cons(), out_fifo.prod(), kernel_func, mk_rtp, barrier],
+    )
+
+    def sequence(a, c, M, K, in_h, out_h):
+        require(M > 0, "M must be positive")
+        require(K > 0, "K must be positive")
+        # Bounding each side first keeps the i32 product M * K from wrapping.
+        require(M <= max_elems, f"M must fit the compiled buffer ({max_elems})")
+        require(K <= max_elems, f"K must fit the compiled buffer ({max_elems})")
+        require(
+            M * K <= max_elems,
+            f"M*K must fit the compiled buffer ({max_elems} elements)",
+        )
+        mk_rtp[0] = M
+        mk_rtp[1] = K
+        barrier.set(1)
+        # The core's DMA moves whole fifo objects, so the shim must too: a
+        # shorter transfer leaves the object incomplete and the core waits forever.
+        in_h.fill(a)
+        out_h.drain(c, wait=True)
+
+    rt = Runtime(
+        sequence,
+        [A, C, M, K, in_fifo.prod(), out_fifo.cons()],
+    )
+    return Program(iron.get_current_device(), rt, workers=[worker]).resolve_program()
+
+
+# ---------------------------------------------------------------------------
+# Strategy dispatch
+# ---------------------------------------------------------------------------
+
+
+_STRATEGIES = {
+    "dma": _transpose_dma,
+    "dma_packet": _transpose_dma_packet,
+    "shuffle": _transpose_shuffle,
+    "combined": _transpose_combined,
+    "dyn": _transpose_dyn,
+}
+
+
+# Per-strategy defaults — picked so `python3 transposes.py -s <s>` works
+# out of the box without the caller having to know each strategy's support
+# envelope.
+_DEFAULTS = {
+    "dma": dict(M=64, K=64, dtype_bytes=4),
+    "dma_packet": dict(M=64, K=32, dtype_bytes=4),
+    "shuffle": dict(M=16, K=16, dtype_bytes=1),
+    # combined: m=n=32 / s=8 is the smallest empirically-working combo.
+    # m=n=16 / s=8 *compiles* (passes the m>s, n>s assert) but the
+    # underlying transpose_8x8 kernel's VECTOR_SIZE math breaks when the
+    # outer tile equals the sub-tile size, producing the wrong block
+    # interleave.  Original combined_transpose Makefile shipped m=64,n=32.
+    "combined": dict(M=128, K=128, dtype_bytes=4, m=32, n=32, s=8),
+    # dyn: an odd, non-power-of-2, mutually-prime (M, K) at bf16 width,
+    # which combined/shuffle cannot express at all, to make the point.
+    "dyn": dict(M=48, K=37, dtype_bytes=2),
+}
+
+
+def _compile_kwargs(opts):
+    base = dict(M=opts.M, K=opts.K, dtype_bytes=opts.dtype_bytes)
+    if opts.strategy == "combined":
+        base.update(m=opts.m, n=opts.n, s=opts.s)
+    if opts.strategy == "dyn":
+        # Compile-only and --emit-mlir bind no tensors, so supply A/C's type,
+        # rounded up to whole 4-byte words as the shim DMA requires.
+        per_word = 4 // opts.dtype_bytes
+        n_elems = -(-opts.M * opts.K // per_word) * per_word
+        flat_ty = np.ndarray[(n_elems,), np.dtype[_BYTES_TO_DTYPE[opts.dtype_bytes]]]
+        base.update(A=flat_ty, C=flat_ty)
+    return base
+
+
+def _apply_defaults(opts):
+    d = _DEFAULTS[opts.strategy]
+    if opts.M is None:
+        opts.M = d["M"]
+    if opts.K is None:
+        opts.K = d["K"]
+    if opts.dtype_bytes is None:
+        opts.dtype_bytes = d["dtype_bytes"]
+    # combined has m/n/s too; pull them from the per-strategy defaults
+    # only when the user didn't override on the CLI.  The argparse
+    # defaults (-m 16 -n 16 --ss 8) are generic placeholders that don't
+    # always satisfy the combined kernel's empirical size constraint, so
+    # use the strategy-specific defaults when present.
+    if opts.strategy == "combined":
+        sentinel_defaults = dict(m=16, n=16, s=8)
+        for k in ("m", "n", "s"):
+            if getattr(opts, k) == sentinel_defaults[k] and k in d:
+                setattr(opts, k, d[k])
+
+
+def _make_argparser():
+    p = argparse.ArgumentParser(prog="AIE Transpose (five strategies)")
+    add_compile_args(p)
+    p.add_argument(
+        "-s",
+        "--strategy",
+        choices=list(_STRATEGIES.keys()),
+        required=True,
+        help="which on-device transpose mechanism to use",
+    )
+    p.add_argument("-M", type=int, default=None, help="input rows")
+    p.add_argument("-K", type=int, default=None, help="input cols (== N for output)")
+    p.add_argument(
+        "--dtype-bytes",
+        type=int,
+        choices=[1, 2, 4],
+        default=None,
+        help="element size in bytes; per-strategy support varies (see module docstring)",
+    )
+    p.add_argument("-m", type=int, default=16, help="outer tile rows (combined)")
+    p.add_argument("-n", type=int, default=16, help="outer tile cols (combined)")
+    p.add_argument(
+        "--ss", dest="s", type=int, default=8, help="inner shuffle size (combined)"
+    )
+    return p
+
+
+def _run_and_verify_dyn(opts):
+    """Dispatch two different (M, K) shapes against the one compiled design.
+
+    `M`/`K` are `DispatchTime` scalars (see `_transpose_dyn`), so unlike the
+    other strategies' single-shape check, this is also the proof that the
+    compiled design is reused rather than rebuilt per shape.
+    """
+    dtype = _BYTES_TO_DTYPE[opts.dtype_bytes]
+    rng = np.random.default_rng(0)
+    info = np.iinfo(dtype)
+    buf_shape = np_ndarray_type_get_shape(_compile_kwargs(opts)["A"])
+    a_t = iron.zeros(buf_shape, dtype=dtype, device="npu")
+    c_t = iron.zeros(buf_shape, dtype=dtype, device="npu")
+
+    for M, K in ((opts.M, opts.K), (max(1, opts.M // 2), max(1, opts.K // 2))):
+        in_np = rng.integers(info.min, info.max + 1, size=(M, K), dtype=dtype)
+        a_t.numpy_view().flat[: M * K] = in_np.flat
+        _transpose_dyn(a_t, c_t, M=M, K=K, dtype_bytes=opts.dtype_bytes)
+        expected = in_np.T
+        actual = c_t.numpy().reshape(-1)[: K * M].reshape(K, M)
+        assert_pass(
+            actual,
+            expected,
+            fail_msg=f"M={M}, K={K}: output does not match transpose(in)",
+        )
+
+
+def _run_and_verify(opts):
+    if opts.strategy == "dyn":
+        _run_and_verify_dyn(opts)
+        return
+    M, K = opts.M, opts.K
+    dtype = _BYTES_TO_DTYPE[opts.dtype_bytes]
+    rng = np.random.default_rng(0)
+    info = np.iinfo(dtype)
+    in_np = rng.integers(info.min, info.max + 1, size=(M, K), dtype=dtype)
+    a_t = iron.tensor(in_np, dtype=dtype, device="npu")
+    c_t = iron.zeros((K, M), dtype=dtype, device="npu")
+
+    _STRATEGIES[opts.strategy](a_t, c_t, **_compile_kwargs(opts))
+
+    expected = in_np.T
+    actual = c_t.numpy().reshape(K, M)
+    assert_pass(actual, expected, fail_msg="output does not match transpose(in)")
+
+
+def main():
+    opts = _make_argparser().parse_args()
+    run_design_cli(
+        _STRATEGIES[opts.strategy],
+        opts,
+        compile_kwargs=_compile_kwargs,
+        run_and_verify=_run_and_verify,
+        validate=_apply_defaults,
+    )
+
+
+if __name__ == "__main__":
+    main()

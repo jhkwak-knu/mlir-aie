@@ -1,9 +1,8 @@
 #
-# This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-# See https://llvm.org/LICENSE.txt for license information.
+# Copyright (C) 2021-2022 Xilinx, Inc.
+# Copyright (C) 2022-2026 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #
-# (c) Copyright 2021 Xilinx Inc.
 
 # optional parameters
 #  -DTOOLCHAINFILES_PATH: path to cross compilation toolchain files, default: <mlir-aie-root-dir>/cmake/toolchainFiles
@@ -13,8 +12,7 @@
 #  -DAIE_RUNTIME_TARGETS: list of targets (x86_64,aarch64) to build runtime libs for, default: x86_64; cross compilation for aarch64 against default Vitis Sysroot
 #  -DAIE_RUNTIME_TEST_TARGET: runtime test target (x86_64 or aarch64) used for running unit test and tutorials, default x86_64
 
-cmake_minimum_required(VERSION 3.23)
-
+cmake_minimum_required(VERSION 3.30)
 set(TOOLCHAINFILES_PATH ${CMAKE_SOURCE_DIR}/cmake/modulesXilinx)
 
 set(AIE_RUNTIME_TARGETS
@@ -43,8 +41,11 @@ if(POLICY CMP0091)
   cmake_policy(SET CMP0091 NEW)
 endif()
 
+# LLVM's tablegen() macro emits a depfile only under CMP0116 NEW. The depfile
+# lists the transitive .td includes, so a generated file rebuilds whenever any
+# .td it includes changes.
 if(POLICY CMP0116)
-  cmake_policy(SET CMP0116 OLD)
+  cmake_policy(SET CMP0116 NEW)
 endif()
 
 if(POLICY CMP0144)
@@ -71,15 +72,15 @@ set(HOST_COMPILER
     "NONE"
     CACHE STRING "Host program compiler selection")
 set(PEANO_INSTALL_DIR
-    "<unset>"
+    "$ENV{PEANO_INSTALL_DIR}"
     CACHE STRING "Location of Peano compiler")
+if(NOT PEANO_INSTALL_DIR OR PEANO_INSTALL_DIR STREQUAL "")
+    set(PEANO_INSTALL_DIR "<unset>" CACHE STRING "Location of Peano compiler" FORCE)
+endif()
 
 option(LLVM_INCLUDE_TOOLS "Generate build targets for the LLVM tools." ON)
 option(LLVM_BUILD_TOOLS
        "Build the LLVM tools. If OFF, just generate build targets." ON)
-option(AIE_INCLUDE_INTEGRATION_TESTS
-       "Generate build targets for the mlir-aie integration tests." OFF)
-
 # Take note of the current git revision for outputting version strings in built executables
 execute_process(COMMAND git rev-parse HEAD OUTPUT_VARIABLE AIE_GIT_COMMIT ERROR_QUIET OUTPUT_STRIP_TRAILING_WHITESPACE)
 
@@ -88,7 +89,30 @@ find_package(MLIR REQUIRED CONFIG)
 message(STATUS "Using MLIRConfig.cmake in: ${MLIR_DIR}")
 message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
 
-# These are a bit of a hack, because we're hijacking alot of LLVM machinery
+# mlir-aie tracks a specific LLVM commit (utils/clone-llvm.sh) and uses MLIR
+# APIs that LLVM release branches do not have. Building against an older LLVM,
+# such as a distro package, otherwise fails part-way through the build with an
+# unrelated-looking tablegen or C++ error (e.g. "Variable not defined:
+# 'SymbolName'"), so reject it here. Newer versions are allowed, since they are
+# what an LLVM bump is tested against.
+set(AIE_CLONE_LLVM_SH "${CMAKE_CURRENT_SOURCE_DIR}/utils/clone-llvm.sh")
+if(EXISTS "${AIE_CLONE_LLVM_SH}")
+  file(STRINGS "${AIE_CLONE_LLVM_SH}" AIE_PINNED_LLVM_LINE REGEX "^WHEEL_VERSION=")
+  if(AIE_PINNED_LLVM_LINE MATCHES "^WHEEL_VERSION=([0-9]+)\\.")
+    set(AIE_PINNED_LLVM_VERSION_MAJOR ${CMAKE_MATCH_1})
+    if(LLVM_VERSION_MAJOR VERSION_LESS AIE_PINNED_LLVM_VERSION_MAJOR)
+      message(FATAL_ERROR
+        "Found LLVM/MLIR ${LLVM_PACKAGE_VERSION} (${LLVM_DIR}), but mlir-aie "
+        "requires the LLVM ${AIE_PINNED_LLVM_VERSION_MAJOR} development commit "
+        "pinned in utils/clone-llvm.sh; released LLVM versions are not supported. "
+        "Either run utils/build-mlir-aie-from-wheels.sh, which downloads the "
+        "matching prebuilt MLIR, or build that commit with utils/clone-llvm.sh "
+        "and utils/build-llvm-local.sh and pass -DMLIR_DIR=<llvm-install>/lib/cmake/mlir.")
+    endif()
+  endif()
+endif()
+
+# Reuse LLVM's build machinery, which requires setting these output dirs explicitly.
 set(LLVM_RUNTIME_OUTPUT_INTDIR ${CMAKE_BINARY_DIR}/bin)
 set(LLVM_LIBRARY_OUTPUT_INTDIR ${CMAKE_BINARY_DIR}/lib)
 set(MLIR_BINARY_DIR ${CMAKE_BINARY_DIR})
@@ -99,11 +123,135 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(AIE_TOOLS_BINARY_DIR ${AIE_BINARY_DIR}/bin)
 set(AIE_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 
+if(WIN32)
+  # Prefer in-tree Find*.cmake modules (FindVitis.cmake, FindXRT.cmake, etc.).
+  list(PREPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake/modulesXilinx")
+  # Force xchesscc off on Windows, since the Vitis chess toolchain is not supported.
+  set(_AIE_BUILD_CHESS_CLANG_DEFAULT OFF)
+else()
+  set(_AIE_BUILD_CHESS_CLANG_DEFAULT ON)
+endif()
+option(AIE_BUILD_CHESS_CLANG "Build chess-clang (requires Vitis chess toolchain)" ${_AIE_BUILD_CHESS_CLANG_DEFAULT})
+option(AIE_BUILD_LSP_SERVER "Build aie-lsp-server (MLIR language server for IDE/editor integration)" ON)
+option(AIE_BUILD_VISUALIZE "Build aie-visualize (AIE design visualization tool)" ON)
+# Build the bundled XRT-free, Boost-free hrx-xclbinutil (an NPU-minimal
+# xclbinutil, vendored in-tree at third_party/hrx-xclbinutil) and install
+# it as `xclbinutil` next to aiecc. Lets aiecc package .xclbins without a system
+# XRT install (e.g. for the HRX/amdxdna runtime). OFF by default.
+option(AIE_BUILD_HRXXCLBINUTIL "Build the bundled hrx-xclbinutil and install it as xclbinutil (no system XRT needed)" OFF)
+
 find_package(Vitis 2023.2 COMPONENTS ${AIE_VITIS_COMPONENTS})
 configure_file(./utils/vitisVariables.config.in
                ${CMAKE_BINARY_DIR}/utils/vitisVariables.config @ONLY)
 find_package(XRT)
-find_package(hsa-runtime64)
+
+# PEANO_INSTALL_DIR (set above) is an unchecked passthrough: if it is set but wrong (missing, not
+# an llvm-aie build, or missing AIE2/AIE2P target support), nothing today says so at configure time
+# -- the first symptom is normally a raw "No such file or directory" from whatever later shells out
+# to ${PEANO_INSTALL_DIR}/bin/clang (test/lit.site.cfg.py.in, programming_examples/**/Makefile).
+# Validate it now and fail loud, the same way an explicitly-requested Vitis/XRT would. A user who
+# has not asked for Peano (PEANO_INSTALL_DIR unset) is unaffected.
+#
+# Peano ships no CMake package config and no dedicated version query, so FindPeano.cmake can only
+# assert identity + capability: is this actually Peano, and does it support the requested target.
+# The one piece of real provenance it does expose is the git repository + revision that LLVM's
+# standard VCS banner embeds into `clang --version` (LLVM_REPOSITORY / LLVM_REVISION, see
+# clang/lib/Basic/Version.cpp) -- e.g. "clang version 21.0.0git
+# (https://github.com/Xilinx/llvm-aie.git <sha>)". That is identity/provenance, not a compatibility
+# predicate: llvm-aie's LLVM_VERSION stays fixed between releases, so there is no meaningful ">="
+# range to gate on here, only "which exact build is this." Record it for diagnostics.
+set(PEANO_VERSION_STRING "")
+set(PEANO_REVISION "")
+if(NOT PEANO_INSTALL_DIR STREQUAL "<unset>")
+  # FindPeano.cmake lives in the cmake/modulesXilinx submodule, and this file only puts that
+  # directory on CMAKE_MODULE_PATH on WIN32; every other build passes -DCMAKE_MODULE_PATH (see
+  # utils/build-mlir-aie-from-wheels.sh and the CI workflows). When it is absent, or the submodule
+  # is uninitialized, find_package below reports "not found" for a reason that has nothing to do
+  # with PEANO_INSTALL_DIR, so check it separately rather than blaming the path.
+  set(peanoFindModule "")
+  foreach(peanoModuleDir IN LISTS CMAKE_MODULE_PATH)
+    if(EXISTS "${peanoModuleDir}/FindPeano.cmake")
+      set(peanoFindModule "${peanoModuleDir}/FindPeano.cmake")
+      break()
+    endif()
+  endforeach()
+  if(NOT peanoFindModule)
+    message(FATAL_ERROR
+      "PEANO_INSTALL_DIR is set to '${PEANO_INSTALL_DIR}' but FindPeano.cmake is not on "
+      "CMAKE_MODULE_PATH ('${CMAKE_MODULE_PATH}'), so the install cannot be validated. Pass "
+      "-DCMAKE_MODULE_PATH=<mlir-aie>/cmake/modulesXilinx, and initialize that submodule with "
+      "git submodule update --init cmake/modulesXilinx.")
+  endif()
+
+  find_package(Peano QUIET)
+  if(NOT Peano_FOUND)
+    message(FATAL_ERROR
+      "PEANO_INSTALL_DIR is set to '${PEANO_INSTALL_DIR}' but no valid Peano (llvm-aie) install "
+      "was found there. Expected ${PEANO_INSTALL_DIR}/bin/clang and ${PEANO_INSTALL_DIR}/bin/llc "
+      "to exist, llc -mtriple=aie --version to report \"Xilinx AI Engine\", and AIE2/AIE2P headers "
+      "under ${PEANO_INSTALL_DIR}/include/. Fix PEANO_INSTALL_DIR, or unset it to configure without "
+      "Peano.")
+  else()
+    if(PEANO_CLANG)
+      execute_process(
+        COMMAND ${PEANO_CLANG} --version
+        OUTPUT_VARIABLE peanoClangVersionOutput
+        ERROR_QUIET
+        RESULT_VARIABLE peanoClangResult
+      )
+      if(peanoClangResult EQUAL 0)
+        if(peanoClangVersionOutput MATCHES "clang version ([^ \n]+)")
+          set(PEANO_VERSION_STRING "${CMAKE_MATCH_1}")
+        endif()
+        if(peanoClangVersionOutput MATCHES "github.com/Xilinx/llvm-aie[^ \n]* ([0-9a-fA-F]+)")
+          set(PEANO_REVISION "${CMAKE_MATCH_1}")
+        endif()
+      endif()
+    endif()
+    if(PEANO_REVISION)
+      message(STATUS "Peano (llvm-aie) validated: ${PEANO_DIR} (version ${PEANO_VERSION_STRING}, revision ${PEANO_REVISION})")
+    elseif(PEANO_VERSION_STRING)
+      message(STATUS "Peano (llvm-aie) validated: ${PEANO_DIR} (version ${PEANO_VERSION_STRING}, no embedded git revision)")
+    else()
+      message(STATUS "Peano (llvm-aie) validated: ${PEANO_DIR}")
+    endif()
+  endif()
+endif()
+
+# Description of the Peano used to configure this build, recorded into aie/version.h so a
+# built tool can report which llvm-aie it was configured against. This is provenance, not a
+# compatibility check: llvm-aie publishes no version query to gate on (see FindPeano above).
+if(PEANO_INSTALL_DIR STREQUAL "<unset>")
+  set(AIE_PEANO_VERSION "not configured")
+elseif(PEANO_VERSION_STRING AND PEANO_REVISION)
+  set(AIE_PEANO_VERSION "${PEANO_VERSION_STRING} (${PEANO_REVISION})")
+elseif(PEANO_VERSION_STRING)
+  set(AIE_PEANO_VERSION "${PEANO_VERSION_STRING}")
+else()
+  # Validated above, but clang --version did not run or did not parse.
+  set(AIE_PEANO_VERSION "unknown")
+endif()
+
+# Find AIEBU library for direct ELF generation (optional, falls back to subprocess)
+# XRT ships it, so look in the XRT the build was pointed at (XRT_ROOT, as the
+# wheel builds pass) before the default install locations.
+set(_aiebu_search_paths)
+foreach(_xrt_root IN ITEMS "${XRT_ROOT}" "$ENV{XRT_ROOT}" "$ENV{XILINX_XRT}")
+  if(_xrt_root)
+    file(TO_CMAKE_PATH "${_xrt_root}" _xrt_root)
+    list(APPEND _aiebu_search_paths "${_xrt_root}/share/cmake/AIEBU")
+  endif()
+endforeach()
+find_package(aiebu QUIET NO_DEFAULT_PATH
+  PATHS ${_aiebu_search_paths}
+        /opt/xilinx/xrt/share/cmake/AIEBU
+        /usr/share/cmake/AIEBU
+)
+if(aiebu_FOUND)
+  message(STATUS "Found AIEBU library - aiecc will use direct library calls for ELF generation")
+else()
+  message(STATUS "AIEBU library not found - aiecc will use subprocess calls to aiebu-asm")
+endif()
 
 # Set up default Vitis Sysroot as sysroot when testing on aarch64
 list(FIND AIE_RUNTIME_TARGETS "aarch64" indexAarch64)
@@ -145,26 +293,46 @@ include(HandleLLVMOptions)
 include(ExternalProject)
 include(CMakeDependentOption)
 
+# The AIE event codegen (include/aie/Dialect/AIE/IR) runs on every build, but
+# mlir_configure_python_dev_packages() only sets Python3_EXECUTABLE when
+# AIE_ENABLE_BINDINGS_PYTHON is on. Same minimum version, so the two agree.
+include(MLIRDetectPythonEnv)
+find_package(Python3 ${MLIR_MINIMUM_PYTHON_VERSION} REQUIRED COMPONENTS Interpreter)
+
 include_directories(${LLVM_INCLUDE_DIRS})
 include_directories(${MLIR_INCLUDE_DIRS})
 include_directories(${PROJECT_SOURCE_DIR}/include)
 include_directories(${PROJECT_BINARY_DIR}/include)
-add_definitions(${LLVM_DEFINITIONS})
 
 cmake_dependent_option(AIE_ENABLE_BINDINGS_PYTHON
   "Enables building of Python bindings." ON "MLIR_ENABLE_BINDINGS_PYTHON" OFF)
 
-cmake_dependent_option(AIE_ENABLE_PYTHON_PASSES
-  "Enables building of passes that connect to python." OFF "AIE_ENABLE_BINDINGS_PYTHON;LLVM_ENABLE_RTTI" OFF)
-
 find_library(XRT_COREUTIL xrt_coreutil HINTS ${XRT_LIB_DIR})
-find_library(UUID uuid)
+
+# On Windows, the UUID library is linked implicitly.
+# Just tell CMake that it's available.
+if(WIN32)
+  set(UUID TRUE)
+else()
+  find_library(UUID uuid)
+endif()
+
 cmake_dependent_option(AIE_ENABLE_XRT_PYTHON_BINDINGS
   "Enables building of python bindings to XRT runtime." ON "XRT_COREUTIL;UUID" OFF)
-if (AIE_ENABLE_XRT_PYTHON_BINDINGS)
-  add_library(xrt_coreutil SHARED IMPORTED)
-  set_property(TARGET xrt_coreutil PROPERTY IMPORTED_LOCATION "${XRT_COREUTIL}")
+
+# Detect whether PyTorch is importable by the configured Python interpreter.
+# Used to enable/skip lit tests that require torch (# REQUIRES: pytorch).
+execute_process(
+  COMMAND ${Python3_EXECUTABLE} -c "import torch"
+  RESULT_VARIABLE _torch_result
+  OUTPUT_QUIET ERROR_QUIET
+)
+if(_torch_result EQUAL 0)
+  set(AIE_ENABLE_PYTORCH ON)
+else()
+  set(AIE_ENABLE_PYTORCH OFF)
 endif()
+message(STATUS "PyTorch available for testing: ${AIE_ENABLE_PYTORCH}")
 
 cmake_dependent_option(AIECC_COMPILE
   "Set aiecc to compile." ON "NOT AIE_COMPILER STREQUAL NONE" OFF)
@@ -181,12 +349,12 @@ cmake_dependent_option(AIECC_COMPILE_WITH_XCHESSCC
 cmake_dependent_option(AIECC_LINK_WITH_XCHESSCC
   "Set aiecc to link with chess." ON "AIECC_LINK;AIE_LINKER STREQUAL XCHESSCC" OFF)
 
-find_library(ELF_LIB elf)
-cmake_dependent_option(AIE_ENABLE_AIRBIN
-  "Enables emitting AIRBIN ELF binaries." OFF "ELF_LIB" OFF)
-
 # If we need runtime libs, then statically link them.
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+if(MSVC AND OPENSSL_USE_STATIC_LIBS)
+  # Match OpenSSL's library suffix to the static MSVC runtime selected above.
+  set(OPENSSL_MSVC_STATIC_RT TRUE)
+endif()
 
 add_flag_if_supported("-Werror=sign-compare" WERROR_SIGN_COMPARE)
 add_flag_if_supported("-Werror=unused" WERROR_USED)
@@ -219,7 +387,10 @@ endif()
 # Make sure we generate the headers
 add_custom_target(aie-headers)
 set_target_properties(aie-headers PROPERTIES FOLDER "Misc")
-add_dependencies(aie-headers mlir-headers)
+# A standalone MLIR stubs mlir-headers and mlir-generic-headers as two unrelated
+# empty targets (MLIRConfig.cmake), so depending on the first reaches nothing
+# attached to the second.
+add_dependencies(aie-headers mlir-headers mlir-generic-headers)
 
 option(AIE_INCLUDE_DOCS "Generate build targets for the MLIR AIE docs." OFF)
 if(AIE_INCLUDE_DOCS)
@@ -254,6 +425,34 @@ add_subdirectory(aie_runtime_lib)
 add_subdirectory(tools)
 add_subdirectory(runtime_lib)
 
+# Bundle llvm-nm and llvm-objcopy alongside the AIE bin/ tools.
+#
+# The IRON JIT external-kernel path renames symbols in Peano-compiled objects
+# by first listing them with `llvm-nm`, then rewriting them with
+# `objcopy --redefine-syms`. Those objects are ordinary ELF32 relocatables, but
+# they carry the AIEngine e_machine (0x108), which no GNU BFD backend claims.
+# GNU nm reads them anyway -- an unknown architecture is no obstacle to listing
+# a symbol table -- but GNU objcopy refuses to auto-detect an input target and
+# fails outright. The LLVM tools need no such hint, so we ship both here; see
+# aie.utils.config, which resolves them and records the asymmetry in full.
+set(_aie_llvm_nm "${LLVM_TOOLS_BINARY_DIR}/llvm-nm${CMAKE_EXECUTABLE_SUFFIX}")
+if(EXISTS "${_aie_llvm_nm}")
+  install(PROGRAMS "${_aie_llvm_nm}"
+          DESTINATION bin
+          COMPONENT aie-tools)
+else()
+  message(FATAL_ERROR "llvm-nm not found at ${_aie_llvm_nm}")
+endif()
+
+set(_aie_llvm_objcopy "${LLVM_TOOLS_BINARY_DIR}/llvm-objcopy${CMAKE_EXECUTABLE_SUFFIX}")
+if(EXISTS "${_aie_llvm_objcopy}")
+  install(PROGRAMS "${_aie_llvm_objcopy}"
+          DESTINATION bin
+          COMPONENT aie-tools)
+else()
+  message(FATAL_ERROR "llvm-objcopy not found at ${_aie_llvm_objcopy}")
+endif()
+
 if(AIE_ENABLE_BINDINGS_PYTHON)
   add_subdirectory(python)
 endif()
@@ -283,6 +482,13 @@ if(NOT LLVM_INSTALL_TOOLCHAIN_ONLY)
     PATTERN "CMakeFiles" EXCLUDE
     PATTERN "config.h" EXCLUDE)
 
+  include("${AIE_SOURCE_DIR}/cmake/install_headers.cmake")
+  install_headers(${CMAKE_CURRENT_SOURCE_DIR}/aie_kernels
+          ${AIE_BINARY_DIR}/include
+          ${CMAKE_INSTALL_PREFIX}/include
+          "aie_kernels"
+  )
+
   if(NOT LLVM_ENABLE_IDE)
     add_llvm_install_targets(install-aie-headers DEPENDS aie-headers COMPONENT
                              aie-headers)
@@ -291,10 +497,18 @@ endif()
 
 
 # Last because each of these has its own CMakeLists.txt which reloads/re-finds LLVM, thus resettings globals.
-add_subdirectory(programming_examples)
-add_subdirectory(programming_guide)
-add_subdirectory(test)
-add_subdirectory(mlir_tutorials)
+# The test/example/tutorial subdirectories' check-* lit targets depend on AIEPythonModules, so they
+# require the Python bindings. Gate them behind an option that is forced OFF when the bindings are
+# off (mirroring how AIE_ENABLE_BINDINGS_PYTHON itself is defined above), so the compiler can be
+# configured and built standalone with a single -DAIE_ENABLE_BINDINGS_PYTHON=OFF.
+cmake_dependent_option(AIE_INCLUDE_TESTS_AND_EXAMPLES
+       "Build the test/example/tutorial subdirectories (require the Python bindings)" ON
+       "AIE_ENABLE_BINDINGS_PYTHON" OFF)
+if(AIE_INCLUDE_TESTS_AND_EXAMPLES)
+  add_subdirectory(programming_examples)
+  add_subdirectory(programming_guide)
+  add_subdirectory(test)
+endif()
 add_subdirectory(cmake/modules)
 
 get_filename_component(COMPILER_DIRECTORY ${CMAKE_CXX_COMPILER} DIRECTORY)
@@ -312,11 +526,21 @@ if (NOT INSTRUMENTED_COVERAGE_FILES)
   )
 endif()
 
+# Report coverage against every tool the lit suite exercises, not just aie-opt.
+# check-aie also runs aie-translate and aiecc (a compiled C++ driver); llvm-cov
+# merges counters across the objects, so code reached only through those tools is
+# no longer reported as uncovered.
+set(AIE_COVERAGE_BINARIES
+  ${CMAKE_BINARY_DIR}/bin/aie-opt
+  ${CMAKE_BINARY_DIR}/bin/aie-translate
+  ${CMAKE_BINARY_DIR}/bin/aiecc)
+
 add_custom_target(generate-aie-coverage-report
   COMMAND ${Python3_EXECUTABLE} ${AIE_SOURCE_DIR}/utils/prepare-code-coverage-artifact.py
   ${LLVM_PROFDATA} ${LLVM_COV} ${LLVM_PROFILE_DATA_DIR}
   ${REPORT_DIR}
-  ${CMAKE_BINARY_DIR}/bin/aie-opt
-  --unified-report --restrict ${INSTRUMENTED_COVERAGE_FILES}
+  ${AIE_COVERAGE_BINARIES}
+  --unified-report --emit-lcov ${REPORT_DIR}/coverage.lcov
+  --restrict ${INSTRUMENTED_COVERAGE_FILES}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
   DEPENDS check-aie) # Run tests

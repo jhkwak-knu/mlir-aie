@@ -1,11 +1,9 @@
-# This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-# See https://llvm.org/LICENSE.txt for license information.
+# Copyright (C) 2021-2022 Xilinx, Inc.
+# Copyright (C) 2022-2026 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #
-# (c) Copyright 2021 Xilinx Inc.
 
-cmake_minimum_required(VERSION 3.10)
-
+cmake_minimum_required(VERSION 3.30)
 if(POLICY CMP0074)
   cmake_policy(SET CMP0074 NEW)
 endif()
@@ -66,7 +64,6 @@ set(MLIR_BINARY_DIR ${CMAKE_BINARY_DIR})
 find_package(Vitis 2023.2 COMPONENTS ${AIE_VITIS_COMPONENTS})
 find_package(Python3 COMPONENTS Interpreter)
 find_package(XRT)
-find_package(hsa-runtime64)
 
 cmake_dependent_option(ENABLE_CHESS_TESTS "Enable backend tests using xchesscc" ON "Vitis_FOUND" OFF)
 cmake_dependent_option(ENABLE_PYTHON_TESTS "Enable python tests" ON "AIE_ENABLE_BINDINGS_PYTHON" OFF)
@@ -75,7 +72,7 @@ cmake_dependent_option(ENABLE_PYTHON_TESTS "Enable python tests" ON "AIE_ENABLE_
 set(LibXAIE_FOUND FALSE)
 if (DEFINED LibXAIE_${AIE_RUNTIME_TEST_TARGET}_DIR)
     message("Test using xaiengine from LibXAIE_${AIE_RUNTIME_TEST_TARGET}_DIR=${LibXAIE_${AIE_RUNTIME_TEST_TARGET}_DIR}")
-    set(LibXAIE_ROOT ${LibXAIE_${target}_DIR})
+    set(LibXAIE_ROOT ${LibXAIE_${AIE_RUNTIME_TEST_TARGET}_DIR})
     find_package(LibXAIE)
 else()
   if(DEFINED VITIS_ROOT)
@@ -95,7 +92,10 @@ include_directories(${LLVM_INCLUDE_DIRS})
 include_directories(${MLIR_INCLUDE_DIRS})
 include_directories(${PROJECT_SOURCE_DIR}/include)
 include_directories(${PROJECT_BINARY_DIR}/include)
-add_definitions(${LLVM_DEFINITIONS})
+
+if(WIN32)
+  file(TO_CMAKE_PATH "${PEANO_INSTALL_DIR}" PEANO_INSTALL_DIR)
+endif()
 
 configure_lit_site_cfg(
   ${CMAKE_CURRENT_SOURCE_DIR}/lit.site.cfg.py.in
@@ -107,16 +107,26 @@ configure_lit_site_cfg(
 set(TEST_DEPENDS
   FileCheck count not
   AIEPythonModules
-  aie-lsp-server
+  aiecc
   aie-opt
   aie-translate
 )
+if(AIE_BUILD_LSP_SERVER)
+  list(APPEND TEST_DEPENDS aie-lsp-server)
+endif()
 
 add_lit_testsuite(check-aie "Running the aie regression tests"
   ${CMAKE_CURRENT_BINARY_DIR}
   DEPENDS ${TEST_DEPENDS}
-  ARGS "-sv --timeout 600"
+  ARGS "-sv --timeout 600 --max-failures 1 --filter-out python-concurrency"
 )
 set_target_properties(check-aie PROPERTIES FOLDER "Tests")
+
+add_lit_testsuite(check-aie-concurrency "Running the aie concurrency tests"
+  ${CMAKE_CURRENT_BINARY_DIR}/python-concurrency
+  DEPENDS ${TEST_DEPENDS}
+  ARGS "-sv --timeout 600 --max-failures 1"
+)
+set_target_properties(check-aie-concurrency PROPERTIES FOLDER "Tests")
 
 add_subdirectory(CppTests)

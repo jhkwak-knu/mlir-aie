@@ -1,0 +1,94 @@
+//===- srs_rounding_mode_aie2.mlir - SRS rounding mode tests ---*- MLIR -*-===//
+//
+// Copyright (C) 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// Verify that AIECoreToStandard sets the rounding mode conditionally:
+//  - conv_even (12) for cores with only float SRS (f32→bf16), as arith.truncf
+//    rounds to nearest even
+//  - positive_inf (9) for cores with integer SRS (i32→i8)
+//  - conv_even (12) for cores with bf16 matmul
+//  - conv_even (12) takes precedence when both bf16 matmul and integer SRS
+//===----------------------------------------------------------------------===//
+
+// RUN: aie-opt --aie-standard-lowering="tilecol=0 tilerow=2" %s | FileCheck --check-prefix=CHECK-FLOAT %s
+// RUN: aie-opt --aie-standard-lowering="tilecol=0 tilerow=3" %s | FileCheck --check-prefix=CHECK-INT %s
+// RUN: aie-opt --aie-standard-lowering="tilecol=0 tilerow=4" %s | FileCheck --check-prefix=CHECK-BF16-MATMUL %s
+// RUN: aie-opt --aie-standard-lowering="tilecol=0 tilerow=5" %s | FileCheck --check-prefix=CHECK-BF16-MATMUL-INT-SRS %s
+
+// Float-only SRS core: rounding mode = conv_even (register 6 = 12)
+// CHECK-FLOAT:  func.func @core_0_2
+// CHECK-FLOAT:    call @llvm.aie2.set.ctrl.reg(%c9_i32, %c1_i32)
+// CHECK-FLOAT:    %c6_i32 = arith.constant 6 : i32
+// CHECK-FLOAT:    %c12_i32 = arith.constant 12 : i32
+// CHECK-FLOAT:    call @llvm.aie2.set.ctrl.reg(%c6_i32, %c12_i32
+
+// Integer SRS core: rounding mode = positive_inf (register 6 = 9)
+// CHECK-INT:  func.func @core_0_3
+// CHECK-INT:    call @llvm.aie2.set.ctrl.reg(%c9_i32, %c1_i32)
+// CHECK-INT:    %c6_i32 = arith.constant 6 : i32
+// CHECK-INT:    %c9_i32_0 = arith.constant 9 : i32
+// CHECK-INT:    call @llvm.aie2.set.ctrl.reg(%c6_i32, %c9_i32_0)
+
+// BF16 matmul core (no SRS): rounding mode = conv_even (register 6 = 12)
+// CHECK-BF16-MATMUL:  func.func @core_0_4
+// CHECK-BF16-MATMUL:    call @llvm.aie2.set.ctrl.reg(%c9_i32, %c1_i32)
+// CHECK-BF16-MATMUL:    %c6_i32 = arith.constant 6 : i32
+// CHECK-BF16-MATMUL:    %c12_i32 = arith.constant 12 : i32
+// CHECK-BF16-MATMUL:    call @llvm.aie2.set.ctrl.reg(%c6_i32, %c12_i32)
+
+// BF16 matmul + integer SRS: conv_even (12) takes precedence over positive_inf (9)
+// CHECK-BF16-MATMUL-INT-SRS:  func.func @core_0_5
+// CHECK-BF16-MATMUL-INT-SRS:    call @llvm.aie2.set.ctrl.reg(%c9_i32, %c1_i32)
+// CHECK-BF16-MATMUL-INT-SRS:    %c6_i32 = arith.constant 6 : i32
+// CHECK-BF16-MATMUL-INT-SRS:    %c12_i32 = arith.constant 12 : i32
+// CHECK-BF16-MATMUL-INT-SRS:    call @llvm.aie2.set.ctrl.reg(%c6_i32, %c12_i32)
+
+module @test_srs_rounding {
+  aie.device(npu1_1col) {
+    %t02 = aie.tile(0, 2)
+    %t03 = aie.tile(0, 3)
+    %t04 = aie.tile(0, 4)
+    %t05 = aie.tile(0, 5)
+
+    // Core with only float SRS (f32 -> bf16): should get conv_even rounding
+    %core02 = aie.core(%t02) {
+      %c0 = arith.constant 0 : i32
+      %v = arith.constant dense<1.0> : vector<16xf32>
+      %srs = aievec.srs %v, %c0 : vector<16xf32>, i32, vector<16xbf16>
+      aie.end
+    }
+
+    // Core with integer SRS (i32 -> i8): should get positive_inf rounding
+    %core03 = aie.core(%t03) {
+      %c0 = arith.constant 0 : i32
+      %v = arith.constant dense<42> : vector<16xi32>
+      %srs = aievec.srs %v, %c0 : vector<16xi32>, i32, vector<16xi8>
+      aie.end
+    }
+
+    // Core with bf16 matmul (no SRS): should get conv_even rounding
+    %core04 = aie.core(%t04) {
+      %lhs = arith.constant dense<1.0> : vector<4x8xbf16>
+      %rhs = arith.constant dense<1.0> : vector<8x4xbf16>
+      %acc = arith.constant dense<0.0> : vector<4x4xf32>
+      %res = aievec.matmul %lhs, %rhs, %acc :
+        vector<4x8xbf16>, vector<8x4xbf16> into vector<4x4xf32>
+      aie.end
+    }
+
+    // Core with bf16 matmul AND integer SRS: conv_even should take precedence
+    %core05 = aie.core(%t05) {
+      %c0 = arith.constant 0 : i32
+      %lhs = arith.constant dense<1.0> : vector<4x8xbf16>
+      %rhs = arith.constant dense<1.0> : vector<8x4xbf16>
+      %acc = arith.constant dense<0.0> : vector<4x4xf32>
+      %res = aievec.matmul %lhs, %rhs, %acc :
+        vector<4x8xbf16>, vector<8x4xbf16> into vector<4x4xf32>
+      %v = arith.constant dense<42> : vector<16xi32>
+      %srs = aievec.srs %v, %c0 : vector<16xi32>, i32, vector<16xi8>
+      aie.end
+    }
+  }
+}

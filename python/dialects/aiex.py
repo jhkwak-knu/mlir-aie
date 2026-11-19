@@ -1,45 +1,157 @@
-# Copyright (C) 2022, Advanced Micro Devices, Inc.
+# Copyright (C) 2022 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 from contextlib import contextmanager
-from functools import partial
 import itertools
-from operator import itemgetter
+from operator import index as _index, itemgetter
 
 import numpy as np
 
 from ._aiex_ops_gen import *
-from ._aie_ops_gen import ObjectFifoCreateOp, dma_bd, EndOp
+from ._aiex_ops_gen import (
+    npu_write32 as _npu_write32,
+    npu_maskwrite32 as _npu_maskwrite32,
+    npu_sync as _npu_sync,
+    npu_address_patch as _npu_address_patch,
+    npu_rtp_write as _npu_rtp_write,
+    npu_push_queue as _npu_push_queue,
+)
+from ._aie_ops_gen import ObjectFifoCreateOp, EndOp, RuntimeSequenceOp
 from . import aie
 from .aie import (
+    BdIteration,
     DMAChannelDir,
     LockAction,
     Neighbors,
     TileOp,
     bds,
+    dma_bd,
+    _as_i32,
 )
 from .transform.structured import MixedValues, _dispatch_mixed_values
 from .._mlir_libs import get_dialect_registry
 from .._mlir_libs._aie import *
-from ..helpers.util import v8bfp16ebs8, v16bfp16ebs16
+from ..extras.meta import region_op
+from ..helpers.npdtypes import v8bfp16ebs8, v16bfp16ebs16
 from ..ir import (
     DictAttr,
     IntegerAttr,
+    IntegerType,
     UnitAttr,
     Type,
     InsertionPoint,
     Attribute,
     AttrBuilder,
+    Value,
+    register_attribute_builder,
 )
 
 # noinspection PyUnresolvedReferences
 from ..extras import types as T
 from ..helpers.util import try_convert_np_type_to_mlir_type
 from ..helpers.taplib import TensorAccessPattern
+from ..helpers.taplib._symbolic import is_sym, si32, sprod
+from ..helpers.taplib.utils import zero_leading_unit_strides
 
 # Comes from _aie
 register_dialect(get_dialect_registry())
 
-npu_sync = partial(npu_sync, column_num=1, row_num=1)
+
+def shim_dims(tap: TensorAccessPattern, ndims: int = 4):
+    """Return `tap`'s offset, sizes and strides as a shim buffer descriptor takes them.
+
+    A walk deeper than `ndims` is coalesced, and one that still does not fit
+    passes through for the compiler to split into BDs of `ndims` dimensions.
+    A shallower one is padded with unit dimensions. Slot 0 is the queue
+    repeat: a leading stride-0 dimension whose size is not the constant 1,
+    staged or not, stays there and the padding goes after it, so
+    `[R, th, tw]` becomes `[R, 1, th, tw]`.
+
+    Args:
+        tap: The access pattern.
+        ndims: The dimensions a buffer descriptor takes.
+
+    Returns:
+        `(offset, sizes, strides)`, with `ndims` sizes and strides unless the
+        walk does not fit.
+
+    Raises:
+        ValueError: If `tap` is padded.
+    """
+    if tap.padding is not None:
+        raise ValueError("a shim DMA cannot pad; padding is a memtile feature")
+    if tap.rank > ndims:
+        tap = tap.coalesce()
+    if tap.rank > ndims:
+        return tap.offset, list(tap.sizes), list(tap.strides)
+    sizes, strides = list(tap.sizes), list(tap.strides)
+    is_repeat = (
+        tap.rank > 1
+        and not is_sym(strides[0])
+        and strides[0] == 0
+        and (is_sym(sizes[0]) or sizes[0] != 1)
+    )
+    at = int(is_repeat)
+    sizes[at:at] = [1] * (ndims - tap.rank)
+    strides[at:at] = [0] * (ndims - tap.rank)
+    return tap.offset, sizes, zero_leading_unit_strides(sizes, strides, start=at)
+
+
+def npu_write32(address, value, buffer=None, column=None, row=None, **kwargs):
+    return _npu_write32(
+        _as_i32(address),
+        _as_i32(value),
+        buffer=buffer,
+        column=column,
+        row=row,
+        **kwargs,
+    )
+
+
+def npu_maskwrite32(address, value, mask, buffer=None, column=None, row=None, **kwargs):
+    return _npu_maskwrite32(
+        _as_i32(address),
+        _as_i32(value),
+        _as_i32(mask),
+        buffer=buffer,
+        column=column,
+        row=row,
+        **kwargs,
+    )
+
+
+def npu_sync(column, row, direction, channel, column_num=1, row_num=1, **kwargs):
+    return _npu_sync(
+        _as_i32(column),
+        _as_i32(row),
+        _as_i32(direction),
+        _as_i32(channel),
+        _as_i32(column_num),
+        _as_i32(row_num),
+        **kwargs,
+    )
+
+
+def npu_address_patch(addr, arg_idx, arg_plus, **kwargs):
+    return _npu_address_patch(addr, _as_i32(arg_plus), arg_idx=arg_idx, **kwargs)
+
+
+def npu_rtp_write(buffer, index, value, **kwargs):
+    return _npu_rtp_write(buffer, index, _as_i32(value), **kwargs)
+
+
+def npu_push_queue(
+    column, row, direction, channel, issue_token, repeat_count, bd_id, **kwargs
+):
+    return _npu_push_queue(
+        column,
+        row,
+        direction,
+        channel,
+        issue_token,
+        _as_i32(repeat_count),
+        _as_i32(bd_id),
+        **kwargs,
+    )
 
 
 def dma_wait(*args: ObjectFifoCreateOp | str):
@@ -67,12 +179,28 @@ class NpuDmaMemcpyNd(NpuDmaMemcpyNdOp):
         sizes: The extent of data to be transferred across each dimension. There is a maximum of four size dimensions.
         strides (optional): Interval steps between data points in each dimension, useful for striding-across and reshaping data.
         burst_length (optional): The configuration of the burst length for the DMA task. If 0, defaults to the highest available value.
+        axcache (optional): The raw 4-bit AxCACHE value for the DMA's AXI-MM transfers. If
+            omitted, the target model's default AxCACHE value is used.
+        length_parameter (optional): Name of a scratchpad parameter n; the
+            transfer then moves the static length plus n * length_unit elements
+            (per iteration). Shim tiles only; see the length_parameter docs on
+            aie.dma_bd.
+        length_unit (optional): Elements added per unit of length_parameter; a
+            multiple of 16 bytes. Required with length_parameter.
+
+    Note:
+        Contiguous row-major access patterns are automatically folded to canonical linear form
+        by the compiler's canonicalization pass. For example, a 2D image access
+        ``sizes=[1, 1, height, width], strides=[0, 0, width, 1]`` is equivalent to
+        ``sizes=[1, 1, 1, height*width], strides=[0, 0, 0, 1]`` and will be canonicalized
+        to the latter. This means the natural multidimensional form can always be used
+        without concern for the hardware d0 dimension size limit.
 
     Example:
 
         npu_dma_memcpy_nd(of_in, 0, input_buffer, sizes=[1, 1, 1, 30])
 
-        The example above describes a linear transfer of 30 data elements, or 120 Bytes, from the input_buffer in host memory into an object FIFO with matching 
+        The example above describes a linear transfer of 30 data elements, or 120 Bytes, from the input_buffer in host memory into an object FIFO with matching
         metadata labeled "of_in".
         The size dimensions are expressed right to left where the right is dimension 0 and the left dimension 3. Higher dimensions not used should be set to 1.
     """
@@ -88,18 +216,19 @@ class NpuDmaMemcpyNd(NpuDmaMemcpyNdOp):
         strides: MixedValues | None = None,
         issue_token: bool | None = None,
         burst_length: int = 0,
-        packet: tuple[int]|None = None
+        axcache: int | None = None,
+        packet: tuple[int] | None = None,
+        offset_parameter: str | None = None,
+        length_parameter: str | None = None,
+        length_unit: int | None = None,
     ):
         if tap and not (offsets is None and sizes is None and strides is None):
             raise ValueError(
                 "NpuDmaMemcpyNd can take either a TileAccessPattern OR (sizes and/or strides and/or offsets), but not both."
             )
         if tap:
-            sizes = tap.sizes.copy()
-            strides = tap.strides.copy()
-            # For some reason, the type checking of offsets does not mesh well with offset being a property
-            # so here we make sure it is evaluated and properly is seen as an integer.
-            offsets = [0] * 3 + [int(tap.offset)]
+            offset, sizes, strides = shim_dims(tap)
+            offsets = [0] * 3 + [offset]
         else:
             if offsets is None:
                 offsets = [0] * 4
@@ -128,7 +257,11 @@ class NpuDmaMemcpyNd(NpuDmaMemcpyNdOp):
             bd_id,
             issue_token=issue_token,
             burst_length=burst_length,
-            packet=packet
+            axcache=axcache,
+            packet=packet,
+            offset_parameter=offset_parameter,
+            length_parameter=length_parameter,
+            length_unit=length_unit,
         )
 
 
@@ -137,25 +270,18 @@ npu_dma_memcpy_nd = NpuDmaMemcpyNd
 
 # Runtime sequence
 
+
 def runtime_sequence(*inputs: Type, sym_name=None, context=None):
     def decorator(f):
-        seq_op = RuntimeSequenceOp()
+        name = sym_name if sym_name else f.__name__
+        seq_op = RuntimeSequenceOp(sym_name=name)
         my_inputs = []
         for input in inputs:
             my_inputs.append(try_convert_np_type_to_mlir_type(input))
         entry_block = seq_op.body.blocks.append(*my_inputs)
         args = entry_block.arguments
-        name = sym_name if sym_name else f.__name__
         with InsertionPoint(entry_block):
             f(*args)
-        seq_op.attributes["sym_name"] = (
-            name
-            if (
-                isinstance(name, Attribute)
-                or not AttrBuilder.contains("SymbolNameAttr")
-            )
-            else AttrBuilder.get("SymbolNameAttr")(name, context=context)
-        )
 
     return decorator
 
@@ -204,7 +330,13 @@ def shim_dma_bd(
     strides: MixedValues | None = None,
     transfer_len: int | None = None,
     burst_length: int = 0,
-    packet: tuple[int]|None = None
+    axcache: int | None = None,
+    packet: tuple[int] | None = None,
+    out_of_order_id: int | None = None,
+    offset_parameter: str | None = None,
+    length_parameter: str | None = None,
+    length_unit: int | None = None,
+    iteration: BdIteration | None = None,
 ):
     if tap and not (offset is None and sizes is None and strides is None):
         raise ValueError(
@@ -212,30 +344,35 @@ def shim_dma_bd(
         )
 
     if tap:
-        sizes = tap.sizes.copy()
-        strides = tap.strides.copy()
-        # For some reason, the type checking of offsets does not mesh well with offset being a property
-        # so here we make sure it is evaluated and properly is seen as an integer.
-        offset = int(tap.offset)
+        offset, sizes, strides = shim_dims(tap)
 
     if offset is None:
         offset = 0
     if sizes is None:
         sizes = [0] * 4
     if strides is None:
-        strides = [0] * 3 + [1]
+        strides = [0] * (len(sizes) - 1) + [1]
 
-    if transfer_len is None:
-        transfer_len = np.prod(sizes[-3:])
+    if not any(is_sym(s) for s in sizes[-3:]):
+        if transfer_len is None:
+            transfer_len = sprod(sizes[-3:])
+        if length_parameter is not None and length_unit is None:
+            length_unit = sprod(sizes[-3:])
 
-    dimensions = list(zip(sizes, strides))
     dma_bd(
         mem,
+        sizes=sizes,
+        strides=strides,
         offset=offset,
-        len=transfer_len,
-        dimensions=dimensions,
+        transfer_len=transfer_len,
         burst_length=burst_length,
-        packet=packet
+        axcache=axcache,
+        packet=packet,
+        out_of_order_id=out_of_order_id,
+        offset_parameter=offset_parameter,
+        length_parameter=length_parameter,
+        length_unit=length_unit,
+        iteration=iteration,
     )
 
 
@@ -249,21 +386,39 @@ def shim_dma_single_bd_task(
     transfer_len: int | None = None,
     issue_token: bool = False,
     burst_length: int = 0,
-    packet: tuple[int]|None = None
+    axcache: int | None = None,
+    packet: tuple[int] | None = None,
+    out_of_order_id: int | None = None,
+    offset_parameter: str | None = None,
+    length_parameter: str | None = None,
+    length_unit: int | None = None,
+    iteration: BdIteration | None = None,
 ):
     """_summary_
     Enables data transfers between the AIE Engine array and external memory.
     DMA tasks operations do not require to specify a BD number and are capable of chaining BD operations.
 
     Args:
-        alloc: The alloc argument associates the DMA task with an ObjectFIFO. This argument is called alloc becuase the shim-side end of a data transfer (specifically a channel on a shim tile) is referenced through a so-called "shim DMA allocation". When an ObjectFIFO is created with a Shim Tile endpoint, an allocation with the same name as the ObjectFIFO is automatically generated.
+        alloc: The alloc argument associates the DMA task with an ObjectFIFO. This argument is called alloc because the shim-side end of a data transfer (specifically a channel on a shim tile) is referenced through a so-called "shim DMA allocation". When an ObjectFIFO is created with a Shim Tile endpoint, an allocation with the same name as the ObjectFIFO is automatically generated.
         mem: Reference to a host buffer, given as an argument to the sequence function, that this transfer will read from or write to.
         tap (optional): A TensorAccessPattern is an alternative method of specifying offset/sizes/strides for determining an access pattern over the mem buffer.
         offset (optional): Starting point for the data transfer. Default values is 0.
-        sizes: The extent of data to be transferred across each dimension. There is a maximum of four size dimensions.
+        sizes: The extent of data to be transferred across each dimension. The dimensions before the last three are iteration dimensions, one execution of the BD per index; past four in all, which must then be constant, the compiler splits the transfer into several BDs.
         strides (optional): Interval steps between data points in each dimension, useful for striding-across and reshaping data.
         issue_token (optional): If a token is issued, one may call dma_await_task on the returned task. Default is False.
         burst_length (optional): The configuration of the burst length for the DMA task. If 0, defaults to the highest available value.
+        axcache (optional): The raw 4-bit AxCACHE value for the DMA's AXI-MM transfers. If
+            omitted, the target model's default AxCACHE value is used.
+        packet (optional): The packet header information represented as a (packet_type, packet_id) tuple.
+        length_parameter (optional): Name of a scratchpad parameter n; the
+            transfer then moves the static length plus n * length_unit elements
+            (per iteration). With `transfer_len=0` it moves exactly n units,
+            each shaped by `sizes`. Shim tiles only; see the length_parameter
+            docs on aie.dma_bd.
+        length_unit (optional): Elements added per unit of length_parameter; a
+            multiple of 16 bytes. Defaults to the elements one pass of the
+            innermost three `sizes` moves.
+        iteration (optional): The BD iteration state as a BdIteration(size, stride, current).
 
     Example:
         out_task = shim_dma_single_bd_task(of_out, C, sizes=[1, 1, 1, N], issue_token=True)
@@ -278,17 +433,58 @@ def shim_dma_single_bd_task(
         )
 
     if tap:
-        sizes = tap.sizes.copy()
-        strides = tap.strides.copy()
-        # For some reason, the type checking of offsets does not mesh well with offset being a property
-        # so here we make sure it is evaluated and properly is seen as an integer.
-        offset = int(tap.offset)
+        offset, sizes, strides = shim_dims(tap)
 
+    # The iteration attribute (when set) claims the shim's single iteration/repeat
+    # slot, so the BD carries ONLY its access dimensions (<=3) and does NOT also
+    # hoist an outer dimension.
     repeat_count = 0
-    if sizes and sizes[0] > 1:
-        repeat_count = sizes[0] - 1
+    repeat_count_val = None
+    if iteration is not None:
+        if sizes is not None and len(sizes) > 3:
+            raise ValueError(
+                "shim_dma_single_bd_task: iteration= supports at most 3 access "
+                "dimensions (the iteration attribute claims the 4th/iteration "
+                f"slot); got {len(sizes)}."
+            )
+    else:
+        # The shim DMA BD has 3 access dimensions plus a hardware repeat/iteration
+        # dimension. The repeat_count below hoists sizes[0] into that iteration
+        # dimension, but the transferred extent is prod(sizes[-3:]) (see shim_dma_bd),
+        # so sizes[0] is left out of it only when there are 4 dimensions. With fewer
+        # than 4 dims and sizes[0] > 1, sizes[0] is counted both as a real access dim
+        # (in transfer_len and in the BD dimensions) and as repeat_count, so the shim
+        # re-issues the whole transfer sizes[0] times, waits on the objectfifo for that
+        # many objects, and dma_await_task never returns. Normalize to the canonical
+        # 4-dim form (left-pad with unit dims) so sizes[0] is only ever the iteration
+        # dimension. Past 4 dims, every dim before the last three iterates, and
+        # aie-decompose-large-dma-bd splits the ones a BD cannot hold into separate
+        # tasks, which it can only do for constant sizes and strides.
+        if sizes is not None:
+            while len(sizes) < 4:
+                sizes = [1] + list(sizes)
+                if strides is not None:
+                    strides = [0] + list(strides)
+
+        # The outer dimensions become the queue-push repeat_count. Constants fold to
+        # the repeat_count attribute; a runtime sizes[0] (4 dims at most) flows into
+        # the repeat_count_val operand so a dynamic tile count is supported.
+        if sizes:
+            outer = sizes[:-3]
+            if all(isinstance(v, (int, np.integer)) for v in outer):
+                runs = int(np.prod([int(v) for v in outer]))
+                if runs > 1:
+                    repeat_count = runs - 1
+            else:
+                # Runtime: a zero sizes[0] wraps to a huge count, which the
+                # queue-push lowering refuses along with any other one past the
+                # target's maximum.
+                repeat_count_val = sizes[0] - 1
     task = dma_configure_task_for(
-        alloc, repeat_count=repeat_count, issue_token=issue_token
+        alloc,
+        repeat_count=repeat_count,
+        repeat_count_val=repeat_count_val,
+        issue_token=issue_token,
     )
     with bds(task) as bd:
         with bd[0]:
@@ -299,7 +495,13 @@ def shim_dma_single_bd_task(
                 strides=strides,
                 transfer_len=transfer_len,
                 burst_length=burst_length,
-                packet=packet
+                axcache=axcache,
+                packet=packet,
+                out_of_order_id=out_of_order_id,
+                offset_parameter=offset_parameter,
+                length_parameter=length_parameter,
+                length_unit=length_unit,
+                iteration=iteration,
             )
             EndOp()
     return task
@@ -314,7 +516,7 @@ def dma_await_task(*args: DMAConfigureTaskForOp):
             "dma_await_task must receive at least one DMAConfigureTaskForOp to wait for"
         )
     for dma_task in args:
-        _orig_dma_await_task(dma_task)
+        _orig_dma_await_task(task=dma_task)
 
 
 _orig_dma_free_task = dma_free_task
@@ -332,13 +534,133 @@ def dma_free_task(*args: DMAConfigureTaskForOp):
 _orig_dma_start_task = dma_start_task
 
 
-def dma_start_task(*args: DMAConfigureTaskForOp):
+def dma_start_task(
+    *args: DMAConfigureTaskForOp,
+    repeat_count: int | Value | None = None,
+    no_token: bool = False,
+    repeat_parameter: str | None = None,
+):
+    """Push each task onto its channel's queue.
+
+    ``repeat_count`` replaces the task's own count for these starts only, and
+    ``no_token`` withholds the completion token the task would otherwise issue.
+    A runtime ``repeat_count`` must fit one queue push. ``repeat_parameter``
+    names a scratchpad parameter whose value, written per run, is the count
+    instead, at most the task's own.
+    """
     if len(args) == 0:
         raise ValueError(
-            "dma_start_task must receive at least one DMAConfigureTaskForOp to free"
+            "dma_start_task must receive at least one DMAConfigureTaskForOp to start"
         )
+    if repeat_parameter is not None and repeat_count is not None:
+        raise ValueError(
+            "dma_start_task takes a repeat_count or a repeat_parameter, not both"
+        )
+    runtime = isinstance(repeat_count, Value)
+    repeat_count_val = repeat_count if runtime else None
     for dma_task in args:
-        _orig_dma_start_task(dma_task)
+        _orig_dma_start_task(
+            dma_task,
+            repeat_count=None if runtime else repeat_count,
+            repeat_count_val=repeat_count_val,
+            no_token=no_token or None,
+            repeat_parameter=repeat_parameter,
+        )
 
-def set_lock_value(lock: aie.LockOp, value: int):
-    return set_lock(lock, value)
+
+def set_lock_value(lock: aie.LockOp, value: int | Value):
+    return set_lock(lock, _as_i32(si32(value)))
+
+
+# Parameter ops
+
+_orig_read_scratchpad_parameter = read_scratchpad_parameter
+
+
+def read_scratchpad_parameter(
+    name: str, result_type: Type
+) -> _orig_read_scratchpad_parameter:
+    """Read a scratchpad runtime parameter inside an `aie.core` body.
+
+    Args:
+        name: The `@sym_name` of the `aiex.scratchpad_parameter` declaration.
+        result_type: The MLIR scalar type of the result (e.g. `T.bf16()`, `T.i32()`).
+
+    Returns:
+        An SSA value of the given type.
+
+    For example:
+
+    ```python
+    val = aiex.read_scratchpad_parameter("foo", T.bf16())
+    ```
+    """
+    return _orig_read_scratchpad_parameter(result_type, name)
+
+
+# CERT control code
+#
+# Registers and barrier ids are attributes, and the generated builders hand
+# them to an attribute builder only if one is registered, so an int or a
+# barrier name is rejected with `std::bad_cast`. The builders below accept the
+# plain values; an attribute that is already built passes through unchanged.
+
+_CERT_NUM_REGISTERS = 24  # r0..r7 local to a job, r8..r23 shared
+
+
+def _cert_index(x, what, count):
+    if isinstance(x, bool):
+        raise TypeError(f"expected {what}, got {x!r}")
+    try:
+        index = _index(x)
+    except TypeError:
+        raise TypeError(f"expected {what}, got {x!r}") from None
+    if not 0 <= index < count:
+        raise ValueError(f"expected {what}, got {x!r}")
+    return index
+
+
+@register_attribute_builder("AIEX_CertRegisterAttr")
+def _cert_register_attr(x, context=None):
+    what = f"a CERT register 0..{_CERT_NUM_REGISTERS - 1}"
+    index = _cert_index(x, what, _CERT_NUM_REGISTERS)
+    return IntegerAttr.get(IntegerType.get_signless(32, context=context), index)
+
+
+def _cert_barrier_id_builder(prefix, count):
+    """Build a barrier id attribute from its assembler name or its index."""
+    what = f"a barrier {prefix}0..{prefix}{count - 1} or its index 0..{count - 1}"
+    # Only the canonical spellings, so "lb01" is not a second name for lb1.
+    names = {f"{prefix}{i}": i for i in range(count)}
+
+    def build(x, context=None):
+        if isinstance(x, str):
+            if x not in names:
+                raise ValueError(f"expected {what}, got {x!r}")
+            index = names[x]
+        else:
+            index = _cert_index(x, what, count)
+        return IntegerAttr.get(IntegerType.get_signless(32, context=context), index)
+
+    return build
+
+
+register_attribute_builder("CertLocalBarrierId")(_cert_barrier_id_builder("lb", 16))
+register_attribute_builder("CertRemoteBarrierId")(_cert_barrier_id_builder("rb", 7))
+
+
+# The region ops are decorators, as `device` and `core` are: the decorated
+# function is the region body and the implicit `aie.end` terminator is added.
+# The op classes (`CertPageOp` and so on) remain for a caller that fills the
+# region itself.
+
+cert_section = region_op(CertSectionOp, terminator=lambda *_: EndOp())
+cert_page = region_op(CertPageOp, terminator=lambda *_: EndOp())
+cert_job = region_op(CertJobOp, terminator=lambda *_: EndOp())
+cert_attach_to_group = region_op(CertAttachToGroupOp, terminator=lambda *_: EndOp())
+cert_uc_dma_chain = region_op(
+    lambda sym_name=None, *, loc=None, ip=None: CertUcDmaChainOp(
+        sym_name=sym_name, loc=loc, ip=ip
+    ),
+    terminator=lambda *_: EndOp(),
+)

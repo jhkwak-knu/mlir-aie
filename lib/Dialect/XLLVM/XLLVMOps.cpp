@@ -1,22 +1,19 @@
 //===---- XLLVMOps.cpp - XLLVM Dialect Operations ---------------*- C++ -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2024 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2024 Advanced Micro Devices, Inc.
 //
 //===----------------------------------------------------------------------===//
 // External LLVM (XLLVM) Dialect implementation.
 //===----------------------------------------------------------------------===//
 
 #include "aie/Dialect/XLLVM/XLLVMDialect.h"
-#include "llvm/IR/IRBuilder.h"
 #include "mlir/Dialect/LLVMIR/LLVMTypes.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/Target/LLVMIR/ModuleTranslation.h"
 #include "mlir/Transforms/FoldUtils.h"
+#include "llvm/IR/IRBuilder.h"
 
 using namespace mlir;
 using namespace xilinx;
@@ -59,7 +56,7 @@ llvm::CallInst *createExternalLLVMIntrinsicCall(
   }
   auto operands = moduleTranslation.lookupValues(intrOp->getOperands());
   SmallVector<llvm::Type *> types;
-  for (auto op : operands)
+  for (auto *op : operands)
     types.push_back(op->getType());
   llvm::Module *module = builder.GetInsertBlock()->getModule();
   llvm::Function *llvmIntr =

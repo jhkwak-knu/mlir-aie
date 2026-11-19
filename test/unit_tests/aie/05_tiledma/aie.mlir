@@ -1,17 +1,17 @@
 //===- aie.mlir ------------------------------------------------*- MLIR -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2021-2022 Xilinx, Inc.
+// Copyright (C) 2022-2025 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2021 Xilinx Inc.
 //
 //===----------------------------------------------------------------------===//
 
-// RUN: %PYTHON aiecc.py %VitisSysrootFlag% --host-target=%aieHostTargetTriplet% %link_against_hsa% %s %test_lib_flags %extraAieCcFlags% %S/test.cpp -o test.elf
+// RUN: %aiecc --xchesscc --xbridge %VitisSysrootFlag% --host-target=%aieHostTargetTriplet% %link_against_hsa% %s %test_lib_flags %extraAieCcFlags% -o test.elf -- %S/test.cpp
 // RUN: %run_on_vck5000 ./test.elf
 
 module @test05_tiledma {
+aie.device(xcvc1902) {
+
   %tile13 = aie.tile(1, 3)
   %tile23 = aie.tile(2, 3)
   %tile33 = aie.tile(3, 3)
@@ -31,8 +31,10 @@ module @test05_tiledma {
   aie.switchbox(%tile33) { aie.connect<"West": 3, "DMA": 1> }
 
   %core13 = aie.core(%tile13) {
-    aie.use_lock(%lock13_3, "Acquire", 1) // acquire for read(e.g. input ping)
-    aie.use_lock(%lock13_5, "Acquire", 0) // acquire for write
+    %c1_ul1 = arith.constant 1 : i32
+    aie.use_lock(%lock13_3, "Acquire", %c1_ul1) // acquire for read(e.g. input ping)
+    %c0_ul2 = arith.constant 0 : i32
+    aie.use_lock(%lock13_5, "Acquire", %c0_ul2) // acquire for write
     %idx1 = arith.constant 3 : index
     %val1 = memref.load %buf13_0[%idx1] : memref<256xi32>
     %2    = arith.addi %val1, %val1 : i32
@@ -41,14 +43,18 @@ module @test05_tiledma {
     %5 = arith.addi %4, %val1 : i32
     %idx2 = arith.constant 5 : index
     memref.store %5, %buf13_1[%idx2] : memref<256xi32>
-    aie.use_lock(%lock13_3, "Release", 0) // release for write
-    aie.use_lock(%lock13_5, "Release", 1) // release for read
+    %c0_ul3 = arith.constant 0 : i32
+    aie.use_lock(%lock13_3, "Release", %c0_ul3) // release for write
+    %c1_ul4 = arith.constant 1 : i32
+    aie.use_lock(%lock13_5, "Release", %c1_ul4) // release for read
     aie.end
   }
 
   %core33 = aie.core(%tile33) {
-    aie.use_lock(%lock33_6, "Acquire", 1) // acquire for read(e.g. input ping)
-    aie.use_lock(%lock33_7, "Acquire", 0) // acquire for write
+    %c1_ul5 = arith.constant 1 : i32
+    aie.use_lock(%lock33_6, "Acquire", %c1_ul5) // acquire for read(e.g. input ping)
+    %c0_ul6 = arith.constant 0 : i32
+    aie.use_lock(%lock33_7, "Acquire", %c0_ul6) // acquire for write
     %idx1 = arith.constant 5 : index
     %val1 = memref.load %buf33_0[%idx1] : memref<256xi32>
     %2    = arith.addi %val1, %val1 : i32
@@ -57,32 +63,43 @@ module @test05_tiledma {
     %5 = arith.addi %4, %val1 : i32
     %idx2 = arith.constant 5 : index
     memref.store %5, %buf33_1[%idx2] : memref<256xi32>
-    aie.use_lock(%lock33_6, "Release", 0) // release for write
-    aie.use_lock(%lock33_7, "Release", 1) // release for read
+    %c0_ul7 = arith.constant 0 : i32
+    aie.use_lock(%lock33_6, "Release", %c0_ul7) // release for write
+    %c1_ul8 = arith.constant 1 : i32
+    aie.use_lock(%lock33_7, "Release", %c1_ul8) // release for read
     aie.end
   }
 
   %mem13 = aie.mem(%tile13) {
+    %c0_i32 = arith.constant 0 : i32
+    %c256_i32 = arith.constant 256 : i32
     %dma0 = aie.dma_start("MM2S", 0, ^bd0, ^end)
     ^bd0:
-      aie.use_lock(%lock13_5, "Acquire", 1)
-      aie.dma_bd(%buf13_1 : memref<256xi32>, 0, 256)
-      aie.use_lock(%lock13_5, "Release", 0)
+      %c1_ul1 = arith.constant 1 : i32
+      aie.use_lock(%lock13_5, "Acquire", %c1_ul1)
+      aie.dma_bd(%buf13_1 : memref<256xi32> offset = 0 len = 256)
+      %c0_ul2 = arith.constant 0 : i32
+      aie.use_lock(%lock13_5, "Release", %c0_ul2)
       aie.next_bd ^end // point to the next BD, or termination
     ^end:
       aie.end
   }
 
   %mem33 = aie.mem(%tile33) {
+    %c0_i32 = arith.constant 0 : i32
+    %c256_i32 = arith.constant 256 : i32
     %dma0 = aie.dma_start("S2MM", 1, ^bd0, ^end)
     ^bd0:
-      aie.use_lock(%lock33_6, "Acquire", 0)
-      aie.dma_bd(%buf33_0: memref<256xi32>, 0, 256)
-      aie.use_lock(%lock33_6, "Release", 1)
+      %c0_ul3 = arith.constant 0 : i32
+      aie.use_lock(%lock33_6, "Acquire", %c0_ul3)
+      aie.dma_bd(%buf33_0 : memref<256xi32> offset = 0 len = 256)
+      %c1_ul4 = arith.constant 1 : i32
+      aie.use_lock(%lock33_6, "Release", %c1_ul4)
       aie.next_bd ^end // point to the next BD, or termination
     ^end:
       aie.end
   }
 
 
+}
 }

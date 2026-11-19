@@ -1,0 +1,1235 @@
+//===- AIEInsertTraceFlows.cpp ----------------------------------*- C++ -*-===//
+//
+// Copyright (C) 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+#include "aie/Dialect/AIE/IR/AIEDialect.h"
+#include "aie/Dialect/AIE/Transforms/AIEPacketIdSpace.h"
+#include "aie/Dialect/AIE/Transforms/AIEPasses.h"
+#include "aie/Dialect/AIEX/IR/AIEXDialect.h"
+
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/IR/Attributes.h"
+#include "mlir/Pass/Pass.h"
+
+#include "llvm/ADT/STLExtras.h"
+
+#include <climits>
+#include <map>
+#include <set>
+
+namespace xilinx::AIE {
+#define GEN_PASS_DEF_AIEINSERTTRACEFLOWS
+#include "aie/Dialect/AIE/Transforms/AIEPasses.h.inc"
+} // namespace xilinx::AIE
+
+using namespace mlir;
+using namespace xilinx;
+using namespace xilinx::AIE;
+
+namespace {
+
+struct TraceInfo {
+  TraceOp traceOp;
+  TileOp tile;
+  int packetId;
+  TracePacketType packetType;
+  WireBundle tracePort; // Trace:0 (core) or Trace:1 (mem)
+  int traceChannel;     // Port number (0 for core, 1 for mem)
+  std::optional<int>
+      startBroadcast;               // Broadcast channel for timer sync (if any)
+  std::optional<int> stopBroadcast; // Broadcast channel for trace stop (if any)
+};
+
+/// Per-channel DMA resource allocation.
+struct ChannelDescriptor {
+  int channel; // S2MM channel number
+  int bdId;    // Buffer descriptor ID
+};
+
+struct ShimInfo {
+  TileOp shimTile;
+  int channel;                             // S2MM channel
+  int bdId;                                // Buffer descriptor ID
+  std::vector<TraceInfo> traceSources;     // All traces routed to this shim
+  std::optional<int> startBroadcast;       // Broadcast to trigger for start
+  std::optional<int> stopBroadcast;        // Broadcast to trigger for stop
+  std::vector<ChannelDescriptor> channels; // Per-channel descriptors
+  std::vector<int> traceChannelAssignment; // Per-trace index into channels
+};
+
+/// The trace buffer of one runtime sequence. The trace units and the routes
+/// belong to the device; the buffer belongs to the sequence.
+struct SequenceTraceConfig {
+  RuntimeSequenceOp seq;
+  int bufferSizeBytes;
+  bool reuseOutputBuffer;
+  int bufferOffset; // byte offset of the trace data in the host buffer
+};
+
+// A dynamic (runtime-sized) runtime sequence carries its transfer sizes as
+// scalar block arguments (the dynamic ABI); its memref args are typed at
+// maximum capacity, not the runtime data size. Any non-memref block argument
+// marks it.
+static bool isDynamicRuntimeSequence(RuntimeSequenceOp seq) {
+  return llvm::any_of(seq.getBody().getArguments(), [](BlockArgument arg) {
+    return !isa<MemRefType>(arg.getType());
+  });
+}
+
+struct AIEInsertTraceFlowsPass
+    : xilinx::AIE::impl::AIEInsertTraceFlowsBase<AIEInsertTraceFlowsPass> {
+
+  void runOnOperation() override {
+    DeviceOp device = getOperation();
+    OpBuilder builder(device);
+    const auto &targetModel = device.getTargetModel();
+
+    // Verify no LogicalTileOps remain — placement must run before this pass
+    bool hasLogicalTile = false;
+    device.walk([&](LogicalTileOp op) {
+      op.emitError() << "LogicalTileOp must be resolved to TileOp before "
+                        "running -aie-insert-trace-flows (run -aie-place-tiles "
+                        "first)";
+      hasLogicalTile = true;
+    });
+    if (hasLogicalTile)
+      return signalPassFailure();
+
+    // Phase 1: Collect all trace operations
+    SmallVector<TraceOp> traces;
+    device.walk([&](TraceOp trace) { traces.push_back(trace); });
+
+    if (traces.empty())
+      return;
+
+    // The trace DMA program below targets one of the two shim S2MM channels
+    // and a shim BD; reject options it cannot encode.
+    int shimChannel = clShimChannel;
+    if (shimChannel < 0 || shimChannel > 1) {
+      device.emitError() << "shim-channel " << shimChannel
+                         << " is not a shim S2MM channel; expected 0 or 1";
+      return signalPassFailure();
+    }
+    uint32_t numShimBds = targetModel.getNumBDs(AIETileType::ShimNOCTile);
+    int bdId = clDefaultBdId;
+    if (bdId < 0 || static_cast<uint32_t>(bdId) >= numShimBds) {
+      device.emitError() << "default-bd-id " << bdId
+                         << " is not a shim BD; expected [0, " << numShimBds
+                         << ")";
+      return signalPassFailure();
+    }
+
+    // Phase 1b: Collect every runtime_sequence with an aie.trace.host_config.
+    // Each one drives the trace units on its own dispatch, so each one gets a
+    // trace buffer and a shim DMA program.
+    SmallVector<RuntimeSequenceOp> runtimeSeqs;
+    SmallVector<TraceHostConfigOp> hostConfigs;
+    RuntimeSequenceOp firstSeq = nullptr;
+    for (auto seq : device.getBody()->getOps<RuntimeSequenceOp>()) {
+      if (!firstSeq)
+        firstSeq = seq;
+      for (auto hc : seq.getBody().front().getOps<TraceHostConfigOp>()) {
+        runtimeSeqs.push_back(seq);
+        hostConfigs.push_back(hc);
+        break;
+      }
+    }
+
+    // Require runtime_sequence when trace ops are present
+    if (!firstSeq) {
+      device.emitError()
+          << "aie.trace ops found but no runtime_sequence defined";
+      return signalPassFailure();
+    }
+
+    // Require trace.host_config in runtime_sequence
+    if (runtimeSeqs.empty()) {
+      firstSeq.emitError()
+          << "runtime_sequence with traces requires aie.trace.host_config";
+      return signalPassFailure();
+    }
+
+    // The packet flows and the stream switch configuration reach the hardware
+    // through the device, so the trace data of every sequence leaves the array
+    // through the same shim.
+    TraceHostConfigOp hostConfig = hostConfigs.front();
+    auto routing = hostConfig.getRouting();
+    int egressShimColFromIR = hostConfig.getEgressShimCol();
+    for (auto other : ArrayRef(hostConfigs).drop_front()) {
+      if (other.getRouting() == routing &&
+          other.getEgressShimCol() == egressShimColFromIR)
+        continue;
+      InFlightDiagnostic err =
+          other.emitError()
+          << "aie.trace.host_config routes trace data differently from another "
+             "runtime_sequence in this device; the routes live in the device's "
+             "stream switches, so every sequence must name the same routing "
+             "and egress column";
+      err.attachNote(hostConfig.getLoc()) << "first aie.trace.host_config here";
+      return signalPassFailure();
+    }
+
+    // The trace buffer is a host buffer, i.e. an argument of the runtime
+    // sequence.
+    //
+    //   - Dedicated (default): append a fresh argument to the runtime sequence
+    //     for the trace buffer. It lands at the tail, so enabling trace never
+    //     perturbs the indices of the data arguments.
+    //   - Reuse-output: trace data is written into the tail of the last
+    //     existing argument (an output buffer), saving a host buffer. No new
+    //     argument is added; the offset skips past the output data.
+    //
+    // Buffer size and reuse mode reach the hardware through the buffer
+    // descriptor that each sequence writes, so each sequence sets its own.
+    SmallVector<SequenceTraceConfig> seqConfigs;
+    for (auto [seq, hc] : llvm::zip(runtimeSeqs, hostConfigs)) {
+      SequenceTraceConfig cfg;
+      cfg.seq = seq;
+      cfg.bufferSizeBytes = hc.getBufferSize();
+      cfg.reuseOutputBuffer = hc.getReuseOutputBuffer();
+      cfg.bufferOffset = 0;
+      if (cfg.reuseOutputBuffer) {
+        auto args = seq.getBody().getArguments();
+        if (args.empty()) {
+          seq.emitError() << "trace.host_config reuse_output_buffer "
+                             "requires the runtime_sequence to have at "
+                             "least one argument to reuse";
+          return signalPassFailure();
+        }
+        if (isDynamicRuntimeSequence(seq)) {
+          seq.emitError()
+              << "trace.host_config reuse_output_buffer=true cannot be used "
+                 "with a dynamic (runtime-sized) runtime_sequence: the trace "
+                 "offset would be computed from the last tensor's maximum "
+                 "static size, not its runtime transfer size, so trace data "
+                 "would be written past the output buffer. Use a separate "
+                 "trace buffer instead (reuse_output_buffer=false)";
+          return signalPassFailure();
+        }
+        auto memrefType = cast<MemRefType>(args.back().getType());
+        cfg.bufferOffset = memrefType.getNumElements() *
+                           (memrefType.getElementTypeBitWidth() / 8);
+      }
+      seqConfigs.push_back(cfg);
+    }
+
+    for (auto hc : hostConfigs)
+      hc.erase();
+
+    // Phase 2: Analyze traces and allocate resources
+    std::vector<TraceInfo> traceInfos;
+
+    // Precompute auto-allocated packet IDs in (col, row) order. Walking
+    // `traces` in IR order would make IDs depend on the order trace ops
+    // were emitted, which in turn depends on the placer's worker-to-tile
+    // mapping. Two placements that produce the same tile set would then
+    // get different trace overlays and exercise different routing-rule
+    // layouts -- a coupling that has produced false-match routing
+    // failures (e.g. mask=17 matching id 4 on a column-0 switch port).
+    // Sorting by (col, row) makes the id-to-tile binding a pure
+    // function of the active trace tile set.
+    llvm::DenseMap<Operation *, int> autoPacketIds;
+    {
+      // Wrapping past the max would alias two traces onto the same id.
+      const int kMaxPacketId = device.getTargetModel().getMaxPacketId();
+
+      // First pass: bucket traces and collect explicit ids. An explicit
+      // id reserves a slot the auto-allocator must avoid, and two
+      // explicit traces pinning the same id is a silent alias today.
+      SmallVector<TraceOp> autoIdTraces;
+      llvm::DenseMap<int, TracePacketOp> explicitIdOwner;
+      for (auto trace : traces) {
+        TracePacketOp explicitPacket = nullptr;
+        for (auto &op : trace.getBody().getOps()) {
+          if (auto p = dyn_cast<TracePacketOp>(op)) {
+            if (p.getId().has_value()) {
+              explicitPacket = p;
+              break;
+            }
+          }
+        }
+        if (!explicitPacket) {
+          autoIdTraces.push_back(trace);
+          continue;
+        }
+        int id = *explicitPacket.getId();
+        auto [it, inserted] = explicitIdOwner.try_emplace(id, explicitPacket);
+        if (!inserted) {
+          InFlightDiagnostic err =
+              explicitPacket.emitError()
+              << "trace packet id " << id
+              << " is already used by another trace; explicit packet ids "
+                 "must be unique across the device";
+          err.attachNote(it->second.getLoc())
+              << "previous use of packet id " << id;
+          return signalPassFailure();
+        }
+      }
+      // stable_sort so that multiple traces on the same tile (e.g. core
+      // + mem trace on the same core tile) get ids in their IR-emission
+      // order rather than an unspecified order.
+      llvm::stable_sort(autoIdTraces, [](TraceOp a, TraceOp b) {
+        auto ta = cast<TileOp>(a.getTile().getDefiningOp());
+        auto tb = cast<TileOp>(b.getTile().getDefiningOp());
+        if (ta.getCol() != tb.getCol())
+          return ta.getCol() < tb.getCol();
+        return ta.getRow() < tb.getRow();
+      });
+      // From clPacketIdStart up, past ids user traces pinned and ids the
+      // device holds (PacketIdSpace).
+      PacketIdSpace held(device);
+      int next = clPacketIdStart;
+      for (auto trace : autoIdTraces) {
+        while (next <= kMaxPacketId &&
+               (explicitIdOwner.count(next) || held.isTaken(next)))
+          ++next;
+        if (next > kMaxPacketId) {
+          device.emitError()
+              << "trace overlay needs " << autoIdTraces.size()
+              << " auto-allocated packet IDs starting at " << clPacketIdStart
+              << " (with " << explicitIdOwner.size()
+              << " id(s) reserved by explicit aie.trace.packet ops, and any "
+                 "held by packet flows or pinned routes elsewhere in the "
+                 "device), but the hardware packet-id field is 5 bits (max "
+              << kMaxPacketId
+              << "); reduce the number of traced tiles, free up an explicit "
+                 "id, or raise -packet-id-start only if you can spare the "
+                 "lower IDs";
+          return signalPassFailure();
+        }
+        autoPacketIds[trace.getOperation()] = next++;
+      }
+    }
+
+    // Each (tile, trace unit) pair may be configured at most once: a hardware
+    // trace unit emits a single packet stream, so two aie.trace ops targeting
+    // the same unit would race on one packet id and corrupt routing. The
+    // packet type identifies the unit (Core/Mem/MemTile/ShimTile).
+    std::set<std::tuple<int, int, int>> seenTraceUnits; // (col, row, pktType)
+
+    for (auto trace : traces) {
+      auto tile = cast<TileOp>(trace.getTile().getDefiningOp());
+
+      // Find packet ID and type from trace body
+      std::optional<int> packetId;
+      std::optional<TracePacketType> packetType;
+      TracePacketOp existingPacketOp = nullptr;
+      for (auto &op : trace.getBody().getOps()) {
+        if (auto packetOp = dyn_cast<TracePacketOp>(op)) {
+          existingPacketOp = packetOp;
+          if (auto explicitId = packetOp.getId())
+            packetId = explicitId;
+          packetType = packetOp.getType();
+          break;
+        }
+      }
+
+      // Determine packet type from tile type if not specified
+      if (!packetType) {
+        if (tile.isShimTile()) {
+          packetType = TracePacketType::ShimTile;
+        } else if (tile.isMemTile()) {
+          packetType = TracePacketType::MemTile;
+        } else {
+          // Core tile defaults to core type
+          packetType = TracePacketType::Core;
+        }
+      }
+
+      // Reject a second trace op on the same hardware unit of the same tile.
+      auto unitKey = std::make_tuple(tile.getCol(), tile.getRow(),
+                                     static_cast<int>(*packetType));
+      if (!seenTraceUnits.insert(unitKey).second) {
+        trace.emitError() << "tile (" << tile.getCol() << ", " << tile.getRow()
+                          << ") is traced more than once on the same trace "
+                             "unit; each unit can have only one trace "
+                             "configuration";
+        return signalPassFailure();
+      }
+
+      // Allocate packet ID if not specified (precomputed in (col, row)
+      // order above).
+      if (!packetId)
+        packetId = autoPacketIds.lookup(trace.getOperation());
+
+      // Make sure the in-IR TracePacketOp carries the (possibly
+      // auto-allocated) id so downstream passes (e.g.,
+      // -aie-trace-to-config) see consistent info.
+      if (!existingPacketOp) {
+        OpBuilder traceBuilder(&trace.getBody().front(),
+                               trace.getBody().front().begin());
+        TracePacketOp::create(traceBuilder, trace.getLoc(),
+                              traceBuilder.getI32IntegerAttr(*packetId),
+                              *packetType);
+      } else if (!existingPacketOp.getId().has_value()) {
+        existingPacketOp.setIdAttr(
+            OpBuilder(existingPacketOp).getI32IntegerAttr(*packetId));
+      }
+
+      // Determine trace port based on packet type
+      WireBundle tracePort = WireBundle::Trace;
+      int traceChannel = 0;
+      if (*packetType == TracePacketType::Mem) {
+        traceChannel = 1; // Mem trace uses port 1
+      }
+
+      // Find start/stop configuration (broadcast or event)
+      std::optional<int> startBroadcast;
+      std::optional<int> stopBroadcast;
+      bool hasStartConfig = false;
+      bool hasStopConfig = false;
+      for (auto &op : trace.getBody().getOps()) {
+        if (auto startOp = dyn_cast<TraceStartEventOp>(op)) {
+          hasStartConfig = true;
+          if (startOp.getBroadcast())
+            startBroadcast = startOp.getBroadcast();
+        }
+        if (auto stopOp = dyn_cast<TraceStopEventOp>(op)) {
+          hasStopConfig = true;
+          if (stopOp.getBroadcast())
+            stopBroadcast = stopOp.getBroadcast();
+        }
+      }
+
+      // Require explicit start/stop configuration
+      if (!hasStartConfig) {
+        trace.emitError() << "trace is missing 'aie.trace.start'";
+        return signalPassFailure();
+      }
+      if (!hasStopConfig) {
+        trace.emitError() << "trace is missing 'aie.trace.stop'";
+        return signalPassFailure();
+      }
+
+      TraceInfo info;
+      info.traceOp = trace;
+      info.tile = tile;
+      info.packetId = *packetId;
+      info.packetType = *packetType;
+      info.tracePort = tracePort;
+      info.traceChannel = traceChannel;
+      info.startBroadcast = startBroadcast;
+      info.stopBroadcast = stopBroadcast;
+      traceInfos.push_back(info);
+    }
+
+    // Phase 2b: Select shim tiles based on routing strategy
+    std::map<int, ShimInfo> shimInfos; // col -> ShimInfo
+
+    if (routing == TraceShimRouting::Single) {
+      // All traces route to a single shim, controlled by the egress_shim_col
+      // parameter (default is 0).
+      int targetCol = egressShimColFromIR;
+      if (targetCol < 0 || targetCol >= targetModel.columns() ||
+          !targetModel.isShimNOCTile(targetCol, 0)) {
+        device.emitError() << "egress_shim_col " << targetCol
+                           << " is not a valid shim NOC tile (device has "
+                           << targetModel.columns() << " columns)";
+        return signalPassFailure();
+      }
+      TileOp shimTile = nullptr;
+      for (auto tile : device.getOps<TileOp>()) {
+        if (tile.getCol() == targetCol && tile.getRow() == 0) {
+          shimTile = tile;
+          break;
+        }
+      }
+
+      if (!shimTile) {
+        builder.setInsertionPointToStart(&device.getRegion().front());
+        shimTile = TileOp::create(builder, device.getLoc(), targetCol, 0);
+      }
+
+      ShimInfo shimInfo;
+      shimInfo.shimTile = shimTile;
+      shimInfo.channel = clShimChannel;
+      shimInfo.bdId = clDefaultBdId;
+      shimInfo.traceSources = traceInfos;
+      // Collect broadcast channels from traces that use them
+      for (auto &trace : traceInfos) {
+        if (trace.startBroadcast && !shimInfo.startBroadcast)
+          shimInfo.startBroadcast = trace.startBroadcast;
+        if (trace.stopBroadcast && !shimInfo.stopBroadcast)
+          shimInfo.stopBroadcast = trace.stopBroadcast;
+      }
+
+      // Map all source columns to the single shim
+      for (auto &info : traceInfos) {
+        int col = info.tile.getCol();
+        if (shimInfos.find(col) == shimInfos.end()) {
+          shimInfos[col] = shimInfo;
+        }
+      }
+      if (shimInfos.find(targetCol) == shimInfos.end()) {
+        shimInfos[targetCol] = shimInfo;
+      }
+    }
+
+    // Phase 2b-lateral: Optionally redirect shim targets to spare columns.
+    // This is a post-processing step that works with ANY routing strategy.
+    // When per-column routing returns, lateral routing will compose with it
+    // (each column's shim redirects to its nearest spare).
+    if (clLateralRouting) {
+      std::set<int> activeColumns;
+      device.walk([&](CoreOp core) {
+        auto coreTile = cast<TileOp>(core.getTile().getDefiningOp());
+        activeColumns.insert(coreTile.getCol());
+      });
+
+      // Collect all unique shim target columns and find redirects
+      std::map<int, int> redirects; // old target col -> new target col
+      for (auto &[col, shimInfo] : shimInfos) {
+        int curTarget = shimInfo.shimTile.getCol();
+        if (redirects.count(curTarget))
+          continue; // already computed
+
+        int spare = -1;
+        if (clLateralTargetCol >= 0) {
+          // Forced lateral target: always redirect unless it's a no-op.
+          if (clLateralTargetCol == curTarget)
+            continue;
+          // Validate the forced column is in range and is a shim NOC tile.
+          int numCols = targetModel.columns();
+          if (clLateralTargetCol >= numCols ||
+              !targetModel.isShimNOCTile(clLateralTargetCol, 0)) {
+            device.emitError() << "lateral-target-col " << clLateralTargetCol
+                               << " is not a valid shim NOC tile (device has "
+                               << numCols << " columns)";
+            return signalPassFailure();
+          }
+          spare = clLateralTargetCol;
+        } else {
+          // Auto-detect: only redirect from active columns to a spare.
+          if (activeColumns.count(curTarget) == 0)
+            continue; // already spare, no redirect needed
+          spare = findNearestSpareColumn(curTarget, activeColumns, targetModel);
+        }
+        if (spare >= 0)
+          redirects[curTarget] = spare;
+      }
+
+      // Apply redirects: rebuild shimInfos with new target columns
+      if (!redirects.empty()) {
+        std::map<int, ShimInfo> newShimInfos;
+        for (auto &[col, shimInfo] : shimInfos) {
+          int curTarget = shimInfo.shimTile.getCol();
+          auto it = redirects.find(curTarget);
+          if (it != redirects.end()) {
+            int newTarget = it->second;
+            shimInfo.shimTile = getOrCreateShim(device, builder, newTarget);
+          }
+          newShimInfos[col] = shimInfo;
+        }
+        shimInfos = std::move(newShimInfos);
+      }
+    }
+
+    // Phase 2b-conflict: Check S2MM channel availability on target shims.
+    // If channels are occupied, adjust: use free channel, redirect lateral,
+    // or error.
+    auto usedChannels = scanUsedS2MMChannels(device);
+
+    for (auto &[col, shimInfo] : shimInfos) {
+      int shimCol = shimInfo.shimTile.getCol();
+      auto usedIt = usedChannels.find(shimCol);
+      if (usedIt == usedChannels.end())
+        continue; // No conflicts on this shim
+
+      const auto &usedSet = usedIt->second;
+      int freeCount = 2 - static_cast<int>(usedSet.size());
+
+      if (freeCount <= 0) {
+        // No channels free -- try lateral redirect
+        if (clLateralRouting) {
+          std::set<int> activeColumns;
+          device.walk([&](CoreOp core) {
+            auto coreTile = cast<TileOp>(core.getTile().getDefiningOp());
+            activeColumns.insert(coreTile.getCol());
+          });
+          // Also treat columns with full shims as "active" for spare search
+          for (auto &[fullCol, channels] : usedChannels) {
+            if (static_cast<int>(channels.size()) >= 2)
+              activeColumns.insert(fullCol);
+          }
+          int spare =
+              findNearestSpareColumn(shimCol, activeColumns, targetModel);
+          if (spare >= 0) {
+            shimInfo.shimTile = getOrCreateShim(device, builder, spare);
+            // A spare has no core but can still carry one flow; it is not
+            // full, so its other channel is free.
+            shimInfo.channel = usedChannels[spare].count(clShimChannel)
+                                   ? 1 - clShimChannel
+                                   : clShimChannel;
+            continue;
+          }
+        }
+        // No lateral available -- emit error
+        device.emitError()
+            << "no S2MM channels available on shim tile at column " << shimCol
+            << " (both channels in use by existing flows or objectFifos); "
+               "set egress_shim_col to a column with a free channel, or "
+               "enable lateral-routing to redirect to a spare column";
+        return signalPassFailure();
+      }
+
+      if (freeCount == 1) {
+        // One channel free -- use it
+        int freeChannel = -1;
+        for (int ch = 0; ch < 2; ch++) {
+          if (usedSet.count(ch) == 0) {
+            freeChannel = ch;
+            break;
+          }
+        }
+        shimInfo.channel = freeChannel;
+      }
+    }
+
+    // Build channel descriptors and trace-to-channel assignments
+    for (auto &[col, shimInfo] : shimInfos) {
+      int shimCol = shimInfo.shimTile.getCol();
+      std::set<int> available = {0, 1};
+      auto usedIt = usedChannels.find(shimCol);
+      if (usedIt != usedChannels.end()) {
+        for (int ch : usedIt->second)
+          available.erase(ch);
+      }
+      shimInfo.channels =
+          buildChannelDescriptors(shimInfo.traceSources.size(),
+                                  shimInfo.channel, shimInfo.bdId, available);
+      // Round-robin assignment of traces to channels
+      for (size_t i = 0; i < shimInfo.traceSources.size(); i++) {
+        shimInfo.traceChannelAssignment.push_back(i % shimInfo.channels.size());
+      }
+    }
+
+    // Phase 2c: Rewrite broadcast to USER_EVENT for destination shim tiles
+    // (shim can't listen for its own broadcast)
+    for (auto &info : traceInfos) {
+      if (!info.tile.isShimTile())
+        continue;
+
+      int col = info.tile.getCol();
+      auto shimIt = shimInfos.find(col);
+      if (shimIt == shimInfos.end())
+        continue;
+
+      // Check if this traced shim tile IS the destination shim
+      if (shimIt->second.shimTile.getTileID() != info.tile.getTileID())
+        continue;
+
+      // This shim is both traced and the destination - rewrite start/stop ops
+      // to use USER_EVENT_1/0 instead of broadcast
+      for (auto &op : info.traceOp.getBody().getOps()) {
+        if (auto startOp = dyn_cast<TraceStartEventOp>(op)) {
+          if (startOp.getBroadcast()) {
+            // Replace broadcast with USER_EVENT_1
+            startOp->removeAttr("broadcast");
+            startOp->setAttr("event", TraceEventAttr::get(builder.getContext(),
+                                                          builder.getStringAttr(
+                                                              "USER_EVENT_1")));
+          }
+        }
+        if (auto stopOp = dyn_cast<TraceStopEventOp>(op)) {
+          if (stopOp.getBroadcast()) {
+            // Replace broadcast with USER_EVENT_0
+            stopOp->removeAttr("broadcast");
+            stopOp->setAttr("event", TraceEventAttr::get(builder.getContext(),
+                                                         builder.getStringAttr(
+                                                             "USER_EVENT_0")));
+          }
+        }
+      }
+
+      info.startBroadcast = std::nullopt;
+      info.stopBroadcast = std::nullopt;
+    }
+
+    // Phase 3: Insert packet flows
+    // Insert before the device terminator
+    Block &deviceBlock = device.getRegion().front();
+    builder.setInsertionPoint(deviceBlock.getTerminator());
+
+    for (auto &info : traceInfos) {
+      // Find target shim for this trace
+      int col = info.tile.getCol();
+      ShimInfo &shimInfo = shimInfos[col];
+
+      // Find this trace's channel assignment
+      int chanIdx = 0;
+      for (size_t i = 0; i < shimInfo.traceSources.size(); i++) {
+        if (shimInfo.traceSources[i].packetId == info.packetId) {
+          chanIdx = shimInfo.traceChannelAssignment[i];
+          break;
+        }
+      }
+      auto &chanDesc = shimInfo.channels[chanIdx];
+
+      // Create packet flow
+      auto packetFlowOp = PacketFlowOp::create(
+          builder, device.getLoc(), builder.getI8IntegerAttr(info.packetId),
+          nullptr, nullptr);
+
+      Block *flowBody = new Block();
+      packetFlowOp.getPorts().push_back(flowBody);
+      OpBuilder flowBuilder = OpBuilder::atBlockEnd(flowBody);
+
+      PacketSourceOp::create(flowBuilder, device.getLoc(),
+                             Value(info.tile.getResult()), info.tracePort,
+                             info.traceChannel);
+
+      PacketDestOp::create(flowBuilder, device.getLoc(),
+                           Value(shimInfo.shimTile.getResult()),
+                           WireBundle::DMA, chanDesc.channel);
+
+      EndOp::create(flowBuilder, device.getLoc());
+
+      packetFlowOp->setAttr("keep_pkt_header", builder.getBoolAttr(true));
+    }
+
+    // Phase 4: Program each runtime sequence to drain its own trace buffer.
+    for (const SequenceTraceConfig &cfg : seqConfigs) {
+      if (failed(emitSequenceTraceOps(cfg, traceInfos, shimInfos)))
+        return signalPassFailure();
+    }
+  }
+
+  /// Give `cfg.seq` a trace buffer and the shim DMA program that drains the
+  /// trace stream into it. `traceInfos` and `shimInfos` describe the
+  /// device-wide overlay, which every sequence of the device drives.
+  LogicalResult emitSequenceTraceOps(const SequenceTraceConfig &cfg,
+                                     std::vector<TraceInfo> &traceInfos,
+                                     std::map<int, ShimInfo> &shimInfos) {
+    DeviceOp device = getOperation();
+    OpBuilder builder(device);
+    const auto &targetModel = device.getTargetModel();
+    RuntimeSequenceOp runtimeSeq = cfg.seq;
+    int bufferSizeBytes = cfg.bufferSizeBytes;
+
+    // A second S2MM channel doubles the bytes the DMAs write. The host and
+    // -aie-fuse-trace-buffers read the byte count from the argument type, so
+    // the type must cover every channel.
+    size_t maxChannels = 1;
+    for (auto &[col, shimInfo] : shimInfos)
+      maxChannels = std::max(maxChannels, shimInfo.channels.size());
+    int traceBytesClaimed = static_cast<int>(maxChannels) * bufferSizeBytes;
+
+    // `aiex.npu.address_patch` names the buffer by SSA value. `aiex.run` may
+    // inline this sequence into a caller with a different argument list.
+    Value traceBuffer;
+    BlockArgument appendedTraceArg; // null when reusing the output buffer
+    if (cfg.reuseOutputBuffer) {
+      traceBuffer = runtimeSeq.getBody().getArguments().back();
+    } else {
+      // An i8 memref makes the type state the buffer's byte size, which both
+      // the host and -aie-fuse-trace-buffers read.
+      appendedTraceArg = runtimeSeq.getBody().front().addArgument(
+          MemRefType::get({traceBytesClaimed},
+                          IntegerType::get(device.getContext(), 8)),
+          runtimeSeq.getLoc());
+      traceBuffer = appendedTraceArg;
+    }
+
+    runtimeSeq.setTraceBufferAttr(TraceBufferAttr::get(
+        device.getContext(),
+        appendedTraceArg ? appendedTraceArg.getArgNumber()
+                         : runtimeSeq.getBody().getNumArguments() - 1,
+        cfg.bufferOffset, traceBytesClaimed, bool(appendedTraceArg)));
+
+    Block &seqBlock = runtimeSeq.getBody().front();
+
+    // Find the last TraceStartConfigOp in the runtime sequence
+    Operation *lastStartConfig = nullptr;
+    for (auto &op : seqBlock.getOperations()) {
+      if (isa<TraceStartConfigOp>(op)) {
+        lastStartConfig = &op;
+      }
+    }
+
+    // Insert after the last start_config op, or at start if none found
+    if (lastStartConfig) {
+      builder.setInsertionPointAfter(lastStartConfig);
+    } else {
+      builder.setInsertionPointToStart(&seqBlock);
+    }
+
+    // 4b. Configure timer sync for tiles using broadcast-based start
+    std::set<std::tuple<int, int, bool>> processedTiles;
+    for (auto &info : traceInfos) {
+      if (!info.startBroadcast)
+        continue;
+
+      int col = info.tile.getCol();
+      int row = info.tile.getRow();
+      bool isMemTrace = info.packetType == TracePacketType::Mem;
+
+      if (processedTiles.count({col, row, isMemTrace}))
+        continue;
+      processedTiles.insert({col, row, isMemTrace});
+
+      // Skip destination shim tiles (handled in 4f)
+      if (info.tile.isShimTile()) {
+        auto shimIt = shimInfos.find(col);
+        if (shimIt != shimInfos.end() &&
+            shimIt->second.shimTile.getTileID() == info.tile.getTileID()) {
+          continue;
+        }
+      }
+
+      // Compute timer control address
+      uint32_t timerCtrlAddr =
+          computeTimerCtrlAddress(info.tile, targetModel, isMemTrace);
+
+      std::string broadcastEventName;
+      if (info.tile.isShimTile()) {
+        broadcastEventName =
+            "BROADCAST_A_" + std::to_string(*info.startBroadcast);
+      } else {
+        broadcastEventName =
+            "BROADCAST_" + std::to_string(*info.startBroadcast);
+      }
+
+      auto broadcastEvent = targetModel.lookupEvent(
+          broadcastEventName, info.tile.getTileID(), isMemTrace);
+      if (!broadcastEvent) {
+        info.traceOp.emitError() << "Failed to lookup broadcast event '"
+                                 << broadcastEventName << "'";
+        return failure();
+      }
+      const RegisterInfo *timerReg = targetModel.lookupRegister(
+          "Timer_Control", info.tile.getTileID(), isMemTrace);
+      if (!timerReg)
+        llvm::report_fatal_error("Failed to lookup Timer_Control register");
+      const BitFieldInfo *resetField = timerReg->getField("Reset_Event");
+      if (!resetField)
+        llvm::report_fatal_error(
+            "Failed to lookup Reset_Event field in Timer_Control");
+      auto timerCtrlValue =
+          targetModel.encodeFieldValue(*resetField, *broadcastEvent);
+      if (!timerCtrlValue)
+        llvm::report_fatal_error("Broadcast event does not fit in "
+                                 "Timer_Control's Reset_Event field");
+
+      xilinx::AIEX::NpuWrite32Op::create(
+          builder, runtimeSeq.getLoc(),
+          AIEX::createConstantI32(builder, runtimeSeq.getLoc(), timerCtrlAddr),
+          AIEX::createConstantI32(builder, runtimeSeq.getLoc(),
+                                  *timerCtrlValue),
+          nullptr, builder.getI32IntegerAttr(col),
+          builder.getI32IntegerAttr(row));
+    }
+
+    // 4c-4f. Insert per-shim configurations
+    std::set<int> configuredShimCols;
+    for (auto &[col, shimInfo] : shimInfos) {
+      int shimCol = shimInfo.shimTile.getCol();
+      if (!configuredShimCols.insert(shimCol).second)
+        continue;
+
+      for (auto [chanIdx, chanDesc] : llvm::enumerate(shimInfo.channels)) {
+        // Convert buffer size (bytes) to 32-bit words for buffer_length
+        int bufferLengthWords = bufferSizeBytes / 4;
+
+        // 4c. Write buffer descriptor
+        xilinx::AIEX::NpuWriteBdOp::create(
+            builder, runtimeSeq.getLoc(),
+            shimCol,           // column
+            chanDesc.bdId,     // bd_id
+            bufferLengthWords, // buffer_length (in 32-bit words)
+            0,                 // buffer_offset
+            1,                 // enable_packet
+            0,                 // out_of_order_id
+            0,                 // packet_id (not used for reception)
+            0,                 // packet_type (not used for reception)
+            0, 0, 0, 0, 0,
+            0, // d0_size, d0_stride, d1_size, d1_stride, d2_size, d2_stride
+            0, 0, 0, // iteration_current, iteration_size, iteration_stride
+            0,       // next_bd
+            0,       // row
+            0,       // use_next_bd
+            1,       // valid_bd
+            0, 0, 0, 0, 0,    // lock_rel_val, lock_rel_id, lock_acq_enable,
+                              // lock_acq_val, lock_acq_id
+            0, 0, 0, 0, 0, 0, // d0_zero_before, d1_zero_before, d2_zero_before,
+                              // d0_zero_after, d1_zero_after, d2_zero_after
+            clTraceBurstLength, // burst_length
+            // axcache left unset: the blockwrite lowering resolves the
+            // target default, so baking it here would only duplicate it.
+            mlir::IntegerAttr());
+
+        // 4d. Address patch -- the channels split the buffer between them, so
+        // channel i starts bufferSizeBytes past channel i-1.
+        uint32_t bdAddress = computeBDAddress(shimCol, chanDesc.bdId,
+                                              shimInfo.shimTile, targetModel);
+        int chanOffset =
+            cfg.bufferOffset + static_cast<int>(chanIdx) * bufferSizeBytes;
+        xilinx::AIEX::NpuAddressPatchOp::create(
+            builder, runtimeSeq.getLoc(), bdAddress, /*addr_val=*/mlir::Value(),
+            traceBuffer,
+            AIEX::createConstantI32(builder, runtimeSeq.getLoc(), chanOffset));
+
+        // 4e. DMA channel configuration — set Controller_ID from tile attribute
+        uint32_t ctrlAddr =
+            computeCtrlAddress(DMAChannelDir::S2MM, chanDesc.channel,
+                               shimInfo.shimTile, targetModel);
+        ensureControllerIdAttr(shimInfo.shimTile, targetModel);
+        auto ctrlIdAttr =
+            shimInfo.shimTile->getAttrOfType<PacketInfoAttr>("controller_id");
+        std::string ctrlRegName =
+            (chanDesc.channel == 0) ? "DMA_S2MM_0_Ctrl" : "DMA_S2MM_1_Ctrl";
+        const RegisterInfo *ctrlReg = targetModel.lookupRegister(
+            ctrlRegName, shimInfo.shimTile.getTileID());
+        if (!ctrlReg)
+          llvm::report_fatal_error(llvm::Twine("Failed to lookup ") +
+                                   ctrlRegName);
+        const BitFieldInfo *ctrlIdField = ctrlReg->getField("Controller_ID");
+        if (!ctrlIdField)
+          llvm::report_fatal_error("Failed to lookup Controller_ID field in " +
+                                   llvm::Twine(ctrlRegName));
+        auto ctrlIdValue =
+            targetModel.encodeFieldValue(*ctrlIdField, ctrlIdAttr.assignedId());
+        if (!ctrlIdValue)
+          llvm::report_fatal_error("Controller ID does not fit in the "
+                                   "Controller_ID field");
+        auto ctrlIdMask = targetModel.getFieldMask(*ctrlIdField);
+        if (!ctrlIdMask)
+          llvm::report_fatal_error(
+              "Controller_ID field does not fit in 32-bit register");
+        xilinx::AIEX::NpuMaskWrite32Op::create(
+            builder, runtimeSeq.getLoc(),
+            AIEX::createConstantI32(builder, runtimeSeq.getLoc(), ctrlAddr),
+            AIEX::createConstantI32(builder, runtimeSeq.getLoc(), *ctrlIdValue),
+            AIEX::createConstantI32(builder, runtimeSeq.getLoc(), *ctrlIdMask),
+            nullptr, builder.getI32IntegerAttr(shimCol),
+            builder.getI32IntegerAttr(0));
+
+        // Push BD to task queue
+        std::string taskQueueRegName = (chanDesc.channel == 0)
+                                           ? "DMA_S2MM_0_Task_Queue"
+                                           : "DMA_S2MM_1_Task_Queue";
+        const RegisterInfo *queueReg = targetModel.lookupRegister(
+            taskQueueRegName, shimInfo.shimTile.getTileID());
+        if (!queueReg)
+          llvm::report_fatal_error(llvm::Twine("Failed to lookup ") +
+                                   taskQueueRegName);
+        const BitFieldInfo *tokenField =
+            queueReg->getField("Enable_Token_Issue");
+        const BitFieldInfo *bdIdField = queueReg->getField("Start_BD_ID");
+        if (!tokenField || !bdIdField)
+          llvm::report_fatal_error(
+              "Failed to lookup Enable_Token_Issue or Start_BD_ID fields");
+        auto tokenValue = targetModel.encodeFieldValue(*tokenField, 1);
+        auto bdIdValue =
+            targetModel.encodeFieldValue(*bdIdField, chanDesc.bdId);
+        if (!tokenValue)
+          llvm::report_fatal_error("Enable_Token_Issue does not fit in the "
+                                   "field of " +
+                                   llvm::Twine(taskQueueRegName));
+        if (!bdIdValue)
+          llvm::report_fatal_error("BD ID does not fit in the Start_BD_ID "
+                                   "field of " +
+                                   llvm::Twine(taskQueueRegName));
+        uint32_t queueValue = *tokenValue | *bdIdValue;
+        xilinx::AIEX::NpuWrite32Op::create(
+            builder, runtimeSeq.getLoc(),
+            AIEX::createConstantI32(builder, runtimeSeq.getLoc(),
+                                    queueReg->offset),
+            AIEX::createConstantI32(builder, runtimeSeq.getLoc(), queueValue),
+            nullptr, builder.getI32IntegerAttr(shimCol),
+            builder.getI32IntegerAttr(0));
+      }
+
+      // 4f. Shim timer and broadcast control (only if start broadcast is used)
+      if (shimInfo.startBroadcast) {
+        // Look up USER_EVENT_1 from target model (trigger event)
+        auto userEvent1 = targetModel.lookupEvent(
+            "USER_EVENT_1", shimInfo.shimTile.getTileID(), false);
+        if (!userEvent1)
+          llvm::report_fatal_error("Failed to lookup USER_EVENT_1 event");
+
+        uint32_t shimTimerCtrlAddr =
+            computeTimerCtrlAddress(shimInfo.shimTile, targetModel, false);
+        const RegisterInfo *shimTimerReg = targetModel.lookupRegister(
+            "Timer_Control", shimInfo.shimTile.getTileID(), false);
+        if (!shimTimerReg)
+          llvm::report_fatal_error("Failed to lookup shim Timer_Control");
+        const BitFieldInfo *shimResetField =
+            shimTimerReg->getField("Reset_Event");
+        if (!shimResetField)
+          llvm::report_fatal_error(
+              "Failed to lookup Reset_Event in shim Timer_Control");
+        auto shimTimerCtrlValue =
+            targetModel.encodeFieldValue(*shimResetField, *userEvent1);
+        if (!shimTimerCtrlValue)
+          llvm::report_fatal_error("USER_EVENT_1 does not fit in shim "
+                                   "Timer_Control's Reset_Event field");
+        xilinx::AIEX::NpuWrite32Op::create(
+            builder, runtimeSeq.getLoc(),
+            AIEX::createConstantI32(builder, runtimeSeq.getLoc(),
+                                    shimTimerCtrlAddr),
+            AIEX::createConstantI32(builder, runtimeSeq.getLoc(),
+                                    *shimTimerCtrlValue),
+            nullptr, builder.getI32IntegerAttr(shimCol),
+            builder.getI32IntegerAttr(0));
+
+        // Configure broadcast register with USER_EVENT_1
+        std::string broadcastRegName =
+            "Event_Broadcast" + std::to_string(*shimInfo.startBroadcast) + "_A";
+        const RegisterInfo *broadcastReg = targetModel.lookupRegister(
+            broadcastRegName, shimInfo.shimTile.getTileID());
+        if (!broadcastReg)
+          llvm::report_fatal_error(llvm::Twine("Failed to lookup ") +
+                                   broadcastRegName);
+        xilinx::AIEX::NpuWrite32Op::create(
+            builder, runtimeSeq.getLoc(),
+            AIEX::createConstantI32(builder, runtimeSeq.getLoc(),
+                                    broadcastReg->offset),
+            AIEX::createConstantI32(builder, runtimeSeq.getLoc(), *userEvent1),
+            nullptr, builder.getI32IntegerAttr(shimCol),
+            builder.getI32IntegerAttr(0));
+
+        // Generate USER_EVENT_1 to trigger the broadcast
+        const RegisterInfo *eventGenReg = targetModel.lookupRegister(
+            "Event_Generate", shimInfo.shimTile.getTileID());
+        if (!eventGenReg)
+          llvm::report_fatal_error("Failed to lookup Event_Generate register");
+        xilinx::AIEX::NpuWrite32Op::create(
+            builder, runtimeSeq.getLoc(),
+            AIEX::createConstantI32(builder, runtimeSeq.getLoc(),
+                                    eventGenReg->offset),
+            AIEX::createConstantI32(builder, runtimeSeq.getLoc(), *userEvent1),
+            nullptr, builder.getI32IntegerAttr(shimCol),
+            builder.getI32IntegerAttr(0));
+      }
+    }
+
+    // Phase 4g: Insert trace stop at end of runtime sequence
+    builder.setInsertionPointToEnd(&seqBlock);
+
+    std::set<int> stoppedShimCols;
+    for (auto &[col, shimInfo] : shimInfos) {
+      if (!shimInfo.stopBroadcast)
+        continue;
+
+      int shimCol = shimInfo.shimTile.getCol();
+      if (!stoppedShimCols.insert(shimCol).second)
+        continue;
+
+      auto userEvent0 = targetModel.lookupEvent(
+          "USER_EVENT_0", shimInfo.shimTile.getTileID(), false);
+      if (!userEvent0)
+        llvm::report_fatal_error("Failed to lookup USER_EVENT_0 event");
+
+      std::string broadcastRegName =
+          "Event_Broadcast" + std::to_string(*shimInfo.stopBroadcast) + "_A";
+      const RegisterInfo *broadcastReg = targetModel.lookupRegister(
+          broadcastRegName, shimInfo.shimTile.getTileID());
+      if (!broadcastReg)
+        llvm::report_fatal_error(llvm::Twine("Failed to lookup ") +
+                                 broadcastRegName);
+      xilinx::AIEX::NpuWrite32Op::create(
+          builder, runtimeSeq.getLoc(),
+          AIEX::createConstantI32(builder, runtimeSeq.getLoc(),
+                                  broadcastReg->offset),
+          AIEX::createConstantI32(builder, runtimeSeq.getLoc(), *userEvent0),
+          nullptr, builder.getI32IntegerAttr(shimCol),
+          builder.getI32IntegerAttr(0));
+
+      const RegisterInfo *stopEventGenReg = targetModel.lookupRegister(
+          "Event_Generate", shimInfo.shimTile.getTileID());
+      if (!stopEventGenReg)
+        llvm::report_fatal_error("Failed to lookup Event_Generate register");
+      xilinx::AIEX::NpuWrite32Op::create(
+          builder, runtimeSeq.getLoc(),
+          AIEX::createConstantI32(builder, runtimeSeq.getLoc(),
+                                  stopEventGenReg->offset),
+          AIEX::createConstantI32(builder, runtimeSeq.getLoc(), *userEvent0),
+          nullptr, builder.getI32IntegerAttr(shimCol),
+          builder.getI32IntegerAttr(0));
+    }
+
+    return success();
+  }
+
+private:
+  /// Ensure a tile has a controller_id attribute. If missing, assign one
+  /// using the target model's mapping.
+  void ensureControllerIdAttr(TileOp tile, const AIETargetModel &tm) {
+    if (tile->hasAttr("controller_id"))
+      return;
+    auto idMap = tm.getTileToControllerIdMap();
+    int pktId = idMap[{tile.colIndex(), tile.rowIndex()}];
+    auto pktInfoAttr = PacketInfoAttr::get(tile->getContext(), 0, pktId);
+    tile->setAttr("controller_id", pktInfoAttr);
+  }
+
+  uint32_t computeBDAddress(int col, int bdId, TileOp shimTile,
+                            const AIETargetModel &tm) {
+    int row = shimTile.getRow();
+    return tm.getDmaBdAddress(col, row, bdId) +
+           tm.getDmaBdAddressOffset(col, row);
+  }
+
+  // Compute DMA task queue address
+  uint32_t computeTaskQueueAddress(DMAChannelDir dir, int channel,
+                                   TileOp shimTile, const AIETargetModel &tm) {
+    std::string regName;
+    if (dir == DMAChannelDir::S2MM) {
+      regName =
+          (channel == 0) ? "DMA_S2MM_0_Task_Queue" : "DMA_S2MM_1_Task_Queue";
+    } else { // MM2S
+      regName =
+          (channel == 0) ? "DMA_MM2S_0_Task_Queue" : "DMA_MM2S_1_Task_Queue";
+    }
+    const RegisterInfo *reg = tm.lookupRegister(regName, shimTile.getTileID());
+    if (!reg)
+      llvm::report_fatal_error(llvm::Twine("Failed to lookup ") + regName);
+    return reg->offset;
+  }
+
+  // Compute DMA control register address
+  uint32_t computeCtrlAddress(DMAChannelDir dir, int channel, TileOp shimTile,
+                              const AIETargetModel &tm) {
+    std::string regName;
+    if (dir == DMAChannelDir::S2MM) {
+      regName = (channel == 0) ? "DMA_S2MM_0_Ctrl" : "DMA_S2MM_1_Ctrl";
+    } else { // MM2S
+      regName = (channel == 0) ? "DMA_MM2S_0_Ctrl" : "DMA_MM2S_1_Ctrl";
+    }
+    const RegisterInfo *reg = tm.lookupRegister(regName, shimTile.getTileID());
+    if (!reg)
+      llvm::report_fatal_error(llvm::Twine("Failed to lookup ") + regName);
+    return reg->offset;
+  }
+
+  // Compute timer control address based on tile type
+  uint32_t computeTimerCtrlAddress(TileOp tile, const AIETargetModel &tm,
+                                   bool isMemTrace) {
+    // Use register database to lookup Timer_Control for the appropriate module
+    const RegisterInfo *reg =
+        tm.lookupRegister("Timer_Control", tile.getTileID(), isMemTrace);
+    if (!reg)
+      llvm::report_fatal_error("Failed to lookup Timer_Control register");
+    return reg->offset;
+  }
+
+  /// Build channel descriptors. Always includes the primary channel.
+  /// Adds a secondary channel when distribute-channels is enabled and there
+  /// are multiple traces. AIE2 shim tiles have exactly 2 S2MM DMA channels.
+  std::vector<ChannelDescriptor>
+  buildChannelDescriptors(size_t numTraces, int primaryChannel, int primaryBdId,
+                          const std::set<int> &availableChannels) {
+    std::vector<ChannelDescriptor> chans;
+    chans.push_back({primaryChannel, primaryBdId});
+    if (clDistributeChannels && numTraces > 1 && primaryBdId > 0) {
+      int ch2 = (primaryChannel == 1) ? 0 : 1;
+      // Only add secondary channel if it's available (not claimed by existing
+      // flows)
+      if (availableChannels.count(ch2)) {
+        chans.push_back({ch2, primaryBdId - 1});
+      }
+    }
+    return chans;
+  }
+
+  /// Find or create a shim tile at the given column.
+  TileOp getOrCreateShim(DeviceOp device, OpBuilder &builder, int col) {
+    for (auto tile : device.getOps<TileOp>()) {
+      if (tile.getCol() == col && tile.getRow() == 0)
+        return tile;
+    }
+    OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToStart(&device.getRegion().front());
+    return TileOp::create(builder, device.getLoc(), col, 0);
+  }
+
+  /// Scan the device for existing S2MM channel claims on shim tiles.
+  /// Checks aie.flow destinations, aie.packet_flow destinations,
+  /// ShimDMAAllocationOp declarations, and objectFifos that end at a shim.
+  std::map<int, std::set<int>> scanUsedS2MMChannels(DeviceOp device) {
+    std::map<int, std::set<int>> used; // shimCol -> set of used S2MM channels
+
+    device.walk([&](FlowOp flow) {
+      auto destTile = cast<TileOp>(flow.getDest().getDefiningOp());
+      if (destTile.isShimTile() && flow.getDestBundle() == WireBundle::DMA) {
+        used[destTile.getCol()].insert(flow.getDestChannel());
+      }
+    });
+
+    device.walk([&](PacketFlowOp pktFlow) {
+      for (auto &op : pktFlow.getPorts().front()) {
+        if (auto dest = dyn_cast<PacketDestOp>(op)) {
+          auto destTile = cast<TileOp>(dest.getTile().getDefiningOp());
+          if (destTile.isShimTile() && dest.getBundle() == WireBundle::DMA) {
+            used[destTile.getCol()].insert(dest.getChannel());
+          }
+        }
+      }
+    });
+
+    device.walk([&](ShimDMAAllocationOp alloc) {
+      if (alloc.getChannelDir() == DMAChannelDir::S2MM) {
+        auto tile = alloc.getTileOp();
+        used[tile.getCol()].insert(alloc.getChannelIndex());
+      }
+    });
+
+    // This pass runs before objectFifo lowering, so an objectFifo that ends
+    // at a shim has no flow yet. Claim what its lowering will: every
+    // consumer pin first, then the lowest free S2MM channel for each
+    // unpinned consumer.
+    SmallVector<TileOp> unpinned;
+    device.walk([&](ObjectFifoCreateOp fifo) {
+      if (fifo.getPlio())
+        return;
+      for (auto [i, consumer] : llvm::enumerate(fifo.getConsumerTiles())) {
+        auto tile = dyn_cast_or_null<TileOp>(consumer.getDefiningOp());
+        if (!tile || !tile.isShimTile())
+          continue;
+        ObjectFifoEndPortAttr port = fifo.getConsumerPort(i);
+        if (std::optional<int> pin = port ? port.channelIndex() : std::nullopt)
+          used[tile.getCol()].insert(*pin);
+        else
+          unpinned.push_back(tile);
+      }
+    });
+    for (TileOp tile : unpinned) {
+      auto &channels = used[tile.getCol()];
+      int ch = 0;
+      while (channels.count(ch))
+        ++ch;
+      channels.insert(ch);
+    }
+
+    return used;
+  }
+
+  /// Find the nearest NOC shim column without active cores.
+  /// Returns -1 if no spare column exists.
+  int findNearestSpareColumn(int sourceCol, const std::set<int> &activeColumns,
+                             const AIETargetModel &targetModel) {
+    int bestCol = -1;
+    int bestDist = INT_MAX;
+    int numCols = targetModel.columns();
+    for (int c = 0; c < numCols; c++) {
+      if (activeColumns.count(c) == 0 && targetModel.isShimNOCTile(c, 0)) {
+        int dist = std::abs(c - sourceCol);
+        if (dist > 0 && dist < bestDist) {
+          bestDist = dist;
+          bestCol = c;
+        }
+      }
+    }
+    return bestCol;
+  }
+};
+
+} // namespace
+
+std::unique_ptr<OperationPass<DeviceOp>>
+xilinx::AIE::createAIEInsertTraceFlowsPass() {
+  return std::make_unique<AIEInsertTraceFlowsPass>();
+}

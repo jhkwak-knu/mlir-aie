@@ -1,27 +1,30 @@
 //===- AIETargets.cpp -------------------------------------------*- C++ -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2021-2022 Xilinx, Inc.
+// Copyright (C) 2022-2026 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2021 Xilinx Inc.
 //
 //===----------------------------------------------------------------------===//
 
 #include "aie/Targets/AIETargets.h"
 
-#include "aie/Dialect/ADF/ADFDialect.h"
 #include "aie/Dialect/AIE/IR/AIEDialect.h"
+#include "aie/Dialect/AIEVec/IR/AIEVecDialect.h"
 #include "aie/Dialect/AIEX/IR/AIEXDialect.h"
+#include "aie/Dialect/AIEX/Transforms/AIEXPasses.h"
 
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
 #include "mlir/Dialect/DLTI/DLTI.h"
 #include "mlir/Dialect/EmitC/IR/EmitC.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Index/IR/IndexDialect.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/Ptr/IR/PtrOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/Target/LLVMIR/Export.h"
@@ -32,7 +35,10 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/JSON.h"
+#include "llvm/Support/raw_ostream.h"
 
+#include <fstream>
+#include <iostream>
 #include <set>
 
 #define DEBUG_TYPE "aie-targets"
@@ -42,7 +48,7 @@ using namespace mlir::vector;
 using namespace xilinx;
 using namespace xilinx::AIE;
 
-llvm::json::Value attrToJSON(Attribute &attr) {
+static llvm::json::Value attrToJSON(Attribute &attr) {
   if (auto a = llvm::dyn_cast<StringAttr>(attr))
     return {a.getValue().str()};
 
@@ -74,22 +80,26 @@ namespace xilinx::AIE {
 static void registerDialects(DialectRegistry &registry) {
   registry.insert<xilinx::AIE::AIEDialect>();
   registry.insert<xilinx::AIEX::AIEXDialect>();
+  registry.insert<xilinx::aievec::AIEVecDialect>();
   registry.insert<func::FuncDialect>();
   registry.insert<scf::SCFDialect>();
   registry.insert<cf::ControlFlowDialect>();
   registry.insert<DLTIDialect>();
   registry.insert<arith::ArithDialect>();
+  registry.insert<affine::AffineDialect>();
+  registry.insert<ub::UBDialect>();
   registry.insert<math::MathDialect>();
   registry.insert<memref::MemRefDialect>();
   registry.insert<VectorDialect>();
   registry.insert<LLVM::LLVMDialect>();
   registry.insert<emitc::EmitCDialect>();
   registry.insert<index::IndexDialect>();
+  registry.insert<ptr::PtrDialect>();
 }
 
 // Output the buffer map for the given buffer operations, with the given offset.
 // The offset is different depending on where the buffers are accessed from.
-void writeBufferMap(raw_ostream &output, BufferOp buf, int offset) {
+static void writeBufferMap(raw_ostream &output, BufferOp buf, int offset) {
   std::string bufName(buf.name().getValue());
   int bufferBaseAddr = getBufferBaseAddress(buf);
   int numBytes = buf.getAllocationSize();
@@ -98,10 +108,11 @@ void writeBufferMap(raw_ostream &output, BufferOp buf, int offset) {
          << '\n';
 }
 
-LogicalResult AIETranslateToTargetArch(ModuleOp module, raw_ostream &output) {
+LogicalResult AIETranslateToTargetArch(ModuleOp module, raw_ostream &output,
+                                       llvm::StringRef deviceName) {
+  DeviceOp targetOp = AIE::DeviceOp::getForSymbolInModule(module, deviceName);
   AIEArch arch = AIEArch::AIE1;
-  if (!module.getOps<DeviceOp>().empty()) {
-    DeviceOp targetOp = *(module.getOps<DeviceOp>().begin());
+  if (targetOp) {
     arch = targetOp.getTargetModel().getTargetArch();
   }
   if (arch == AIEArch::AIE1)
@@ -118,19 +129,6 @@ void registerAIETranslations() {
   static llvm::cl::opt<int> tileRow(
       "tilerow", llvm::cl::desc("row coordinate of core to translate"),
       llvm::cl::init(0));
-
-#ifdef AIE_ENABLE_AIRBIN
-  static llvm::cl::opt<std::string> outputFilename(
-      "airbin-output-filepath",
-      llvm::cl::desc("Output airbin file path (including filename)"),
-      llvm::cl::value_desc("airbin-output-filepath"),
-      llvm::cl::init("airbin.elf"));
-
-  static llvm::cl::opt<std::string> coreFilesDir(
-      "airbin-aux-core-dir-path",
-      llvm::cl::desc("Auxiliary core elf files dir path"),
-      llvm::cl::value_desc("airbin-aux-core-dir-path"), llvm::cl::init("."));
-#endif
 
   static llvm::cl::opt<std::string> workDirPath(
       "work-dir-path", llvm::cl::Optional,
@@ -159,11 +157,36 @@ void registerAIETranslations() {
       llvm::cl::desc(
           "Select binary (true) or text (false) output for supported "
           "translations. e.g. aie-npu-to-binary, aie-ctrlpkt-to-bin"));
-
+  static llvm::cl::opt<bool> npuFoldDDRAddrOffset(
+      "aie-npu-fold-ddr-addr-offset", llvm::cl::init(true),
+      llvm::cl::desc(
+          "For aie-npu-to-binary and aie-npu-to-cpp: fold the AIE "
+          "DDR-aperture offset into the arg_plus of DDR address patches for "
+          "host arguments beyond the firmware-translated set. Required for "
+          "the xclbin + instruction-buffer runtime; must be false for the "
+          "full-ELF (xrt.ext.kernel) runtime and for HRX, which translate "
+          "every host buffer address themselves."));
+  static llvm::cl::opt<bool> npuEmitDispatchShim(
+      "aie-npu-emit-dispatch-shim", llvm::cl::init(false),
+      llvm::cl::desc(
+          "For aie-npu-to-cpp: also emit the extern \"C\" dispatch_abi() and "
+          "dispatch_generate() entry points the JIT dispatch bridge loads via "
+          "ctypes. Requires exactly one aie.runtime_sequence."));
+  static llvm::cl::opt<std::string> deviceName(
+      "aie-device-name", llvm::cl::init(""),
+      llvm::cl::desc("Specify which device to translate"));
   static llvm::cl::opt<std::string> sequenceName(
       "aie-sequence-name", llvm::cl::init(""),
       llvm::cl::desc(
           "Specify the name of the aiex.runtime_sequence to translate"));
+  static llvm::cl::opt<std::string> npuEmitLocmap(
+      "aie-npu-emit-locmap", llvm::cl::init(""),
+      llvm::cl::value_desc("filename"),
+      llvm::cl::desc(
+          "For aie-npu-to-binary, also write a JSON sidecar mapping each "
+          "transaction word's byte offset to its source MLIR Location (and "
+          "regdb register name where applicable) to the given file. The binary "
+          "is still emitted to the main output."));
 
   TranslateFromMLIRRegistration registrationMMap(
       "aie-generate-mmap", "Generate AIE memory map",
@@ -171,10 +194,11 @@ void registerAIETranslations() {
         DenseMap<TileID, Operation *> tiles;
         DenseMap<Operation *, SmallVector<BufferOp, 4>> buffers;
 
-        if (module.getOps<DeviceOp>().empty()) {
+        DeviceOp targetOp =
+            AIE::DeviceOp::getForSymbolInModule(module, deviceName);
+        if (!targetOp) {
           module.emitOpError("expected AIE.device operation at toplevel");
         }
-        DeviceOp targetOp = *(module.getOps<DeviceOp>().begin());
 
         collectTiles(targetOp, tiles);
         // sort the tiles for deterministic output
@@ -223,25 +247,34 @@ void registerAIETranslations() {
   TranslateFromMLIRRegistration registrationShimDMAToJSON(
       "aie-generate-json", "Transform AIE shim DMA allocation info into JSON",
       [](ModuleOp module, raw_ostream &output) {
-        for (auto d : module.getOps<DeviceOp>()) {
-          llvm::json::Object moduleJSON;
-          for (auto shimDMAMeta : d.getOps<ShimDMAAllocationOp>()) {
-            llvm::json::Object shimJSON;
-            auto channelDir = shimDMAMeta.getChannelDirAttr();
-            shimJSON["channelDir"] = attrToJSON(channelDir);
-            auto channelIndex = shimDMAMeta.getChannelIndexAttr();
-            shimJSON["channelIndex"] = attrToJSON(channelIndex);
-            auto col = shimDMAMeta.getColAttr();
-            shimJSON["col"] = attrToJSON(col);
-            moduleJSON[shimDMAMeta.getSymName()] =
-                llvm::json::Value(std::move(shimJSON));
-          }
-          llvm::json::Value topv(std::move(moduleJSON));
-          std::string ret;
-          llvm::raw_string_ostream ss(ret);
-          ss << llvm::formatv("{0:2}", topv) << "\n";
-          output << ss.str();
+        DeviceOp d =
+            AIE::DeviceOp::getForSymbolInModuleOrError(module, deviceName);
+        if (!d) {
+          return failure();
         }
+        llvm::json::Object moduleJSON;
+        for (auto shimDMAMeta : d.getOps<ShimDMAAllocationOp>()) {
+          llvm::json::Object shimJSON;
+          auto channelDir = shimDMAMeta.getChannelDirAttr();
+          shimJSON["channelDir"] = attrToJSON(channelDir);
+          auto channelIndex = shimDMAMeta.getChannelIndexAttr();
+          shimJSON["channelIndex"] = attrToJSON(channelIndex);
+          AIE::TileOp tile = shimDMAMeta.getTileOp();
+          if (!tile) {
+            shimDMAMeta.emitError(
+                "shim DMA allocation must reference a valid TileOp");
+            return failure();
+          }
+          auto col = tile.getColAttr();
+          shimJSON["col"] = attrToJSON(col);
+          moduleJSON[shimDMAMeta.getSymName()] =
+              llvm::json::Value(std::move(shimJSON));
+        }
+        llvm::json::Value topv(std::move(moduleJSON));
+        std::string ret;
+        llvm::raw_string_ostream ss(ret);
+        ss << llvm::formatv("{0:2}", topv) << "\n";
+        output << ss.str();
         return success();
       },
       registerDialects);
@@ -249,28 +282,34 @@ void registerAIETranslations() {
   TranslateFromMLIRRegistration registrationLDScript(
       "aie-generate-ldscript", "Generate AIE loader script",
       [](ModuleOp module, raw_ostream &output) {
-        return AIETranslateToLdScript(module, output, tileCol, tileRow);
+        return AIETranslateToLdScript(module, output, tileCol, tileRow,
+                                      deviceName);
       },
       registerDialects);
 
   TranslateFromMLIRRegistration registrationBCF(
       "aie-generate-bcf", "Generate AIE bcf",
       [](ModuleOp module, raw_ostream &output) {
-        return AIETranslateToBCF(module, output, tileCol, tileRow);
+        return AIETranslateToBCF(module, output, tileCol, tileRow, deviceName);
       },
       registerDialects);
 
   TranslateFromMLIRRegistration registrationTargetArch(
       "aie-generate-target-arch", "Get the target architecture",
-      AIETranslateToTargetArch, registerDialects);
+      [](ModuleOp module, raw_ostream &output) {
+        return AIETranslateToTargetArch(module, output, deviceName);
+      },
+      registerDialects);
 
   TranslateFromMLIRRegistration registrationCoreList(
       "aie-generate-corelist", "Generate python list of cores",
       [](ModuleOp module, raw_ostream &output) {
-        if (module.getOps<DeviceOp>().empty()) {
+        DeviceOp targetOp =
+            AIE::DeviceOp::getForSymbolInModule(module, deviceName);
+        if (!targetOp) {
           module.emitOpError("expected AIE.device operation at toplevel");
+          return failure();
         }
-        DeviceOp targetOp = *(module.getOps<DeviceOp>().begin());
 
         output << "[";
         for (auto tileOp : targetOp.getOps<TileOp>()) {
@@ -288,46 +327,38 @@ void registerAIETranslations() {
       },
       registerDialects);
 
-  TranslateFromMLIRRegistration registrationXADF(
-      "adf-generate-cpp-graph", "Translate ADFDialect to C++ graph",
-      ADFGenerateCPPGraph, [](DialectRegistry &registry) {
-        registry.insert<xilinx::ADF::ADFDialect>();
-        registerDialects(registry);
-      });
-#ifdef AIE_ENABLE_AIRBIN
-  TranslateFromMLIRRegistration registrationAirbin(
-      "aie-generate-airbin", "Generate configuration binary blob",
-      [](ModuleOp module, raw_ostream &) {
-        return AIETranslateToAirbin(module, outputFilename, coreFilesDir);
-      },
-      registerDialects);
-#endif
   TranslateFromMLIRRegistration registrationXAIE(
       "aie-generate-xaie", "Generate libxaie configuration",
       [](ModuleOp module, raw_ostream &output) {
-        return AIETranslateToXAIEV2(module, output);
-      },
-      registerDialects);
-  TranslateFromMLIRRegistration registrationHSA(
-      "aie-generate-hsa", "Generate hsa data movement configuration",
-      [](ModuleOp module, raw_ostream &output) {
-        return AIETranslateToHSA(module, output);
+        return AIETranslateToXAIEV2(module, output, deviceName);
       },
       registerDialects);
   TranslateFromMLIRRegistration registrationXJSON(
-      "aie-flows-to-json", "Translate AIE flows to JSON", AIEFlowsToJSON,
+      "aie-flows-to-json", "Translate AIE flows to JSON",
+      [](ModuleOp module, raw_ostream &output) {
+        return AIEFlowsToJSON(module, output, deviceName);
+      },
       registerDialects);
   TranslateFromMLIRRegistration registrationXPE(
       "aie-mlir-to-xpe", "Translate AIE design to XPE file for simulation",
-      AIETranslateGraphXPE, registerDialects);
+      [](ModuleOp module, raw_ostream &output) {
+        return AIETranslateGraphXPE(module, output, deviceName);
+      },
+      registerDialects);
   TranslateFromMLIRRegistration registrationSCSimConfig(
       "aie-mlir-to-scsim-config",
       "Translate AIE design to SCSimConfig file for simulation",
-      AIETranslateSCSimConfig, registerDialects);
+      [](ModuleOp module, raw_ostream &output) {
+        return AIETranslateSCSimConfig(module, output, deviceName);
+      },
+      registerDialects);
   TranslateFromMLIRRegistration registrationShimSolution(
       "aie-mlir-to-shim-solution",
       "Translate AIE design to ShimSolution file for simulation",
-      AIETranslateShimSolution, registerDialects);
+      [](ModuleOp module, raw_ostream &output) {
+        return AIETranslateShimSolution(module, output, deviceName);
+      },
+      registerDialects);
   TranslateFromMLIRRegistration registrationCDODirect(
       "aie-generate-cdo", "Generate libxaie for CDO directly",
       [](ModuleOp module, raw_ostream &) {
@@ -339,18 +370,23 @@ void registerAIETranslations() {
         } else
           workDirPath_ = workDirPath.getValue();
         LLVM_DEBUG(llvm::dbgs() << "work-dir-path: " << workDirPath_ << "\n");
-        return AIETranslateToCDODirect(module, workDirPath_.c_str(), bigEndian,
-                                       cdoUnified, cdoDebug, cdoAieSim,
-                                       cdoXaieDebug, cdoEnableCores);
+        return AIETranslateToCDODirect(module, workDirPath_.c_str(), deviceName,
+                                       bigEndian, cdoUnified, cdoDebug,
+                                       cdoAieSim, cdoXaieDebug, cdoEnableCores);
       },
       registerDialects);
   TranslateFromMLIRRegistration registrationNPU(
       "aie-npu-to-binary", "Translate npu instructions to binary",
       [](ModuleOp module, raw_ostream &output) {
         std::vector<uint32_t> instructions;
-        auto r = AIETranslateNpuToBinary(module, instructions, sequenceName);
+        std::vector<TxnLocEntry> locmap;
+        bool emitLocmap = !npuEmitLocmap.empty();
+        auto r = AIETranslateNpuToBinary(
+            module, instructions, deviceName, sequenceName,
+            emitLocmap ? &locmap : nullptr, npuFoldDDRAddrOffset);
         if (failed(r))
           return r;
+        // The binary (or hex text) is always emitted to the main output.
         if (outputBinary) {
           output.write(reinterpret_cast<const char *>(instructions.data()),
                        instructions.size() * sizeof(uint32_t));
@@ -358,7 +394,29 @@ void registerAIETranslations() {
           for (auto w : instructions)
             output << llvm::format("%08X\n", w);
         }
+        // With -aie-npu-emit-locmap=<file>, additionally write the JSON
+        // location sidecar (mapping each transaction word's byte offset to its
+        // source MLIR Location) to that file.
+        if (emitLocmap) {
+          std::error_code ec;
+          llvm::raw_fd_ostream locFile(npuEmitLocmap, ec,
+                                       llvm::sys::fs::OF_Text);
+          if (ec) {
+            llvm::errs() << "Error opening locmap file '" << npuEmitLocmap
+                         << "': " << ec.message() << "\n";
+            return failure();
+          }
+          emitNpuLocmapJSON(locFile, deviceName, /*binaryName=*/"", locmap);
+        }
         return success();
+      },
+      registerDialects);
+  TranslateFromMLIRRegistration registrationNpuToCpp(
+      "aie-npu-to-cpp",
+      "Translate npu instructions to a C++ TXN-builder function",
+      [](ModuleOp module, raw_ostream &output) {
+        return AIETranslateNpuToCpp(module, output, npuFoldDDRAddrOffset,
+                                    npuEmitDispatchShim);
       },
       registerDialects);
   TranslateFromMLIRRegistration registrationCtrlPkt(
@@ -366,7 +424,7 @@ void registerAIETranslations() {
       [](ModuleOp module, raw_ostream &output) {
         std::vector<uint32_t> instructions;
         auto r = AIETranslateControlPacketsToUI32Vec(module, instructions,
-                                                     sequenceName);
+                                                     deviceName, sequenceName);
         if (failed(r))
           return r;
         if (outputBinary) {
@@ -377,6 +435,14 @@ void registerAIETranslations() {
             output << llvm::format("%08X\n", w);
         }
         return success();
+      },
+      registerDialects);
+
+  // Translate cert dialect operations to assembly
+  TranslateFromMLIRRegistration registrationCertToAsm(
+      "aie-cert-to-asm", "Translate cert operations to assembly",
+      [](ModuleOp module, raw_ostream &output) {
+        return AIETranslateToUcDma(module, output);
       },
       registerDialects);
 }

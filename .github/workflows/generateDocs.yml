@@ -1,16 +1,40 @@
+# Copyright (C) 2021 Xilinx, Inc.
+# Copyright (C) 2022-2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
 name: Generate GitHub Pages
+
+permissions:
+  contents: read
+
+# All gh-pages writers share this lock, including kernel result publishers.
+# Preserve active and queued deploys (up to GitHub's 100-run queue limit).
+concurrency:
+  group: gh-pages-publish
+  cancel-in-progress: false
+  queue: max
 
 on:
   push:
     branches:
       - main
+    tags:
+      - 'v*'
 #  pull_request:
   workflow_dispatch:
+    inputs:
+      version_label:
+        description: >-
+          Deploy the current docs under this version label (e.g. "1.3.4")
+          and tag it "latest". Leave blank to deploy as "dev". Use this to
+          backfill a release whose git tag predates the mike/MkDocs setup.
+        required: false
+        default: ""
 
 jobs:
   build-docs:
     name: Generate Documentation
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
 
     # Grant GITHUB_TOKEN the permissions required to make a Pages deployment
     permissions:
@@ -20,23 +44,43 @@ jobs:
       - name: Configure Environment
         run: echo "$GITHUB_WORKSPACE/llvm/install/bin" >> $GITHUB_PATH
 
-      # Clone the repo and its submodules. Do shallow clone to save clone
-      # time.
+      # mike needs the full gh-pages branch history to update versions.json
       - name: Get the project repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
-          fetch-depth: 2
-          submodules: "true"
+          fetch-depth: 0
+          submodules: "recursive"
+
+      # docs/programming_guide is a gitignored symlink to the repo-root
+      # programming_guide/ tree (kept out of git so a stray `git add .` during
+      # local `mkdocs serve` can't commit it). The nav references pages under it,
+      # so recreate it here or the strict build aborts on missing-nav-target
+      # warnings.
+      - name: Link programming_guide into docs tree
+        run: ln -s ../programming_guide docs/programming_guide
+
+      # Same gitignored-symlink trick for the aiecc driver docs (tools/aiecc):
+      # the nav publishes its README and the page references the .svg graphics
+      # under tools/aiecc/docs/.
+      - name: Link aiecc docs into docs tree
+        run: ln -s ../tools/aiecc docs/aiecc
+
+      - name: Configure git for mike
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
       - name: Install packages
-        run: sudo apt-get install -y graphviz lld doxygen
+        run: sudo apt-get install -y graphviz lld doxygen ninja-build
 
       - name: Install Python packages
-        run: sudo pip install psutil rich numpy pybind11 nanobind
-
-      - name: Install Ninja
-        # https://github.com/llvm/actions/tree/main/install-ninja
-        uses: llvm/actions/install-ninja@6a57890d0e3f9f35dfc72e7e48bc5e1e527cdd6c
+        run: |
+          pip install --upgrade pip
+          python utils/mlir_aie_wheels/vendor_eudsl.py \
+              --requirements python/requirements.txt \
+              --install-non-eudsl
+          python -m pip install --require-hashes -r python/requirements_dev.lock
+          python -m pip install --require-hashes -r docs/requirements-mkdocs.lock
 
       - name: Get Submodule Hash
         id: get-submodule-hash
@@ -45,10 +89,22 @@ jobs:
 
       - name: Ccache for C++ compilation
         # https://github.com/hendrikmuhs/ccache-action/releases/tag/v1.2.9
-        uses: hendrikmuhs/ccache-action@v1.2
+        uses: hendrikmuhs/ccache-action@f09c25b45002a07be2955cbe52e8cee55643f89d  # v1.2.24
         with:
           key: ${{ runner.os }}-releaseasserts-${{ steps.get-submodule-hash.outputs.hash }}
+          # The key carries the submodule hash, so every bump mints a new key with
+          # nothing to restore. Fall back to the newest cache under the prefix,
+          # which is the case ccache exists for: most objects survive the bump.
+          restore-keys: ${{ runner.os }}-releaseasserts-
           max-size: 1G
+
+      # Compare the compiler by content, not mtime, so the cache hits across
+      # runs on ephemeral runners. Matches .github/actions/setup_ccache.
+      - name: Configure ccache
+        shell: bash
+        run: |
+          ccache --set-config=compiler_check=content
+          ccache --set-config=sloppiness=locale,time_macros
 
       - name: Get cmakeModules
         id: clone-cmakeModules
@@ -58,7 +114,6 @@ jobs:
       - name: Get MLIR
         id: mlir-wheels
         run: |
-          
           VERSION=$(utils/clone-llvm.sh --get-wheel-version)
           pip -q download mlir==$VERSION \
             -f https://github.com/Xilinx/mlir-aie/releases/expanded_assets/mlir-distro
@@ -68,13 +123,11 @@ jobs:
           echo "MLIR_WHEEL_VERSION=$VERSION" | tee -a $GITHUB_OUTPUT
           echo "MLIR_DIR=$PWD/mlir" | tee -a $GITHUB_OUTPUT
 
-      # Build the repo test target in release mode to build and test.
-      - name: Build Docs
+      - name: Build C++ Doxygen Docs
         run: |
-          
           mkdir build_release
           pushd build_release
-          
+
           cmake .. \
             -DCMAKE_BUILD_TYPE=Release \
             -DLLVM_ENABLE_ASSERTIONS=OFF \
@@ -83,32 +136,126 @@ jobs:
             -DLLVM_DIR=$PWD/../mlir/lib/cmake/llvm \
             -DLLVM_USE_LINKER=lld \
             -DAIE_INCLUDE_DOCS=ON \
-            -DAIE_ENABLE_PYTHON_PASSES=OFF \
             -DLLVM_EXTERNAL_LIT=$(which lit)
           make docs
           popd
-          pushd python
-          doxygen
-          popd
-          cp -r docs/* build_release/docs
-          dot -Tpng docs/dialects.dot > build_release/docs/dialects.png
-          dot -Tsvg docs/dialects.dot > build_release/docs/dialects.svg
 
-      - name: Save MLIR Version
+      - name: Render dialect graph
         run: |
-          echo "{" > build_release/docs/build_info.json
-          echo "llvm-version: \"${{ steps.mlir-wheels.outputs.MLIR_WHEEL_VERSION }}\"," >> build_release/docs/build_info.json
-          echo "}" > build_release/docs/build_info.json
+          dot -Tpng docs/dialects.dot > docs/dialects.png
+          dot -Tsvg docs/dialects.dot > docs/dialects.svg
 
-      - name: test
+      - name: Copy generated dialect docs into docs/
         run: |
-          find ./build_release/docs
+          # cmake writes AIEDialect.md etc to build_release/docs/ via mlir-tblgen
+          cp build_release/docs/*.md docs/ 2>/dev/null || true
 
-      - name: Publish to GitHub-Pages
+      - name: Resolve version label
+        id: version
+        env:
+          MANUAL_LABEL: ${{ github.event.inputs.version_label }}
+        run: |
+          # Also resolve the git ref that in-page "go read the source" links
+          # should point at (consumed by docs/hooks/rewrite_source_links.py via
+          # DOCS_GITHUB_REF). It must match the deployed docs version so a
+          # pinned version's links don't drift to main.
+          if [[ -n "${MANUAL_LABEL}" ]]; then
+            # Manual backfill: workflow_dispatch with an explicit label
+            # (e.g. "1.3"). Deploy under that label and make it "latest".
+            # Point source links at the matching tag if it exists, else main.
+            REF="main"
+            if git rev-parse -q --verify "refs/tags/v${MANUAL_LABEL}" >/dev/null; then
+              REF="v${MANUAL_LABEL}"
+            fi
+            echo "label=${MANUAL_LABEL}" >> $GITHUB_OUTPUT
+            echo "aliases=latest" >> $GITHUB_OUTPUT
+            echo "ref=${REF}" >> $GITHUB_OUTPUT
+          elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            # Full version per release: e.g. refs/tags/v1.4.0 → "1.4.0".
+            # Every tagged release gets its own picker entry; the newest is
+            # always aliased "latest". Source links pin to the release tag.
+            LABEL="${GITHUB_REF#refs/tags/v}"
+            echo "label=${LABEL}" >> $GITHUB_OUTPUT
+            echo "aliases=latest" >> $GITHUB_OUTPUT
+            echo "ref=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          else
+            # main push -> "dev" docs, also re-aliased "latest" so the site
+            # root tracks main between releases; source links point at main.
+            echo "label=dev" >> $GITHUB_OUTPUT
+            echo "aliases=latest" >> $GITHUB_OUTPUT
+            echo "ref=main" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Deploy with mike
         if: github.event_name != 'pull_request'
-        # https://github.com/peaceiris/actions-gh-pages/releases/tag/v3.9.3
-        uses: peaceiris/actions-gh-pages@v3.9.3
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./build_release/docs
-          enable_jekyll: true
+        env:
+          # Consumed by docs/hooks/rewrite_source_links.py so in-page source
+          # links point at the same git ref as this docs version.
+          DOCS_GITHUB_REF: ${{ steps.version.outputs.ref }}
+        run: |
+          LABEL="${{ steps.version.outputs.label }}"
+          ALIASES="${{ steps.version.outputs.aliases }}"
+
+          if [ -n "$ALIASES" ]; then
+            mike deploy --push --update-aliases "$LABEL" $ALIASES
+          else
+            mike deploy --push "$LABEL"
+          fi
+
+          # Ensure the root index.html redirects to the default version.
+          # "latest" takes priority once it exists (now re-aliased on every
+          # main push, not just tagged releases); "dev" is only the fallback
+          # for the very first deploy, before "latest" has ever been created.
+          if mike list | grep -q "latest"; then
+            mike set-default --push latest
+          else
+            mike set-default --push dev
+          fi
+
+      - name: Copy Doxygen output into gh-pages
+        if: github.event_name != 'pull_request'
+        run: |
+          # mike has already pushed the MkDocs site to gh-pages. Inject the
+          # Doxygen HTML under the versioned path and push.
+          #
+          # Use a dedicated worktree instead of `git checkout gh-pages` in the
+          # main tree: the "Copy generated dialect docs" step overwrites the
+          # tracked docs/*Dialect.md / *Passes.md stubs, leaving the tree dirty,
+          # so a branch switch here would abort ("local changes would be
+          # overwritten by checkout").
+          LABEL="${{ steps.version.outputs.label }}"
+          git fetch origin gh-pages
+          git worktree add ../gh-pages-wt gh-pages
+
+          # Remove legacy Jekyll/CMake detritus from the gh-pages root. mike
+          # owns versioned subdirs (dev/, 1.x.y/, versions.json, index.html);
+          # dashboard/, kernel-checks/, component-checks/, ci-health/ and
+          # code-health/ belong to the nightly check, CI health and code
+          # health workflows and must survive deployment. The old
+          # home of the kernel checks, bench/, is legacy and goes with the rest.
+          cd ../gh-pages-wt
+          # Keep the versioned dirs (dev/, 1.x.y/) plus the bare "latest"
+          # alias mike writes as a symlink (a file literally named "latest",
+          # no trailing slash). The (/|$) is load-bearing: matching only
+          # "latest/" would let git rm delete the symlink, 404-ing the site.
+          git ls-files -z \
+            | grep -zv '^\.nojekyll$' \
+            | grep -zv '^index\.html$' \
+            | grep -zv '^versions\.json$' \
+            | grep -zvE '^(dashboard|kernel-checks|component-checks|ci-health|code-health)/' \
+            | grep -zvE '^(dev|latest)(/|$)' \
+            | grep -zvE '^[0-9]+\.' \
+            | xargs -0 -r git rm -rf --ignore-unmatch -q
+          cd -
+
+          mkdir -p "../gh-pages-wt/${LABEL}/doxygen"
+          # Doxygen writes under the docs/ subdir of the build tree because
+          # docs/CMakeLists.txt sets OUTPUT_DIRECTORY to its own binary dir
+          # (add_subdirectory(docs) => build_release/docs), matching the
+          # "Copy generated dialect docs" step that reads build_release/docs/*.md.
+          cp -r build_release/docs/doxygen/html "../gh-pages-wt/${LABEL}/doxygen/"
+          git -C ../gh-pages-wt add "${LABEL}/doxygen/"
+          git -C ../gh-pages-wt diff --cached --quiet \
+            || git -C ../gh-pages-wt commit -m "docs: add Doxygen output for ${LABEL}"
+          git -C ../gh-pages-wt push origin gh-pages
+          git worktree remove ../gh-pages-wt

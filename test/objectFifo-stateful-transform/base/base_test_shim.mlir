@@ -1,0 +1,45 @@
+//===- base_test_shim.mlir --------------------------------------*- MLIR -*-===//
+//
+// Copyright (C) 2025 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+// RUN: aie-opt --aie-objectFifo-stateful-transform="skip-verify=true" --aie-objectFifo-unroll %s | FileCheck %s
+
+// CHECK: module @elementGenerationShim {
+// CHECK:   aie.device(xcvc1902) {
+// CHECK-DAG:     %[[VAL_0:.*]] = aie.tile(1, 0)
+// CHECK-DAG:     %[[VAL_1:.*]] = aie.tile(1, 2)
+// CHECK-DAG:     %[[VAL_2:.*]] = aie.buffer(%[[VAL_1]]) {sym_name = "of1__cons__buf0"} : memref<16xi32>
+// CHECK-DAG:     %[[VAL_3:.*]] = aie.buffer(%[[VAL_1]]) {sym_name = "of1__cons__buf1"} : memref<16xi32>
+// CHECK-DAG:     %[[VAL_4:.*]] = aie.lock(%[[VAL_1]]) {init = 0 : i32, sym_name = "of1__cons__lock0"}
+// CHECK-DAG:     %[[VAL_5:.*]] = aie.lock(%[[VAL_1]]) {init = 0 : i32, sym_name = "of1__cons__lock1"}
+// CHECK-DAG:     aie.flow(%[[VAL_0]], DMA : 0, %[[VAL_1]], DMA : 0)
+// CHECK-DAG:     aie.shim_dma_allocation @of1__shim_alloc(%[[VAL_0]], MM2S, 0)
+// CHECK:     %[[VAL_6:.*]] = aie.mem(%[[VAL_1]]) {
+// CHECK:       %0 = aie.dma_start(S2MM, 0, ^bb1, ^bb3)
+// CHECK:     ^bb1:  // 2 preds: ^bb0, ^bb2
+// CHECK:       aie.use_lock(%[[VAL_4]], Acquire, %{{.*}})
+// CHECK:       aie.dma_bd(%[[VAL_2]] : memref<16xi32> offset = {{.*}} len = {{.*}})
+// CHECK:       aie.use_lock(%[[VAL_4]], Release, %{{.*}})
+// CHECK:       aie.next_bd ^bb2
+// CHECK:     ^bb2:  // pred: ^bb1
+// CHECK:       aie.use_lock(%[[VAL_5]], Acquire, %{{.*}})
+// CHECK:       aie.dma_bd(%[[VAL_3]] : memref<16xi32> offset = {{.*}} len = {{.*}})
+// CHECK:       aie.use_lock(%[[VAL_5]], Release, %{{.*}})
+// CHECK:       aie.next_bd ^bb1
+// CHECK:     ^bb3:  // pred: ^bb0
+// CHECK:       aie.end
+// CHECK:     }
+// CHECK:   }
+// CHECK: }
+
+module @elementGenerationShim {
+   aie.device(xcvc1902) {
+      %tile10 = aie.tile(1, 0)
+      %tile12 = aie.tile(1, 2)
+
+      aie.objectfifo @of1 (%tile10, {%tile12}, 2 : i32) : !aie.objectfifo<memref<16xi32>>
+   }
+}

@@ -1,8 +1,8 @@
+/* Copyright (C) 2021 Xilinx, Inc.
+ * Copyright (C) 2022-2026 Advanced Micro Devices, Inc.
+ * SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception */
+
 //===- AIETargets.h ---------------------------------------------*- C++ -*-===//
-//
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
-// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
@@ -10,73 +10,143 @@
 #define AIE_TARGETS_AIETARGETS_H
 
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Location.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/Support/LogicalResult.h"
 
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <array>
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
 #include <vector>
 
 namespace xilinx {
 namespace AIE {
 
+// One entry in the sidecar location map produced by AIETranslateNpuToBinary
+// (and AIETranslateControlPacketsToUI32Vec). Each entry describes one
+// transaction operation in the .bin: the byte range it occupies, its opcode,
+// the absolute device address it touches (when applicable), the originating
+// aiex.npu.* op's MLIR Location, and an optional regdb register name resolved
+// from (address, tile-module). The vector is written alongside the .bin as a
+// JSON sidecar (see emitNpuLocmapJSON) so consumers can correlate transaction
+// words back to the source op's MLIR Location.
+struct TxnLocEntry {
+  uint32_t byteOffset = 0;
+  uint32_t byteSize = 0;
+  std::string opcodeName;          // "WRITE32", "BLOCKWRITE", etc.
+  std::string sourceOpName;        // "aiex.npu.write32", etc.
+  std::optional<uint64_t> address; // absolute device address when applicable
+  std::string registerName; // regdb-resolved register name; empty if unknown
+  std::string
+      registerModule; // regdb module: "core", "memory", "memory_tile", "shim"
+  std::optional<mlir::Location> loc;
+};
+
+// Serialize a vector of TxnLocEntry as JSON to `output`, with the given
+// device name and binary file basename for the JSON header.
+void emitNpuLocmapJSON(llvm::raw_ostream &output, llvm::StringRef deviceName,
+                       llvm::StringRef binaryName,
+                       const std::vector<TxnLocEntry> &locmap);
+
 mlir::LogicalResult AIETranslateToXAIEV2(mlir::ModuleOp module,
-                                         llvm::raw_ostream &output);
-mlir::LogicalResult AIETranslateToHSA(mlir::ModuleOp module,
-                                      llvm::raw_ostream &output);
+                                         llvm::raw_ostream &output,
+                                         llvm::StringRef deviceName = "");
 mlir::LogicalResult AIEFlowsToJSON(mlir::ModuleOp module,
-                                   llvm::raw_ostream &output);
-mlir::LogicalResult ADFGenerateCPPGraph(mlir::ModuleOp module,
-                                        llvm::raw_ostream &output);
+                                   llvm::raw_ostream &output,
+                                   llvm::StringRef deviceName = "");
 mlir::LogicalResult AIETranslateSCSimConfig(mlir::ModuleOp module,
-                                            llvm::raw_ostream &output);
+                                            llvm::raw_ostream &output,
+                                            llvm::StringRef deviceName = "");
 mlir::LogicalResult AIETranslateShimSolution(mlir::ModuleOp module,
-                                             llvm::raw_ostream &);
+                                             llvm::raw_ostream &,
+                                             llvm::StringRef deviceName = "");
 mlir::LogicalResult AIETranslateGraphXPE(mlir::ModuleOp module,
-                                         llvm::raw_ostream &);
-mlir::LogicalResult AIETranslateNpuToBinary(mlir::ModuleOp,
-                                            std::vector<uint32_t> &,
-                                            llvm::StringRef sequenceName = "");
+                                         llvm::raw_ostream &, llvm::StringRef);
+// The TXN encoding of each device an aiex.npu.write_config or write_teardown
+// names. Shared by the translations of one module's sequences, folded or not,
+// it encodes each written device once: a configuration's writes patch no DDR
+// address. Safe to share across threads.
+class NpuConfigCache {
+public:
+  struct Config {
+    std::vector<uint32_t> words;
+    uint32_t count = 0;
+    // At offsets from the first word.
+    std::vector<TxnLocEntry> locmap;
+  };
+
+  // `device`'s configuration, or with `teardown` its teardown, encoded by
+  // `encode` the first time it is asked for; nullptr if that failed.
+  const Config *
+  getOrEncode(mlir::Operation *device, bool teardown,
+              llvm::function_ref<mlir::LogicalResult(Config &)> encode);
+
+private:
+  std::mutex mutex;
+  // Indexed by whether the encoding is a teardown.
+  std::array<llvm::DenseMap<mlir::Operation *, std::unique_ptr<Config>>, 2>
+      configs;
+};
+
+mlir::LogicalResult AIETranslateNpuToBinary(
+    mlir::ModuleOp, std::vector<uint32_t> &, llvm::StringRef deviceName = "",
+    llvm::StringRef sequenceName = "",
+    std::vector<TxnLocEntry> *locmap = nullptr, bool foldDDRAddrOffset = true,
+    NpuConfigCache *configs = nullptr);
+/// \brief Emit a C++ builder that reconstructs the TXN stream at runtime.
+/// \param foldDDRAddrOffset apply firmware DDR folding; see
+/// aie/Runtime/TxnEncoding.h for the runtime-specific address convention.
+/// \param emitDispatchShim also emit the extern "C" dispatch_abi() /
+/// dispatch_generate() entry points the JIT dispatch bridge loads via ctypes.
+mlir::LogicalResult AIETranslateNpuToCpp(mlir::ModuleOp module,
+                                         llvm::raw_ostream &output,
+                                         bool foldDDRAddrOffset = true,
+                                         bool emitDispatchShim = false);
+mlir::LogicalResult AIETranslateToUcDma(mlir::ModuleOp module,
+                                        llvm::raw_ostream &output);
+mlir::LogicalResult AIETranslateToUcDma(mlir::ModuleOp module,
+                                        std::string &assembly,
+                                        llvm::StringRef outputPath = "");
 mlir::LogicalResult
 AIETranslateControlPacketsToUI32Vec(mlir::ModuleOp, std::vector<uint32_t> &,
-                                    llvm::StringRef sequenceName = "");
-mlir::LogicalResult AIETranslateToLdScript(mlir::ModuleOp module,
-                                           llvm::raw_ostream &output,
-                                           int tileCol, int tileRow);
+                                    llvm::StringRef deviceName = "",
+                                    llvm::StringRef sequenceName = "",
+                                    std::vector<TxnLocEntry> *locmap = nullptr);
+// `resolveLinkFile`, when given, rewrites each `link_files` entry before it
+// becomes an INPUT() directive.
+mlir::LogicalResult AIETranslateToLdScript(
+    mlir::ModuleOp module, llvm::raw_ostream &output, int tileCol, int tileRow,
+    llvm::StringRef deviceName = "", bool probe = false,
+    llvm::function_ref<std::string(llvm::StringRef)> resolveLinkFile = nullptr);
 mlir::LogicalResult AIETranslateToBCF(mlir::ModuleOp module,
                                       llvm::raw_ostream &output, int tileCol,
-                                      int tileRow);
+                                      int tileRow,
+                                      llvm::StringRef deviceName = "");
 mlir::LogicalResult
-AIELLVMLink(llvm::raw_ostream &output, std::vector<std::string> Files,
+AIELLVMLink(llvm::raw_ostream &output, const std::vector<std::string> &Files,
             bool DisableDITypeMap = false, bool NoVerify = false,
             bool Internalize = false, bool OnlyNeeded = false,
             bool PreserveAssemblyUseListOrder = false, bool Verbose = false);
 
-mlir::LogicalResult
-AIETranslateToCDODirect(mlir::ModuleOp m, llvm::StringRef workDirPath,
-                        bool bigEndian = false, bool emitUnified = false,
-                        bool cdoDebug = false, bool aieSim = false,
-                        bool xaieDebug = false, bool enableCores = true);
-
-#ifdef AIE_ENABLE_AIRBIN
-mlir::LogicalResult AIETranslateToAirbin(mlir::ModuleOp module,
-                                         const std::string &outputFilename,
-                                         const std::string &coreFilesDir,
-                                         bool testAirBin = false);
-#endif
+mlir::LogicalResult AIETranslateToCDODirect(
+    mlir::ModuleOp m, llvm::StringRef workDirPath, llvm::StringRef deviceName,
+    bool bigEndian = false, bool emitUnified = false, bool cdoDebug = false,
+    bool aieSim = false, bool xaieDebug = false, bool enableCores = true);
 
 mlir::LogicalResult AIETranslateToTargetArch(mlir::ModuleOp module,
-                                             llvm::raw_ostream &output);
+                                             llvm::raw_ostream &output,
+                                             llvm::StringRef deviceName);
 
 } // namespace AIE
 
-namespace aievec {
-
-/// Translates the AIE vector dialect MLIR to C++ code.
-mlir::LogicalResult translateAIEVecToCpp(mlir::Operation *op, bool aie2,
-                                         mlir::raw_ostream &os);
-
-} // namespace aievec
 } // namespace xilinx
 
 #endif

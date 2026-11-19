@@ -1,0 +1,338 @@
+# test_kernels_memoization.py -*- Python -*-
+#
+# Copyright (C) 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+#
+
+# RUN: %pytest %s
+"""Equal-kernel sharing, collision protection, independent zero, and auto-prefix
+on symbol collision for the aie.iron.kernels factory functions.
+
+Sibling files:
+  test_kernels_specs.py   — spec-table-driven coverage of every factory
+  test_kernels_chess.py   — use_chess + emulated bf16 plumbing
+"""
+
+import numpy as np
+import pytest
+
+from aie.iron import kernels
+from aie.iron.kernel import ExternalFunction, Kernel
+from aie.iron.kernels._common import _make_extern
+
+# ---------------------------------------------------------------------------
+# Memoization + collision protection (kernels.X helpers and ExternalFunction)
+#
+# Background: a real bug caught while porting whole_array — calling
+# kernels.mm() twice with different parameters produced two ExternalFunctions
+# with the same default `<name>.o` filename.  Both were registered with the
+# JIT, both got compiled, and the .o files silently overwrote each other.
+# The wrong-flag kernel won the race, producing wrong hardware output.
+#
+# These tests pin down the two defenses:
+#   (A) _make_extern derives a kernel's identity from the full input
+#       parameter set, so identical helper calls return equal kernels that
+#       share one object.  Different parameterizations get distinct
+#       object_file_names (auto-suffixed with a digest of compile_flags).
+#   (B) ExternalFunction.__init__ refuses to register two instances with
+#       the same (name, object_file_name) but a different content digest —
+#       a backstop for code that bypasses the helper (constructs
+#       ExternalFunction directly).
+# ---------------------------------------------------------------------------
+
+
+def test_kernels_mm_same_params_share_one_object():
+    """Defense A: identical kernels.mm() calls return equal kernels, one object."""
+    ef1 = kernels.mm(
+        dim_m=64, dim_k=64, dim_n=32, input_dtype=np.int16, output_dtype=np.int16
+    )
+    ef2 = kernels.mm(
+        dim_m=64, dim_k=64, dim_n=32, input_dtype=np.int16, output_dtype=np.int16
+    )
+    assert ef1 == ef2
+    assert ef1.object_file is ef2.object_file
+
+
+def test_kernels_mm_different_params_are_different_kernels():
+    """Defense A: different params get distinct kernels (no spurious sharing)."""
+    ef_plain = kernels.mm(dim_m=64, dim_k=64, dim_n=32, c_col_maj=False)
+    ef_ccm = kernels.mm(dim_m=64, dim_k=64, dim_n=32, c_col_maj=True)
+    assert ef_plain != ef_ccm
+
+
+def test_kernels_mm_different_params_have_distinct_object_files():
+    """Defense A: distinct parameterizations get distinct object_file_names so
+    JIT compilation outputs cannot overwrite each other on disk.
+    This is the precise bug that broke whole_array c_col_maj support."""
+    ef_plain = kernels.mm(dim_m=64, dim_k=64, dim_n=32, c_col_maj=False)
+    ef_ccm = kernels.mm(dim_m=64, dim_k=64, dim_n=32, c_col_maj=True)
+    assert ef_plain.object_file_name != ef_ccm.object_file_name
+
+
+def test_kernels_mm_b_and_c_col_maj_independent():
+    """Defense A: (b_col_maj, c_col_maj) tuples produce four distinct instances."""
+    instances = {
+        (b, c): kernels.mm(dim_m=64, dim_k=64, dim_n=32, b_col_maj=b, c_col_maj=c)
+        for b in (False, True)
+        for c in (False, True)
+    }
+    # All four are distinct ExternalFunction instances
+    assert len({id(v) for v in instances.values()}) == 4
+    # And all four have distinct .o filenames
+    assert len({v.object_file_name for v in instances.values()}) == 4
+
+
+def test_external_function_collision_check_fires():
+    """Defense B: directly constructing two ExternalFunctions with the same
+    (name, object_file_name) but different compile_flags is rejected."""
+    # Use a unique source_string so we don't collide with real kernels.X
+    # registrations from other tests in this session.
+    src = "/* dummy */ int sentinel_for_collision_test() { return 0; }"
+    name = "sentinel_for_collision_test"
+    obj = "sentinel_for_collision_test.o"
+    ExternalFunction(
+        name=name,
+        object_file_name=obj,
+        source_string=src,
+        arg_types=[],
+        compile_flags=["-DA"],
+    )
+    with pytest.raises(ValueError, match="would collide"):
+        ExternalFunction(
+            name=name,
+            object_file_name=obj,
+            source_string=src,
+            arg_types=[],
+            compile_flags=["-DB"],  # different flags → different content digest
+        )
+
+
+def test_inline_collision_disambiguation_preserves_ir_extension():
+    """Digest-renamed inline artifacts keep their .ll/.bc suffix.
+
+    The suffix no longer decides how the artifact is linked (that is
+    ``link_with_mode``), but it still selects the emitted format in
+    ``compile_cxx_core_function``, so the rename must not drop it.
+    """
+    name = "sentinel_inline_collision"
+    first = ExternalFunction(
+        name=name,
+        source_string='extern "C" void sentinel_inline_collision() {}',
+        inline=True,
+    )
+    second = ExternalFunction(
+        name=name,
+        source_string=(
+            'extern "C" void sentinel_inline_collision() { volatile int distinguish_source = 1; }'
+        ),
+        inline=True,
+    )
+
+    assert first.object_file_name == f"{name}.ll"
+    assert second.object_file_name != first.object_file_name
+    assert second.object_file_name.endswith(".ll")
+
+
+def test_inline_defaults_to_ll_artifact_with_merge_mode():
+    """inline=True defaults to a .ll and declares the merge link policy."""
+    ef = ExternalFunction(
+        name="sentinel_inline_default_name",
+        source_string='extern "C" void sentinel_inline_default_name() {}',
+        inline=True,
+    )
+    assert ef.object_file_name == "sentinel_inline_default_name.ll"
+    assert ef.link_with_mode == "merge"
+
+
+def test_object_path_declares_no_link_with_mode():
+    """The default object-linked path emits no mode, so existing IR is
+    byte-identical to what it was before link_with_mode existed."""
+    ef = ExternalFunction(
+        name="sentinel_object_default_name",
+        source_string='extern "C" void sentinel_object_default_name() {}',
+    )
+    assert ef.object_file_name == "sentinel_object_default_name.o"
+    assert ef.link_with_mode is None
+
+
+def test_inline_explicit_ir_object_file_name_is_not_rewritten():
+    """An explicit .ll/.bc name is honored verbatim -- the caller's artifact
+    name is never silently rewritten, and .bc still means bitcode."""
+    ef = ExternalFunction(
+        name="sentinel_inline_explicit_bc",
+        object_file_name="sentinel_inline_explicit.bc",
+        source_string='extern "C" void sentinel_inline_explicit_bc() {}',
+        inline=True,
+    )
+    assert ef.object_file_name == "sentinel_inline_explicit.bc"
+    assert ef.link_with_mode == "merge"
+
+
+def test_inline_explicit_non_ir_object_file_name_rejected():
+    """A non-IR explicit name used to be silently rewritten to .ll so aiecc
+    would route it by suffix; routing is explicit metadata now, so the wrong
+    suffix is simply rejected."""
+    with pytest.raises(ValueError, match=r"must end in '\.ll'"):
+        ExternalFunction(
+            name="sentinel_inline_explicit_o",
+            object_file_name="sentinel_inline_explicit.o",
+            source_string='extern "C" void sentinel_inline_explicit_o() {}',
+            inline=True,
+        )
+
+
+def test_external_function_collision_check_allows_identical_redeclaration():
+    """Defense B: re-registering an EXACT duplicate is fine (set semantics).
+
+    Only differing-content collisions are rejected; identical re-instantiation
+    might happen if a helper happens to be called twice without the memoization
+    layer (e.g. by tests).  It must not raise.
+    """
+    src = "/* dummy */ int sentinel_redeclare_ok() { return 0; }"
+    name = "sentinel_redeclare_ok"
+    obj = "sentinel_redeclare_ok.o"
+    ExternalFunction(
+        name=name,
+        object_file_name=obj,
+        source_string=src,
+        arg_types=[],
+        compile_flags=["-DA"],
+    )
+    # Same content → same digest → no collision.
+    ExternalFunction(
+        name=name,
+        object_file_name=obj,
+        source_string=src,
+        arg_types=[],
+        compile_flags=["-DA"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Accumulator initialization uses an independent, reusable zero object.
+# ---------------------------------------------------------------------------
+
+
+def test_mm_zero_initializer_is_independent_kernel():
+    ef = kernels.mm(
+        dim_m=64, dim_k=64, dim_n=32, input_dtype=np.int16, output_dtype=np.int16
+    )
+    zero = ef.contract.initializers[0][1](ef)
+    assert isinstance(zero, Kernel)
+    assert zero == kernels.zero(64 * 32, np.int16)
+    assert zero.object_file is not ef.object_file
+
+
+def test_zero_initializer_reused_across_matmul_reduction_sizes():
+    first = kernels.mm(dim_m=64, dim_k=64, dim_n=32)
+    second = kernels.mm(dim_m=64, dim_k=32, dim_n=32)
+    assert first.contract.initializers[0][1](first) == second.contract.initializers[0][
+        1
+    ](second)
+
+
+def test_zero_arg_count():
+    """zero kernel takes one arg (the output buffer to zero)."""
+    assert len(kernels.zero(64 * 32, np.int16).arg_types()) == 1
+
+
+def test_zero_scalar_variant():
+    scalar = kernels.zero(64, np.int16, vectorized=False)
+    vector = kernels.zero(64, np.int16)
+    assert "-DZERO_SCALAR" in scalar.compile_flags
+    assert scalar.object_file is not vector.object_file
+
+
+def test_mv_zero_initializer_is_independent_kernel():
+    ef = kernels.mv(dim_m=32, dim_k=32, vectorized=False)
+    zero = ef.contract.initializers[0][1](ef)
+    assert zero == kernels.zero(32, np.int32)
+    assert zero.object_file is not ef.object_file
+
+
+def test_mm_no_longer_carries_only_flags():
+    """Sanity: dropping the MATMUL_ONLY/ZERO_ONLY gating means kernels.mm
+    no longer adds those flags to its compile_flags."""
+    ef = kernels.mm(
+        dim_m=64, dim_k=64, dim_n=32, input_dtype=np.int16, output_dtype=np.int16
+    )
+    assert "-DMATMUL_ONLY" not in ef._compile_flags
+    assert "-DZERO_ONLY" not in ef._compile_flags
+
+
+# ---------------------------------------------------------------------------
+# Auto-prefix on symbol collision (Defense C — see _make_extern in
+# python/iron/kernels/_common.py).
+#
+# Two kernels.X() calls with different parameterizations would otherwise
+# produce two ExternalFunctions with the same C symbol name and trip
+# duplicate-symbol errors at MLIR-verify and link time.  _make_extern now
+# auto-prefixes the second-and-later instance's symbol with the same digest
+# already used for object_file_name disambiguation.  The first call keeps
+# the unprefixed canonical name (preserves byte-identity for existing
+# single-version designs).
+# ---------------------------------------------------------------------------
+
+
+def test_kernels_mm_parameterized_symbol_is_digest_prefixed():
+    """A parameterized variant's symbol is digest-prefixed and the digest is a
+    pure function of the kernel's identity — never of registration order, so a
+    separate build (e.g. the full-model .o cache vs. a per-block design)
+    computes the SAME symbol and .o filename and can reuse the object."""
+    ef = kernels.mm(
+        dim_m=64, dim_k=64, dim_n=32, input_dtype=np.int16, output_dtype=np.int16
+    )
+    assert ef._original_name == "matmul_i16_i16"
+    assert ef._symbol_prefix is not None and len(ef._symbol_prefix) == 8
+    assert ef._name == f"{ef._symbol_prefix}_matmul_i16_i16"
+
+
+def test_kernels_mm_two_versions_get_distinct_symbol_names():
+    """Two parameterizations get two distinct digest-prefixed symbols so MLIR +
+    linker don't see two `func.func @matmul_i16_i16` declarations."""
+    ef1 = kernels.mm(dim_m=64, dim_k=64, dim_n=32, c_col_maj=False)
+    ef2 = kernels.mm(dim_m=64, dim_k=64, dim_n=32, c_col_maj=True)
+    assert ef1._name != ef2._name
+    # Both are digest-prefixed; the prefix is order-independent.
+    for ef in (ef1, ef2):
+        assert ef._symbol_prefix is not None and len(ef._symbol_prefix) == 8
+        assert ef._name == f"{ef._symbol_prefix}_matmul_i16_i16"
+
+
+def test_kernels_mm_three_versions_all_distinct_names():
+    """Three distinct parameterizations get three distinct effective names,
+    each digest-prefixed."""
+    efs = [
+        kernels.mm(dim_m=64, dim_k=64, dim_n=32, b_col_maj=False, c_col_maj=False),
+        kernels.mm(dim_m=64, dim_k=64, dim_n=32, b_col_maj=True, c_col_maj=False),
+        kernels.mm(dim_m=64, dim_k=64, dim_n=32, b_col_maj=False, c_col_maj=True),
+    ]
+    names = [e._name for e in efs]
+    assert len(set(names)) == 3
+    assert all(e._symbol_prefix is not None for e in efs)
+
+
+def test_kernels_mm_object_file_name_is_order_independent():
+    """object_file_name is the suffix form ``{name}_{digest}.o`` and embeds the
+    same digest as the symbol prefix — so the on-disk filename a separate build
+    reuses by name is identical regardless of registration order."""
+    ef = kernels.mm(dim_m=64, dim_k=64, dim_n=32, c_col_maj=True)
+    assert ef._object_file_name == f"matmul_i16_i16_{ef._symbol_prefix}.o"
+
+
+def test_extern_names_differ_by_source_dir(tmp_path):
+    """Same-content sources in two directories are two kernels, in one process.
+
+    Their local includes may resolve to different headers.
+    """
+    names = set()
+    for checkout in ("a", "b"):
+        source = tmp_path / checkout / "k.cc"
+        source.parent.mkdir()
+        source.write_text('extern "C" void k(int *x) {}')
+        ef = _make_extern("k", source, [np.ndarray[(4,), np.dtype[np.int32]]])
+        names.add((ef.object_file_name, ef._symbol_prefix))
+    assert len(names) == 2
+    # So are one source's builds against two include paths.
+    other = _make_extern("k", source, ef.arg_types(), include_dirs=[str(tmp_path)])
+    assert other._symbol_prefix != ef._symbol_prefix

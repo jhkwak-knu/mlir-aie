@@ -1,17 +1,17 @@
 //===- aie.mlir ------------------------------------------------*- MLIR -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2021-2022 Xilinx, Inc.
+// Copyright (C) 2022-2025 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2021 Xilinx Inc.
 //
 //===----------------------------------------------------------------------===//
 
-// RUN: %PYTHON aiecc.py %VitisSysrootFlag% --host-target=%aieHostTargetTriplet% %link_against_hsa% %s %test_lib_flags %extraAieCcFlags% %S/test.cpp -o test.elf
+// RUN: %aiecc --xchesscc --xbridge %VitisSysrootFlag% --host-target=%aieHostTargetTriplet% %link_against_hsa% %s %test_lib_flags %extraAieCcFlags% -o test.elf -- %S/test.cpp
 // RUN: %run_on_vck5000 ./test.elf
 
 module @test15_prime_sieve {
+aie.device(xcvc1902) {
+
   %tile13 = aie.tile(1, 3)
   %tile14 = aie.tile(1, 4)
   %tile15 = aie.tile(1, 5)
@@ -40,7 +40,8 @@ module @test15_prime_sieve {
       memref.store %sum_iter, %buf13_0[%arg0] : memref<256xi32>
       scf.yield %sum_next : i32
     }
-    aie.use_lock(%lock13_0, "Release", 1)
+    %c1_ul0 = arith.constant 1 : i32
+    aie.use_lock(%lock13_0, "Release", %c1_ul0)
     aie.end
   }
   func.func @do_sieve(%bufin: memref<256xi32>, %bufout:memref<256xi32>) -> () {
@@ -89,27 +90,41 @@ module @test15_prime_sieve {
   }
 
   %core14 = aie.core(%tile14) {
-    aie.use_lock(%lock13_0, "Acquire", 1)
-    aie.use_lock(%lock14_0, "Acquire", 0)
+    %c1_ul1 = arith.constant 1 : i32
+    aie.use_lock(%lock13_0, "Acquire", %c1_ul1)
+    %c0_ul2 = arith.constant 0 : i32
+    aie.use_lock(%lock14_0, "Acquire", %c0_ul2)
     func.call @do_sieve(%buf13_0, %buf14_0) : (memref<256xi32>, memref<256xi32>) -> ()
-    aie.use_lock(%lock13_0, "Release", 0)
-    aie.use_lock(%lock14_0, "Release", 1)
+    %c0_ul3 = arith.constant 0 : i32
+    aie.use_lock(%lock13_0, "Release", %c0_ul3)
+    %c1_ul4 = arith.constant 1 : i32
+    aie.use_lock(%lock14_0, "Release", %c1_ul4)
     aie.end
   }
   %core15 = aie.core(%tile15) {
-    aie.use_lock(%lock14_0, "Acquire", 1)
-    aie.use_lock(%lock15_0, "Acquire", 0)
+    %c1_ul5 = arith.constant 1 : i32
+    aie.use_lock(%lock14_0, "Acquire", %c1_ul5)
+    %c0_ul6 = arith.constant 0 : i32
+    aie.use_lock(%lock15_0, "Acquire", %c0_ul6)
     func.call @do_sieve(%buf14_0, %buf15_0) : (memref<256xi32>, memref<256xi32>) -> ()
-    aie.use_lock(%lock14_0, "Release", 0)
-    aie.use_lock(%lock15_0, "Release", 1)
+    %c0_ul7 = arith.constant 0 : i32
+    aie.use_lock(%lock14_0, "Release", %c0_ul7)
+    %c1_ul8 = arith.constant 1 : i32
+    aie.use_lock(%lock15_0, "Release", %c1_ul8)
     aie.end
   }
   %core16 = aie.core(%tile16) {
-    aie.use_lock(%lock15_0, "Acquire", 1)
-    aie.use_lock(%lock16_0, "Acquire", 0)
+    %c1_ul9 = arith.constant 1 : i32
+    aie.use_lock(%lock15_0, "Acquire", %c1_ul9)
+    %c0_ul10 = arith.constant 0 : i32
+    aie.use_lock(%lock16_0, "Acquire", %c0_ul10)
     func.call @do_sieve(%buf15_0, %buf16_0) : (memref<256xi32>, memref<256xi32>) -> ()
-    aie.use_lock(%lock15_0, "Release", 0)
-    aie.use_lock(%lock16_0, "Release", 1)
+    %c0_ul11 = arith.constant 0 : i32
+    aie.use_lock(%lock15_0, "Release", %c0_ul11)
+    %c1_ul12 = arith.constant 1 : i32
+    aie.use_lock(%lock16_0, "Release", %c1_ul12)
     aie.end
   }
+
+}
 }

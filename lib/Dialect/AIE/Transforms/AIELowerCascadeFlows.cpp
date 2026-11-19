@@ -1,10 +1,8 @@
 //===- AIELowerCascadeFlows.cpp ---------------------------------*- C++ -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2022 Xilinx, Inc.
+// Copyright (C) 2022-2026 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2024 Xilinx Inc.
 //
 //===----------------------------------------------------------------------===//
 
@@ -16,6 +14,11 @@
 
 #include "llvm/ADT/Twine.h"
 
+namespace xilinx::AIE {
+#define GEN_PASS_DEF_AIELOWERCASCADEFLOWS
+#include "aie/Dialect/AIE/Transforms/AIEPasses.h.inc"
+} // namespace xilinx::AIE
+
 #define DEBUG_TYPE "aie-lower-cascade-flows"
 
 using namespace mlir;
@@ -23,7 +26,7 @@ using namespace xilinx;
 using namespace xilinx::AIE;
 
 struct AIELowerCascadeFlowsPass
-    : AIELowerCascadeFlowsBase<AIELowerCascadeFlowsPass> {
+    : xilinx::AIE::impl::AIELowerCascadeFlowsBase<AIELowerCascadeFlowsPass> {
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<AIEDialect>();
   }
@@ -32,7 +35,7 @@ struct AIELowerCascadeFlowsPass
     const auto &targetModel = device.getTargetModel();
     OpBuilder builder = OpBuilder::atBlockTerminator(device.getBody());
 
-    std::set<TileOp> tilesWithCascadeFlow;
+    DenseSet<TileOp> tilesWithCascadeFlow;
     DenseMap<TileOp, WireBundle> cascadeInputsPerTile;
     DenseMap<TileOp, WireBundle> cascadeOutputsPerTile;
 
@@ -56,12 +59,14 @@ struct AIELowerCascadeFlowsPass
         // TODO: remove when this pass supports routing
         cascadeFlow.emitOpError(
             "source tile must be to the North or West of the destination tile");
-        return;
+        return signalPassFailure();
       }
     }
 
     // generate configure cascade ops
-    for (TileOp tile : tilesWithCascadeFlow) {
+    for (TileOp tile : device.getOps<TileOp>()) {
+      if (!tilesWithCascadeFlow.contains(tile))
+        continue;
       WireBundle inputDir;
       if (cascadeInputsPerTile.find(tile) != cascadeInputsPerTile.end()) {
         inputDir = cascadeInputsPerTile[tile];
@@ -74,9 +79,9 @@ struct AIELowerCascadeFlowsPass
       } else {
         outputDir = WireBundle::South;
       }
-      builder.create<ConfigureCascadeOp>(builder.getUnknownLoc(), tile,
-                                         static_cast<CascadeDir>(inputDir),
-                                         static_cast<CascadeDir>(outputDir));
+      ConfigureCascadeOp::create(builder, tile.getLoc(), tile,
+                                 static_cast<CascadeDir>(inputDir),
+                                 static_cast<CascadeDir>(outputDir));
     }
 
     // erase CascadeFlowOps

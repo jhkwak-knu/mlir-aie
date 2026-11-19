@@ -1,5 +1,8 @@
 #!/usr/bin/bash
 
+# Copyright (C) 2024-2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
 # run this script from one of the subdirectories to perform a sweep,
 # e.g. from within whole_array, run ../sweep.sh.
 
@@ -28,7 +31,6 @@ export n=64
 export dtype_in=i16
 export dtype_out=i16
 export n_aie_cols=4
-export XRT_HACK_UNSECURE_LOADING_XCLBIN=1
 
 # Print configuration used to run for reproducibility
 env >>$log_out

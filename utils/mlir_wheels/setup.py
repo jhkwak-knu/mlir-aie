@@ -1,7 +1,11 @@
+# Copyright (C) 2023-2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
 from datetime import datetime
 import os
 import platform
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -11,9 +15,48 @@ from sysconfig import get_paths
 from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
 
+from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
+
+
+class bdist_wheel(_bdist_wheel):
+    def finalize_options(self):
+        _bdist_wheel.finalize_options(self)
+        self.root_is_pure = False
+
+    def get_tag(self):
+        python, abi, plat = _bdist_wheel.get_tag(self)
+        python, abi = "py3", "none"
+
+        CIBW_ARCHS = os.environ.get("CIBW_ARCHS")
+        if CIBW_ARCHS in {"arm64", "aarch64", "ARM64"}:
+            if "x86_64" in plat:
+                plat = plat.replace("x86_64", "aarch64")
+            elif "AMD64" in plat:
+                plat = plat.replace("AMD64", "aarch64")
+
+        return python, abi, plat
+
 
 def check_env(build, default=0):
     return os.environ.get(build, str(default)) in {"1", "true", "True", "ON", "YES"}
+
+
+def real_compiler_path(name):
+    """Resolve `name` outside ccache's masquerade directories.
+
+    setup_ccache puts /usr/lib/ccache on PATH. Every compiler name in that
+    directory is a symlink to ccache. LLVM_CCACHE_BUILD also sets a ccache
+    compiler launcher. The launcher hashes the ccache binary under
+    compiler_check=mtime. ccache can return an object that an earlier
+    compiler built.
+    """
+    real_dirs = [
+        d for d in os.environ.get("PATH", "").split(os.pathsep) if "ccache" not in d
+    ]
+    path = shutil.which(name, path=os.pathsep.join(real_dirs))
+    if not path:
+        raise RuntimeError(f"could not find {name} outside ccache's directories")
+    return path
 
 
 class CMakeExtension(Extension):
@@ -24,15 +67,6 @@ class CMakeExtension(Extension):
 
 def get_cross_cmake_args():
     cmake_args = {}
-
-    def native_tools():
-        nonlocal cmake_args
-
-        native_tools_dir = Path(sys.prefix).absolute() / "bin"
-        assert native_tools_dir is not None, "native_tools_dir missing"
-        assert os.path.exists(native_tools_dir), "native_tools_dir doesn't exist"
-        cmake_args["LLVM_USE_HOST_TOOLS"] = "ON"
-        cmake_args["LLVM_NATIVE_TOOL_DIR"] = str(native_tools_dir)
 
     CIBW_ARCHS = os.environ.get("CIBW_ARCHS")
     if CIBW_ARCHS in {"arm64", "aarch64", "ARM64"}:
@@ -57,10 +91,31 @@ def get_cross_cmake_args():
         if ARCH == "AArch64":
             cmake_args["LLVM_DEFAULT_TARGET_TRIPLE"] = "aarch64-linux-gnu"
             cmake_args["LLVM_HOST_TRIPLE"] = "aarch64-linux-gnu"
-            cmake_args["CMAKE_C_COMPILER"] = "aarch64-linux-gnu-gcc"
-            cmake_args["CMAKE_CXX_COMPILER"] = "aarch64-linux-gnu-g++"
+            cmake_args["CMAKE_C_COMPILER"] = real_compiler_path("aarch64-linux-gnu-gcc")
+            cmake_args["CMAKE_CXX_COMPILER"] = real_compiler_path(
+                "aarch64-linux-gnu-g++"
+            )
             cmake_args["CMAKE_CXX_FLAGS"] = "-static-libgcc -static-libstdc++"
-            native_tools()
+            # GNU ld fails to insert AArch64 long-branch veneers for the fully
+            # static mlir-opt/mlir-translate binaries, causing "relocation
+            # truncated to fit: R_AARCH64_CALL26" inside libstdc++.a itself.
+            # lld handles arbitrarily large binaries correctly.
+            #
+            # A cross gcc searches the -B directories for the plain name
+            # ld.lld. It searches PATH for aarch64-linux-gnu-ld.lld. The
+            # lld package installs /usr/bin/ld.lld and no prefixed alias.
+            # -B/usr/bin is therefore the one directory where -fuse-ld=lld
+            # finds a linker.
+            _LLD_LINKER_FLAGS = "-fuse-ld=lld -B/usr/bin"
+            cmake_args["CMAKE_EXE_LINKER_FLAGS_INIT"] = _LLD_LINKER_FLAGS
+            cmake_args["CMAKE_MODULE_LINKER_FLAGS_INIT"] = _LLD_LINKER_FLAGS
+            cmake_args["CMAKE_SHARED_LINKER_FLAGS_INIT"] = _LLD_LINKER_FLAGS
+            # The cross build runs tblgen on the host against this tree's
+            # .td sources. tblgen embeds the TargetOpcode enum of the
+            # sources that built it. A tblgen from another commit therefore
+            # fails on these sources. LLVM_USE_HOST_TOOLS builds tblgen from
+            # this tree, in a NATIVE subdirectory.
+            cmake_args["LLVM_USE_HOST_TOOLS"] = "ON"
         elif ARCH == "X86":
             cmake_args["LLVM_DEFAULT_TARGET_TRIPLE"] = "x86_64-unknown-linux-gnu"
             cmake_args["LLVM_HOST_TRIPLE"] = "x86_64-unknown-linux-gnu"
@@ -113,7 +168,7 @@ class CMakeBuild(build_ext):
             "-DMLIR_ENABLE_BINDINGS_PYTHON=ON",
             "-DMLIR_ENABLE_EXECUTION_ENGINE=ON",
             "-DMLIR_ENABLE_SPIRV_CPU_RUNNER=ON",
-            # get rid of that annoying af git on the end of .17git
+            # Strip the trailing "git" from the version suffix (e.g. ".17git").
             "-DLLVM_VERSION_SUFFIX=",
             # Disables generation of "version soname" (i.e. libFoo.so.<version>), which
             # causes pure duplication of various shlibs for Python wheels.
@@ -233,16 +288,42 @@ version = f"{llvm_version[0]}.{llvm_version[1]}.{llvm_version[2]}.{llvm_datetime
 version += commit_hash
 
 llvm_url = f"https://github.com/llvm/llvm-project/commit/{commit_hash}"
+
+_llvm_license_src = Path("llvm-project") / "LICENSE.TXT"
+if _llvm_license_src.exists():
+    shutil.copy(_llvm_license_src, Path(__file__).parent / "LICENSE")
+
 setup(
     name="mlir" if check_env("ENABLE_RTTI", 1) else "mlir-no-rtti",
     version=version,
     author="Maksim Levental",
     author_email="maksim.levental@gmail.com",
+    maintainer="AMD Inc.",
     description=f"MLIR distribution as wheel. Created at {now} build of {llvm_url}",
     long_description=f"MLIR distribution as wheel. Created at {now} build of [llvm/llvm-project/{commit_hash}]({llvm_url})",
     long_description_content_type="text/markdown",
+    url="https://github.com/Xilinx/mlir-aie",
+    license="Apache-2.0 WITH LLVM-exception",
+    license_files=["LICENSE"],
+    project_urls={
+        "Source": "https://github.com/Xilinx/mlir-aie",
+        "Upstream LLVM": "https://github.com/llvm/llvm-project",
+        "Issues": "https://github.com/Xilinx/mlir-aie/issues",
+    },
+    classifiers=[
+        "Development Status :: 4 - Beta",
+        "License :: OSI Approved :: Apache Software License",
+        "Topic :: Software Development :: Compilers",
+        "Programming Language :: Python :: 3",
+        "Operating System :: POSIX :: Linux",
+        "Operating System :: Microsoft :: Windows",
+        "Operating System :: MacOS",
+    ],
     ext_modules=[CMakeExtension("mlir", sourcedir="llvm-project/llvm")],
-    cmdclass={"build_ext": CMakeBuild},
+    cmdclass={
+        "build_ext": CMakeBuild,
+        "bdist_wheel": bdist_wheel,
+    },
     zip_safe=False,
     download_url=llvm_url,
 )

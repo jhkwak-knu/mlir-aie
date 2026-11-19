@@ -1,10 +1,7 @@
 //===- test.cpp -------------------------------------------000---*- C++ -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2023 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// Copyright (C) 2023, Advanced Micro Devices, Inc.
 //
 //===----------------------------------------------------------------------===//
 
@@ -20,8 +17,8 @@
 #include "xrt/xrt_kernel.h"
 
 #include "xrt/experimental/xrt_elf.h"
-#include "xrt/experimental/xrt_module.h"
 #include "xrt/experimental/xrt_ext.h"
+#include "xrt/experimental/xrt_module.h"
 
 #include "cxxopts.hpp"
 #include "test_utils.h"

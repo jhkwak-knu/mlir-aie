@@ -1,11 +1,15 @@
+# Copyright (C) 2024-2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+import os
+import warnings
+
 import matplotlib.animation as animation
 import matplotlib.patheffects as pe
 import matplotlib.pyplot as plt
 import numpy as np
-import os
-import sys
 
-from .utils import ceildiv
+from ..npdtypes import ceildiv
 
 
 def animate_from_accesses(
@@ -13,9 +17,25 @@ def animate_from_accesses(
     access_count_tensors: list[np.ndarray] | None,
     title: str = "Animated Access Visualization",
 ) -> animation.FuncAnimation:
+    """Animate a sequence of 2-D access order (and count) arrays, one frame each.
+
+    Args:
+        access_order_tensors (list[np.ndarray]): One access order array per
+            frame, as `TensorAccessPattern.access_order()` returns.
+        access_count_tensors (list[np.ndarray] | None): One access count array
+            per frame, or None to animate the access order only.
+        title (str, optional): Title of the animation.
+            Defaults to "Animated Access Visualization".
+
+    Returns:
+        animation.FuncAnimation: A handle to the animation.
+
+    Raises:
+        ValueError: If there are no frames, or the two lists differ in length.
+    """
     if len(access_order_tensors) < 1:
         raise ValueError("At least one access order tensor is required.")
-    if not (access_count_tensors is None):
+    if access_count_tensors is not None:
         if len(access_count_tensors) < 1:
             raise ValueError(
                 "access_count_tensor should be None or requires at least one tensor"
@@ -32,7 +52,8 @@ def animate_from_accesses(
     height_width_ratio = ceildiv(tensor_height, tensor_width)
     fig_height = min(fig_width, fig_width * height_width_ratio)
 
-    if not (access_count_tensors is None):
+    ax_count = None
+    if access_count_tensors is not None:
         fig_height *= 2
         fig, (ax_order, ax_count) = plt.subplots(2, 1)
     else:
@@ -48,15 +69,15 @@ def animate_from_accesses(
     ax_order.invert_yaxis()
     ax_order.set_title("Access Order Animation")
 
-    if not (access_count_tensors is None):
+    if ax_count is not None:
         ax_count.xaxis.tick_top()
         ax_count.invert_yaxis()
-        ax_count.set_title(f"Access Counts")
+        ax_count.set_title("Access Counts")
 
     def animate_order(i):
         access_heatmap = ax_order.pcolormesh(access_order_tensors[i])
 
-        if not (access_count_tensors is None):
+        if access_count_tensors is not None and ax_count is not None:
             count_heatmap = ax_count.pcolormesh(
                 xs, ys, access_count_tensors[i], cmap="gnuplot2"
             )
@@ -64,7 +85,7 @@ def animate_from_accesses(
                 access_heatmap,
                 count_heatmap,
             )
-        return access_heatmap
+        return (access_heatmap,)
 
     _animation = animation.FuncAnimation(
         fig,
@@ -85,13 +106,27 @@ def visualize_from_accesses(
     show_arrows: bool | None = None,
     file_path: str | None = None,
     show_plot: bool = True,
-):
+) -> None:
+    """Plot a 2-D access order array, and optionally its access count.
+
+    Args:
+        access_order_tensor (np.ndarray): The access order, as
+            `TensorAccessPattern.access_order()` returns.
+        access_count_tensor (np.ndarray | None): The access count, or None to
+            plot the access order only.
+        title (str, optional): Title of the plot. Defaults to "Access Visualization".
+        show_arrows (bool | None, optional): Draw arrows between consecutively
+            accessed elements. Defaults to None (only for small tensors).
+        file_path (str | None, optional): Path to save the plot to. Defaults to None.
+        show_plot (bool, optional): Show the plot, e.g. in a Jupyter notebook.
+            Defaults to True.
+    """
     tensor_height, tensor_width = access_order_tensor.shape
     if tensor_height * tensor_width >= 1024:
         if show_arrows:
-            print(
-                f"show_arrows not recommended for tensor sizes > 1024 elements",
-                file=sys.stderr,
+            warnings.warn(
+                "show_arrows not recommended for tensor sizes > 1024 elements",
+                stacklevel=2,
             )
         if show_arrows is None:
             show_arrows = False
@@ -105,7 +140,8 @@ def visualize_from_accesses(
     height_width_ratio = ceildiv(tensor_height, tensor_width)
     fig_height = min(fig_width, fig_width * height_width_ratio)
 
-    if not (access_count_tensor is None):
+    ax_count = None
+    if access_count_tensor is not None:
         fig_height *= 2
         fig, (ax_order, ax_count) = plt.subplots(2, 1)
     else:
@@ -122,7 +158,7 @@ def visualize_from_accesses(
     ax_order.invert_yaxis()
     ax_order.set_title("Access Order")
 
-    if not (access_count_tensor is None):
+    if access_count_tensor is not None and ax_count is not None:
         max_count = np.max(access_count_tensor)
         _count_heatmap = ax_count.pcolormesh(
             xs, ys, access_count_tensor, cmap="gnuplot2"
@@ -164,9 +200,9 @@ def visualize_from_accesses(
         plt.show()
     if file_path:
         if os.path.exists(file_path):
-            print(
+            warnings.warn(
                 f"Cannot save plot to {file_path}; file already exists",
-                file=sys.stderr,
+                stacklevel=2,
             )
         plt.savefig(file_path)
     plt.close()

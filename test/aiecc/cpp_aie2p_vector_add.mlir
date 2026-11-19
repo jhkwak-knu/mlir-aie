@@ -1,0 +1,51 @@
+//===- cpp_aie2p_vector_add.mlir - Regression test for #2950 ------*- MLIR -*-===//
+//
+// Copyright (C) 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+// Regression test for #2950: aiecc must correctly propagate the aie-target
+// option to convert-vector-to-aievec sub-pipelines. Without the fix, aie2p
+// targets fall back to aie1 lowering patterns (producing aievec_aie1 ops),
+// which causes aie-standard-lowering to fail to extract core functions.
+
+// REQUIRES: peano
+
+// RUN: aiecc --get-xclbin --verbose %s 2>&1 | FileCheck %s
+
+// Regression: the aie2p vector lowering must succeed (without the fix,
+// aie-standard-lowering fails to extract core functions). Reaching a
+// successful aie2p code-generation exec and xclbin write proves it.
+// CHECK: ({{[0-9]+}}/{{[0-9]+}}) input_physical.mlir
+// CHECK: exec:{{.*}}--march=aie2p
+// CHECK: wrote edge 'aie.xclbin'
+
+module {
+  aie.device(npu2) {
+    %tile_0_2 = aie.tile(0, 2)
+    %buf_a = aie.buffer(%tile_0_2) {sym_name = "buf_a"} : memref<256xbf16>
+    %buf_b = aie.buffer(%tile_0_2) {sym_name = "buf_b"} : memref<256xbf16>
+    %buf_c = aie.buffer(%tile_0_2) {sym_name = "buf_c"} : memref<256xbf16>
+
+    %core_0_2 = aie.core(%tile_0_2) {
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      %c256 = arith.constant 256 : index
+      %c16 = arith.constant 16 : index
+      %cst = arith.constant 0.0 : bf16
+
+      // Vector add loop: this exercises convert-vector-to-aievec.
+      // With the correct aie2p target, this produces aievec.ups + aievec.add_elem + aievec.srs.
+      // With the broken aie1 fallback, it produces aievec_aie1.add which can't be
+      // lowered to LLVM, resulting in empty core function and linker failure.
+      scf.for %i = %c0 to %c256 step %c16 {
+        %a = vector.transfer_read %buf_a[%i], %cst {in_bounds = [true]} : memref<256xbf16>, vector<16xbf16>
+        %b = vector.transfer_read %buf_b[%i], %cst {in_bounds = [true]} : memref<256xbf16>, vector<16xbf16>
+        %c = arith.addf %a, %b : vector<16xbf16>
+        vector.transfer_write %c, %buf_c[%i] {in_bounds = [true]} : vector<16xbf16>, memref<256xbf16>
+      }
+      aie.end
+    }
+  }
+}

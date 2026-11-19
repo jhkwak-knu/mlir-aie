@@ -1,10 +1,8 @@
 //===- AIE.td ----------------------------------------------*- tablegen -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2019-2022 Xilinx, Inc.
+// Copyright (C) 2022-2024 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2019 Xilinx Inc.
 //
 //===----------------------------------------------------------------------===//
 
@@ -25,9 +23,40 @@ def AIE_Dialect : Dialect {
     switch is referred to as `switchbox` to avoid confusion with the
     `switch` keyword in C/C++.
 
+    `aie.shareable_with` is an array of flat symbol references. On a route
+    endpoint it lists other route endpoints allowed to share its shim channel;
+    both endpoints must permit the pairing. On a shim DMA allocation it lists
+    route endpoints allowed to use that fixed channel. Empty lists forbid
+    these shares. Explicit lists override lifetime analysis, but resource and
+    packet-routing constraints still apply. Omission permits MM2S inference;
+    S2MM sharing requires explicit permission because receive ordering does
+    not constrain independent senders. The author must guarantee stream order
+    and completion across repeated executions. On an unsplit objectFIFO, the
+    list names other objectFIFOs and applies to its shim DMA endpoint; splitting
+    transfers the permissions to route endpoints and rewrites the references.
+
+    On a device, `aie.reserve_controller_packet_ids` reserves controller IDs
+    when assigning packet IDs.
+
+    `aie.generated_configure` marks the runtime sequence that
+    convert-aie-to-transaction generated to hold its device's configuration.
+    That sequence is named `configure` unless a user sequence already has the
+    name, so consumers key on the attribute, not the name.
+
   }];
   let useDefaultTypePrinterParser = 1;
   let useDefaultAttributePrinterParser = 1;
+  // Python wrappers in dialects/aie.py and AIEX lowerings emit arith.constant
+  // and other operations, so this dialect depends on arith being available.
+  let dependentDialects = ["::mlir::arith::ArithDialect"];
+  // The op assembly formats still print inherent attributes in `attr-dict`;
+  // opt out of upstream's strict-properties default until they migrate.
+  let useStrictPropertiesInAssemblyFormat = 0;
+  // Overlay-owned settings survive application configuration and teardown.
+  let discardableAttrs = (ins "::mlir::UnitAttr":$is_ctrl_pkt_overlay,
+      "::mlir::UnitAttr":$priority_route, "::mlir::ArrayAttr":$shareable_with,
+      "::mlir::UnitAttr":$reserve_controller_packet_ids,
+      "::mlir::UnitAttr":$generated_configure);
 }
 
 #endif // AIE_BASE

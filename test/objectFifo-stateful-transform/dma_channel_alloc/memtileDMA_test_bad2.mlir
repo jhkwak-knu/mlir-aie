@@ -1,16 +1,15 @@
 //===- memtileDMA_test_bad2.mlir -------------------------------*- MLIR -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2024 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// Copyright (C) 2024, Advanced Micro Devices, Inc.
 //
 //===----------------------------------------------------------------------===//
 
-// RUN: not aie-opt --aie-objectFifo-stateful-transform %s 2>&1 | FileCheck %s
+// RUN: not aie-opt --aie-objectFifo-stateful-transform="skip-verify=true" %s 2>&1 | FileCheck %s
 
 // CHECK:   error: 'aie.tile' op number of output DMA channel exceeded!
+// CHECK-SAME: requires at least 7 MM2S channels, but capacity is 6
+// CHECK: note: DMA endpoint @objfifo__prod__dma for ObjectFifo @objfifo
 
 module @memtileDMA_channels {
     aie.device(xcve2302) {
@@ -29,32 +28,32 @@ module @memtileDMA_channels {
         %mem11 = aie.memtile_dma(%tile11) {
             %dma1 = aie.dma_start(MM2S, 0, ^bb1, ^bb2)
         ^bb1:
-            aie.dma_bd(%buff0 : memref<16xi32>, 0, 16)
+            aie.dma_bd(%buff0 : memref<16xi32> offset = 0 len = 16)
             aie.next_bd ^bb1
         ^bb2:
             %dma2 = aie.dma_start(MM2S, 1, ^bb3, ^bb4)
         ^bb3:
-            aie.dma_bd(%buff2 : memref<16xi32>, 0, 16)
+            aie.dma_bd(%buff2 : memref<16xi32> offset = 0 len = 16)
             aie.next_bd ^bb3
         ^bb4:
             %dma3 = aie.dma_start(MM2S, 2, ^bb5, ^bb6)
         ^bb5:
-            aie.dma_bd(%buff2 : memref<16xi32>, 0, 16)
+            aie.dma_bd(%buff2 : memref<16xi32> offset = 0 len = 16)
             aie.next_bd ^bb5
         ^bb6:
             %dma4 = aie.dma_start(MM2S, 3, ^bb7, ^bb8)
         ^bb7:
-            aie.dma_bd(%buff2 : memref<16xi32>, 0, 16)
+            aie.dma_bd(%buff2 : memref<16xi32> offset = 0 len = 16)
             aie.next_bd ^bb7
         ^bb8:
             %dma5 = aie.dma_start(MM2S, 4, ^bb9, ^bb10)
         ^bb9:
-            aie.dma_bd(%buff2 : memref<16xi32>, 0, 16)
+            aie.dma_bd(%buff2 : memref<16xi32> offset = 0 len = 16)
             aie.next_bd ^bb9
         ^bb10:
             %dma6 = aie.dma_start(MM2S, 5, ^bb11, ^bb12)
         ^bb11:
-            aie.dma_bd(%buff2 : memref<16xi32>, 0, 16)
+            aie.dma_bd(%buff2 : memref<16xi32> offset = 0 len = 16)
             aie.next_bd ^bb11
         ^bb12:
             aie.end

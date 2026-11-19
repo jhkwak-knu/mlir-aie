@@ -1,10 +1,7 @@
 //===- badtiledma5.mlir ----------------------------------------*- MLIR -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2025 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2025 Advanced Micro Devices, Inc.
 //
 //===----------------------------------------------------------------------===//
 
@@ -18,7 +15,7 @@ module {
       %srcDma = aie.dma_start(S2MM, 0, ^bd0, ^end)
         ^bd0:
         // CHECK: Burst length is only supported in Shim NOC tiles that are connected to the memory-mapped NOC.
-        aie.dma_bd(%buf21_0 : memref<7168xi32>, 0, 7168){ burst_length = 256 : i32 }
+        aie.dma_bd(%buf21_0 : memref<7168xi32> offset = 0 len = 7168){ burst_length = 256 : i32 }
         aie.next_bd ^end
       ^end:
         aie.end

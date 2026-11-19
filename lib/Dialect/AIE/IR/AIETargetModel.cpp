@@ -1,15 +1,15 @@
 //===- AIETargetModel.cpp ---------------------------------------*- C++ -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2019-2022 Xilinx, Inc.
+// Copyright (C) 2023 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2019 Xilinx Inc.
-// (c) Copyright 2023 Advanced Micro Devices, Inc.
 //
 //===----------------------------------------------------------------------===//
 
 #include "aie/Dialect/AIE/IR/AIETargetModel.h"
+#include "aie/Dialect/AIE/Util/AIERegisterDatabase.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/ErrorHandling.h"
 #include <cstdint>
 #include <utility>
 
@@ -17,7 +17,167 @@ using namespace llvm;
 
 namespace xilinx {
 namespace AIE {
+
+namespace {
+
+std::string getModuleForTile(const AIETargetModel &model, TileID tile,
+                             bool isMem) {
+  if (model.isShimNOCorPLTile(tile.col, tile.row))
+    return "shim";
+  if (model.isMemTile(tile.col, tile.row))
+    return "memory_tile";
+  return isMem ? std::string("memory") : std::string("core");
+}
+
+// Get module name for event lookups (events database uses different names)
+std::string getModuleForTileEvents(const AIETargetModel &model, TileID tile,
+                                   bool isMem) {
+  if (model.isShimNOCorPLTile(tile.col, tile.row))
+    return "pl"; // Events database uses "pl" for shim tiles
+  if (model.isMemTile(tile.col, tile.row))
+    return "mem_tile"; // Events database uses "mem_tile" instead of
+                       // "memory_tile"
+  return isMem ? std::string("memory") : std::string("core");
+}
+
+} // namespace
+
 AIETargetModel::~AIETargetModel() = default;
+
+// Base class implementations for register database
+
+std::unique_ptr<RegisterDatabase> AIETargetModel::loadRegisterDatabase() const {
+  // Default: no register database available
+  return nullptr;
+}
+
+const RegisterDatabase *AIETargetModel::getRegisterDatabase() const {
+  std::call_once(regDBInitFlag, [this]() { regDB = loadRegisterDatabase(); });
+  return regDB.get();
+}
+
+const RegisterInfo *AIETargetModel::lookupRegister(llvm::StringRef name,
+                                                   TileID tile,
+                                                   bool isMem) const {
+  const auto *db = getRegisterDatabase();
+  if (!db)
+    return nullptr;
+  return db->lookupRegister(name, getModuleForTile(*this, tile, isMem));
+}
+
+std::optional<uint32_t> AIETargetModel::lookupEvent(llvm::StringRef name,
+                                                    TileID tile,
+                                                    bool isMem) const {
+  const auto *db = getRegisterDatabase();
+  if (!db)
+    return std::nullopt;
+  return db->lookupEvent(name, getModuleForTileEvents(*this, tile, isMem));
+}
+
+std::optional<uint32_t>
+AIETargetModel::encodeFieldValue(const BitFieldInfo &field,
+                                 uint32_t value) const {
+  const auto *db = getRegisterDatabase();
+  if (!db)
+    return std::nullopt;
+  return db->encodeFieldValue(field, value);
+}
+
+std::optional<uint32_t>
+AIETargetModel::getFieldMask(const BitFieldInfo &field) const {
+  uint32_t width = field.getWidth();
+  if (width == 0 || width > 32 || field.bit_end >= 32)
+    return std::nullopt;
+
+  uint64_t mask = (width == 32) ? 0xFFFFFFFFULL : ((1ULL << width) - 1ULL);
+  mask <<= field.bit_start;
+  if (mask > UINT32_MAX)
+    return std::nullopt;
+
+  return static_cast<uint32_t>(mask);
+}
+
+DenseMap<TileID, int>
+AIETargetModel::getTileToControllerIdMap(bool columnWiseUniqueIDs) const {
+  if (rows() <= 6) {
+    // Controller id combinations chosen to avoid packet flow deadlock due to
+    // single-level LUT bit-masking on packet header. Shim tile ids are < 16
+    // because the TCT actor id field is only 4 bits.
+    SmallVector<SmallVector<int>> validTileIds = {{15, 26, 27, 29, 30, 31},
+                                                  {14, 21, 22, 23, 24, 25},
+                                                  {13, 11, 17, 18, 19, 20},
+                                                  {12, 28, 7, 8, 9, 10}};
+    if (!columnWiseUniqueIDs && columns() > (int)validTileIds.size())
+      llvm::report_fatal_error(
+          "Device has " + llvm::Twine(columns()) + " columns but only " +
+          llvm::Twine(validTileIds.size()) +
+          " globally-unique controller ID sets are defined; "
+          "use column-wise unique IDs mode.");
+    DenseMap<TileID, int> tileIDMap;
+    for (int col = 0; col < columns(); col++) {
+      for (int row = 0; row < rows(); row++) {
+        if (columnWiseUniqueIDs)
+          tileIDMap[{col, row}] = validTileIds[0][row];
+        else
+          tileIDMap[{col, row}] = validTileIds[col][row];
+      }
+    }
+    return tileIDMap;
+  }
+
+  // Devices with more than 6 rows use sequential assignment.
+  assert(columnWiseUniqueIDs &&
+         "Device has more tiles than candidate packet ids; "
+         "use column-wise unique IDs mode.");
+  DenseMap<TileID, int> tileIDMap;
+  int unusedPacketIdFrom = 0;
+  for (int col = 0; col < columns(); col++) {
+    if (columnWiseUniqueIDs)
+      unusedPacketIdFrom = 0;
+    for (int row = 0; row < rows(); row++)
+      tileIDMap[{col, row}] = unusedPacketIdFrom++;
+  }
+  return tileIDMap;
+}
+
+std::optional<uint32_t> AIETargetModel::resolvePortValue(llvm::StringRef value,
+                                                         TileID tile,
+                                                         bool master) const {
+  auto colonPos = value.find(':');
+  if (colonPos == StringRef::npos)
+    return std::nullopt;
+
+  StringRef portName = value.substr(0, colonPos);
+  StringRef channelStr = value.substr(colonPos + 1);
+
+  int channel;
+  if (channelStr.getAsInteger(10, channel) || channel < 0)
+    return std::nullopt;
+
+  WireBundle bundle;
+  if (portName.equals_insensitive("north")) {
+    bundle = WireBundle::North;
+  } else if (portName.equals_insensitive("south")) {
+    bundle = WireBundle::South;
+  } else if (portName.equals_insensitive("east")) {
+    bundle = WireBundle::East;
+  } else if (portName.equals_insensitive("west")) {
+    bundle = WireBundle::West;
+  } else if (portName.equals_insensitive("dma")) {
+    bundle = WireBundle::DMA;
+  } else if (portName.equals_insensitive("fifo")) {
+    bundle = WireBundle::FIFO;
+  } else if (portName.equals_insensitive("core")) {
+    bundle = WireBundle::Core;
+  } else if (portName.equals_insensitive("ctrl")) {
+    bundle = WireBundle::TileControl;
+  } else {
+    return std::nullopt;
+  }
+
+  return getStreamSwitchPortIndex(tile.col, tile.row, bundle,
+                                  static_cast<uint32_t>(channel), master);
+}
 
 ///
 /// AIE1 TargetModel
@@ -316,20 +476,23 @@ bool AIE1TargetModel::isLegalTileConnection(int col, int row,
   if (isMemTile(col, row)) {
     return false;
   }
-  // Shimtile
-  else if (isShimNOCorPLTile(col, row)) {
+  // Shimtile and Coretile currently share this trace-routing constraint;
+  // flagged by bugprone-branch-clone -- unconfirmed whether that's
+  // deliberate or a copy-paste that should differ per tile kind, needs
+  // hardware-team confirmation before changing.
+  // NOLINTBEGIN(bugprone-branch-clone)
+  if (isShimNOCorPLTile(col, row)) {
     if (srcBundle == WireBundle::Trace)
       return dstBundle == WireBundle::South;
-    else
-      return true;
+    return true;
   }
   // Coretile
-  else if (isCoreTile(col, row)) {
+  if (isCoreTile(col, row)) {
     if (srcBundle == WireBundle::Trace)
       return dstBundle == WireBundle::South;
-    else
-      return true;
+    return true;
   }
+  // NOLINTEND(bugprone-branch-clone)
   return false;
 }
 
@@ -346,9 +509,247 @@ AIE1TargetModel::getLocalLockAddress(uint32_t lockId, TileID tile) const {
   return std::nullopt;
 }
 
+namespace {
+namespace aie1_port_id {
+namespace core {
+
+// Slave port offset/size constants
+static constexpr uint32_t S_CORE_OFFSET = 0;
+static constexpr uint32_t S_CORE_SIZE = 2;
+static constexpr uint32_t S_CTRL_OFFSET = 4;
+static constexpr uint32_t S_CTRL_SIZE = 1;
+static constexpr uint32_t S_DMA_OFFSET = 2;
+static constexpr uint32_t S_DMA_SIZE = 2;
+static constexpr uint32_t S_EAST_OFFSET = 21;
+static constexpr uint32_t S_EAST_SIZE = 4;
+static constexpr uint32_t S_FIFO_OFFSET = 5;
+static constexpr uint32_t S_FIFO_SIZE = 2;
+static constexpr uint32_t S_NORTH_OFFSET = 17;
+static constexpr uint32_t S_NORTH_SIZE = 4;
+static constexpr uint32_t S_SOUTH_OFFSET = 7;
+static constexpr uint32_t S_SOUTH_SIZE = 6;
+static constexpr uint32_t S_TRACE_OFFSET = 25;
+static constexpr uint32_t S_TRACE_SIZE = 2;
+static constexpr uint32_t S_WEST_OFFSET = 13;
+static constexpr uint32_t S_WEST_SIZE = 4;
+
+// Master port offset/size constants
+static constexpr uint32_t M_CORE_OFFSET = 0;
+static constexpr uint32_t M_CORE_SIZE = 2;
+static constexpr uint32_t M_CTRL_OFFSET = 4;
+static constexpr uint32_t M_CTRL_SIZE = 1;
+static constexpr uint32_t M_DMA_OFFSET = 2;
+static constexpr uint32_t M_DMA_SIZE = 2;
+static constexpr uint32_t M_EAST_OFFSET = 21;
+static constexpr uint32_t M_EAST_SIZE = 4;
+static constexpr uint32_t M_FIFO_OFFSET = 5;
+static constexpr uint32_t M_FIFO_SIZE = 2;
+static constexpr uint32_t M_NORTH_OFFSET = 15;
+static constexpr uint32_t M_NORTH_SIZE = 6;
+static constexpr uint32_t M_SOUTH_OFFSET = 7;
+static constexpr uint32_t M_SOUTH_SIZE = 4;
+static constexpr uint32_t M_WEST_OFFSET = 11;
+static constexpr uint32_t M_WEST_SIZE = 4;
+
+} // namespace core
+
+namespace shim {
+
+// Slave port offset/size constants
+static constexpr uint32_t S_CTRL_OFFSET = 0;
+static constexpr uint32_t S_CTRL_SIZE = 1;
+static constexpr uint32_t S_EAST_OFFSET = 19;
+static constexpr uint32_t S_EAST_SIZE = 4;
+static constexpr uint32_t S_FIFO_OFFSET = 1;
+static constexpr uint32_t S_FIFO_SIZE = 2;
+static constexpr uint32_t S_NORTH_OFFSET = 15;
+static constexpr uint32_t S_NORTH_SIZE = 4;
+static constexpr uint32_t S_SOUTH_OFFSET = 3;
+static constexpr uint32_t S_SOUTH_SIZE = 8;
+static constexpr uint32_t S_TRACE_OFFSET = 23;
+static constexpr uint32_t S_TRACE_SIZE = 1;
+static constexpr uint32_t S_WEST_OFFSET = 11;
+static constexpr uint32_t S_WEST_SIZE = 4;
+
+// Master port offset/size constants
+static constexpr uint32_t M_CTRL_OFFSET = 0;
+static constexpr uint32_t M_CTRL_SIZE = 1;
+static constexpr uint32_t M_EAST_OFFSET = 19;
+static constexpr uint32_t M_EAST_SIZE = 4;
+static constexpr uint32_t M_FIFO_OFFSET = 1;
+static constexpr uint32_t M_FIFO_SIZE = 2;
+static constexpr uint32_t M_NORTH_OFFSET = 13;
+static constexpr uint32_t M_NORTH_SIZE = 6;
+static constexpr uint32_t M_SOUTH_OFFSET = 3;
+static constexpr uint32_t M_SOUTH_SIZE = 6;
+static constexpr uint32_t M_WEST_OFFSET = 9;
+static constexpr uint32_t M_WEST_SIZE = 4;
+
+} // namespace shim
+} // namespace aie1_port_id
+} // anonymous namespace
+
+std::optional<uint32_t> AIE1TargetModel::getStreamSwitchPortIndex(
+    int col, int row, WireBundle bundle, uint32_t port_num, bool master) const {
+  if (master) {
+    if (isCoreTile(col, row)) {
+      switch (bundle) {
+      case WireBundle::Core:
+        if (port_num >= aie1_port_id::core::M_CORE_SIZE)
+          return std::nullopt;
+        return aie1_port_id::core::M_CORE_OFFSET + port_num;
+      case WireBundle::TileControl:
+        if (port_num >= aie1_port_id::core::M_CTRL_SIZE)
+          return std::nullopt;
+        return aie1_port_id::core::M_CTRL_OFFSET + port_num;
+      case WireBundle::DMA:
+        if (port_num >= aie1_port_id::core::M_DMA_SIZE)
+          return std::nullopt;
+        return aie1_port_id::core::M_DMA_OFFSET + port_num;
+      case WireBundle::East:
+        if (port_num >= aie1_port_id::core::M_EAST_SIZE)
+          return std::nullopt;
+        return aie1_port_id::core::M_EAST_OFFSET + port_num;
+      case WireBundle::FIFO:
+        if (port_num >= aie1_port_id::core::M_FIFO_SIZE)
+          return std::nullopt;
+        return aie1_port_id::core::M_FIFO_OFFSET + port_num;
+      case WireBundle::North:
+        if (port_num >= aie1_port_id::core::M_NORTH_SIZE)
+          return std::nullopt;
+        return aie1_port_id::core::M_NORTH_OFFSET + port_num;
+      case WireBundle::South:
+        if (port_num >= aie1_port_id::core::M_SOUTH_SIZE)
+          return std::nullopt;
+        return aie1_port_id::core::M_SOUTH_OFFSET + port_num;
+      case WireBundle::West:
+        if (port_num >= aie1_port_id::core::M_WEST_SIZE)
+          return std::nullopt;
+        return aie1_port_id::core::M_WEST_OFFSET + port_num;
+      default:
+        return std::nullopt;
+      }
+    } else if (isShimNOCorPLTile(col, row)) {
+      switch (bundle) {
+      case WireBundle::TileControl:
+        if (port_num >= aie1_port_id::shim::M_CTRL_SIZE)
+          return std::nullopt;
+        return aie1_port_id::shim::M_CTRL_OFFSET + port_num;
+      case WireBundle::East:
+        if (port_num >= aie1_port_id::shim::M_EAST_SIZE)
+          return std::nullopt;
+        return aie1_port_id::shim::M_EAST_OFFSET + port_num;
+      case WireBundle::FIFO:
+        if (port_num >= aie1_port_id::shim::M_FIFO_SIZE)
+          return std::nullopt;
+        return aie1_port_id::shim::M_FIFO_OFFSET + port_num;
+      case WireBundle::North:
+        if (port_num >= aie1_port_id::shim::M_NORTH_SIZE)
+          return std::nullopt;
+        return aie1_port_id::shim::M_NORTH_OFFSET + port_num;
+      case WireBundle::South:
+        if (port_num >= aie1_port_id::shim::M_SOUTH_SIZE)
+          return std::nullopt;
+        return aie1_port_id::shim::M_SOUTH_OFFSET + port_num;
+      case WireBundle::West:
+        if (port_num >= aie1_port_id::shim::M_WEST_SIZE)
+          return std::nullopt;
+        return aie1_port_id::shim::M_WEST_OFFSET + port_num;
+      default:
+        return std::nullopt;
+      }
+    } else {
+      return std::nullopt;
+    }
+  } else {
+    if (isCoreTile(col, row)) {
+      switch (bundle) {
+      case WireBundle::Core:
+        if (port_num >= aie1_port_id::core::S_CORE_SIZE)
+          return std::nullopt;
+        return aie1_port_id::core::S_CORE_OFFSET + port_num;
+      case WireBundle::TileControl:
+        if (port_num >= aie1_port_id::core::S_CTRL_SIZE)
+          return std::nullopt;
+        return aie1_port_id::core::S_CTRL_OFFSET + port_num;
+      case WireBundle::DMA:
+        if (port_num >= aie1_port_id::core::S_DMA_SIZE)
+          return std::nullopt;
+        return aie1_port_id::core::S_DMA_OFFSET + port_num;
+      case WireBundle::East:
+        if (port_num >= aie1_port_id::core::S_EAST_SIZE)
+          return std::nullopt;
+        return aie1_port_id::core::S_EAST_OFFSET + port_num;
+      case WireBundle::FIFO:
+        if (port_num >= aie1_port_id::core::S_FIFO_SIZE)
+          return std::nullopt;
+        return aie1_port_id::core::S_FIFO_OFFSET + port_num;
+      case WireBundle::North:
+        if (port_num >= aie1_port_id::core::S_NORTH_SIZE)
+          return std::nullopt;
+        return aie1_port_id::core::S_NORTH_OFFSET + port_num;
+      case WireBundle::South:
+        if (port_num >= aie1_port_id::core::S_SOUTH_SIZE)
+          return std::nullopt;
+        return aie1_port_id::core::S_SOUTH_OFFSET + port_num;
+      case WireBundle::Trace:
+        if (port_num >= aie1_port_id::core::S_TRACE_SIZE)
+          return std::nullopt;
+        return aie1_port_id::core::S_TRACE_OFFSET + port_num;
+      case WireBundle::West:
+        if (port_num >= aie1_port_id::core::S_WEST_SIZE)
+          return std::nullopt;
+        return aie1_port_id::core::S_WEST_OFFSET + port_num;
+      default:
+        return std::nullopt;
+      }
+    } else if (isShimNOCorPLTile(col, row)) {
+      switch (bundle) {
+      case WireBundle::TileControl:
+        if (port_num >= aie1_port_id::shim::S_CTRL_SIZE)
+          return std::nullopt;
+        return aie1_port_id::shim::S_CTRL_OFFSET + port_num;
+      case WireBundle::East:
+        if (port_num >= aie1_port_id::shim::S_EAST_SIZE)
+          return std::nullopt;
+        return aie1_port_id::shim::S_EAST_OFFSET + port_num;
+      case WireBundle::FIFO:
+        if (port_num >= aie1_port_id::shim::S_FIFO_SIZE)
+          return std::nullopt;
+        return aie1_port_id::shim::S_FIFO_OFFSET + port_num;
+      case WireBundle::North:
+        if (port_num >= aie1_port_id::shim::S_NORTH_SIZE)
+          return std::nullopt;
+        return aie1_port_id::shim::S_NORTH_OFFSET + port_num;
+      case WireBundle::South:
+        if (port_num >= aie1_port_id::shim::S_SOUTH_SIZE)
+          return std::nullopt;
+        return aie1_port_id::shim::S_SOUTH_OFFSET + port_num;
+      case WireBundle::Trace:
+        if (port_num >= aie1_port_id::shim::S_TRACE_SIZE)
+          return std::nullopt;
+        return aie1_port_id::shim::S_TRACE_OFFSET + port_num;
+      case WireBundle::West:
+        if (port_num >= aie1_port_id::shim::S_WEST_SIZE)
+          return std::nullopt;
+        return aie1_port_id::shim::S_WEST_OFFSET + port_num;
+      default:
+        return std::nullopt;
+      }
+    } else {
+      return std::nullopt;
+    }
+  }
+}
+
 ///
 /// AIE2 TargetModel
 ///
+
+std::unique_ptr<RegisterDatabase>
+AIE2TargetModel::loadRegisterDatabase() const {
+  return RegisterDatabase::loadAIE2();
+}
 
 AIEArch AIE2TargetModel::getTargetArch() const { return AIEArch::AIE2; }
 
@@ -427,6 +828,11 @@ uint64_t AIE2TargetModel::getDmaBdAddress(int col, int row, uint32_t bd_id,
                                           int channel,
                                           AIE::DMAChannelDir direction) const {
   uint64_t offset = 0;
+  // Shimtile and Coretile currently compute the same offset; flagged by
+  // bugprone-branch-clone -- unconfirmed whether the DMA BD register bank
+  // genuinely shares this base across both tile kinds, needs hardware-team
+  // confirmation before changing.
+  // NOLINTBEGIN(bugprone-branch-clone)
   if (isShimNOCTile(col, row)) {
     offset = 0x0001D000 + bd_id * 0x20;
   } else if (isMemTile(col, row)) {
@@ -437,8 +843,120 @@ uint64_t AIE2TargetModel::getDmaBdAddress(int col, int row, uint32_t bd_id,
     llvm_unreachable(
         "AIE2TargetModel::getDmaBdAddress called for non-DMA tile");
   }
+  // NOLINTEND(bugprone-branch-clone)
   return ((col & 0xff) << getColumnShift()) | ((row & 0xff) << getRowShift()) |
          offset;
+}
+
+static DmaBdLayout makeAIE2ShimBdLayout() {
+  DmaBdLayout l;
+  l.numWords = 8;
+  l.bufferLength = {0, 0, 32};
+  l.bufferOffset = {1, 0, 32};
+  l.enablePacket = {2, 30, 1};
+  l.outOfOrderId = {2, 24, 6};
+  l.packetId = {2, 19, 5};
+  l.packetType = {2, 16, 3};
+  l.d0Size = {3, 20, 10};
+  l.d0Stride = {3, 0, 20};
+  l.burstLength = {4, 30, 2};
+  l.d1Size = {4, 20, 10};
+  l.d1Stride = {4, 0, 20};
+  l.axcache = {5, 24, 4};
+  l.d2Stride = {5, 0, 20};
+  l.iterationCurrent = {6, 26, 6};
+  l.iterationSize = {6, 20, 6};
+  l.iterationStride = {6, 0, 20};
+  l.nextBd = {7, 27, 4};
+  l.useNextBd = {7, 26, 1};
+  l.validBd = {7, 25, 1};
+  l.lockRelValue = {7, 18, 7};
+  l.lockRelId = {7, 13, 4};
+  l.lockAcqEnable = {7, 12, 1};
+  l.lockAcqValue = {7, 5, 7};
+  l.lockAcqId = {7, 0, 4};
+  return l;
+}
+
+// D2_Wrap and D3_Stepsize are left out: the lowering never programs them, and
+// the d2 extent is carried by buffer_length as on the other tiles.
+static DmaBdLayout makeAIE2MemTileBdLayout() {
+  DmaBdLayout l;
+  l.numWords = 8;
+  l.enablePacket = {0, 31, 1};
+  l.packetType = {0, 28, 3};
+  l.packetId = {0, 23, 5};
+  l.outOfOrderId = {0, 17, 6};
+  l.bufferLength = {0, 0, 17};
+  l.d0ZeroBefore = {1, 26, 6};
+  l.nextBd = {1, 20, 6};
+  l.useNextBd = {1, 19, 1};
+  l.bufferOffset = {1, 0, 19};
+  l.d0Size = {2, 17, 10};
+  l.d0Stride = {2, 0, 17};
+  l.d1ZeroBefore = {3, 27, 5};
+  l.d1Size = {3, 17, 10};
+  l.d1Stride = {3, 0, 17};
+  l.d2ZeroBefore = {4, 27, 4};
+  l.d2Stride = {4, 0, 17};
+  l.d2ZeroAfter = {5, 28, 4};
+  l.d1ZeroAfter = {5, 23, 5};
+  l.d0ZeroAfter = {5, 17, 6};
+  l.iterationCurrent = {6, 23, 6};
+  l.iterationSize = {6, 17, 6};
+  l.iterationStride = {6, 0, 17};
+  l.validBd = {7, 31, 1};
+  l.lockRelValue = {7, 24, 7};
+  l.lockRelId = {7, 16, 8};
+  l.lockAcqEnable = {7, 15, 1};
+  l.lockAcqValue = {7, 8, 7};
+  l.lockAcqId = {7, 0, 8};
+  return l;
+}
+
+// The core tile's buffer offset is its Base_Address field, in 32-bit words.
+static DmaBdLayout makeAIE2CoreTileBdLayout() {
+  DmaBdLayout l;
+  l.numWords = 6;
+  l.bufferOffset = {0, 14, 14};
+  l.bufferLength = {0, 0, 14};
+  l.enablePacket = {1, 30, 1};
+  l.outOfOrderId = {1, 24, 6};
+  l.packetId = {1, 19, 5};
+  l.packetType = {1, 16, 3};
+  l.d1Stride = {2, 13, 13};
+  l.d0Stride = {2, 0, 13};
+  l.d1Size = {3, 21, 8};
+  l.d0Size = {3, 13, 8};
+  l.d2Stride = {3, 0, 13};
+  l.iterationCurrent = {4, 19, 6};
+  l.iterationSize = {4, 13, 6};
+  l.iterationStride = {4, 0, 13};
+  l.nextBd = {5, 27, 4};
+  l.useNextBd = {5, 26, 1};
+  l.validBd = {5, 25, 1};
+  l.lockRelValue = {5, 18, 7};
+  l.lockRelId = {5, 13, 4};
+  l.lockAcqEnable = {5, 12, 1};
+  l.lockAcqValue = {5, 5, 7};
+  l.lockAcqId = {5, 0, 4};
+  return l;
+}
+
+const DmaBdLayout *AIE2TargetModel::getDmaBdLayout(AIETileType tileType) const {
+  static const DmaBdLayout shim = makeAIE2ShimBdLayout();
+  static const DmaBdLayout mem = makeAIE2MemTileBdLayout();
+  static const DmaBdLayout core = makeAIE2CoreTileBdLayout();
+  switch (tileType) {
+  case AIETileType::ShimNOCTile:
+    return &shim;
+  case AIETileType::MemTile:
+    return &mem;
+  case AIETileType::CoreTile:
+    return &core;
+  default:
+    return nullptr;
+  }
 }
 
 uint32_t AIE2TargetModel::getDmaBdAddressOffset(int col, int row) const {
@@ -466,6 +984,32 @@ AIE2TargetModel::getDmaControlAddress(int col, int row, int channel,
   } else {
     llvm_unreachable(
         "AIE2TargetModel::getDmaControlAddress called for non-DMA tile");
+  }
+
+  return ((col & 0xff) << getColumnShift()) | ((row & 0xff) << getRowShift()) |
+         offset;
+}
+
+std::optional<uint32_t>
+AIE2TargetModel::getDmaStatusAddress(int col, int row, int channel,
+                                     AIE::DMAChannelDir direction) const {
+  // Status registers sit one word apart per channel, unlike the task-queue
+  // control registers above, which are two words apart.
+  uint32_t offset = 0;
+  if (isShimNOCTile(col, row)) {
+    offset = 0x0001D220 + (channel * 0x4);
+    if (direction == AIE::DMAChannelDir::MM2S)
+      offset += 0x8;
+  } else if (isMemTile(col, row)) {
+    offset = 0x000A0660 + (channel * 0x4);
+    if (direction == AIE::DMAChannelDir::MM2S)
+      offset += 0x20;
+  } else if (isCoreTile(col, row)) {
+    offset = 0x0001DF00 + (channel * 0x4);
+    if (direction == AIE::DMAChannelDir::MM2S)
+      offset += 0x10;
+  } else {
+    return std::nullopt;
   }
 
   return ((col & 0xff) << getColumnShift()) | ((row & 0xff) << getRowShift()) |
@@ -675,7 +1219,7 @@ bool AIE2TargetModel::isLegalTileConnection(int col, int row,
   // Lambda function to check if a bundle is in a list
   auto isBundleInList = [](WireBundle bundle,
                            std::initializer_list<WireBundle> bundles) {
-    return std::find(bundles.begin(), bundles.end(), bundle) != bundles.end();
+    return llvm::find(bundles, bundle) != bundles.end();
   };
 
   // Memtile
@@ -731,7 +1275,7 @@ bool AIE2TargetModel::isLegalTileConnection(int col, int row,
     }
   }
   // Coretile
-  else if (isCoreTile(col, row)) {
+  if (isCoreTile(col, row)) {
     if (isBundleInList(srcBundle,
                        {WireBundle::DMA, WireBundle::FIFO, WireBundle::South,
                         WireBundle::West, WireBundle::North, WireBundle::East}))
@@ -778,6 +1322,311 @@ AIE2TargetModel::getLocalLockAddress(uint32_t lockId, TileID tile) const {
       lockId < getNumLocks(tile.col, tile.row))
     return shimTileBaseAddress + lockAddrOffset * lockId;
 
+  return std::nullopt;
+}
+
+namespace {
+namespace aie2_port_id {
+namespace core {
+
+// Slave port offset/size constants
+static constexpr uint32_t S_CORE_OFFSET = 0;
+static constexpr uint32_t S_CORE_SIZE = 1;
+static constexpr uint32_t S_CTRL_OFFSET = 3;
+static constexpr uint32_t S_CTRL_SIZE = 1;
+static constexpr uint32_t S_DMA_OFFSET = 1;
+static constexpr uint32_t S_DMA_SIZE = 2;
+static constexpr uint32_t S_EAST_OFFSET = 19;
+static constexpr uint32_t S_EAST_SIZE = 4;
+static constexpr uint32_t S_FIFO_OFFSET = 4;
+static constexpr uint32_t S_FIFO_SIZE = 1;
+static constexpr uint32_t S_NORTH_OFFSET = 15;
+static constexpr uint32_t S_NORTH_SIZE = 4;
+static constexpr uint32_t S_SOUTH_OFFSET = 5;
+static constexpr uint32_t S_SOUTH_SIZE = 6;
+static constexpr uint32_t S_TRACE_OFFSET = 23;
+static constexpr uint32_t S_TRACE_SIZE = 2;
+static constexpr uint32_t S_WEST_OFFSET = 11;
+static constexpr uint32_t S_WEST_SIZE = 4;
+
+// Master port offset/size constants
+static constexpr uint32_t M_CORE_OFFSET = 0;
+static constexpr uint32_t M_CORE_SIZE = 1;
+static constexpr uint32_t M_CTRL_OFFSET = 3;
+static constexpr uint32_t M_CTRL_SIZE = 1;
+static constexpr uint32_t M_DMA_OFFSET = 1;
+static constexpr uint32_t M_DMA_SIZE = 2;
+static constexpr uint32_t M_EAST_OFFSET = 19;
+static constexpr uint32_t M_EAST_SIZE = 4;
+static constexpr uint32_t M_FIFO_OFFSET = 4;
+static constexpr uint32_t M_FIFO_SIZE = 1;
+static constexpr uint32_t M_NORTH_OFFSET = 13;
+static constexpr uint32_t M_NORTH_SIZE = 6;
+static constexpr uint32_t M_SOUTH_OFFSET = 5;
+static constexpr uint32_t M_SOUTH_SIZE = 4;
+static constexpr uint32_t M_WEST_OFFSET = 9;
+static constexpr uint32_t M_WEST_SIZE = 4;
+
+} // namespace core
+
+namespace mem {
+
+// Slave port offset/size constants
+static constexpr uint32_t S_CTRL_OFFSET = 6;
+static constexpr uint32_t S_CTRL_SIZE = 1;
+static constexpr uint32_t S_DMA_OFFSET = 0;
+static constexpr uint32_t S_DMA_SIZE = 6;
+static constexpr uint32_t S_NORTH_OFFSET = 13;
+static constexpr uint32_t S_NORTH_SIZE = 4;
+static constexpr uint32_t S_SOUTH_OFFSET = 7;
+static constexpr uint32_t S_SOUTH_SIZE = 6;
+static constexpr uint32_t S_TRACE_OFFSET = 17;
+static constexpr uint32_t S_TRACE_SIZE = 1;
+
+// Master port offset/size constants
+static constexpr uint32_t M_CTRL_OFFSET = 6;
+static constexpr uint32_t M_CTRL_SIZE = 1;
+static constexpr uint32_t M_DMA_OFFSET = 0;
+static constexpr uint32_t M_DMA_SIZE = 6;
+static constexpr uint32_t M_NORTH_OFFSET = 11;
+static constexpr uint32_t M_NORTH_SIZE = 6;
+static constexpr uint32_t M_SOUTH_OFFSET = 7;
+static constexpr uint32_t M_SOUTH_SIZE = 4;
+
+} // namespace mem
+
+namespace shim {
+
+// Slave port offset/size constants
+static constexpr uint32_t S_CTRL_OFFSET = 0;
+static constexpr uint32_t S_CTRL_SIZE = 1;
+static constexpr uint32_t S_EAST_OFFSET = 18;
+static constexpr uint32_t S_EAST_SIZE = 4;
+static constexpr uint32_t S_FIFO_OFFSET = 1;
+static constexpr uint32_t S_FIFO_SIZE = 1;
+static constexpr uint32_t S_NORTH_OFFSET = 14;
+static constexpr uint32_t S_NORTH_SIZE = 4;
+static constexpr uint32_t S_SOUTH_OFFSET = 2;
+static constexpr uint32_t S_SOUTH_SIZE = 8;
+static constexpr uint32_t S_TRACE_OFFSET = 22;
+static constexpr uint32_t S_TRACE_SIZE = 2;
+static constexpr uint32_t S_WEST_OFFSET = 10;
+static constexpr uint32_t S_WEST_SIZE = 4;
+
+// Master port offset/size constants
+static constexpr uint32_t M_CTRL_OFFSET = 0;
+static constexpr uint32_t M_CTRL_SIZE = 1;
+static constexpr uint32_t M_EAST_OFFSET = 18;
+static constexpr uint32_t M_EAST_SIZE = 4;
+static constexpr uint32_t M_FIFO_OFFSET = 1;
+static constexpr uint32_t M_FIFO_SIZE = 1;
+static constexpr uint32_t M_NORTH_OFFSET = 12;
+static constexpr uint32_t M_NORTH_SIZE = 6;
+static constexpr uint32_t M_SOUTH_OFFSET = 2;
+static constexpr uint32_t M_SOUTH_SIZE = 6;
+static constexpr uint32_t M_WEST_OFFSET = 8;
+static constexpr uint32_t M_WEST_SIZE = 4;
+
+} // namespace shim
+} // namespace aie2_port_id
+} // namespace
+
+std::optional<uint32_t> AIE2TargetModel::getStreamSwitchPortIndex(
+    int col, int row, WireBundle bundle, uint32_t port_num, bool master) const {
+
+  if (master) {
+    if (isCoreTile(col, row)) {
+      switch (bundle) {
+      case WireBundle::Core:
+        if (port_num >= aie2_port_id::core::M_CORE_SIZE)
+          return std::nullopt;
+        return aie2_port_id::core::M_CORE_OFFSET + port_num;
+      case WireBundle::TileControl:
+        if (port_num >= aie2_port_id::core::M_CTRL_SIZE)
+          return std::nullopt;
+        return aie2_port_id::core::M_CTRL_OFFSET + port_num;
+      case WireBundle::DMA:
+        if (port_num >= aie2_port_id::core::M_DMA_SIZE)
+          return std::nullopt;
+        return aie2_port_id::core::M_DMA_OFFSET + port_num;
+      case WireBundle::East:
+        if (port_num >= aie2_port_id::core::M_EAST_SIZE)
+          return std::nullopt;
+        return aie2_port_id::core::M_EAST_OFFSET + port_num;
+      case WireBundle::FIFO:
+        if (port_num >= aie2_port_id::core::M_FIFO_SIZE)
+          return std::nullopt;
+        return aie2_port_id::core::M_FIFO_OFFSET + port_num;
+      case WireBundle::North:
+        if (port_num >= aie2_port_id::core::M_NORTH_SIZE)
+          return std::nullopt;
+        return aie2_port_id::core::M_NORTH_OFFSET + port_num;
+      case WireBundle::South:
+        if (port_num >= aie2_port_id::core::M_SOUTH_SIZE)
+          return std::nullopt;
+        return aie2_port_id::core::M_SOUTH_OFFSET + port_num;
+      case WireBundle::West:
+        if (port_num >= aie2_port_id::core::M_WEST_SIZE)
+          return std::nullopt;
+        return aie2_port_id::core::M_WEST_OFFSET + port_num;
+      default:
+        return std::nullopt;
+      }
+    } else if (isMemTile(col, row)) {
+      switch (bundle) {
+      case WireBundle::TileControl:
+        if (port_num >= aie2_port_id::mem::M_CTRL_SIZE)
+          return std::nullopt;
+        return aie2_port_id::mem::M_CTRL_OFFSET + port_num;
+      case WireBundle::DMA:
+        if (port_num >= aie2_port_id::mem::M_DMA_SIZE)
+          return std::nullopt;
+        return aie2_port_id::mem::M_DMA_OFFSET + port_num;
+      case WireBundle::North:
+        if (port_num >= aie2_port_id::mem::M_NORTH_SIZE)
+          return std::nullopt;
+        return aie2_port_id::mem::M_NORTH_OFFSET + port_num;
+      case WireBundle::South:
+        if (port_num >= aie2_port_id::mem::M_SOUTH_SIZE)
+          return std::nullopt;
+        return aie2_port_id::mem::M_SOUTH_OFFSET + port_num;
+      default:
+        return std::nullopt;
+      }
+    } else if (isShimNOCTile(col, row)) {
+      switch (bundle) {
+      case WireBundle::TileControl:
+        if (port_num >= aie2_port_id::shim::M_CTRL_SIZE)
+          return std::nullopt;
+        return aie2_port_id::shim::M_CTRL_OFFSET + port_num;
+      case WireBundle::East:
+        if (port_num >= aie2_port_id::shim::M_EAST_SIZE)
+          return std::nullopt;
+        return aie2_port_id::shim::M_EAST_OFFSET + port_num;
+      case WireBundle::FIFO:
+        if (port_num >= aie2_port_id::shim::M_FIFO_SIZE)
+          return std::nullopt;
+        return aie2_port_id::shim::M_FIFO_OFFSET + port_num;
+      case WireBundle::North:
+        if (port_num >= aie2_port_id::shim::M_NORTH_SIZE)
+          return std::nullopt;
+        return aie2_port_id::shim::M_NORTH_OFFSET + port_num;
+      case WireBundle::South:
+        if (port_num >= aie2_port_id::shim::M_SOUTH_SIZE)
+          return std::nullopt;
+        return aie2_port_id::shim::M_SOUTH_OFFSET + port_num;
+      case WireBundle::West:
+        if (port_num >= aie2_port_id::shim::M_WEST_SIZE)
+          return std::nullopt;
+        return aie2_port_id::shim::M_WEST_OFFSET + port_num;
+      default:
+        return std::nullopt;
+      }
+    }
+    // Slave ports
+  } else {
+
+    if (isCoreTile(col, row)) {
+      switch (bundle) {
+      case WireBundle::Core:
+        if (port_num >= aie2_port_id::core::S_CORE_SIZE)
+          return std::nullopt;
+        return aie2_port_id::core::S_CORE_OFFSET + port_num;
+      case WireBundle::TileControl:
+        if (port_num >= aie2_port_id::core::S_CTRL_SIZE)
+          return std::nullopt;
+        return aie2_port_id::core::S_CTRL_OFFSET + port_num;
+      case WireBundle::DMA:
+        if (port_num >= aie2_port_id::core::S_DMA_SIZE)
+          return std::nullopt;
+        return aie2_port_id::core::S_DMA_OFFSET + port_num;
+      case WireBundle::East:
+        if (port_num >= aie2_port_id::core::S_EAST_SIZE)
+          return std::nullopt;
+        return aie2_port_id::core::S_EAST_OFFSET + port_num;
+      case WireBundle::FIFO:
+        if (port_num >= aie2_port_id::core::S_FIFO_SIZE)
+          return std::nullopt;
+        return aie2_port_id::core::S_FIFO_OFFSET + port_num;
+      case WireBundle::North:
+        if (port_num >= aie2_port_id::core::S_NORTH_SIZE)
+          return std::nullopt;
+        return aie2_port_id::core::S_NORTH_OFFSET + port_num;
+      case WireBundle::South:
+        if (port_num >= aie2_port_id::core::S_SOUTH_SIZE)
+          return std::nullopt;
+        return aie2_port_id::core::S_SOUTH_OFFSET + port_num;
+      case WireBundle::Trace:
+        if (port_num >= aie2_port_id::core::S_TRACE_SIZE)
+          return std::nullopt;
+        return aie2_port_id::core::S_TRACE_OFFSET + port_num;
+      case WireBundle::West:
+        if (port_num >= aie2_port_id::core::S_WEST_SIZE)
+          return std::nullopt;
+        return aie2_port_id::core::S_WEST_OFFSET + port_num;
+      default:
+        return std::nullopt;
+      }
+    } else if (isMemTile(col, row)) {
+      switch (bundle) {
+      case WireBundle::TileControl:
+        if (port_num >= aie2_port_id::mem::S_CTRL_SIZE)
+          return std::nullopt;
+        return aie2_port_id::mem::S_CTRL_OFFSET + port_num;
+      case WireBundle::DMA:
+        if (port_num >= aie2_port_id::mem::S_DMA_SIZE)
+          return std::nullopt;
+        return aie2_port_id::mem::S_DMA_OFFSET + port_num;
+      case WireBundle::North:
+        if (port_num >= aie2_port_id::mem::S_NORTH_SIZE)
+          return std::nullopt;
+        return aie2_port_id::mem::S_NORTH_OFFSET + port_num;
+      case WireBundle::South:
+        if (port_num >= aie2_port_id::mem::S_SOUTH_SIZE)
+          return std::nullopt;
+        return aie2_port_id::mem::S_SOUTH_OFFSET + port_num;
+      case WireBundle::Trace:
+        if (port_num >= aie2_port_id::mem::S_TRACE_SIZE)
+          return std::nullopt;
+        return aie2_port_id::mem::S_TRACE_OFFSET + port_num;
+      default:
+        return std::nullopt;
+      }
+    } else if (isShimNOCTile(col, row)) {
+      switch (bundle) {
+      case WireBundle::TileControl:
+        if (port_num >= aie2_port_id::shim::S_CTRL_SIZE)
+          return std::nullopt;
+        return aie2_port_id::shim::S_CTRL_OFFSET + port_num;
+      case WireBundle::East:
+        if (port_num >= aie2_port_id::shim::S_EAST_SIZE)
+          return std::nullopt;
+        return aie2_port_id::shim::S_EAST_OFFSET + port_num;
+      case WireBundle::FIFO:
+        if (port_num >= aie2_port_id::shim::S_FIFO_SIZE)
+          return std::nullopt;
+        return aie2_port_id::shim::S_FIFO_OFFSET + port_num;
+      case WireBundle::North:
+        if (port_num >= aie2_port_id::shim::S_NORTH_SIZE)
+          return std::nullopt;
+        return aie2_port_id::shim::S_NORTH_OFFSET + port_num;
+      case WireBundle::South:
+        if (port_num >= aie2_port_id::shim::S_SOUTH_SIZE)
+          return std::nullopt;
+        return aie2_port_id::shim::S_SOUTH_OFFSET + port_num;
+      case WireBundle::Trace:
+        if (port_num >= aie2_port_id::shim::S_TRACE_SIZE)
+          return std::nullopt;
+        return aie2_port_id::shim::S_TRACE_OFFSET + port_num;
+      case WireBundle::West:
+        if (port_num >= aie2_port_id::shim::S_WEST_SIZE)
+          return std::nullopt;
+        return aie2_port_id::shim::S_WEST_OFFSET + port_num;
+      default:
+        return std::nullopt;
+      }
+    }
+  }
   return std::nullopt;
 }
 
@@ -891,6 +1740,16 @@ AIETargetModel::getMemLocalBaseAddress(int localCol, int localRow, int memCol,
   return std::nullopt;
 }
 
+uint32_t AIETargetModel::getNumDMAChannels(int col, int row,
+                                           AIE::DMAChannelDir dir) const {
+  bool mm2s = dir == AIE::DMAChannelDir::MM2S;
+  if (isShimNOCorPLTile(col, row))
+    return mm2s ? getNumSourceShimMuxConnections(col, row, WireBundle::DMA)
+                : getNumDestShimMuxConnections(col, row, WireBundle::DMA);
+  return mm2s ? getNumSourceSwitchboxConnections(col, row, WireBundle::DMA)
+              : getNumDestSwitchboxConnections(col, row, WireBundle::DMA);
+}
+
 bool AIETargetModel::isSupportedBlockFormat(std::string const &format) const {
   return false;
 }
@@ -907,6 +1766,76 @@ bool BaseNPU2TargetModel::isSupportedBlockFormat(
     std::string const &format) const {
   std::set<std::string> supportedTypes = {"v8bfp16ebs8", "v16bfp16ebs16"};
   return static_cast<bool>(supportedTypes.find(format) != supportedTypes.end());
+}
+
+// AIE2PS overrides: shim DMA registers are at different offsets than AIE2.
+// Memtile and core tile DMA addresses are identical to AIE2.
+uint64_t
+AIE2PSTargetModel::getDmaBdAddress(int col, int row, uint32_t bd_id,
+                                   int channel,
+                                   AIE::DMAChannelDir direction) const {
+  if (isShimNOCTile(col, row)) {
+    uint64_t offset = 0x00009000 + bd_id * 0x30;
+    return ((col & 0xff) << getColumnShift()) |
+           ((row & 0xff) << getRowShift()) | offset;
+  }
+  // Memtile and core tile use same addresses as AIE2.
+  return AIE2TargetModel::getDmaBdAddress(col, row, bd_id, channel, direction);
+}
+
+uint32_t
+AIE2PSTargetModel::getDmaControlAddress(int col, int row, int channel,
+                                        AIE::DMAChannelDir direction) const {
+  if (isShimNOCTile(col, row)) {
+    uint32_t offset = 0x00009300 + (channel * 0x8);
+    if (direction == AIE::DMAChannelDir::MM2S)
+      offset += 0x10;
+    return ((col & 0xff) << getColumnShift()) |
+           ((row & 0xff) << getRowShift()) | offset;
+  }
+  // Memtile and core tile use same addresses as AIE2.
+  return AIE2TargetModel::getDmaControlAddress(col, row, channel, direction);
+}
+
+std::optional<uint32_t>
+AIE2PSTargetModel::getDmaStatusAddress(int col, int row, int channel,
+                                       AIE::DMAChannelDir direction) const {
+  // The AIE2PS shim relocates its DMA registers (control is at 0x9300, not
+  // 0x1D200), and the status block has not been confirmed against a register
+  // spec. Report "unknown" rather than guess an address a maskpoll would then
+  // read garbage from; memtile and core tiles match AIE2.
+  if (isShimNOCTile(col, row))
+    return std::nullopt;
+  return AIE2TargetModel::getDmaStatusAddress(col, row, channel, direction);
+}
+
+// AIE2PS shim tiles have uC stream switch port for routing TCT to CERT uC.
+uint32_t
+AIE2PSTargetModel::getNumDestSwitchboxConnections(int col, int row,
+                                                  WireBundle bundle) const {
+  if (isShimNOCTile(col, row) && bundle == WireBundle::Controller32)
+    return 1;
+  return AIE2TargetModel::getNumDestSwitchboxConnections(col, row, bundle);
+}
+
+uint32_t
+AIE2PSTargetModel::getNumSourceSwitchboxConnections(int col, int row,
+                                                    WireBundle bundle) const {
+  if (isShimNOCTile(col, row) && bundle == WireBundle::Controller32)
+    return 1;
+  return AIE2TargetModel::getNumSourceSwitchboxConnections(col, row, bundle);
+}
+
+std::optional<uint32_t> AIE2PSTargetModel::getStreamSwitchPortIndex(
+    int col, int row, WireBundle bundle, uint32_t channel, bool master) const {
+  // AIE2PS shim: Controller32 maps to hw master port 22 / slave port 23.
+  if (isShimNOCTile(col, row) && bundle == WireBundle::Controller32) {
+    if (channel > 0)
+      return std::nullopt;
+    return master ? 22 : 23;
+  }
+  return AIE2TargetModel::getStreamSwitchPortIndex(col, row, bundle, channel,
+                                                   master);
 }
 
 } // namespace AIE

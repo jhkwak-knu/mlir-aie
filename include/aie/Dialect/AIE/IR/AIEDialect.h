@@ -1,10 +1,8 @@
 //===- AIEDialect.h ---------------------------------------------*- C++ -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2019-2022 Xilinx, Inc.
+// Copyright (C) 2022-2026 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2019 Xilinx Inc.
 //
 //===----------------------------------------------------------------------===//
 
@@ -12,15 +10,23 @@
 #define MLIR_AIE_DIALECT_H
 
 #include "AIEEnums.h"
+#include "aie/Dialect/AIE/IR/AIECoreMemory.h"
 
 #include "aie/Dialect/AIE/IR/AIETargetModel.h"
 
+#include "mlir/Dialect/DLTI/Traits.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/Interfaces/DataLayoutInterfaces.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/OpImplementation.h"
+#include "mlir/IR/SymbolTable.h"
+#include "mlir/Interfaces/DataLayoutInterfaces.h"
+
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSwitch.h"
 
 namespace xilinx::AIE {
 
@@ -43,20 +49,158 @@ template <typename ConcreteType>
 struct SkipAccessibilityCheckTrait
     : mlir::OpTrait::TraitBase<ConcreteType, SkipAccessibilityCheckTrait> {};
 
+// Supplies `Symbol`'s visibility accessors for ops that keep visibility in a
+// plain `sym_visibility` attribute rather than in a tablegen-declared argument
+// (which is what upstream's `SymbolVisibility` trait requires).
+template <typename ConcreteType>
+struct AttrBasedSymbolVisibility
+    : mlir::OpTrait::TraitBase<ConcreteType, AttrBasedSymbolVisibility> {
+  static constexpr llvm::StringRef getVisibilityAttrName() {
+    return "sym_visibility";
+  }
+
+  // `mlir::detail::verifySymbol` only checks the inherent attribute, so it
+  // never sees ours.
+  static mlir::LogicalResult verifyTrait(mlir::Operation *op) {
+    mlir::Attribute vis = op->getAttr(getVisibilityAttrName());
+    if (!vis)
+      return mlir::success();
+    auto visStrAttr = llvm::dyn_cast<mlir::StringAttr>(vis);
+    if (!visStrAttr)
+      return op->emitOpError()
+             << "requires visibility attribute '" << getVisibilityAttrName()
+             << "' to be a string attribute, but got " << vis;
+    if (!llvm::is_contained(
+            llvm::ArrayRef<llvm::StringRef>{"public", "private", "nested"},
+            visStrAttr.getValue()))
+      return op->emitOpError()
+             << "visibility expected to be one of [\"public\", \"private\", "
+                "\"nested\"], but got "
+             << visStrAttr;
+    return mlir::success();
+  }
+
+  mlir::SymbolTable::Visibility getVisibility() {
+    mlir::StringAttr vis =
+        this->getOperation()->template getAttrOfType<mlir::StringAttr>(
+            getVisibilityAttrName());
+    if (!vis)
+      return mlir::SymbolTable::Visibility::Public;
+    return llvm::StringSwitch<mlir::SymbolTable::Visibility>(vis.getValue())
+        .Case("private", mlir::SymbolTable::Visibility::Private)
+        .Case("nested", mlir::SymbolTable::Visibility::Nested)
+        .Default(mlir::SymbolTable::Visibility::Public);
+  }
+
+  void setVisibility(mlir::SymbolTable::Visibility vis) {
+    mlir::Operation *op = this->getOperation();
+    if (vis == mlir::SymbolTable::Visibility::Public) {
+      op->removeAttr(getVisibilityAttrName());
+      return;
+    }
+    assert((vis == mlir::SymbolTable::Visibility::Private ||
+            vis == mlir::SymbolTable::Visibility::Nested) &&
+           "unknown symbol visibility kind");
+    llvm::StringRef visName =
+        vis == mlir::SymbolTable::Visibility::Private ? "private" : "nested";
+    op->setAttr(getVisibilityAttrName(),
+                mlir::StringAttr::get(op->getContext(), visName));
+  }
+};
+
+// Marker trait for operations that can be flow endpoints (e.g., TileOp, CoreOp,
+// MemOp)
+template <typename ConcreteType>
+struct IsFlowEndPoint : mlir::OpTrait::TraitBase<ConcreteType, IsFlowEndPoint> {
+};
+
 class TileOp;
+class RouteEndpointOp;
 
 uint32_t getShimBurstLengthBytes(const AIE::AIETargetModel &tm,
                                  uint32_t burstLength);
 uint32_t getShimBurstLengthEncoding(const AIE::AIETargetModel &tm,
                                     uint32_t burstLength);
 
+// Looks up a name, falling back to a scan for the `sym_name` attribute.
+// `aie.buffer`, `aie.external_buffer`, `aie.lock` and `aie.dma` are referred to
+// by name but define an SSA value, so they cannot be `Symbol` ops and
+// `mlir::SymbolTable` does not find them.
+mlir::Operation *lookupNamedOpIn(mlir::Operation *symbolTableOp,
+                                 mlir::StringAttr name);
+mlir::Operation *lookupNamedOpIn(mlir::Operation *symbolTableOp,
+                                 llvm::StringRef name);
+// Looks in the symbol table nearest to (or at) `from`.
+mlir::Operation *lookupNamedOp(mlir::Operation *from, mlir::StringAttr name);
+mlir::Operation *lookupNamedOp(mlir::Operation *from, llvm::StringRef name);
+
+template <typename OpTy, typename NameT>
+OpTy lookupNamedOpIn(mlir::Operation *symbolTableOp, NameT name) {
+  return llvm::dyn_cast_if_present<OpTy>(lookupNamedOpIn(symbolTableOp, name));
+}
+
+template <typename OpTy, typename NameT>
+OpTy lookupNamedOp(mlir::Operation *from, NameT name) {
+  return llvm::dyn_cast_if_present<OpTy>(lookupNamedOp(from, name));
+}
+
+// `lookupNamedOpIn` indexed once, for resolving many names in a symbol table
+// whose named ops do not change meanwhile.
+class NamedOpTable {
+public:
+  explicit NamedOpTable(mlir::Operation *symbolTableOp);
+
+  mlir::Operation *lookup(mlir::StringAttr name) const {
+    return ops.lookup(name);
+  }
+  template <typename OpTy>
+  OpTy lookup(mlir::StringAttr name) const {
+    return llvm::dyn_cast_if_present<OpTy>(lookup(name));
+  }
+
+  // "<prefix><n>" for the first n from `counter` up that no op in the table
+  // has. `counter` moves past n, so names drawn from one counter differ
+  // although the table does not record them.
+  std::string uniqueName(llvm::StringRef prefix, unsigned &counter) const;
+
+private:
+  mlir::MLIRContext *context;
+  llvm::DenseMap<mlir::StringAttr, mlir::Operation *> ops;
+};
+
+// The NamedOpTables of several symbol tables, each indexed on first use, as
+// mlir::SymbolTableCollection is for symbols.
+class NamedOpTableCollection {
+public:
+  NamedOpTable &getTable(mlir::Operation *symbolTableOp) {
+    return tables.try_emplace(symbolTableOp, symbolTableOp).first->second;
+  }
+  template <typename OpTy>
+  OpTy lookupIn(mlir::Operation *symbolTableOp, mlir::StringAttr name) {
+    return getTable(symbolTableOp).lookup<OpTy>(name);
+  }
+
+private:
+  llvm::DenseMap<mlir::Operation *, NamedOpTable> tables;
+};
+
 mlir::LogicalResult
 verifyOffsetSizeAndStrideOp(mlir::OffsetSizeAndStrideOpInterface op);
 
-} // namespace xilinx::AIE
+// custom<TypedDynamicIndexList>($values, $integers, type($values)): the
+// upstream custom<DynamicIndexList> with an optional type on each SSA entry,
+// `%v` for i64 and `%v : type` otherwise.
+mlir::ParseResult parseTypedDynamicIndexList(
+    mlir::OpAsmParser &parser,
+    llvm::SmallVectorImpl<mlir::OpAsmParser::UnresolvedOperand> &values,
+    mlir::DenseI64ArrayAttr &integers,
+    llvm::SmallVectorImpl<mlir::Type> &types);
+void printTypedDynamicIndexList(mlir::OpAsmPrinter &printer,
+                                mlir::Operation *op, mlir::OperandRange values,
+                                llvm::ArrayRef<int64_t> integers,
+                                mlir::TypeRange types);
 
-/// Include the generated interface declarations.
-#include "aie/Dialect/AIE/IR/AIEInterfaces.h.inc"
+} // namespace xilinx::AIE
 
 namespace xilinx::AIE {
 mlir::LogicalResult
@@ -100,6 +244,9 @@ void registerAIETranslations();
 #define GET_ATTRDEF_CLASSES
 #include "aie/Dialect/AIE/IR/AIEAttrs.h.inc"
 
+// Interfaces come after the attributes and types their methods traffic in.
+#include "aie/Dialect/AIE/IR/AIEInterfaces.h.inc"
+
 ////////////////////////////////////////////////////////////////////////////////
 //////////////////// Custom Operations for the Dialect /////////////////////////
 ////////////////////////////////////////////////////////////////////////////////
@@ -131,29 +278,7 @@ using Port = struct Port {
 
   friend std::ostream &operator<<(std::ostream &os, const Port &port) {
     os << "(";
-    switch (port.bundle) {
-    case WireBundle::Core:
-      os << "Core";
-      break;
-    case WireBundle::DMA:
-      os << "DMA";
-      break;
-    case WireBundle::North:
-      os << "N";
-      break;
-    case WireBundle::East:
-      os << "E";
-      break;
-    case WireBundle::South:
-      os << "S";
-      break;
-    case WireBundle::West:
-      os << "W";
-      break;
-    default:
-      os << "X";
-      break;
-    }
+    os << stringifyWireBundle(port.bundle).str();
     os << ": " << std::to_string(port.channel) << ")";
     return os;
   }
@@ -165,8 +290,11 @@ using Port = struct Port {
     os << to_string(port);
     return os;
   }
-
 };
+
+std::optional<std::pair<TileID, Port>>
+getConnectingWireEndpoint(const AIETargetModel &targetModel, TileID tile,
+                          Port port);
 
 using Connect = struct Connect {
   Port src;
@@ -174,6 +302,12 @@ using Connect = struct Connect {
 
   bool operator==(const Connect &rhs) const {
     return std::tie(src, dst) == std::tie(rhs.src, rhs.dst);
+  }
+
+  bool operator!=(const Connect &rhs) const { return !(*this == rhs); }
+
+  bool operator<(const Connect &rhs) const {
+    return std::tie(src, dst) < std::tie(rhs.src, rhs.dst);
   }
 };
 
@@ -189,14 +323,40 @@ using DMAChannel = struct DMAChannel {
 const AIETargetModel &getTargetModel(mlir::Operation *op);
 const AIETargetModel &getTargetModel(AIEDevice device);
 
+/// Which of `a`'s and `b`'s memory modules both tiles can address.
+AIETargetModel::SharedMemory sharedMemory(TileOp a, TileOp b);
+
 mlir::ParseResult
 parseObjectFifoProducerTile(mlir::OpAsmParser &parser,
                             mlir::OpAsmParser::UnresolvedOperand &operand,
                             BDDimLayoutArrayAttr &dimensions);
 
 void printObjectFifoProducerTile(mlir::OpAsmPrinter &printer,
-                                 mlir::Operation *op, mlir::Value tile,
+                                 mlir::Operation *op, mlir::Value operand,
                                  BDDimLayoutArrayAttr dimensions);
+
+mlir::ParseResult parseDMAStartChannel(mlir::OpAsmParser &parser,
+                                       mlir::Attribute &channel);
+
+void printDMAStartChannel(mlir::OpAsmPrinter &printer, mlir::Operation *op,
+                          mlir::Attribute channel);
+
+mlir::ParseResult
+parseObjectFifoAcquireObjects(mlir::OpAsmParser &parser,
+                              ObjectFifoPortAttr &port,
+                              llvm::SmallVectorImpl<mlir::Type> &objects);
+
+void printObjectFifoAcquireObjects(mlir::OpAsmPrinter &printer,
+                                   mlir::Operation *op, ObjectFifoPortAttr port,
+                                   mlir::TypeRange objects);
+
+mlir::ParseResult parseObjectFifoReleaseCount(mlir::OpAsmParser &parser,
+                                              ObjectFifoPortAttr &port,
+                                              mlir::IntegerAttr &size);
+
+void printObjectFifoReleaseCount(mlir::OpAsmPrinter &printer,
+                                 mlir::Operation *op, ObjectFifoPortAttr port,
+                                 mlir::IntegerAttr size);
 
 mlir::ParseResult parseObjectFifoConsumerTiles(
     mlir::OpAsmParser &parser,
@@ -205,9 +365,61 @@ mlir::ParseResult parseObjectFifoConsumerTiles(
 
 void printObjectFifoConsumerTiles(mlir::OpAsmPrinter &printer,
                                   mlir::Operation *op, mlir::OperandRange tiles,
-                                  BDDimLayoutArrayArrayAttr dimensions);
+                                  BDDimLayoutArrayArrayAttr dimsPerTileAttr);
+
+mlir::ParseResult
+parseFlowVias(mlir::OpAsmParser &parser,
+              llvm::SmallVectorImpl<mlir::OpAsmParser::UnresolvedOperand> &vias,
+              mlir::DenseI32ArrayAttr &ingressBundles,
+              mlir::DenseI32ArrayAttr &ingressChannels,
+              mlir::DenseI32ArrayAttr &egressBundles,
+              mlir::DenseI32ArrayAttr &egressChannels);
+
+void printFlowVias(mlir::OpAsmPrinter &printer, mlir::Operation *op,
+                   mlir::OperandRange vias,
+                   mlir::DenseI32ArrayAttr ingressBundles,
+                   mlir::DenseI32ArrayAttr ingressChannels,
+                   mlir::DenseI32ArrayAttr egressBundles,
+                   mlir::DenseI32ArrayAttr egressChannels);
 
 int32_t getBufferBaseAddress(mlir::Operation *bufOp);
+
+// Trace Event Value Parsing/Printing (handles both string and typed enums)
+mlir::ParseResult parseTraceEvent(mlir::AsmParser &parser,
+                                  mlir::Attribute &result);
+void printTraceEventEnum(mlir::AsmPrinter &printer, mlir::Attribute attr);
+
+} // namespace xilinx::AIE
+
+namespace xilinx::AIE {
+
+// A draining walk over a whole stream of objects rather than one of them:
+// output `j` walks `inner` from object `advance * j - top` on, reading `span`
+// consecutive objects through the inner dimension `rowDim` steps by one
+// object (none when `span` is 1); the `top` objects before the first and
+// `bottom` past the last of `objects` read as zeros.
+struct StreamWindow {
+  int64_t objectSize;
+  int64_t outputs;
+  int64_t advance;
+  int64_t span;
+  int64_t top;
+  int64_t bottom;
+  int64_t objects;
+  int64_t rowDim;
+  llvm::SmallVector<BDDimLayoutAttr> inner;
+
+  // Elements each output moves.
+  int64_t transfer() const;
+};
+
+// One output of a StreamWindow: the first object it reads, counting the `top`
+// zero objects, and the lock units it takes before and gives back after.
+struct StreamWindowStep {
+  int64_t first;
+  int64_t acquire;
+  int64_t release;
+};
 
 } // namespace xilinx::AIE
 
@@ -216,23 +428,26 @@ int32_t getBufferBaseAddress(mlir::Operation *bufOp);
 #include "aie/Dialect/AIE/IR/AIEOps.h.inc"
 
 namespace xilinx::AIE {
-class DeviceOp;
-class ShimDMAAllocationOp;
-struct ShimDMAllocationGetter {
-public:
-  std::optional<AIE::ShimDMAAllocationOp> get(DeviceOp dev,
-                                              mlir::StringRef sym_name);
 
-private:
-  llvm::DenseMap<std::pair<DeviceOp, mlir::StringRef>,
-                 std::optional<AIE::ShimDMAAllocationOp>>
-      allocGetter;
-  std::optional<AIE::ShimDMAAllocationOp>
-  cachelessGet(DeviceOp dev, mlir::StringRef sym_name);
-};
-} // namespace xilinx::AIE
+// The endpoints `end`'s `turns` names, each once, in order of first turn;
+// none when it takes no turns.
+llvm::SmallVector<ObjectFifoDmaEndpointOp>
+turnEndpoints(ObjectFifoDmaEndpointOp end);
 
-namespace xilinx::AIE {
+// Passes a chain of turns is unrolled for, given each end's turns a pass and
+// descriptors: until every end is back at its first descriptor. An end on a
+// contiguous pool, given 0 descriptors, takes as many as its turns need.
+int64_t turnPasses(llvm::ArrayRef<std::pair<int64_t, int64_t>> ends);
+
+// Whether packets leave `master` of `tile` with their header: not into a DMA,
+// nor down the shim's South to one, unless `keep` says.
+bool keepsPktHeader(TileID tile, Port master, std::optional<bool> keep);
+
+// Whether `bundle` links a switchbox to a neighbouring one.
+inline bool isDirectional(WireBundle bundle) {
+  return bundle == WireBundle::North || bundle == WireBundle::South ||
+         bundle == WireBundle::East || bundle == WireBundle::West;
+}
 
 void collectTiles(DeviceOp &device,
                   llvm::DenseMap<TileID, mlir::Operation *> &tiles);
@@ -240,22 +455,122 @@ void collectTiles(DeviceOp &device,
 void collectBuffers(
     DeviceOp &device,
     llvm::DenseMap<mlir::Operation *, llvm::SmallVector<BufferOp, 4>> &buffers);
+
+// Returns true when a BDDimLayoutAttr array (outermost-first) describes a
+// contiguous row-major scan: innermost stride == 1 and each outer stride
+// equals the product of all inner sizes.  Used by DMABDOp verification and
+// canonicalization to allow natural ND forms on shim tiles that will be
+// linearized by the compiler.
+bool isContiguousBDTransfer(llvm::ArrayRef<BDDimLayoutAttr> dims);
+
+// The elements a BD streaming `dims` with `pads` sends, each dimension widened
+// by its padding; `fallback` unless it has both.
+int64_t paddedSize(llvm::ArrayRef<BDDimLayoutAttr> dims,
+                   llvm::ArrayRef<BDPadLayoutAttr> pads, int64_t fallback);
+
+// The dimensions aie-normalize-dma-bd-dims leaves a constant BD with, given its
+// dimensions (outermost first) and its length in elements: none when it
+// becomes one linear transfer, else its size-1 dimensions dropped. nullopt
+// when it stays as written: no size-1 dimension, or a length that is not the
+// dimensions' product (a leading repeat outside the length).
+std::optional<llvm::SmallVector<BDDimLayoutAttr>>
+normalizedBDDims(llvm::ArrayRef<BDDimLayoutAttr> dims, int64_t len);
+
+// The byte size of `lengthUnit` elements of `buffer`, checked to be a multiple
+// of 16 bytes whose word count fits a 32-bit BD length.
+mlir::FailureOr<int64_t> getLengthUnitBytes(mlir::Operation *op,
+                                            int64_t lengthUnit,
+                                            mlir::BaseMemRefType buffer);
+
+// Validate a BD's runtime length (`length_parameter`, see aie.dma_bd) against
+// its static pattern, shared by aie.dma_bd and aiex.npu.dma_memcpy_nd.
+// `lenElems` is the static length of one iteration, in elements. `contiguous`
+// says the BD is lowered in linear mode; otherwise the added length continues
+// the third dimension as placed by placeRuntimeLengthDimension, so
+// `innerSizes` (the three innermost sizes, innermost-first) must give it a
+// size above one and a row that divides the length unit.
+mlir::LogicalResult verifyLengthParameter(mlir::Operation *op,
+                                          std::optional<int64_t> lengthUnit,
+                                          mlir::BaseMemRefType buffer,
+                                          std::optional<int64_t> lenElems,
+                                          bool contiguous,
+                                          llvm::ArrayRef<int64_t> innerSizes);
+
+// The added length of a runtime-length BD steps the third dimension. When that
+// dimension has size one, its stride is not encoded, so a pattern stepping
+// rows in its second dimension is lowered with them in the third instead and
+// the second left at size one. `sizes` and `strides` are innermost-first and
+// hold at least three dimensions.
+void placeRuntimeLengthDimension(llvm::MutableArrayRef<int64_t> sizes,
+                                 llvm::MutableArrayRef<int64_t> strides);
+
+// Validate the tile a runtime-length BD is lowered on: an AIE2/AIE2P shim NOC
+// tile whose BD buffer length is a whole 32-bit register, which the firmware
+// update adds to.
+mlir::LogicalResult verifyLengthParameterTile(mlir::Operation *op,
+                                              const AIETargetModel &targetModel,
+                                              int col, int row);
+
+// Validate the sender-side out_of_order_id field on a single BD. Callable from
+// the AIEX dialect, whose runtime-sequence task BDs skip DMABDOp::verify.
+mlir::LogicalResult
+verifyDMABDOutOfOrderId(DMABDOp bd, bool packetEnabledByContext = false);
+
+// Validate a BD's iteration attribute against its tile type's iteration and
+// step fields. Callable from the AIEX dialect, like verifyDMABDOutOfOrderId.
+mlir::LogicalResult verifyDMABDIteration(DMABDOp bd, AIETileType tileType);
+
+// Below allocation a packet header is only useful once its id is assigned.
+// `what` names the attribute in the diagnostic. Callable from the AIEX
+// dialect, whose runtime ops carry the same header.
+mlir::LogicalResult verifyAssignedPacket(mlir::Operation *op,
+                                         PacketInfoAttr packet,
+                                         llvm::StringRef what = "packet");
+
+// Validate an out-of-order S2MM channel and its receive BDs.
+mlir::LogicalResult
+verifyOutOfOrderChannel(mlir::Operation *op, DMAChannelDir dir, bool outOfOrder,
+                        llvm::ArrayRef<DMABDOp> bds,
+                        bool packetEnabledByContext = false);
+
+// Validate the use_locks of one BD block and return them. A BD has one acquire
+// field and one release field; by convention the block uses either no lock or
+// both, except that an out-of-order BD may release alone. Either result is
+// null when the block has no such lock.
+mlir::LogicalResult verifyBdLockPair(mlir::Block &block, bool outOfOrder,
+                                     UseLockOp &acquire, UseLockOp &release);
+
+// The stream window `dims` (outermost first) and `pads` (`(top, bottom)` on
+// the outermost dimension only) describe over objects of `objectSize`
+// elements. The outermost dimension steps whole objects between outputs; at
+// most one inner dimension steps whole objects, by one; the others stay
+// within an object. Fills `window` on success.
+mlir::LogicalResult
+inferStreamWindow(llvm::ArrayRef<BDDimLayoutAttr> dims,
+                  llvm::ArrayRef<BDPadLayoutAttr> pads, int64_t objectSize,
+                  llvm::function_ref<mlir::InFlightDiagnostic()> emitError,
+                  StreamWindow &window);
+
+// Each output's step: it takes the objects up to the newest it reads and gives
+// back those no later output reads, the last one all that are left.
+llvm::SmallVector<StreamWindowStep> streamWindowSteps(const StreamWindow &w);
+
+// BD ids already assigned within a tile's static DMA program (the
+// aie.dma_bd chain(s) inside one DmaBody-implementing op: aie.mem,
+// aie.memtile_dma, aie.shim_dma).
+llvm::SmallVector<uint32_t> getAssignedBdIds(DmaBody program);
+
+// Fails, with an error on each, if a dma_start in `device` still names a route
+// endpoint in place of a channel index. For passes and translations that need
+// the index, which aie-objectfifo-allocate assigns.
+mlir::LogicalResult verifyDMAChannelsResolved(DeviceOp device);
+
 } // namespace xilinx::AIE
 
 namespace llvm {
 // Functions hash just like pointers.
 template <>
 struct DenseMapInfo<xilinx::AIE::ObjectFifoAcquireOp> {
-  static xilinx::AIE::ObjectFifoAcquireOp getEmptyKey() {
-    auto *pointer = DenseMapInfo<void *>::getEmptyKey();
-    return xilinx::AIE::ObjectFifoAcquireOp::getFromOpaquePointer(pointer);
-  }
-
-  static xilinx::AIE::ObjectFifoAcquireOp getTombstoneKey() {
-    auto *pointer = DenseMapInfo<void *>::getTombstoneKey();
-    return xilinx::AIE::ObjectFifoAcquireOp::getFromOpaquePointer(pointer);
-  }
-
   static unsigned getHashValue(xilinx::AIE::ObjectFifoAcquireOp val) {
     return hash_value(val.getAsOpaquePointer());
   }
@@ -271,16 +586,6 @@ namespace llvm {
 // Functions hash just like pointers.
 template <>
 struct DenseMapInfo<xilinx::AIE::ObjectFifoCreateOp> {
-  static xilinx::AIE::ObjectFifoCreateOp getEmptyKey() {
-    auto *pointer = DenseMapInfo<void *>::getEmptyKey();
-    return xilinx::AIE::ObjectFifoCreateOp::getFromOpaquePointer(pointer);
-  }
-
-  static xilinx::AIE::ObjectFifoCreateOp getTombstoneKey() {
-    auto *pointer = DenseMapInfo<void *>::getTombstoneKey();
-    return xilinx::AIE::ObjectFifoCreateOp::getFromOpaquePointer(pointer);
-  }
-
   static unsigned getHashValue(xilinx::AIE::ObjectFifoCreateOp val) {
     return hash_value(val.getAsOpaquePointer());
   }
@@ -295,14 +600,6 @@ template <>
 struct DenseMapInfo<xilinx::AIE::DMAChannel> {
   using FirstInfo = DenseMapInfo<xilinx::AIE::DMAChannelDir>;
   using SecondInfo = DenseMapInfo<int>;
-
-  static xilinx::AIE::DMAChannel getEmptyKey() {
-    return {FirstInfo::getEmptyKey(), SecondInfo::getEmptyKey()};
-  }
-
-  static xilinx::AIE::DMAChannel getTombstoneKey() {
-    return {FirstInfo::getTombstoneKey(), SecondInfo::getTombstoneKey()};
-  }
 
   static unsigned getHashValue(const xilinx::AIE::DMAChannel &d) {
     return detail::combineHashValue(FirstInfo::getHashValue(d.direction),
@@ -319,14 +616,6 @@ template <>
 struct DenseMapInfo<xilinx::AIE::Port> {
   using FirstInfo = DenseMapInfo<xilinx::AIE::WireBundle>;
   using SecondInfo = DenseMapInfo<int>;
-
-  static xilinx::AIE::Port getEmptyKey() {
-    return {FirstInfo::getEmptyKey(), SecondInfo::getEmptyKey()};
-  }
-
-  static xilinx::AIE::Port getTombstoneKey() {
-    return {FirstInfo::getTombstoneKey(), SecondInfo::getTombstoneKey()};
-  }
 
   static unsigned getHashValue(const xilinx::AIE::Port &d) {
     return detail::combineHashValue(FirstInfo::getHashValue(d.bundle),

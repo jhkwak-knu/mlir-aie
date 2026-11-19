@@ -1,10 +1,7 @@
 //===- Dialects.cpp ---------------------------------------------*- C++ -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2022-2024 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2022-2024 Advanced Micro Devices, Inc. or its affiliates
 //
 //===----------------------------------------------------------------------===//
 
@@ -39,19 +36,6 @@ MlirType aieObjectFifoTypeGet(MlirType type) {
 }
 
 //===---------------------------------------------------------------------===//
-// ObjectFifoSubviewType
-//===---------------------------------------------------------------------===//
-
-bool aieTypeIsObjectFifoSubviewType(MlirType type) {
-  return llvm::isa<xilinx::AIE::AIEObjectFifoSubviewType>(unwrap(type));
-}
-
-MlirType aieObjectFifoSubviewTypeGet(MlirType type) {
-  return wrap(xilinx::AIE::AIEObjectFifoSubviewType::get(
-      llvm::cast<mlir::MemRefType>(unwrap(type))));
-}
-
-//===---------------------------------------------------------------------===//
 // BlockFloatType
 //===---------------------------------------------------------------------===//
 
@@ -59,6 +43,99 @@ bool aieTypeIsBlockFloatType(MlirType type) {
   return llvm::isa<xilinx::AIEX::BlockFloatType>(unwrap(type));
 }
 
-MlirType aieBlockFloatTypeGet(MlirContext ctx, const std::string& blockType) {
+MlirType aieBlockFloatTypeGet(MlirContext ctx, const std::string &blockType) {
   return wrap(xilinx::AIEX::BlockFloatType::get(unwrap(ctx), blockType));
+}
+
+//===---------------------------------------------------------------------===//
+// Data layout
+//===---------------------------------------------------------------------===//
+
+uint64_t aieTypeGetSizeInBits(MlirType type) {
+  mlir::Type t = unwrap(type);
+  // Restricted to what the default layout can answer for, so an unrelated type
+  // reports "no size" instead of tripping the DataLayout assertion.
+  if (!llvm::isa<mlir::IntegerType, mlir::FloatType, mlir::IndexType,
+                 mlir::DataLayoutTypeInterface>(t))
+    return 0;
+  return mlir::DataLayout().getTypeSizeInBits(t);
+}
+
+//===---------------------------------------------------------------------===//
+// TileLike Interface
+//===---------------------------------------------------------------------===//
+
+bool aieOpImplementsTileLike(MlirOperation op) {
+  return llvm::isa<xilinx::AIE::TileLike>(unwrap(op));
+}
+
+bool aieTileLikeIsCoreTile(MlirOperation op) {
+  auto tileLike = llvm::dyn_cast<xilinx::AIE::TileLike>(unwrap(op));
+  return tileLike && tileLike.isCoreTile();
+}
+
+bool aieTileLikeIsMemTile(MlirOperation op) {
+  auto tileLike = llvm::dyn_cast<xilinx::AIE::TileLike>(unwrap(op));
+  return tileLike && tileLike.isMemTile();
+}
+
+bool aieTileLikeIsShimNOCTile(MlirOperation op) {
+  auto tileLike = llvm::dyn_cast<xilinx::AIE::TileLike>(unwrap(op));
+  return tileLike && tileLike.isShimNOCTile();
+}
+
+bool aieTileLikeIsShimPLTile(MlirOperation op) {
+  auto tileLike = llvm::dyn_cast<xilinx::AIE::TileLike>(unwrap(op));
+  return tileLike && tileLike.isShimPLTile();
+}
+
+bool aieTileLikeIsShimNOCorPLTile(MlirOperation op) {
+  auto tileLike = llvm::dyn_cast<xilinx::AIE::TileLike>(unwrap(op));
+  return tileLike && tileLike.isShimNOCorPLTile();
+}
+
+//===---------------------------------------------------------------------===//
+// TraceBufferAttr / TraceSliceAttr
+//===---------------------------------------------------------------------===//
+
+bool aieAttrIsTraceBuffer(MlirAttribute attr) {
+  return llvm::isa<xilinx::AIE::TraceBufferAttr>(unwrap(attr));
+}
+
+uint32_t aieTraceBufferGetArgIndex(MlirAttribute attr) {
+  return llvm::cast<xilinx::AIE::TraceBufferAttr>(unwrap(attr)).getArgIndex();
+}
+
+uint32_t aieTraceBufferGetOffset(MlirAttribute attr) {
+  return llvm::cast<xilinx::AIE::TraceBufferAttr>(unwrap(attr)).getOffset();
+}
+
+uint32_t aieTraceBufferGetSize(MlirAttribute attr) {
+  return llvm::cast<xilinx::AIE::TraceBufferAttr>(unwrap(attr)).getSize();
+}
+
+bool aieTraceBufferGetDedicated(MlirAttribute attr) {
+  return llvm::cast<xilinx::AIE::TraceBufferAttr>(unwrap(attr)).getDedicated();
+}
+
+bool aieAttrIsTraceSlice(MlirAttribute attr) {
+  return llvm::isa<xilinx::AIE::TraceSliceAttr>(unwrap(attr));
+}
+
+MlirStringRef aieTraceSliceGetDevice(MlirAttribute attr) {
+  return wrap(
+      llvm::cast<xilinx::AIE::TraceSliceAttr>(unwrap(attr)).getDevice());
+}
+
+MlirStringRef aieTraceSliceGetSequence(MlirAttribute attr) {
+  return wrap(
+      llvm::cast<xilinx::AIE::TraceSliceAttr>(unwrap(attr)).getSequence());
+}
+
+uint32_t aieTraceSliceGetOffset(MlirAttribute attr) {
+  return llvm::cast<xilinx::AIE::TraceSliceAttr>(unwrap(attr)).getOffset();
+}
+
+uint32_t aieTraceSliceGetSize(MlirAttribute attr) {
+  return llvm::cast<xilinx::AIE::TraceSliceAttr>(unwrap(attr)).getSize();
 }

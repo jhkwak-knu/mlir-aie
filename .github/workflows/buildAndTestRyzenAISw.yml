@@ -1,4 +1,11 @@
+# Copyright (C) 2024-2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
 name: Build and Test with Ryzen AI Sofware
+
+permissions:
+  contents: read
+  packages: read
 
 on:
   push:
@@ -12,6 +19,9 @@ on:
         type: string
         required: false
         default: ''
+  schedule:
+    # Runs at midnight (00:00) every day
+    - cron: '0 0 * * *'
 
 defaults:
   run:
@@ -31,20 +41,20 @@ jobs:
   build-repo:
     name: Build and Test with Ryzen AI Software
 
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     strategy:
       matrix:
         ubuntu_version: [ "ubuntu22", "ubuntu24" ]
     steps:
 
       - name: Free disk space
-        uses: descriptinc/free-disk-space@main
+        uses: descriptinc/free-disk-space@1b4b157593c6801212a2ed488c205e0a810b4592  # main
         with:
           tool-cache: true
           android: true
           dotnet: true
           haskell: true
-          large-packages: true
+          large-packages: false # The package list includes powershell, unavailable on Ubuntu 26.04.
           swap-storage: false
 
       - name: Docker prune
@@ -52,20 +62,34 @@ jobs:
         run: |
           docker system prune -a -f
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
-          submodules: "true"
-      - uses: uraimo/run-on-arch-action@v2.7.0
+          submodules: "recursive"
+
+      # The build runs inside a docker container (below), so this only
+      # primes a host-side cache dir. It is bind-mounted into the container
+      # with the same path and handed to ccache there via CCACHE_DIR, so the
+      # container's compiler invocations land in the same cache the
+      # actions/cache post-step later saves.
+      - uses: ./.github/actions/setup_ccache
+        id: setup_ccache
+        with:
+          MATRIX_OS: ${{ matrix.ubuntu_version }}
+          MATRIX_ARCH: x86
+          EXTRA_KEY: ryzenai-sw
+
+      - uses: ./.github/actions/run_x86_container
         name: Build and Test
         id: runcmd
         with:
-          distro: none
-          base_image: ghcr.io/xilinx/mlir-aie/${{ matrix.ubuntu_version }}-ryzenai-1.3.0ea:1.0
-          githubToken: ${{ github.token }}
-          dockerRunArgs: |
-            --mac-address 02:42:ac:11:00:02
+          image: ghcr.io/xilinx/mlir-aie/${{ matrix.ubuntu_version }}-ryzenai-1.3.0ea:1.0
+          github-token: ${{ github.token }}
+          mac-address: 02:42:ac:11:00:02
+          volumes: |
+            ${{ steps.setup_ccache.outputs.HOST_CCACHE_DIR }}:${{ steps.setup_ccache.outputs.HOST_CCACHE_DIR }}
           env: |
-            XILINXD_LICENSE_FILE: /opt/xilinx/Xilinx.lic
+            XILINXD_LICENSE_FILE=/opt/xilinx/Xilinx.lic
+            CCACHE_DIR=${{ steps.setup_ccache.outputs.HOST_CCACHE_DIR }}
           run: |
 
             MLIR_DIR=$PWD
@@ -89,16 +113,32 @@ jobs:
               git reset --hard ${{ inputs.AIE_COMMIT }}
             fi
 
+            pip install --upgrade pip
             pip install onnxruntime==1.17.0
-            pip install -r python/requirements.txt
+            python utils/mlir_aie_wheels/vendor_eudsl.py \
+                --requirements python/requirements.txt \
+                --install-non-eudsl
             pip install -r python/requirements_ml.txt
-            HOST_MLIR_PYTHON_PACKAGE_PREFIX=aie pip install -r python/requirements_extras.txt
+            # Ryzen AI 1.3 SDK is cp310-only (see python3.10 sed above).
+            # requirements_dev.lock targets py>=3.11 (drops cibuildwheel 3.x
+            # transitively); fall back to the loose .txt here.
+            pip install -r python/requirements_dev.txt
 
             VERSION=$(utils/clone-llvm.sh --get-wheel-version)
 
             cd /workspace
-            pip -q download mlir==$VERSION \
-              -f https://github.com/Xilinx/mlir-aie/releases/expanded_assets/mlir-distro
+            for attempt in 1 2 3; do
+              rm -f mlir-*.whl
+              if pip -q download mlir==$VERSION \
+                -f https://github.com/Xilinx/mlir-aie/releases/expanded_assets/mlir-distro; then
+                break
+              fi
+              if [ "$attempt" -eq 3 ]; then
+                echo "Failed to download MLIR wheel after ${attempt} attempts" >&2
+                exit 1
+              fi
+              sleep $((attempt * 5))
+            done
             unzip -q mlir-*.whl
 
             mkdir -p /workspace/install
@@ -115,7 +155,6 @@ jobs:
                 -DXRT_ROOT=/opt/xilinx/xrt \
                 -DAIE_ENABLE_PYTHON_PASSES=OFF \
                 -DAIE_ENABLE_XRT_PYTHON_BINDINGS=ON \
-                -DAIE_INCLUDE_INTEGRATION_TESTS=OFF \
                 -DAIE_VITIS_COMPONENTS='AIE2;AIE2P' \
                 -DPython3_EXECUTABLE=$(which python) \
                 -DLLVM_EXTERNAL_LIT=$(which lit) \
@@ -123,9 +162,15 @@ jobs:
                 -DCMAKE_MODULE_PATH=$MLIR_DIR/cmake/modulesXilinx \
                 -DMLIR_DIR=/workspace/mlir/lib/cmake/mlir
 
+            # See https://github.com/hendrikmuhs/ccache-action/issues/146:
+            # compare by content, not mtime, since the checkout the compiler
+            # invocations run against is fresh every job.
+            ccache --set-config=compiler_check=content
+            ccache -s
             ninja install
+            ccache -s
             # filter out slow tests (e.g. create-flows/vecmul_4x4_slow_test.mlir) due to timeout.
-            export LIT_OPTS="-sv --timeout 600 --filter-out slow_test"
+            export LIT_OPTS="-j1 -sv --timeout 600 --filter-out slow_test"
             ninja check-aie
 
             popd

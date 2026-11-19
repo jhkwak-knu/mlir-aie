@@ -1,27 +1,56 @@
 #
-# This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-# See https://llvm.org/LICENSE.txt for license information.
+# Copyright (C) 2021-2022 Xilinx, Inc.
+# Copyright (C) 2022-2026 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #
-# (c) Copyright 2021 Xilinx Inc.
 
 add_mlir_dialect_library(
   AIETransforms
-  AIEAssignBuffers.cpp
+  AIEPlacer.cpp
+  AIEStructuralRank.cpp
+  AIEPlaceTiles.cpp
+  AIESAPlacer.cpp
   AIEAssignBufferDescriptorIDs.cpp
+  AIEObjectFifoLiveness.cpp
+  AIEAssignBuffers.cpp
+  AIEAssignCoreLinkFiles.cpp
   AIEAssignLockIDs.cpp
   AIEFindFlows.cpp
+  AIEStreamDependencyAnalysis.cpp
+  AIESplitFlowVias.cpp
   AIEPathFinder.cpp
+  AIERoutingDiagnostics.cpp
   AIECreatePathFindFlows.cpp
   AIECoreToStandard.cpp
+  AIECoreIntRangeNarrowing.cpp
   AIECanonicalizeDevice.cpp
   AIELocalizeLocks.cpp
+  AIENormalizeDmaBdDims.cpp
   AIENormalizeAddressSpaces.cpp
-  AIEVectorOpt.cpp
-  AIEObjectFifoStatefulTransform.cpp
-  AIEObjectFifoRegisterProcess.cpp
+  AIEVectorToPointerLoops.cpp
+  AIEVectorTransferLowering.cpp
+  AIEHoistVectorTransferPointers.cpp
+  AIEDMAChannelAnalysis.cpp
+  AIEAssignPacketIds.cpp
+  AIEObjectFifoAllocate.cpp
+  AIECheckAgainstImage.cpp
+  AIEObjectFifoLowerDMAs.cpp
+  AIEObjectFifoInsertCoreQueuePushes.cpp
+  AIEObjectFifoLowerCores.cpp
+  AIEObjectFifoErasePools.cpp
+  AIEObjectFifoPipeline.cpp
+  AIEObjectFifoSplit.cpp
+  AIEObjectFifoVerify.cpp
+  AIEObjectFifoUnroll.cpp
   AIELowerCascadeFlows.cpp
   AIEGenerateColumnControlOverlay.cpp
+  AIEImportOverlay.cpp
+  AIETraceToConfig.cpp
+  AIEInsertTraceFlows.cpp
+  AIEPacketIdSpace.cpp
+  AIEShimSharing.cpp
+  AIEChannelTurns.cpp
+  AIEPoolLocks.cpp
   ADDITIONAL_HEADER_DIRS
   ${AIE_BINARY_DIR}/include
 
@@ -36,8 +65,13 @@ add_mlir_dialect_library(
   MLIRAIEPassIncGen
 
   LINK_LIBS PUBLIC
+  AIEX
+  MLIRAnalysis
+  MLIRArithTransforms
   MLIRIR
   MLIRPass
   MLIRSupport
+  MLIRSCFTransforms
   MLIRTransformUtils
-  MLIRFuncDialect)
+  MLIRFuncDialect
+  MLIRMemRefUtils)

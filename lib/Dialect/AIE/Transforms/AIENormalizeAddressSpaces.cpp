@@ -1,16 +1,15 @@
 //===- AIENormalizeAddressSpaces.cpp ----------------------------*- C++ -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2021-2022 Xilinx, Inc.
+// Copyright (C) 2022-2026 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2021 Xilinx Inc.
 //
 //===----------------------------------------------------------------------===//
 
 #include "aie/Dialect/AIE/IR/AIEDialect.h"
 #include "aie/Dialect/AIE/Transforms/AIEPasses.h"
 
+#include "mlir/Dialect/Ptr/IR/PtrOps.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
@@ -22,18 +21,31 @@ using namespace mlir;
 using namespace xilinx;
 using namespace xilinx::AIE;
 
-Type memRefToDefaultAddressSpace(Type t) {
+static Type memRefToDefaultAddressSpace(Type t) {
   if (auto memRefType = llvm::dyn_cast<MemRefType>(t);
-      memRefType && memRefType.getMemorySpace() != nullptr)
+      memRefType && memRefType.getMemorySpace() != nullptr) {
+    // Preserve ptr::GenericSpaceAttr - it's needed for ptr dialect
+    // transformations
+    if (llvm::isa<ptr::GenericSpaceAttr>(memRefType.getMemorySpace()))
+      return t; // Keep as-is
+
+    // Remove other memory spaces
     return MemRefType::get(memRefType.getShape(), memRefType.getElementType(),
                            memRefType.getLayout(), nullptr /* Address Space */);
+  }
   return t;
 }
 
 #include "aie/Dialect/AIE/Transforms/AIENormalizeAddressSpaces.inc"
 
+namespace xilinx::AIE {
+#define GEN_PASS_DEF_AIENORMALIZEADDRESSSPACES
+#include "aie/Dialect/AIE/Transforms/AIEPasses.h.inc"
+} // namespace xilinx::AIE
+
 struct AIENormalizeAddressSpacesPass
-    : AIENormalizeAddressSpacesBase<AIENormalizeAddressSpacesPass> {
+    : xilinx::AIE::impl::AIENormalizeAddressSpacesBase<
+          AIENormalizeAddressSpacesPass> {
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<func::FuncDialect>();
   }

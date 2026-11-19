@@ -1,14 +1,11 @@
 //===- aie.mlir ------------------------------------------------*- MLIR -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2022 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// Copyright (C) 2022, Advanced Micro Devices, Inc.
 //
 //===----------------------------------------------------------------------===//
 
-// RUN: %PYTHON aiecc.py -j4 %VitisSysrootFlag% --host-target=%aieHostTargetTriplet% %link_against_hsa% %s %test_lib_flags %extraAieCcFlags% %S/test.cpp -o test.elf
+// RUN: %aiecc --xchesscc --xbridge %VitisSysrootFlag% --host-target=%aieHostTargetTriplet% %link_against_hsa% %s %test_lib_flags %extraAieCcFlags% -o test.elf -- %S/test.cpp
 // RUN: %run_on_vck5000 ./test.elf
 
 aie.device(xcvc1902) {
@@ -47,11 +44,9 @@ aie.device(xcvc1902) {
             ^bb0(%arg2: i32):
             %next = func.call @payload(%arg2) : (i32) -> i32
 
-            %inputSubview = aie.objectfifo.acquire @of_in (Consume, 1) : !aie.objectfifosubview<memref<256xi32>>
-            %outputSubview = aie.objectfifo.acquire @of_out (Produce, 1) : !aie.objectfifosubview<memref<256xi32>>
+            %input = aie.objectfifo.acquire @of_in (Consume, 1) : memref<256xi32>
+            %output = aie.objectfifo.acquire @of_out (Produce, 1) : memref<256xi32>
 
-            %input = aie.objectfifo.subview.access %inputSubview[0] : !aie.objectfifosubview<memref<256xi32>> -> memref<256xi32>
-            %output = aie.objectfifo.subview.access %outputSubview[0] : !aie.objectfifosubview<memref<256xi32>> -> memref<256xi32>
 
             scf.for %indexInHeight = %c0 to %height step %c1 {
                 %d1 = memref.load %input[%indexInHeight] : memref<256xi32>

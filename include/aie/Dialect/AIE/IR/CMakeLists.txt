@@ -1,13 +1,12 @@
 #
-# This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-# See https://llvm.org/LICENSE.txt for license information.
+# Copyright (C) 2021-2022 Xilinx, Inc.
+# Copyright (C) 2022-2026 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #
-# (c) Copyright 2021 Xilinx Inc.
 
 # Use a simplified version AIEDocs.td to generate the AIEDialect.md ending up as
 # https://xilinx.github.io/mlir-aie/AIEDialect.html
-add_mlir_doc(AIEDocs AIEDialect ./ -gen-dialect-doc)
+add_mlir_doc(AIEDocs AIEDialect ./ -gen-dialect-doc -dialect=aie)
 
 # Add AIE dialect
 set(LLVM_TARGET_DEFINITIONS AIE.td)
@@ -22,6 +21,7 @@ mlir_tablegen(AIETypes.h.inc -gen-typedef-decls -typedefs-dialect=aie)
 mlir_tablegen(AIETypes.cpp.inc -gen-typedef-defs -typedefs-dialect=aie)
 add_public_tablegen_target(MLIRAIETypesIncGen)
 add_dependencies(aie-headers MLIRAIETypesIncGen)
+add_dependencies(MLIRAIETypesIncGen GenerateAIEEventsTD)
 
 # Add AIE interfaces
 set(LLVM_TARGET_DEFINITIONS AIEInterfaces.td)
@@ -43,6 +43,46 @@ mlir_tablegen(AIEEnums.h.inc -gen-enum-decls)
 mlir_tablegen(AIEEnums.cpp.inc -gen-enum-defs)
 add_public_tablegen_target(MLIRAIEEnumsIncGen)
 add_dependencies(aie-headers MLIRAIEEnumsIncGen)
+add_dependencies(MLIRAIEEnumsIncGen GenerateAIEEventsTD)
+
+# Generate AIE event enums from aie-codegen headers
+set(AIE_CODEGEN_EVENTS_DIR "${AIE_SOURCE_DIR}/third_party/aie-codegen/src/events")
+set(EVENTS_HEADER_FILES
+  "${AIE_CODEGEN_EVENTS_DIR}/xaie_events_aie.h"
+  "${AIE_CODEGEN_EVENTS_DIR}/xaie_events_aieml.h"
+  "${AIE_CODEGEN_EVENTS_DIR}/xaie_events_aie2p.h"
+)
+
+set(GENERATED_EVENTS_TD_FILES
+  "${CMAKE_BINARY_DIR}/include/AIEEventsAIE.td.inc"
+  "${CMAKE_BINARY_DIR}/include/AIEEventsAIE2.td.inc"
+  "${CMAKE_BINARY_DIR}/include/AIEEventsAIE2P.td.inc"
+)
+
+set(GENERATED_EVENTS_JSON "${CMAKE_BINARY_DIR}/lib/regdb/events_database.json")
+
+add_custom_command(
+  OUTPUT ${GENERATED_EVENTS_TD_FILES} ${GENERATED_EVENTS_JSON}
+  COMMAND ${Python3_EXECUTABLE}
+    ${AIE_SOURCE_DIR}/utils/generate_events_tablegen.py
+    -i ${EVENTS_HEADER_FILES}
+    -o ${CMAKE_BINARY_DIR}/include
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/lib/regdb
+  COMMAND ${Python3_EXECUTABLE}
+    ${AIE_SOURCE_DIR}/utils/generate_events_json.py
+    -i ${EVENTS_HEADER_FILES}
+    -o ${CMAKE_BINARY_DIR}/lib/regdb
+  DEPENDS
+    ${AIE_SOURCE_DIR}/utils/generate_events_tablegen.py
+    ${AIE_SOURCE_DIR}/utils/generate_events_json.py
+    ${EVENTS_HEADER_FILES}
+  COMMENT "Generating AIE event tablegen and JSON database from aie-codegen headers"
+  VERBATIM
+)
+
+add_custom_target(GenerateAIEEventsTD
+  DEPENDS ${GENERATED_EVENTS_TD_FILES} ${GENERATED_EVENTS_JSON}
+)
 
 # Add AIE attributes
 set(LLVM_TARGET_DEFINITIONS AIEAttrs.td)
@@ -50,3 +90,7 @@ mlir_tablegen(AIEAttrs.h.inc -gen-attrdef-decls)
 mlir_tablegen(AIEAttrs.cpp.inc -gen-attrdef-defs)
 add_public_tablegen_target(MLIRAIEAttrDefsIncGen)
 add_dependencies(aie-headers MLIRAIEAttrDefsIncGen)
+add_dependencies(MLIRAIEAttrDefsIncGen GenerateAIEEventsTD)
+
+# Ensure generated event enums exist before generating documentation
+add_dependencies(AIEDialectDocGen GenerateAIEEventsTD)

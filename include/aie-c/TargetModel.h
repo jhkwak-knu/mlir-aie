@@ -1,10 +1,7 @@
 //===- TargetModel.h --------------------------------------------*- C++ -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2024 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2024 Advanced Micro Devices, Inc.
 //
 //===----------------------------------------------------------------------===//
 
@@ -54,6 +51,15 @@ MLIR_CAPI_EXPORTED int aieTargetModelRows(AieTargetModel targetModel);
 
 /// Returns true if this is an NPU target model.
 MLIR_CAPI_EXPORTED bool aieTargetModelIsNPU(AieTargetModel targetModel);
+
+/// Returns the AIE architecture (as the underlying value of
+/// xilinx::AIE::AIEArch: AIE1=1, AIE2=2, AIE2p=3).
+MLIR_CAPI_EXPORTED uint32_t
+aieTargetModelGetTargetArch(AieTargetModel targetModel);
+
+/// Returns the tile type for the given coordinates.
+MLIR_CAPI_EXPORTED uint32_t
+aieTargetModelGetTileType(AieTargetModel targetModel, int col, int row);
 
 MLIR_CAPI_EXPORTED bool aieTargetModelIsCoreTile(AieTargetModel targetModel,
                                                  int col, int row);
@@ -126,10 +132,37 @@ MLIR_CAPI_EXPORTED uint32_t
 aieTargetModelGetLocalMemorySize(AieTargetModel targetModel);
 
 MLIR_CAPI_EXPORTED uint32_t
+aieTargetModelGetDefaultCoreStackSize(AieTargetModel targetModel);
+
+MLIR_CAPI_EXPORTED uint32_t
 aieTargetModelGetNumLocks(AieTargetModel targetModel, int col, int row);
 
 MLIR_CAPI_EXPORTED uint32_t aieTargetModelGetNumBDs(AieTargetModel targetModel,
                                                     int col, int row);
+
+/// Largest value a lock register holds.
+MLIR_CAPI_EXPORTED uint32_t
+aieTargetModelGetMaxLockValue(AieTargetModel targetModel);
+
+/// Largest repeat count one DMA task queue push can carry (unsupported = 0).
+MLIR_CAPI_EXPORTED uint32_t
+aieTargetModelGetMaxRepeatCount(AieTargetModel targetModel);
+
+/// How many tasks one DMA channel's task queue holds (unsupported = 0).
+MLIR_CAPI_EXPORTED uint32_t
+aieTargetModelGetDmaTaskQueueDepth(AieTargetModel targetModel);
+
+/// Field widths of a DMA buffer descriptor, which differ by tile type. The step
+/// field counts address granules, not elements -- see
+/// aieGetTargetModelAddressGenGranularity.
+MLIR_CAPI_EXPORTED uint32_t
+aieTargetModelGetDmaBdWrapBits(AieTargetModel targetModel, int col, int row);
+
+MLIR_CAPI_EXPORTED uint32_t
+aieTargetModelGetDmaBdStepBits(AieTargetModel targetModel, int col, int row);
+
+MLIR_CAPI_EXPORTED uint32_t
+aieTargetModelGetDmaBdIterBits(AieTargetModel targetModel, int col, int row);
 
 MLIR_CAPI_EXPORTED uint32_t
 aieTargetModelGetNumMemTileRows(AieTargetModel targetModel);
@@ -139,6 +172,18 @@ aieTargetModelGetMemTileSize(AieTargetModel targetModel);
 
 MLIR_CAPI_EXPORTED uint32_t
 aieTargetModelGetNumBanks(AieTargetModel targetModel, int col, int row);
+
+/// Whether one DMA buffer descriptor of tile (col, row) on `device` holds the
+/// pattern, as aie-normalize-dma-bd-dims and the DMA lowerings take it.
+/// `sizes` and `strides` are four dimensions, outermost first, and `len` the
+/// descriptor's length, all in elements of `elementType`.
+MLIR_CAPI_EXPORTED bool aieDmaBdFits(uint32_t device, int col, int row,
+                                     MlirType elementType, int64_t offset,
+                                     const int64_t *sizes,
+                                     const int64_t *strides, int64_t len);
+
+MLIR_CAPI_EXPORTED uint32_t aieTargetModelGetMaxChannelNumForAdjacentTile(
+    AieTargetModel targetModel, int col, int row);
 
 MLIR_CAPI_EXPORTED uint32_t aieTargetModelGetNumDestSwitchboxConnections(
     AieTargetModel targetModel, int col, int row, uint32_t bundle);
@@ -151,9 +196,6 @@ MLIR_CAPI_EXPORTED uint32_t aieTargetModelGetNumDestShimMuxConnections(
 
 MLIR_CAPI_EXPORTED uint32_t aieTargetModelGetNumSourceShimMuxConnections(
     AieTargetModel targetModel, int col, int row, uint32_t bundle);
-
-/// Returns true if this is an NPU target model.
-MLIR_CAPI_EXPORTED bool aieTargetModelIsNPU(AieTargetModel targetModel);
 
 MLIR_CAPI_EXPORTED uint32_t
 aieTargetModelGetColumnShift(AieTargetModel targetModel);

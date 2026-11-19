@@ -1,0 +1,653 @@
+# transform.py -*- Python -*-
+#
+# Copyright (C) 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+#
+"""Tiled transform algorithms (unary/binary, single-core/parallel) built on IRON."""
+
+from typing import get_args, get_origin
+
+import numpy as np
+from aie.helpers.npdtypes import np_ndarray_type_of
+from aie.helpers.taplib import TensorAccessPattern
+from aie.iron.controlflow import range_
+from aie.iron.dataflow import ObjectFifo
+from aie.iron.kernel import ExternalFunction
+from aie.iron.program import Program
+from aie.iron.runtime import Runtime, TaskGroup
+from aie.iron.worker import Worker
+from aie.utils import get_current_device
+
+from ._pipeline import Stage, kernel_params, pipeline
+
+
+def _transform_gen(func, inputs: list, output, *params, tile_size=16, trace_size=0):
+    """General tiled transform to apply a function on inputs and obtain a single output.
+
+    Assumes all input and output shapes are the same.
+
+    Args:
+        func: Function to apply, either a lambda/callable or ExternalFunction.
+              For ExternalFunction, arg_types should be [*input_tiles, output_tile, *params]
+        inputs: List of input tensors (will be tiled automatically)
+        output: Output tensor (will be tiled automatically)
+        *params: Additional parameters for ExternalFunction only.
+                 Scalar dtypes (np.int32, etc.) are passed as MLIR constants;
+                 array types are transferred via ObjectFifos.
+        tile_size: Size of each tile processed by a worker (default: 16)
+        trace_size: When > 0, enable per-Worker core trace and a
+            ``trace_size``-byte runtime trace buffer (default: 0).  The kernel
+            (or lambda) is expected to emit event0()/event1() markers; the
+            trace shim records cycles between them.
+    """
+    is_external_func = isinstance(func, ExternalFunction)
+
+    # Validate tile_size matches ExternalFunction's tile_size() if defined
+    if is_external_func and func.tile_size() != tile_size:
+        raise ValueError(
+            f"tile_size ({tile_size}) does not match ExternalFunction's "
+            f"input/output shape in arg_type"
+        )
+
+    # Validate all tensors have same shape and dtype
+    all_tensors = inputs + [output]
+    ref_shape = all_tensors[0].shape
+    ref_dtype = all_tensors[0].dtype
+    for i, t in enumerate(all_tensors):
+        if t.shape != ref_shape:
+            raise ValueError(
+                f"Tensor {i} shape {t.shape} doesn't match expected {ref_shape}"
+            )
+        if t.dtype != ref_dtype:
+            raise ValueError(
+                f"Tensor {i} dtype {t.dtype} doesn't match expected {ref_dtype}"
+            )
+
+    num_elements = np.size(inputs[0])
+    num_inputs = len(inputs)
+
+    n = tile_size
+
+    if num_elements % n != 0:
+        raise ValueError(
+            f"Number of elements ({num_elements}) must be a multiple of tile size ({n})"
+        )
+
+    N_div_n = num_elements // n
+    dtype = ref_dtype
+
+    # Define tensor and tile types
+    tensor_ty = np.ndarray[(num_elements,), np.dtype[dtype]]
+    tile_ty = np.ndarray[(n,), np.dtype[dtype]]
+
+    of_inputs = [ObjectFifo(tile_ty, name=f"in{i}") for i in range(num_inputs)]
+    of_out = ObjectFifo(tile_ty, name="out")
+    kparams = kernel_params(func, params, num_inputs + 1)
+
+    def body(ins, outs, held, constants, _):
+        if is_external_func:
+            constants[0](*ins, outs[0], *kparams.resolve(held), n)
+        else:
+            # Lambda/callable: apply element-wise. Without this explicit
+            # loop, only the first element of each tile would be processed.
+            for j in range_(n):
+                outs[0][j] = constants[0](*(elem[j] for elem in ins))
+
+    stage = Stage(
+        body,
+        inputs=[(of, 1) for of in of_inputs],
+        outputs=[of_out],
+        held=kparams.fifos,
+        constants=[func],
+        iterations=N_div_n,
+        trace=trace_size > 0,
+    )
+    # Host buffers: inputs, output, then the tensor params.
+    transfers = [(of, "fill", i) for i, of in enumerate(of_inputs)]
+    transfers += [
+        (of, "fill", num_inputs + 1 + i) for i, of in enumerate(kparams.fifos)
+    ]
+    transfers.append((of_out, "drain", num_inputs))
+    return pipeline(
+        [stage],
+        [tensor_ty] * (num_inputs + 1) + kparams.types,
+        transfers,
+        trace_size=trace_size,
+    )
+
+
+def _transform_parallel_gen(
+    func,
+    inputs: list,
+    output,
+    *params,
+    tile_size=16,
+    trace_size=0,
+    num_channels=1,
+    pass_size_to_kernel=True,
+):
+    """General parallel transform to apply a function on inputs and obtain a single output.
+
+    Distributes work across multiple AIE tiles for parallel execution.
+
+    Creates one worker per (column, channel). The compiler validates DMA
+    channel availability against the target model during placement.
+
+    Args:
+        func: Function to apply, either a lambda/callable or ExternalFunction.
+              For ExternalFunction, arg_types should be [*input_tiles, output_tile, *params]
+        inputs: List of input tensors (will be tiled automatically)
+        output: Output tensor (will be tiled automatically)
+        *params: Additional parameters for ExternalFunction only.
+                 Scalar dtypes (np.int32, etc.) are passed as MLIR constants;
+                 array types are transferred via ObjectFifos.
+        tile_size: Size of each tile processed by a worker (default: 16)
+        trace_size: When > 0, enable per-column-Worker core trace and a
+            ``trace_size``-byte runtime trace buffer (default: 0).  Same
+            event0()/event1() expectation as `_transform_gen`.
+        num_channels: Workers per column operating on disjoint sub-ranges
+            (default: 1). Values above 1 are not compatible with shared
+            ``*params``.
+        pass_size_to_kernel: When True (default), the kernel receives an extra
+            trailing ``int`` argument equal to ``tile_size``.  Set False for
+            kernels whose signature is just ``(*in_tiles, out_tile)`` (e.g.
+            ``iron.kernels.add``, ``iron.kernels.mul``).
+    """
+    if num_channels < 1:
+        raise ValueError("num_channels must be positive")
+    if num_channels > 1 and params:
+        raise ValueError(
+            "num_channels > 1 is not supported together with shared *params; "
+            "use num_channels=1 instead."
+        )
+    is_external_func = isinstance(func, ExternalFunction)
+
+    # Validate tile_size matches ExternalFunction arg_type
+    if is_external_func and func.tile_size() != tile_size:
+        raise ValueError(
+            f"tile_size ({tile_size}) does not match ExternalFunction's "
+            f"input/output shape in arg_type"
+        )
+
+    # Validate all tensors have same shape and dtype
+    all_tensors = inputs + [output]
+    ref_shape = all_tensors[0].shape
+    ref_dtype = all_tensors[0].dtype
+    for i, t in enumerate(all_tensors):
+        if t.shape != ref_shape:
+            raise ValueError(
+                f"Tensor {i} shape {t.shape} doesn't match expected {ref_shape}"
+            )
+        if t.dtype != ref_dtype:
+            raise ValueError(
+                f"Tensor {i} dtype {t.dtype} doesn't match expected {ref_dtype}"
+            )
+
+    num_inputs = len(inputs)
+    num_elements = np.size(inputs[0])
+    dtype = ref_dtype
+
+    # Determine number of columns based on device
+    device = get_current_device()
+    if device is None:
+        raise RuntimeError(
+            "iron.algorithms.transform_parallel requires an active NPU device. "
+            "Call iron.set_current_device() or ensure DefaultNPURuntime is initialized "
+            "before calling parallel transform functions."
+        )
+    num_columns = device.cols
+
+    per_tile_elements = tile_size
+    n = per_tile_elements * num_columns * num_channels
+
+    if num_elements % n != 0:
+        raise ValueError(
+            f"Number of elements ({num_elements}) must be a multiple of "
+            f"tile_size × num_columns × num_channels "
+            f"({per_tile_elements} × {num_columns} × {num_channels} = {n})."
+        )
+    N_div_n = num_elements // n
+
+    # Define tensor and tile types
+    tensor_ty = np.ndarray[(num_elements,), np.dtype[dtype]]
+    tile_ty = np.ndarray[(per_tile_elements,), np.dtype[dtype]]
+
+    # Create ObjectFifos for each (input, column, channel) and (column, channel).
+    # The inner channel list collapses to length 1 when num_channels=1, which
+    # preserves the original per-column naming ("in0_0") for that common case.
+    of_inputs = [
+        [
+            [
+                ObjectFifo(
+                    tile_ty,
+                    name=(
+                        f"in{inp_idx}_{col}"
+                        if num_channels == 1
+                        else f"in{inp_idx}_{col}_{chan}"
+                    ),
+                )
+                for chan in range(num_channels)
+            ]
+            for col in range(num_columns)
+        ]
+        for inp_idx in range(num_inputs)
+    ]
+    of_outs = [
+        [
+            ObjectFifo(
+                tile_ty,
+                name=(f"out_{col}" if num_channels == 1 else f"out_{col}_{chan}"),
+            )
+            for chan in range(num_channels)
+        ]
+        for col in range(num_columns)
+    ]
+
+    # Handle params for ExternalFunction
+    tensor_params = []  # params that need ObjectFifos
+    scalar_params = []  # params passed directly as MLIR constants
+    param_of_list = []  # Shared ObjectFifos for tensor params (one per param)
+    param_tensor_types = []
+
+    if is_external_func:
+        arg_types = func.arg_types()
+        # Skip input and output tile types (num_inputs + output)
+        param_arg_types = arg_types[num_inputs + 1 :]
+
+        for i, (param, arg_type) in enumerate(zip(params, param_arg_types)):
+            if isinstance(arg_type, type) and issubclass(arg_type, np.generic):
+                scalar_params.append((i, param))
+            else:
+                tensor_params.append((i, param))
+
+        # Create shared ObjectFifos for tensor params (shared across all workers)
+        for i, param in tensor_params:
+            param_ty = np.ndarray[param.shape, np.dtype[param.dtype]]
+            param_tensor_types.append(param_ty)
+            param_of_list.append(ObjectFifo(param_ty, name=f"param{i}"))
+
+    def core_body(*of_args):
+        # of_args = [*of_inputs_cons, *param_of_cons, of_out_prod, func]
+        of_ins = of_args[:num_inputs]
+        func_to_apply = of_args[-1]  # Last element is func
+        of_output = of_args[-2]  # Second to last is output
+        of_params = of_args[num_inputs:-2]
+
+        # For ExternalFunction: acquire params once (constant for all iterations)
+        all_params = []
+        if is_external_func and params:
+            elem_tensor_params = [of_param.acquire(1) for of_param in of_params]
+
+            # Build the full param list in correct order
+            all_params = [None] * len(params)
+            for (orig_idx, _), elem in zip(tensor_params, elem_tensor_params):
+                all_params[orig_idx] = elem
+            for orig_idx, param in scalar_params:
+                all_params[orig_idx] = param
+
+        # Tile iteration loop
+        for _ in range_(N_div_n):
+            elem_ins = [of_in.acquire(1) for of_in in of_ins]
+            elem_out = of_output.acquire(1)
+
+            if is_external_func:
+                if pass_size_to_kernel:
+                    func_to_apply(*elem_ins, elem_out, *all_params, per_tile_elements)
+                else:
+                    func_to_apply(*elem_ins, elem_out, *all_params)
+            else:
+                # Lambda/callable: apply element-wise
+                # Without this explicit loop, only the
+                # first element of each tile would be processed.
+                for j in range_(per_tile_elements):
+                    in_elems = [elem_in[j] for elem_in in elem_ins]
+                    elem_out[j] = func_to_apply(*in_elems)
+
+            # Release inputs and output
+            for of_in in of_ins:
+                of_in.release(1)
+            of_output.release(1)
+
+        # Release tensor params (ExternalFunction only)
+        for of_param in of_params:
+            of_param.release(1)
+
+    # Create a worker per (column, channel).  When num_channels=1, this is
+    # one worker per column, matching the original layout exactly.
+    my_workers = [
+        Worker(
+            core_body,
+            [of_inputs[inp_idx][col][chan].cons() for inp_idx in range(num_inputs)]
+            + [of.cons() for of in param_of_list]
+            + [of_outs[col][chan].prod()]
+            + [func],
+            trace=(1 if trace_size > 0 else 0),
+        )
+        for col in range(num_columns)
+        for chan in range(num_channels)
+    ]
+
+    # One chunk per (column, channel): equal, disjoint sub-ranges of the
+    # input in row-major (col, chan) order.
+    taps = TensorAccessPattern.full((num_elements,)).partition(
+        num_columns * num_channels
+    )
+
+    # Runtime operations to move data to/from the AIE-array.
+    # Pre-build the prod/cons handle grids so they can be registered via fn_args
+    # (endpoints bound before resolution); the body indexes into them.
+    in_prods = [
+        [
+            [of_inputs[inp][col][chan].prod() for chan in range(num_channels)]
+            for col in range(num_columns)
+        ]
+        for inp in range(num_inputs)
+    ]
+    out_conses = [
+        [of_outs[col][chan].cons() for chan in range(num_channels)]
+        for col in range(num_columns)
+    ]
+    param_prods = [p.prod() for p in param_of_list]
+
+    all_types = [tensor_ty] * num_inputs + [tensor_ty] + param_tensor_types
+    num_params = len(param_tensor_types)
+
+    def sequence(*args):
+        input_seq_args = args[:num_inputs]
+        output_seq_arg = args[num_inputs]
+        param_seq_args = args[num_inputs + 1 : num_inputs + 1 + num_params]
+
+        # Fill input ObjectFifos with data
+        tg_in = TaskGroup()
+        for col in range(num_columns):
+            for chan in range(num_channels):
+                tap = taps[col * num_channels + chan]
+                for inp_idx in range(num_inputs):
+                    in_prods[inp_idx][col][chan].fill(
+                        input_seq_args[inp_idx],
+                        tap,
+                        group=tg_in,
+                    )
+        tg_in.finish()
+
+        # Fill tensor param ObjectFifos (ExternalFunction only, shared across workers)
+        for param_prod, param_arg in zip(param_prods, param_seq_args):
+            param_prod.fill(param_arg)
+
+        # Drain output ObjectFifos
+        tg_out = TaskGroup()
+        for col in range(num_columns):
+            for chan in range(num_channels):
+                out_conses[col][chan].drain(
+                    output_seq_arg,
+                    taps[col * num_channels + chan],
+                    wait=True,
+                    group=tg_out,
+                )
+        tg_out.finish()
+
+    rt = Runtime(
+        sequence,
+        [*all_types, in_prods, out_conses, param_prods],
+    )
+
+    # Place program components and generate an MLIR module
+    prog = Program(device, rt, workers=my_workers)
+    if trace_size > 0:
+        prog.enable_trace(trace_size)
+    return prog.resolve_program()
+
+
+def make_param_descriptor(tensor_ty):
+    """Build a fake-tensor descriptor (``.shape``, ``.size``, ``.dtype``).
+
+    Used as an extra param to [`transform`][aie.iron.algorithms._transform.transform] and friends.
+
+    Mirrors `_make_fake_tensor` but skips the tile-divisibility check
+    because params (e.g. a 1-element ``factor`` tensor) are passed through
+    a dedicated ObjectFifo and aren't tiled.
+    """
+    tensor_ty = np_ndarray_type_of(tensor_ty)
+    try:
+        shape_arg, dtype_arg = get_args(tensor_ty)
+        num_elements = 1
+        for dim in shape_arg:
+            num_elements *= dim
+        dtype = get_args(dtype_arg)[0]
+    except Exception as exc:
+        raise TypeError(
+            f"make_param_descriptor expects a numpy ndarray type such as "
+            f"np.ndarray[(1,), np.dtype[np.int32]], got {tensor_ty!r}"
+        ) from exc
+
+    _shape = tuple(shape_arg)
+    _size = num_elements
+    _dtype = dtype
+
+    class _ParamDescriptor:
+        shape = _shape
+        size = _size
+        dtype = _dtype
+
+    return _ParamDescriptor()
+
+
+def _expand_param(param):
+    """Allow callers to pass a real tensor, a numpy ndarray type or an operand."""
+    param = np_ndarray_type_of(param)
+    if get_origin(param) is np.ndarray:
+        return make_param_descriptor(param)
+    return param
+
+
+def _make_fake_tensor(tensor_ty, tile_size, fn_name):
+    """Parse a numpy ndarray type descriptor and return a fake tensor object.
+
+    Extracts ``num_elements`` and ``dtype`` from *tensor_ty*, validates that
+    *tile_size* divides evenly into *num_elements*, and returns a lightweight
+    object exposing ``.shape``, ``.size``, and ``.dtype`` attributes — enough
+    for `_transform_gen` and `_transform_parallel_gen` to operate
+    without real NPU memory.
+
+    Args:
+        tensor_ty: A numpy ``ndarray`` type (e.g. ``np.ndarray[(1024,),
+            np.dtype[np.int32]]``).
+        tile_size (int): Number of elements per tile.
+        fn_name (str): Caller name used in error messages.
+
+    Returns:
+        An object with ``.shape``, ``.size``, and ``.dtype``.
+    """
+    tensor_ty = np_ndarray_type_of(tensor_ty)
+    try:
+        shape_arg, dtype_arg = get_args(tensor_ty)
+        num_elements = 1
+        for dim in shape_arg:
+            num_elements *= dim
+        dtype = get_args(dtype_arg)[0]
+    except Exception as exc:
+        raise TypeError(
+            f"{fn_name} expects a numpy ndarray type such as "
+            f"np.ndarray[(N,), np.dtype[np.int32]], got {tensor_ty!r}"
+        ) from exc
+
+    if num_elements % tile_size != 0:
+        raise ValueError(
+            f"Number of elements ({num_elements}) must be a multiple of "
+            f"tile size ({tile_size})"
+        )
+
+    # Capture dtype in a local alias to avoid the class-scope shadowing issue
+    # where `dtype = dtype` inside a class body is self-referential.
+    _dtype = dtype
+
+    class _TypeDescriptor:
+        shape = (num_elements,)
+        size = num_elements
+        dtype = _dtype
+
+    return _TypeDescriptor()
+
+
+def transform(func, tensor_ty, *params, tile_size=16, trace_size=0):
+    """Apply ``func`` element-wise over a tensor described by *tensor_ty*.
+
+    Like [`transform`][aie.iron.algorithms._transform.transform] but accepts a numpy ``ndarray`` type descriptor
+    instead of a real tensor.  Intended for use inside ``@iron.jit`` generator
+    bodies where the tensor's shape and dtype are expressed as ``CompileTime[T]``
+    parameters and the actual tensors are not yet available:
+
+    ```python
+    @iron.jit
+    def my_design(inp: In, out: Out,
+                  N: CompileTime[int], dtype: CompileTime[type] = np.int32):
+        tensor_ty = np.ndarray[(N,), np.dtype[dtype]]
+        return iron.algorithms.transform(lambda x: x + 1, tensor_ty)
+    ```
+
+    Args:
+        func: Function or `ExternalFunction` to apply.
+        tensor_ty: A numpy ``ndarray`` type (e.g. ``np.ndarray[(1024,),
+            np.dtype[np.int32]]``). Shape and dtype are inferred from this.
+        *params: Additional parameters forwarded to ``func`` (ExternalFunction
+            only).  Each ``param`` may be a real tensor, a numpy ``ndarray``
+            type descriptor (transparently expanded via
+            [`make_param_descriptor`][aie.iron.algorithms._transform.make_param_descriptor]), or a numpy scalar type.
+        tile_size (int, optional): Number of elements per tile. Defaults to 16.
+        trace_size (int, optional): When > 0, enable Worker core trace and a
+            ``trace_size``-byte runtime trace buffer. Defaults to 0 (off).
+
+    Returns:
+        mlir.ir.Module: The compiled MLIR module.
+    """
+    fake_tensor = _make_fake_tensor(tensor_ty, tile_size, "transform")
+    expanded_params = tuple(_expand_param(p) for p in params)
+    return _transform_gen(
+        func,
+        [fake_tensor],
+        fake_tensor,
+        *expanded_params,
+        tile_size=tile_size,
+        trace_size=trace_size,
+    )
+
+
+def transform_binary(func, tensor_ty, tile_size=16, trace_size=0):
+    """Apply ``func`` element-wise over two tensors described by *tensor_ty*.
+
+    Like [`transform_binary`][aie.iron.algorithms._transform.transform_binary] but accepts a numpy ``ndarray`` type
+    descriptor instead of real tensors.  Intended for use inside
+    ``@iron.jit`` generator bodies.
+
+    Args:
+        func: Function or `ExternalFunction` to apply.
+        tensor_ty: A numpy ``ndarray`` type (e.g. ``np.ndarray[(1024,),
+            np.dtype[np.int32]]``). Shape and dtype are inferred from this.
+        tile_size (int, optional): Number of elements per tile. Defaults to 16.
+        trace_size (int, optional): When > 0, enable Worker core trace and a
+            ``trace_size``-byte runtime trace buffer. Defaults to 0 (off).
+
+    Returns:
+        mlir.ir.Module: The compiled MLIR module.
+    """
+    fake_tensor = _make_fake_tensor(tensor_ty, tile_size, "transform_binary")
+    return _transform_gen(
+        func,
+        [fake_tensor, fake_tensor],
+        fake_tensor,
+        tile_size=tile_size,
+        trace_size=trace_size,
+    )
+
+
+def transform_parallel(
+    func,
+    tensor_ty,
+    *params,
+    tile_size=16,
+    trace_size=0,
+    num_channels=1,
+    pass_size_to_kernel=True,
+):
+    """Apply ``func`` element-wise in parallel using a tensor type descriptor.
+
+    Like [`transform_parallel`][aie.iron.algorithms._transform.transform_parallel] but accepts a numpy ``ndarray`` type
+    descriptor instead of a real tensor.  Intended for use inside
+    ``@iron.jit`` generator bodies.
+
+    Args:
+        func: Function or `ExternalFunction` to apply.
+        tensor_ty: A numpy ``ndarray`` type (e.g. ``np.ndarray[(1024,),
+            np.dtype[np.int32]]``). Shape and dtype are inferred from this.
+        *params: Additional compile-time scalar parameters forwarded to
+            ``func`` (ExternalFunction only).
+        tile_size (int, optional): Number of elements per tile per worker.
+            Defaults to 16.
+        trace_size (int, optional): When > 0, enable per-column Worker core
+            trace and a ``trace_size``-byte runtime trace buffer.
+            Defaults to 0 (off).
+        num_channels (int, optional): Workers per column. The compiler checks
+            target DMA capacity. Values above 1 are not compatible with shared
+            ``*params``. Defaults to 1.
+        pass_size_to_kernel (bool, optional): Append ``tile_size`` as a
+            trailing ``int`` argument on every kernel call.  Defaults to True;
+            set False for kernels with bare ``(in, out)`` signatures.
+
+    Returns:
+        mlir.ir.Module: The compiled MLIR module.
+    """
+    fake_tensor = _make_fake_tensor(tensor_ty, tile_size, "transform_parallel")
+    expanded_params = tuple(_expand_param(p) for p in params)
+    return _transform_parallel_gen(
+        func,
+        [fake_tensor],
+        fake_tensor,
+        *expanded_params,
+        tile_size=tile_size,
+        trace_size=trace_size,
+        num_channels=num_channels,
+        pass_size_to_kernel=pass_size_to_kernel,
+    )
+
+
+def transform_parallel_binary(
+    func,
+    tensor_ty,
+    tile_size=16,
+    trace_size=0,
+    num_channels=1,
+    pass_size_to_kernel=True,
+):
+    """Apply ``func`` over two tensors in parallel using a tensor type descriptor.
+
+    Like [`transform_parallel_binary`][aie.iron.algorithms._transform.transform_parallel_binary] but accepts a numpy ``ndarray``
+    type descriptor instead of real tensors.  Intended for use inside
+    ``@iron.jit`` generator bodies.
+
+    Args:
+        func: Function or `ExternalFunction` to apply.
+        tensor_ty: A numpy ``ndarray`` type (e.g. ``np.ndarray[(1024,),
+            np.dtype[np.int32]]``). Shape and dtype are inferred from this.
+        tile_size (int, optional): Number of elements per tile per worker.
+            Defaults to 16.
+        trace_size (int, optional): When > 0, enable per-column Worker core
+            trace and a ``trace_size``-byte runtime trace buffer.
+            Defaults to 0 (off).
+        num_channels (int, optional): Workers per column. The compiler checks
+            target DMA capacity. Defaults to 1.
+        pass_size_to_kernel (bool, optional): Append ``tile_size`` as a
+            trailing ``int`` argument on every kernel call.  Defaults to True.
+
+    Returns:
+        mlir.ir.Module: The compiled MLIR module.
+    """
+    fake_tensor = _make_fake_tensor(tensor_ty, tile_size, "transform_parallel_binary")
+    return _transform_parallel_gen(
+        func,
+        [fake_tensor, fake_tensor],
+        fake_tensor,
+        tile_size=tile_size,
+        trace_size=trace_size,
+        num_channels=num_channels,
+        pass_size_to_kernel=pass_size_to_kernel,
+    )

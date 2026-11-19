@@ -1,0 +1,131 @@
+<!-- Copyright (C) 2026 Advanced Micro Devices, Inc. -->
+<!-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception -->
+
+# Host Runtime (`aie.utils.hostruntime`)
+
+Host-side helpers for selecting a device, allocating NPU-accessible tensors,
+running compiled designs, and sharing common CLI / argument plumbing across
+programming examples.
+
+Import the public surface from `aie.utils.hostruntime` (or via the
+`aie.utils` / `iron` re-exports where noted). The symbols below are rendered
+from the Python package under `python/utils/hostruntime/` using the same
+mkdocstrings path layout as the other Python API pages (`utils.*`, not the
+installed `aie.utils.*` import name).
+
+---
+
+## Runtime abstractions
+
+Abstract runtime types that concrete backends (for example XRT) implement.
+
+::: aie.utils.hostruntime.hostruntime
+    options:
+      show_root_heading: false
+      docstring_options:
+        warn_missing_types: false
+
+---
+
+## Tensor and device utilities
+
+Device selection, the `NpuTensor` tensor type, and numerical helpers used when
+comparing host results. `NpuTensor` was previously called `Tensor`, which
+remains available as an alias.
+
+A tensor is a shape and a dtype over bytes it does not own. The bytes, and the
+record of which agent currently holds each range of them, belong to the
+[`Storage`](#allocations-and-coherence) below.
+
+::: aie.utils.hostruntime
+    options:
+      show_root_heading: false
+      members:
+        - NpuTensor
+        - set_current_device
+        - DeviceSelection
+        - bfloat16_safe_allclose
+      docstring_options:
+        warn_missing_types: false
+
+::: aie.utils.hostruntime.tensor_class
+    options:
+      show_root_heading: false
+      members:
+        - NpuTensor
+      docstring_options:
+        warn_missing_types: false
+
+---
+
+## Allocations and coherence
+
+`Storage` is one allocation plus the coherence of the memory in it: which byte
+ranges the host has written and which the device has. Many tensors may name one
+storage, which is why the state lives here rather than on any of them.
+
+It is a single concrete class, not a hierarchy. What differs between backends is
+only where the host's bytes come from and what reconciling a range does, so those
+are supplied as a `Transport`. A transport that cannot honour a range says so in
+its name rather than accepting the arguments and ignoring them.
+
+This is the split torch draws between `UntypedStorage` and `Tensor`, and is where
+`NpuTensor.storage_offset` comes from.
+
+::: aie.utils.hostruntime.buffer
+    options:
+      show_root_heading: false
+      members:
+        - Storage
+        - Transport
+        - HostOnlyTransport
+        - WholeExtentTransport
+      docstring_options:
+        warn_missing_types: false
+
+---
+
+## Shared CLI/argument helpers
+
+Reusable `argparse` flag groups and the standard design CLI dispatcher used by
+the programming examples.
+
+::: aie.utils.hostruntime.argparse
+    options:
+      show_root_heading: false
+      docstring_options:
+        warn_missing_types: false
+
+::: aie.utils.hostruntime.cli
+    options:
+      show_root_heading: false
+      docstring_options:
+        warn_missing_types: false
+
+---
+
+## XRT runtime implementation
+
+Concrete XRT-backed runtime, tensor, and scratchpad types. These modules import
+`pyxrt`, so they are only importable in environments where XRT / PyXRT is
+installed. MkDocs CI does not install XRT, so these symbols are summarized here
+(same approach as the non-importable JIT helpers on the IRON page) with links to
+source. On a machine with PyXRT available they can also be rendered with
+mkdocstrings, for example:
+
+```markdown
+::: aie.utils.hostruntime.xrtruntime.hostruntime
+    options:
+      show_root_heading: false
+```
+
+| Symbol | Module | Summary |
+|--------|--------|---------|
+| `XRTKernelHandle` | [`xrtruntime.hostruntime`](../../python/utils/hostruntime/xrtruntime/hostruntime.py) | Handle for a loaded XRT kernel. |
+| `XRTKernelResult` | [`xrtruntime.hostruntime`](../../python/utils/hostruntime/xrtruntime/hostruntime.py) | Result wrapper for a PyXRT kernel run. |
+| `XRTHostRuntime` | [`xrtruntime.hostruntime`](../../python/utils/hostruntime/xrtruntime/hostruntime.py) | Singleton manager for AIE XRT resources. |
+| `CachedXRTKernelHandle` | [`xrtruntime.hostruntime`](../../python/utils/hostruntime/xrtruntime/hostruntime.py) | Cached handle for a loaded XRT kernel. |
+| `CachedXRTRuntime` | [`xrtruntime.hostruntime`](../../python/utils/hostruntime/xrtruntime/hostruntime.py) | Cached `XRTHostRuntime` that reuses contexts for the same xclbin. |
+| `XRTTensor` | [`xrtruntime.tensor`](../../python/utils/hostruntime/xrtruntime/tensor.py) | Tensor backed by NPU/CPU-accessible memory managed with PyXRT. |
+| `XrtTransport` | [`xrtruntime.tensor`](../../python/utils/hostruntime/xrtruntime/tensor.py) | `Transport` for an XRT allocation; reconciles a range through a derived sub-buffer. |
+| `ParameterScratchpad` | [`xrtruntime.parameter_scratchpad`](../../python/utils/hostruntime/xrtruntime/parameter_scratchpad.py) | Write named runtime parameters to a run's ctrl scratchpad; the lower-level form of an `iron.jit` call's `parameters=`. |

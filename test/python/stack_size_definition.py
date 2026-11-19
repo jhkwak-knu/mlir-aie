@@ -1,23 +1,26 @@
-# Copyright (C) 2023, Advanced Micro Devices, Inc.
+# Copyright (C) 2023 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 # RUN: %python %s | FileCheck %s
 
 from aie.iron import Program, Runtime, Worker
-from aie.iron.placers import SequentialPlacer
+
 from aie.iron.device import NPU1
 
 # CHECK: {stack_size = 2048 : i32}
 
 my_worker = Worker(None, stack_size=2048, while_true=False)
 
-rt = Runtime()
-with rt.sequence():
-    rt.start(my_worker)
 
-my_program = Program(NPU1(), rt)
+def sequence():
+    pass
 
-module = my_program.resolve_program(SequentialPlacer())
+
+rt = Runtime(sequence, [])
+
+my_program = Program(NPU1(), rt, workers=[my_worker])
+
+module = my_program.resolve_program()
 
 print(module)
 
@@ -26,6 +29,7 @@ print(module)
 
 from aie.dialects.aie import *
 from aie.extras.context import mlir_mod_ctx
+
 
 def mlir_aie_design():
 
@@ -42,3 +46,21 @@ def mlir_aie_design():
 with mlir_mod_ctx() as ctx:
     mlir_aie_design()
     print(ctx.module)
+
+
+# Worker validates stack_size the way it validates data_size: a
+# ValueError at construction time, before the value reaches the MLIR verifier.
+try:
+    Worker(None, stack_size=0, while_true=False)
+    raise AssertionError("expected ValueError for stack_size < 1")
+except ValueError:
+    pass
+
+try:
+    Worker(None, stack_size="2048", while_true=False)
+    raise AssertionError("expected ValueError for non-int stack_size")
+except ValueError:
+    pass
+
+# CHECK: PASS
+print("PASS")

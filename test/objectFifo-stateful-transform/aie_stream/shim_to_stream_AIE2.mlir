@@ -1,0 +1,42 @@
+//===- shim_to_stream_AIE2.mlir --------------------------------*- MLIR -*-===//
+//
+// Copyright (C) 2025 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+// RUN: aie-opt --aie-objectFifo-stateful-transform --aie-objectFifo-unroll %s | FileCheck %s
+
+// CHECK: module @shim_to_stream_AIE2 {
+// CHECK:   aie.device(xcve2302) {
+// CHECK-DAG:     %shim_noc_tile_2_0 = aie.tile(2, 0)
+// CHECK-DAG:     %tile_3_3 = aie.tile(3, 3)
+// CHECK-DAG:     %of_stream__prodlock0 = aie.lock(%shim_noc_tile_2_0) {init = 1 : i32, sym_name = "of_stream__prodlock0"}
+// CHECK-DAG:     %of_stream__conslock0 = aie.lock(%shim_noc_tile_2_0) {init = 0 : i32, sym_name = "of_stream__conslock0"}
+// CHECK-DAG:     aie.flow(%shim_noc_tile_2_0, DMA : 0, %tile_3_3, Core : 0)
+// CHECK-DAG:     %ext_buffer_in = aie.external_buffer {sym_name = "ext_buffer_in"} : memref<16xi32>
+// CHECK-DAG:     aie.shim_dma_allocation @of_stream__shim_alloc(%shim_noc_tile_2_0, MM2S, 0)
+// CHECK:     %shim_dma_2_0 = aie.shim_dma(%shim_noc_tile_2_0) {
+// CHECK:       %0 = aie.dma_start(MM2S, 0, ^bb1, ^bb2)
+// CHECK:     ^bb1:  // 2 preds: ^bb0, ^bb1
+// CHECK:       aie.use_lock(%of_stream__conslock0, AcquireGreaterEqual, %{{.*}})
+// CHECK:       aie.dma_bd(%ext_buffer_in : memref<16xi32> offset = {{.*}} len = {{.*}})
+// CHECK:       aie.use_lock(%of_stream__prodlock0, Release, %{{.*}})
+// CHECK:       aie.next_bd ^bb1
+// CHECK:     ^bb2:  // pred: ^bb0
+// CHECK:       aie.end
+// CHECK:     }
+// CHECK:   }
+// CHECK: }
+
+module @shim_to_stream_AIE2 {
+ aie.device(xcve2302) {
+    %tile20 = aie.tile(2, 0)
+    %tile33 = aie.tile(3, 3)
+
+    aie.objectfifo @of_stream (%tile20, {%tile33}, 2 : i32) {cons_ports = [#aie.end_port<Core : 0>]} : !aie.objectfifo<memref<16xi32>>
+
+    %ext_buffer_in = aie.external_buffer {sym_name = "ext_buffer_in"}: memref<16xi32>
+    aie.objectfifo.register_external_buffers @of_stream (%tile20, {%ext_buffer_in}) : (memref<16xi32>)
+  }
+}

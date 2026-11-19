@@ -1,18 +1,12 @@
 //===- aie.mlir ------------------------------------------------*- MLIR -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2024 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2024 Advanced Micro Devices, Inc.
 //
 //===----------------------------------------------------------------------===//
 
 module {
   aie.device(NPUDEVICE) {
-    memref.global "public" @out0 : memref<8xi32>
-    memref.global "public" @ctrl0 : memref<8xi32>
-
     %tile_0_0 = aie.tile(0, 0) {controller_id = #aie.packet_info<pkt_type = 0, pkt_id = 4>}
     %tile_0_2 = aie.tile(0, 2)
 
@@ -23,7 +17,8 @@ module {
 
     %input_buffer = aie.buffer(%tile_0_2) {sym_name = "input_buffer"} : memref<8xi32>
     %output_buffer = aie.buffer(%tile_0_2) {sym_name = "output_buffer"} : memref<8xi32>
-    %other_buffer = aie.buffer(%tile_0_2) {sym_name = "other_buffer"} : memref<8xi32>
+    // The host's control packets read this buffer at tile-relative address 0x440.
+    %other_buffer = aie.buffer(%tile_0_2) {sym_name = "other_buffer", address = 0x440 : i32} : memref<8xi32>
 
     aie.packet_flow(0x1) {
       aie.packet_source<%tile_0_0, DMA : 0>
@@ -53,30 +48,34 @@ module {
         memref.store %1, %input_buffer[%arg1] : memref<8xi32>
         memref.store %c1_i32, %other_buffer[%arg1] : memref<8xi32>
       }
-      %c4294967295 = arith.constant 4294967295 : index
-      scf.for %arg0 = %c0 to %c4294967295 step %c1 {
-        aie.use_lock(%input_lock0, AcquireGreaterEqual, 1)
+      %c9223372036854775807 = arith.constant 9223372036854775807 : index
+      scf.for %arg0 = %c0 to %c9223372036854775807 step %c1 {
+        %c1_ul1 = arith.constant 1 : i32
+        aie.use_lock(%input_lock0, AcquireGreaterEqual, %c1_ul1)
         scf.for %arg1 = %c0 to %c8 step %c1 {
           // 4
           %1 = memref.load %input_buffer[%arg1] : memref<8xi32>
           %2 = arith.addi %1, %c1_i32 : i32
           memref.store %2, %input_buffer[%arg1] : memref<8xi32>
         }
-        aie.use_lock(%input_lock0, AcquireGreaterEqual, 1)
+        %c1_ul2 = arith.constant 1 : i32
+        aie.use_lock(%input_lock0, AcquireGreaterEqual, %c1_ul2)
         scf.for %arg1 = %c0 to %c8 step %c1 {
           // 5
           %1 = memref.load %input_buffer[%arg1] : memref<8xi32>
           %2 = arith.addi %1, %c1_i32 : i32
           memref.store %2, %input_buffer[%arg1] : memref<8xi32>
         }
-        aie.use_lock(%input_lock2, AcquireGreaterEqual, 1)
+        %c1_ul3 = arith.constant 1 : i32
+        aie.use_lock(%input_lock2, AcquireGreaterEqual, %c1_ul3)
         scf.for %arg1 = %c0 to %c8 step %c1 {
           // 6
           %1 = memref.load %input_buffer[%arg1] : memref<8xi32>
           %2 = arith.addi %1, %c1_i32 : i32
           memref.store %2, %input_buffer[%arg1] : memref<8xi32>
         }
-        aie.use_lock(%input_lock2, AcquireGreaterEqual, 1)
+        %c1_ul4 = arith.constant 1 : i32
+        aie.use_lock(%input_lock2, AcquireGreaterEqual, %c1_ul4)
         scf.for %arg1 = %c0 to %c8 step %c1 {
           // 7
           %1 = memref.load %input_buffer[%arg1] : memref<8xi32>
@@ -84,14 +83,16 @@ module {
           memref.store %2, %input_buffer[%arg1] : memref<8xi32>
         }
         // write to output buffer
-        aie.use_lock(%output_lock5, AcquireGreaterEqual, 1)
+        %c1_ul5 = arith.constant 1 : i32
+        aie.use_lock(%output_lock5, AcquireGreaterEqual, %c1_ul5)
         scf.for %arg1 = %c0 to %c8 step %c1 {
             %1 = memref.load %input_buffer[%arg1] : memref<8xi32>
             memref.store %1, %output_buffer[%arg1] : memref<8xi32>
             %2 = arith.addi %1, %c1_i32 : i32
             memref.store %2, %other_buffer[%arg1] : memref<8xi32>
         }
-        aie.use_lock(%output_lock4, Release, 1)
+        %c1_ul6 = arith.constant 1 : i32
+        aie.use_lock(%output_lock4, Release, %c1_ul6)
       }
       aie.end
     }
@@ -99,19 +100,21 @@ module {
     %mem_0_2 = aie.mem(%tile_0_2) {
       %0 = aie.dma_start(MM2S, 0, ^bb1, ^bb2)
     ^bb1:  // 2 preds: ^bb0, ^bb2
-      aie.use_lock(%output_lock4, AcquireGreaterEqual, 1)
-      aie.dma_bd(%output_buffer : memref<8xi32>, 0, 8) {packet = #aie.packet_info<pkt_id = 3, pkt_type = 0>}
-      aie.use_lock(%output_lock5, Release, 1)
+      %c1_ul7 = arith.constant 1 : i32
+      aie.use_lock(%output_lock4, AcquireGreaterEqual, %c1_ul7)
+      aie.dma_bd(%output_buffer : memref<8xi32> offset = 0 len = 8) {packet = #aie.packet_info<pkt_id = 3, pkt_type = 0>}
+      %c1_ul8 = arith.constant 1 : i32
+      aie.use_lock(%output_lock5, Release, %c1_ul8)
       aie.next_bd ^bb1
     ^bb2:
       aie.end
     }
 
-    aie.shim_dma_allocation @ctrl0(S2MM, 0, 0)
-    aie.shim_dma_allocation @out0(S2MM, 1, 0)
+    aie.shim_dma_allocation @ctrl0 (%tile_0_0, S2MM, 0)
+    aie.shim_dma_allocation @out0 (%tile_0_0, S2MM, 1)
 
     memref.global "private" constant @blockwrite_data_0 : memref<8xi32> = dense<[2, 0, 0x40090000, 0, 0x40000000, 0, 0, 0x2000000]>
-    aiex.runtime_sequence @seq(%arg0: memref<8xi32>, %arg1: memref<8xi32>, %arg2: memref<8xi32>) {
+    aie.runtime_sequence @seq(%arg0: memref<8xi32>, %arg1: memref<8xi32>, %arg2: memref<8xi32>) {
       %c0_i64 = arith.constant 0 : i64
       %c1_i64 = arith.constant 1 : i64
       %c2_i64 = arith.constant 2 : i64
@@ -129,29 +132,70 @@ module {
       aiex.npu.blockwrite(%0) {address = 0x1d000 : ui32, column = 0 : i32, row = 0 : i32} : memref<8xi32>
 
       // patch bd0 address for packet 0, push to mm2s_0_task_queue, wait
-      aiex.npu.address_patch {addr = 0x1d004 : ui32, arg_idx = 1 : i32, arg_plus = 0 : i32}
-      aiex.npu.maskwrite32 {address = 0x1d210 : ui32, column = 0 : i32, row = 0 : i32, mask = 0x00000F00 : ui32, value = 0x400 : ui32}
-      aiex.npu.write32 {address = 0x1d214 : ui32, column = 0 : i32, row = 0 : i32, value = 0x80000000 : ui32}
-      aiex.npu.sync {channel = 0 : i32, column = 0 : i32, column_num = 1 : i32, direction = 1 : i32, row = 0 : i32, row_num = 1 : i32}
+      %cst_npu_0 = arith.constant 0 : i32
+      aiex.npu.address_patch(%cst_npu_0 : i32) {addr = 0x1d004 : ui32, arg_idx = 1 : i32}
+      %cst_npu_1 = arith.constant 0x1d210 : i32
+      %cst_npu_2 = arith.constant 0x400 : i32
+      %cst_npu_3 = arith.constant 0x00000F00 : i32
+      aiex.npu.maskwrite32(%cst_npu_1, %cst_npu_2, %cst_npu_3) {column = 0 : i32, row = 0 : i32} : i32, i32, i32
+      %cst_npu_4 = arith.constant 0x1d214 : i32
+      %cst_npu_5 = arith.constant 0x80000000 : i32
+      aiex.npu.write32(%cst_npu_4, %cst_npu_5) {column = 0 : i32, row = 0 : i32} : i32, i32
+      %cst_npu_6 = arith.constant 0 : i32
+      %cst_npu_7 = arith.constant 0 : i32
+      %cst_npu_8 = arith.constant 1 : i32
+      %cst_npu_9 = arith.constant 0 : i32
+      %cst_npu_10 = arith.constant 1 : i32
+      %cst_npu_11 = arith.constant 1 : i32
+      aiex.npu.sync(%cst_npu_6, %cst_npu_7, %cst_npu_8, %cst_npu_9, %cst_npu_10, %cst_npu_11) : i32, i32, i32, i32, i32, i32
 
       // patch bd0 address for packet 1, push to mm2s_0_task_queue, wait
-      aiex.npu.address_patch {addr = 0x1d004 : ui32, arg_idx = 1 : i32, arg_plus = 8 : i32}
-      aiex.npu.write32 {address = 0x1d214 : ui32, column = 0 : i32, row = 0 : i32, value = 0x80000000 : ui32}
-      aiex.npu.sync {channel = 0 : i32, column = 0 : i32, column_num = 1 : i32, direction = 1 : i32, row = 0 : i32, row_num = 1 : i32}
+      %cst_npu_12 = arith.constant 8 : i32
+      aiex.npu.address_patch(%cst_npu_12 : i32) {addr = 0x1d004 : ui32, arg_idx = 1 : i32}
+      %cst_npu_13 = arith.constant 0x1d214 : i32
+      %cst_npu_14 = arith.constant 0x80000000 : i32
+      aiex.npu.write32(%cst_npu_13, %cst_npu_14) {column = 0 : i32, row = 0 : i32} : i32, i32
+      %cst_npu_15 = arith.constant 0 : i32
+      %cst_npu_16 = arith.constant 0 : i32
+      %cst_npu_17 = arith.constant 1 : i32
+      %cst_npu_18 = arith.constant 0 : i32
+      %cst_npu_19 = arith.constant 1 : i32
+      %cst_npu_20 = arith.constant 1 : i32
+      aiex.npu.sync(%cst_npu_15, %cst_npu_16, %cst_npu_17, %cst_npu_18, %cst_npu_19, %cst_npu_20) : i32, i32, i32, i32, i32, i32
 
       // wait for dma output
       aiex.npu.dma_wait {symbol = @out0}
 
       // patch bd0 length and address for packet 2, push to mm2s_0_task_queue, wait
-      aiex.npu.write32 {address = 0x1d000 : ui32, column = 0 : i32, row = 0 : i32, value = 1 : ui32}
-      aiex.npu.address_patch {addr = 0x1d004 : ui32, arg_idx = 1 : i32, arg_plus = 16 : i32}
-      aiex.npu.write32 {address = 0x1d214 : ui32, column = 0 : i32, row = 0 : i32, value = 0x80000000 : ui32}
-      aiex.npu.sync {channel = 0 : i32, column = 0 : i32, column_num = 1 : i32, direction = 1 : i32, row = 0 : i32, row_num = 1 : i32}
+      %cst_npu_21 = arith.constant 0x1d000 : i32
+      %cst_npu_22 = arith.constant 1 : i32
+      aiex.npu.write32(%cst_npu_21, %cst_npu_22) {column = 0 : i32, row = 0 : i32} : i32, i32
+      %cst_npu_23 = arith.constant 16 : i32
+      aiex.npu.address_patch(%cst_npu_23 : i32) {addr = 0x1d004 : ui32, arg_idx = 1 : i32}
+      %cst_npu_24 = arith.constant 0x1d214 : i32
+      %cst_npu_25 = arith.constant 0x80000000 : i32
+      aiex.npu.write32(%cst_npu_24, %cst_npu_25) {column = 0 : i32, row = 0 : i32} : i32, i32
+      %cst_npu_26 = arith.constant 0 : i32
+      %cst_npu_27 = arith.constant 0 : i32
+      %cst_npu_28 = arith.constant 1 : i32
+      %cst_npu_29 = arith.constant 0 : i32
+      %cst_npu_30 = arith.constant 1 : i32
+      %cst_npu_31 = arith.constant 1 : i32
+      aiex.npu.sync(%cst_npu_26, %cst_npu_27, %cst_npu_28, %cst_npu_29, %cst_npu_30, %cst_npu_31) : i32, i32, i32, i32, i32, i32
 
       // patch bd0 address for packet 3, push to mm2s_0_task_queue, wait
-      aiex.npu.address_patch {addr = 0x1d004 : ui32, arg_idx = 1 : i32, arg_plus = 20 : i32}
-      aiex.npu.write32 {address = 0x1d214 : ui32, column = 0 : i32, row = 0 : i32, value = 0x80000000 : ui32}
-      aiex.npu.sync {channel = 0 : i32, column = 0 : i32, column_num = 1 : i32, direction = 1 : i32, row = 0 : i32, row_num = 1 : i32}
+      %cst_npu_32 = arith.constant 20 : i32
+      aiex.npu.address_patch(%cst_npu_32 : i32) {addr = 0x1d004 : ui32, arg_idx = 1 : i32}
+      %cst_npu_33 = arith.constant 0x1d214 : i32
+      %cst_npu_34 = arith.constant 0x80000000 : i32
+      aiex.npu.write32(%cst_npu_33, %cst_npu_34) {column = 0 : i32, row = 0 : i32} : i32, i32
+      %cst_npu_35 = arith.constant 0 : i32
+      %cst_npu_36 = arith.constant 0 : i32
+      %cst_npu_37 = arith.constant 1 : i32
+      %cst_npu_38 = arith.constant 0 : i32
+      %cst_npu_39 = arith.constant 1 : i32
+      %cst_npu_40 = arith.constant 1 : i32
+      aiex.npu.sync(%cst_npu_35, %cst_npu_36, %cst_npu_37, %cst_npu_38, %cst_npu_39, %cst_npu_40) : i32, i32, i32, i32, i32, i32
 
       // wait for control port output
       aiex.npu.dma_wait {symbol = @ctrl0}

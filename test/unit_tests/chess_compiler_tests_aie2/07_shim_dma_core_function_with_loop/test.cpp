@@ -1,14 +1,13 @@
 //===- test.cpp -------------------------------------------------*- C++ -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2020-2022 Xilinx, Inc.
+// Copyright (C) 2022-2023 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2020 Xilinx Inc.
 //
 //===----------------------------------------------------------------------===//
 
 #include "test_library.h"
+#include <aie_codegen.h>
 #include <cassert>
 #include <cmath>
 #include <cstdio>
@@ -18,7 +17,6 @@
 #include <sys/mman.h>
 #include <thread>
 #include <unistd.h>
-#include <xaiengine.h>
 
 #include "aie_inc.cpp"
 

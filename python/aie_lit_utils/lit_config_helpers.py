@@ -1,0 +1,1052 @@
+# aie/test/utils/lit_config_helpers.py
+# -*- Python -*-
+#
+# Copyright (C) 2025 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+#
+
+"""
+Shared utilities for AIE/AIR lit test configuration.
+Consolidates hardware detection, path management, and common substitutions.
+
+This module provides a centralized way to handle:
+- Hardware detection (XRT, NPU devices)
+- Tool detection (Chess, Peano, aiesimulator)
+- PATH management
+- Common substitutions and features
+
+Usage:
+    from lit_config_helpers import LitConfigHelper
+
+    helper = LitConfigHelper()
+    xrt_config = helper.detect_xrt(...)
+    helper.apply_config_to_lit(config, {"xrt": xrt_config})
+"""
+
+import copy
+import hashlib
+import logging
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+
+import lit.formats
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class HardwareConfig:
+    """
+    Configuration for detected hardware or tools.
+
+    Attributes:
+        found: Whether the hardware/tool was detected
+        features: List of lit features to add
+        substitutions: Dictionary of lit substitutions
+        flags: Compiler/linker flags for this hardware
+        environment: Dictionary of environment variables to set
+    """
+
+    found: bool = False
+    features: List[str] = field(default_factory=list)
+    substitutions: Dict[str, str] = field(default_factory=dict)
+    flags: str = ""
+    environment: Dict[str, str] = field(default_factory=dict)
+
+
+class SanitizerLogShTest(lit.formats.ShTest):
+    """Run each test with its sanitizer reports in files of its own.
+
+    A report piped into FileCheck is kept. The files are
+    ``<log_dir>/<sha1(full lit name)[:16]>.<pid>``, the naming
+    utils/kernel_checks/code_health.py reads back.
+
+    Args:
+        log_dir: Absolute directory for the report files.
+    """
+
+    OPTIONS = ("ASAN_OPTIONS", "UBSAN_OPTIONS", "TSAN_OPTIONS")
+
+    def __init__(self, log_dir: str):
+        super().__init__()
+        self.log_dir = log_dir
+
+    def execute(self, test, litConfig):
+        name = hashlib.sha1(test.getFullName().encode()).hexdigest()[:16]
+        log_path = f"log_path={os.path.join(self.log_dir, name)}"
+        env = dict(test.config.environment)
+        for key in self.OPTIONS:
+            env[key] = f"{env[key]}:{log_path}" if env.get(key) else log_path
+        test.config = copy.copy(test.config)
+        test.config.environment = env
+        return super().execute(test, litConfig)
+
+
+class LitConfigHelper:
+    """Helper class for managing lit test configurations."""
+
+    # NPU Model mappings - centralized for easy updates
+    # Maps generation name to list of model strings that may appear in xrt-smi
+    NPU_MODELS = {
+        "npu1": ["npu1", "Phoenix"],
+        "npu2": [
+            "npu4",
+            "Strix",
+            "npu5",
+            "Strix Halo",
+            "npu6",
+            "Krackan",
+            "Gorgon Point",
+        ],
+    }
+
+    PATH_ENV_VARS = {"PATH", "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"}
+
+    @staticmethod
+    def _prepend_env_paths(current_value: str, new_value: str) -> str:
+        """Prepend path entries without overwriting the existing values."""
+        entries = []
+        for value in (new_value, current_value):
+            if not value:
+                continue
+            entries.extend([entry for entry in value.split(os.path.pathsep) if entry])
+
+        merged = []
+        seen = set()
+        for entry in entries:
+            normalized = os.path.normcase(os.path.normpath(entry))
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            merged.append(entry)
+        return os.path.pathsep.join(merged)
+
+    @staticmethod
+    def _quote_lit_arg(value: str) -> str:
+        """Quote arguments for lit's shell parser."""
+        return '"' + value.replace("\\", "/").replace('"', '\\"') + '"'
+
+    @staticmethod
+    def _run_on_npu_wrap(aie_src_root: str, npu_kind: str) -> str:
+        """Build the cross-platform run-on-NPU wrapper command."""
+        wrapper = os.path.join(aie_src_root, "utils", "run_on_npu.py")
+        return " ".join(
+            [
+                LitConfigHelper._quote_lit_arg(sys.executable),
+                LitConfigHelper._quote_lit_arg(wrapper),
+                LitConfigHelper._quote_lit_arg(npu_kind),
+            ]
+        )
+
+    @staticmethod
+    def _run_with_test_cache_wrap(aie_src_root: str, test_key: str = "%s") -> str:
+        """Build the cross-platform per-test cache wrapper command."""
+        wrapper = os.path.join(aie_src_root, "utils", "run_with_test_cache.py")
+        return " ".join(
+            [
+                LitConfigHelper._quote_lit_arg(sys.executable),
+                LitConfigHelper._quote_lit_arg(wrapper),
+                LitConfigHelper._quote_lit_arg(test_key),
+            ]
+        )
+
+    @staticmethod
+    def add_makefile_examples_feature(config_obj) -> None:
+        """Enable Make-based example tests on POSIX hosts."""
+        if os.name != "nt" and shutil.which("make"):
+            config_obj.available_features.add("makefile_examples")
+
+    @staticmethod
+    def add_hrxxclbinutil_feature(config_obj) -> None:
+        """Enable tests that build an xclbin with the bundled XRT-free xclbinutil.
+
+        -DAIE_BUILD_HRXXCLBINUTIL=ON installs it into the AIE tools dir, so a
+        bare `xclbinutil` resolves to that copy. shutil.which picks up the
+        platform's executable suffix (.exe on Windows via PATHEXT).
+        """
+        if shutil.which("xclbinutil", path=config_obj.aie_tools_dir) is not None:
+            config_obj.available_features.add("hrxxclbinutil")
+
+    # Matches cmake_minimum_required() in the example CMakeLists.
+    CMAKE_EXAMPLES_MIN_VERSION = (3, 30)
+
+    @staticmethod
+    def add_cmake_examples_feature(config_obj) -> None:
+        """Enable CMake-based example tests (works on Windows, unlike Make).
+
+        Requires cmake, ctest and ninja — what run_cmake.lit actually invokes —
+        and a cmake new enough for the examples' cmake_minimum_required. Without
+        the version check the lits hard-FAIL on a host whose cmake is too old
+        (Ubuntu 24.04 ships 3.28) instead of being reported UNSUPPORTED."""
+        if not all(shutil.which(tool) for tool in ("cmake", "ctest", "ninja")):
+            return
+        version = LitConfigHelper._cmake_version()
+        if version < LitConfigHelper.CMAKE_EXAMPLES_MIN_VERSION:
+            logger.info("cmake %s is too old for the CMake-based examples", version)
+            return
+        config_obj.available_features.add("cmake_examples")
+
+    @staticmethod
+    def _cmake_version() -> tuple:
+        """(major, minor) of the cmake on PATH, or (0, 0) if it can't be read."""
+        try:
+            out = subprocess.run(
+                ["cmake", "--version"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            return (0, 0)
+        match = re.search(r"cmake version (\d+)\.(\d+)", out)
+        if not match:
+            return (0, 0)
+        return (int(match.group(1)), int(match.group(2)))
+
+    @staticmethod
+    def _find_xrt_smi(xrt_bin_dir: str) -> Optional[str]:
+        """Find xrt-smi without assuming it exists under XRT_ROOT."""
+        candidates = []
+        if xrt_bin_dir:
+            candidates.extend(
+                [
+                    os.path.join(xrt_bin_dir, "xrt-smi"),
+                    os.path.join(xrt_bin_dir, "bin", "xrt-smi"),
+                ]
+            )
+            if os.name == "nt":
+                candidates.extend(
+                    [
+                        os.path.join(xrt_bin_dir, "xrt-smi.exe"),
+                        os.path.join(xrt_bin_dir, "bin", "xrt-smi.exe"),
+                    ]
+                )
+
+        if os.name == "nt":
+            system_root = os.environ.get("SystemRoot", r"C:\Windows")
+            candidates.append(
+                os.path.join(system_root, "System32", "AMD", "xrt-smi.exe")
+            )
+
+        for candidate in candidates:
+            if os.path.isfile(candidate):
+                return candidate
+
+        return shutil.which("xrt-smi")
+
+    @staticmethod
+    def prepend_path(llvm_config, path: str) -> None:
+        """
+        Prepend a directory to the PATH environment variable.
+
+        Args:
+            llvm_config: LLVM lit config object
+            path: Directory path to prepend
+        """
+        paths = [path]
+        current_paths = llvm_config.config.environment.get("PATH", None)
+        if current_paths:
+            paths.extend(current_paths.split(os.path.pathsep))
+        paths = [os.path.normcase(os.path.normpath(p)) for p in paths]
+        llvm_config.config.environment["PATH"] = os.pathsep.join(paths)
+
+    @staticmethod
+    def detect_xrt(
+        xrt_lib_dir: str,
+        xrt_include_dir: str,
+        xrt_bin_dir: str,
+        aie_src_root: str,
+        llvm_config,
+        vitis_components: Optional[List[str]] = None,
+        can_use_peano_feature_gate: bool = False,
+    ) -> HardwareConfig:
+        """
+        Detect XRT installation and Ryzen AI NPU hardware.
+
+        Args:
+            xrt_lib_dir: Path to XRT library directory
+            xrt_include_dir: Path to XRT include directory
+            xrt_bin_dir: Path to XRT binary directory
+            aie_src_root: Path to AIE source root (for the run_on_npu wrapper)
+            vitis_components: List of available Vitis components for feature filtering
+            can_use_peano_feature_gate: Whether Peano may be used for Ryzen AI
+                feature gating when Vitis AIETOOLS support is absent
+
+        Returns:
+            HardwareConfig with XRT detection results
+
+            HardwareConfig contains:
+                - found: True if XRT is detected and valid
+                - flags: Compiler/linker flags for XRT (includes -I, -L, and libraries)
+                - substitutions: Dictionary with "%xrt_flags", "%run_on_npu1%",
+                                 "%run_on_npu2%", and "%aie_cmake_device%"
+                                 ("npu2" when a Strix NPU is detected, else "npu";
+                                 what the run_cmake lits pass as -DAIE_DEVICE)
+                - features: List of features including "ryzen_ai", "ryzen_ai_npu1", or "ryzen_ai_npu2"
+                           based on detected NPU hardware and available Vitis components
+        """
+        if vitis_components is None:
+            vitis_components = []
+
+        expected_npu = os.environ.get("AIE_EXPECTED_NPU")
+        if expected_npu and expected_npu not in LitConfigHelper.NPU_MODELS:
+            llvm_config.lit_config.fatal(
+                "AIE_EXPECTED_NPU must be 'npu1' or 'npu2', " f"got {expected_npu!r}"
+            )
+
+        config = HardwareConfig()
+        run_on_npu1 = "echo"
+        run_on_npu2 = "echo"
+        # Whichever generation is actually detected, so device-agnostic tests
+        # (single lit file, no npu1/npu2 duplication) can target it directly.
+        # Consumed by %aie_cmake_device% below.
+        detected_npu_device = ""
+
+        if not xrt_lib_dir:
+            logger.info("xrt not found")
+            config.flags = ""
+            config.substitutions["%xrt_flags"] = ""
+
+            if expected_npu:
+                llvm_config.lit_config.fatal(
+                    f"AIE_EXPECTED_NPU={expected_npu}, but XRT is unavailable"
+                )
+
+            config.substitutions["%run_on_npu1%"] = run_on_npu1
+            config.substitutions["%run_on_npu2%"] = run_on_npu2
+            config.substitutions["%aie_cmake_device%"] = "npu"
+            return config
+
+        logger.info("xrt found at %s", os.path.dirname(xrt_lib_dir))
+        config.found = True
+        if os.name == "nt":
+            config.flags = f"-I{xrt_include_dir} -L{xrt_lib_dir} -lxrt_coreutil"
+        else:
+            config.flags = f"-I{xrt_include_dir} -L{xrt_lib_dir} -luuid -lxrt_coreutil"
+        config.substitutions["%xrt_flags"] = config.flags
+
+        # Runtime library search path. Compose with the lit environment instead of
+        # rebuilding PATH/LD_LIBRARY_PATH from the process environment.
+        if os.name == "nt":
+            runtime_dirs = [path for path in (xrt_bin_dir, xrt_lib_dir) if path]
+            if runtime_dirs:
+                config.environment["PATH"] = os.path.pathsep.join(runtime_dirs)
+        elif xrt_lib_dir:
+            config.environment["LD_LIBRARY_PATH"] = xrt_lib_dir
+
+        # Detect NPU hardware. XRT installation layout and xrt-smi location are
+        # not always the same on Windows, so probe them independently.
+        try:
+            xrtsmi = LitConfigHelper._find_xrt_smi(xrt_bin_dir)
+            if not xrtsmi:
+                raise FileNotFoundError("xrt-smi")
+
+            probe_env = os.environ.copy()
+            for key, value in config.environment.items():
+                if key in LitConfigHelper.PATH_ENV_VARS:
+                    probe_env[key] = LitConfigHelper._prepend_env_paths(
+                        probe_env.get(key, ""), value
+                    )
+                else:
+                    probe_env[key] = value
+
+            print(f"Using xrt-smi: {xrtsmi}")
+            attempts = 3 if expected_npu else 1
+            result = None
+            for attempt in range(1, attempts + 1):
+                try:
+                    result = subprocess.run(
+                        [xrtsmi, "examine"],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        env=probe_env,
+                        timeout=10,
+                    )
+                except subprocess.TimeoutExpired:
+                    if attempt == attempts:
+                        raise
+                else:
+                    if not expected_npu:
+                        break
+                    probe_output = result.stdout.decode(
+                        "utf-8", errors="ignore"
+                    ) + result.stderr.decode("utf-8", errors="ignore")
+                    if result.returncode == 0 and any(
+                        model in probe_output
+                        for model in LitConfigHelper.NPU_MODELS[expected_npu]
+                    ):
+                        break
+
+                if attempt < attempts:
+                    delay = attempt * 3
+                    logger.warning(
+                        "Expected %s was not visible to xrt-smi on attempt %d/%d; "
+                        "retrying in %ds",
+                        expected_npu.upper(),
+                        attempt,
+                        attempts,
+                        delay,
+                    )
+                    time.sleep(delay)
+
+            if result is None:
+                raise RuntimeError("xrt-smi did not complete")
+            if expected_npu and result.returncode != 0:
+                raise subprocess.CalledProcessError(result.returncode, result.args)
+
+            output = (
+                result.stdout.decode("utf-8", errors="ignore")
+                + "\n"
+                + result.stderr.decode("utf-8", errors="ignore")
+            ).split("\n")
+
+            # Pattern matches both old and new xrt-smi output formats:
+            # Old: "|[0000:41:00.1]  ||RyzenAI-npu1  |"
+            # New: "|[0000:41:00.1]  |NPU Phoenix  |"
+            pattern = re.compile(
+                r"[\|]?(\[.+:.+:.+\]).+\|(RyzenAI-(npu\d)|NPU ([\w ]+?))\s*\|"
+            )
+
+            for line in output:
+                match = pattern.match(line)
+                if not match:
+                    continue
+
+                device_id = match.group(1)
+                logger.info("Found Ryzen AI device: %s", device_id)
+
+                # Extract model name from either group 3 or 4
+                model = "unknown"
+                if match.group(3):
+                    model = str(match.group(3))
+                elif match.group(4):
+                    model = str(match.group(4))
+
+                logger.info("\tmodel: '%s'", model)
+
+                # Map model to NPU generation and filter by available components
+                # Use substring matching so e.g. "Krackan" matches "Krackan 1"
+                if any(known in model for known in LitConfigHelper.NPU_MODELS["npu1"]):
+                    if "AIE2" in vitis_components or can_use_peano_feature_gate:
+                        run_on_npu1 = LitConfigHelper._run_on_npu_wrap(
+                            aie_src_root, "npu1"
+                        )
+                        config.features.extend(["ryzen_ai", "ryzen_ai_npu1"])
+                        config.substitutions["%run_on_npu1%"] = run_on_npu1
+                        detected_npu_device = "npu1"
+                        logger.info(
+                            "Running tests on NPU1 with command line: %s", run_on_npu1
+                        )
+                    else:
+                        logger.warning("NPU1 detected but no AIE2 backend is available")
+                elif any(
+                    known in model for known in LitConfigHelper.NPU_MODELS["npu2"]
+                ):
+                    if "AIE2P" in vitis_components or can_use_peano_feature_gate:
+                        run_on_npu2 = LitConfigHelper._run_on_npu_wrap(
+                            aie_src_root, "npu2"
+                        )
+                        config.features.extend(["ryzen_ai", "ryzen_ai_npu2"])
+                        config.substitutions["%run_on_npu2%"] = run_on_npu2
+                        detected_npu_device = "npu2"
+                        llvm_config.with_environment("NPU2", "1")
+                        logger.info(
+                            "Running tests on NPU2 with command line: %s", run_on_npu2
+                        )
+                    else:
+                        logger.warning(
+                            "NPU2 detected but no AIE2P backend is available"
+                        )
+                else:
+                    logger.warning("xrt-smi reported unknown NPU model '%s'.", model)
+                break
+
+        except subprocess.TimeoutExpired:
+            logger.warning("Failed to run xrt-smi (timeout)")
+        except FileNotFoundError:
+            logger.warning("Failed to run xrt-smi (not found)")
+        except Exception as e:
+            logger.warning("Failed to run xrt-smi: %s", e)
+
+        if expected_npu and f"ryzen_ai_{expected_npu}" not in config.features:
+            llvm_config.lit_config.fatal(
+                f"AIE_EXPECTED_NPU={expected_npu}, but the matching hardware "
+                "feature was not found!"
+            )
+
+        config.substitutions["%run_on_npu1%"] = run_on_npu1
+        config.substitutions["%run_on_npu2%"] = run_on_npu2
+        # add_aie_design/add_aie_run_test's -DAIE_DEVICE takes "npu" (not
+        # "npu1") for the first-gen device -- map the detected generation.
+        config.substitutions["%aie_cmake_device%"] = (
+            "npu2" if detected_npu_device == "npu2" else "npu"
+        )
+
+        return config
+
+    @staticmethod
+    def detect_chess(
+        vitis_root: str, enable_chess_tests: bool, llvm_config
+    ) -> HardwareConfig:
+        """
+        Detect Chess compiler and validate license.
+
+        Args:
+            vitis_root: Path to Vitis installation
+            enable_chess_tests: Whether chess tests are enabled in config
+            llvm_config: LLVM lit config object for environment setup
+
+        Returns:
+            HardwareConfig with Chess detection results
+        """
+        config = HardwareConfig()
+
+        if not enable_chess_tests:
+            logger.info("Chess tests disabled")
+            return config
+
+        logger.info("Looking for Chess...")
+        xchesscc_path = None
+        if vitis_root:
+            xchesscc_path = shutil.which("xchesscc")
+
+        if not xchesscc_path:
+            # Check if license exists anyway
+            xilinxd_license_file = os.getenv("XILINXD_LICENSE_FILE")
+            if xilinxd_license_file:
+                logger.info("Chess license found")
+                llvm_config.with_environment(
+                    "XILINXD_LICENSE_FILE", xilinxd_license_file
+                )
+            else:
+                logger.info("Chess not found")
+            return config
+
+        logger.info("Chess found: %s", xchesscc_path)
+        config.found = True
+        config.features.extend(["chess", "valid_xchess_license"])
+
+        # Handle license files
+        lm_license_file = os.getenv("LM_LICENSE_FILE")
+        xilinxd_license_file = os.getenv("XILINXD_LICENSE_FILE")
+
+        if lm_license_file:
+            llvm_config.with_environment("LM_LICENSE_FILE", lm_license_file)
+        if xilinxd_license_file:
+            llvm_config.with_environment("XILINXD_LICENSE_FILE", xilinxd_license_file)
+
+        if not (lm_license_file or xilinxd_license_file):
+            logger.warning(
+                "no valid xchess license that is required by some of the lit tests"
+            )
+
+        return config
+
+    @staticmethod
+    def detect_peano(
+        peano_tools_dir: str, peano_install_dir: str, llvm_config
+    ) -> HardwareConfig:
+        """
+        Detect Peano backend availability.
+
+        Args:
+            peano_tools_dir: Path to Peano tools directory
+            peano_install_dir: Path to Peano installation root
+            llvm_config: LLVM lit config object for environment setup
+
+        Returns:
+            HardwareConfig with Peano detection results
+        """
+        config = HardwareConfig()
+
+        try:
+            llc_executable = "llc.exe" if os.name == "nt" else "llc"
+            llc_path = os.path.join(peano_tools_dir, llc_executable)
+            result = subprocess.run(
+                [llc_path, "-mtriple=aie", "--version"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=5,
+            )
+
+            if re.search(
+                "Xilinx AI Engine", result.stdout.decode("utf-8", errors="ignore")
+            ):
+                config.found = True
+                config.features.append("peano")
+
+                peano_executable_suffix = ".exe" if os.name == "nt" else ""
+                for tool_name in ["clang++", "clang"]:
+                    tool_path = os.path.join(
+                        peano_tools_dir, f"{tool_name}{peano_executable_suffix}"
+                    )
+                    config.substitutions[
+                        re.escape(f"%PEANO_INSTALL_DIR/bin/{tool_name}")
+                    ] = LitConfigHelper._quote_lit_arg(tool_path)
+
+                config.substitutions["%PEANO_INSTALL_DIR"] = peano_install_dir
+                # Also set environment variable for tests that need it
+                llvm_config.with_environment("PEANO_INSTALL_DIR", peano_install_dir)
+                logger.info("Peano found: %s", llc_path)
+                return config
+        except subprocess.TimeoutExpired:
+            logger.warning("Peano detection timed out at %s", peano_tools_dir)
+        except FileNotFoundError:
+            logger.warning("Peano not found, but expected at %s", peano_tools_dir)
+            return config
+        except Exception as e:
+            logger.warning("Peano detection failed: %s", e)
+
+        logger.warning("Peano not found, but expected at %s", peano_tools_dir)
+        return config
+
+    @staticmethod
+    def detect_aiesimulator(aie_obj_root) -> HardwareConfig:
+        """
+        Detect aiesimulator availability.
+
+        Returns:
+            HardwareConfig with aiesimulator detection results
+        """
+        config = HardwareConfig()
+        sim_path = shutil.which("aiesimulator")
+
+        if sim_path:
+            logger.info("aiesimulator found: %s", sim_path)
+            config.found = True
+            config.features.append("aiesimulator")
+            config.environment["LD_LIBRARY_PATH"] = "{}".format(
+                os.path.join(aie_obj_root, "runtime_lib", "x86_64", "xaiengine", "lib")
+            )
+        else:
+            logger.info("aiesimulator not found")
+        return config
+
+    @staticmethod
+    def detect_opencv(
+        opencv_include_dir: str, opencv_lib_dir: str, opencv_libs: str
+    ) -> HardwareConfig:
+        """
+        Detect OpenCV installation and generate compiler flags.
+
+        Args:
+            opencv_include_dir: Path to OpenCV include directory
+            opencv_lib_dir: Path to OpenCV library directory (optional)
+            opencv_libs: Semicolon-separated list of OpenCV libraries
+
+        Returns:
+            HardwareConfig with OpenCV detection results and flags
+        """
+        config = HardwareConfig()
+
+        if not opencv_include_dir or not opencv_libs:
+            logger.info("opencv not found")
+            config.substitutions["%opencv_flags"] = ""
+            return config
+
+        logger.info("opencv found")
+        config.found = True
+        config.features.append("opencv")
+
+        # Build compiler flags
+        flags = f" -I{opencv_include_dir}"
+        if opencv_lib_dir:
+            flags += f" -L{opencv_lib_dir}"
+
+        libs = opencv_libs.split(";")
+        flags += " " + " ".join([f"-l{lib}" for lib in libs])
+
+        config.substitutions["%opencv_flags"] = flags
+        return config
+
+    @staticmethod
+    def setup_host_target_triplet(
+        aie_host_target: str, vitis_sysroot: str = ""
+    ) -> Tuple[str, str]:
+        """
+        Configure host target triplet and sysroot flags.
+
+        Args:
+            aie_host_target: Host target architecture
+            vitis_sysroot: Path to Vitis sysroot (for cross-compilation)
+
+        Returns:
+            Tuple of (triplet_string, sysroot_flag)
+        """
+        if "x86_64" in aie_host_target:
+            return "x86_64-unknown-linux-gnu", ""
+        elif aie_host_target == "aarch64":
+            sysroot_flag = f"--sysroot={vitis_sysroot}" if vitis_sysroot else ""
+            return "aarch64-linux-gnu", sysroot_flag
+        else:
+            return aie_host_target, ""
+
+    @staticmethod
+    def _is_functional_cxx_compiler(path: str) -> bool:
+        """Check that `path` is a compiler binary that actually runs.
+
+        Vitis prepends its aietools/bin (device-target tooling) onto PATH;
+        some Vitis installs ship a clang++ there that is a wrapper script
+        shelling out to a peano clang++ binary that does not exist in that
+        install. Such a wrapper still passes an `os.path.exists`/`which`
+        check, so it must be invoked to confirm it works.
+        """
+        try:
+            subprocess.run(
+                [path, "--version"], capture_output=True, timeout=10, check=True
+            )
+            return True
+        except (OSError, subprocess.SubprocessError):
+            return False
+
+    @staticmethod
+    def setup_host_compiler_substitutions(config_obj) -> None:
+        """Add host compiler substitutions for tests that build host executables.
+
+        AIE/Peano tool directories are added to PATH for device-side tools, so
+        host-side tests should not rely on a bare ``clang++`` resolving to the
+        host LLVM compiler. This substitution keeps host compilation explicit
+        and preserves Windows executable suffix handling. Using ``clang++``
+        means ``-lstdc++`` need not be listed explicitly in link flags, but
+        run.lit files must still pass an explicit ``-std=c++XX``: clang++'s
+        default language standard varies across supported Clang versions.
+        """
+        host_clangxx = os.path.join(
+            config_obj.llvm_tools_dir, f"clang++{config_obj.llvm_exe_ext}"
+        )
+        if not (
+            os.path.exists(host_clangxx)
+            and LitConfigHelper._is_functional_cxx_compiler(host_clangxx)
+        ):
+            which_clangxx = shutil.which("clang++")
+            if which_clangxx and LitConfigHelper._is_functional_cxx_compiler(
+                which_clangxx
+            ):
+                host_clangxx = which_clangxx
+            elif os.path.exists(
+                "/usr/bin/clang++"
+            ) and LitConfigHelper._is_functional_cxx_compiler("/usr/bin/clang++"):
+                host_clangxx = "/usr/bin/clang++"
+            else:
+                host_clangxx = "clang++"
+        config_obj.substitutions.append(
+            ("%host_clang", LitConfigHelper._quote_lit_arg(host_clangxx))
+        )
+
+    @staticmethod
+    def setup_host_link_substitution(config_obj) -> None:
+        """Add host linker flags for tests that build XRT host executables.
+
+        Linux-hosted tests link librt and libm explicitly; libstdc++ is omitted
+        because the host compiler substitution now resolves to ``clang++``,
+        which links the C++ standard library automatically. Windows-hosted tests
+        link against CMake-built dynamic MSVC libraries, matching CMake's
+        default /MD runtime selection.
+        """
+        if os.name == "nt":
+            host_link_flags = " ".join(
+                [
+                    "-fms-runtime-lib=dll",
+                    "-Xlinker",
+                    "/NODEFAULTLIB:libucrt",
+                    "-Xlinker",
+                    "/DEFAULTLIB:ucrt",
+                ]
+            )
+        else:
+            host_link_flags = "-lrt -lm"
+        config_obj.substitutions.append(("%host_link_flags", host_link_flags))
+
+    @staticmethod
+    def setup_aiecc_substitution(config_obj) -> None:
+        """Add an explicit substitution for the C++ aiecc driver.
+
+        Tests that exercise the compiler should invoke the build-tree
+        executable directly so they do not depend on PATH order or a stale
+        installed console script.
+        """
+        aiecc = os.path.join(
+            config_obj.aie_tools_dir, f"aiecc{config_obj.llvm_exe_ext}"
+        )
+        config_obj.substitutions.append(
+            ("%aiecc", LitConfigHelper._quote_lit_arg(aiecc))
+        )
+
+    @staticmethod
+    def add_python_tool_substitutions(config_obj, tool_names: List[str]) -> None:
+        """Add explicit substitutions for Python scripts under the AIE bin dir.
+
+        Lit's normal tool discovery can struggle with ``.py`` tool names on
+        Windows, so these substitutions quote the build-tree tool paths
+        directly.
+        """
+        for tool_name in tool_names:
+            config_obj.substitutions.append(
+                (
+                    tool_name,
+                    LitConfigHelper._quote_lit_arg(
+                        os.path.join(config_obj.aie_tools_dir, tool_name)
+                    ),
+                )
+            )
+
+    @staticmethod
+    def can_import_python_module(
+        config_obj, python_executable: str, module_name: str
+    ) -> bool:
+        """Return True when lit's test Python can import a module.
+
+        Probes the environment lit actually uses for tests so feature gates do
+        not advertise Python extensions that are missing from the active PATH.
+        """
+        probe_env = os.environ.copy()
+        for key, value in config_obj.environment.items():
+            if key in LitConfigHelper.PATH_ENV_VARS:
+                probe_env[key] = LitConfigHelper._prepend_env_paths(
+                    probe_env.get(key, ""), value
+                )
+            else:
+                probe_env[key] = value
+
+        probe = "import importlib; " f"importlib.import_module({module_name!r})"
+        try:
+            result = subprocess.run(
+                [python_executable, "-c", probe],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=probe_env,
+                timeout=10,
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning("Python module import probe timed out for %s", module_name)
+            return False
+        except FileNotFoundError:
+            logger.warning(
+                "Python executable not found for import probe: %s", python_executable
+            )
+            return False
+        except Exception as e:
+            logger.warning(
+                "Python module import probe failed for %s: %s", module_name, e
+            )
+            return False
+
+        if result.returncode == 0:
+            return True
+
+        stderr = result.stderr.decode("utf-8", errors="ignore").strip()
+        logger.warning(
+            "Python module %s is not importable by %s%s",
+            module_name,
+            python_executable,
+            f": {stderr}" if stderr else "",
+        )
+        return False
+
+    @staticmethod
+    def python_module_has_attribute(
+        config_obj,
+        python_executable: str,
+        module_name: str,
+        attribute_path: Tuple[str, ...],
+    ) -> bool:
+        """Return whether lit's test Python exposes a module attribute path."""
+        probe_env = os.environ.copy()
+        for key, value in config_obj.environment.items():
+            if key in LitConfigHelper.PATH_ENV_VARS:
+                probe_env[key] = LitConfigHelper._prepend_env_paths(
+                    probe_env.get(key, ""), value
+                )
+            else:
+                probe_env[key] = value
+
+        probe = (
+            "import functools, importlib; "
+            f"module = importlib.import_module({module_name!r}); "
+            f"functools.reduce(getattr, {attribute_path!r}, module); "
+            "print('ok')"
+        )
+        try:
+            result = subprocess.run(
+                [python_executable, "-c", probe],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=probe_env,
+                timeout=10,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False
+        except Exception:
+            return False
+
+        return result.returncode == 0
+
+    @staticmethod
+    def python_expr_is_true(config_obj, python_executable: str, expr: str) -> bool:
+        """Return whether ``bool(eval(expr))`` is True in lit's test Python.
+
+        Probes the same environment lit uses for tests (so PATH/LD_LIBRARY_PATH
+        additions are honored) and exits 0 only when the expression is truthy.
+        Used to gate features on a runtime *value* (e.g. libhrx being locatable)
+        rather than mere module importability.
+        """
+        probe_env = os.environ.copy()
+        for key, value in config_obj.environment.items():
+            if key in LitConfigHelper.PATH_ENV_VARS:
+                probe_env[key] = LitConfigHelper._prepend_env_paths(
+                    probe_env.get(key, ""), value
+                )
+            else:
+                probe_env[key] = value
+
+        probe = f"import sys; sys.exit(0 if bool({expr}) else 1)"
+        try:
+            result = subprocess.run(
+                [python_executable, "-c", probe],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=probe_env,
+                timeout=30,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False
+        except Exception:
+            return False
+
+        return result.returncode == 0
+
+    @staticmethod
+    def apply_config_to_lit(config_obj, hardware_configs: Dict[str, HardwareConfig]):
+        """
+        Apply detected hardware configurations to lit config.
+
+        Args:
+            config_obj: Lit config object with available_features and substitutions
+            hardware_configs: Dictionary mapping names to HardwareConfig objects
+        """
+        for name, hw_config in hardware_configs.items():
+            # Add features
+            for feature in hw_config.features:
+                config_obj.available_features.add(feature)
+
+            # Add substitutions
+            for key, value in hw_config.substitutions.items():
+                config_obj.substitutions.append((key, value))
+
+            # Add environment variables
+            for key, value in hw_config.environment.items():
+                if key in LitConfigHelper.PATH_ENV_VARS:
+                    current_value = config_obj.environment.get(key, "")
+                    config_obj.environment[key] = LitConfigHelper._prepend_env_paths(
+                        current_value, value
+                    )
+                else:
+                    config_obj.environment[key] = value
+
+    @staticmethod
+    def setup_standard_environment(
+        llvm_config, config_obj, aie_obj_root: str, vitis_aietools_dir: str
+    ):
+        """
+        Set up standard environment variables and paths.
+
+        Args:
+            llvm_config: LLVM lit config
+            config_obj: Config object
+            aie_obj_root: AIE object root directory
+            vitis_aietools_dir: Vitis AIE tools directory
+        """
+        # Ensure hardware discovery messages are visible during lit runs.
+        logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
+
+        # Python path for AIE Python bindings. Preserve any existing entries.
+        aie_python_dir = os.path.join(aie_obj_root, "python")
+        current_pythonpath = config_obj.environment.get(
+            "PYTHONPATH", os.environ.get("PYTHONPATH", "")
+        )
+        # pyxrt ships in the XRT install, which is on PYTHONPATH only after
+        # sourcing XRT's setup.sh. Fall back to the XRT found at configure time,
+        # after the ambient entries so a sourced XRT still wins.
+        xrt_dir = getattr(config_obj, "xrt_dir", "")
+        xrt_python_dir = os.path.join(xrt_dir, "python")
+        if xrt_dir and os.path.isdir(xrt_python_dir):
+            current_pythonpath = LitConfigHelper._prepend_env_paths(
+                xrt_python_dir, current_pythonpath
+            )
+        config_obj.environment["PYTHONPATH"] = LitConfigHelper._prepend_env_paths(
+            current_pythonpath, aie_python_dir
+        )
+
+        # AIE tools environment
+        llvm_config.with_environment("AIETOOLS", vitis_aietools_dir)
+
+        # Peano clang needs this
+        llvm_config.with_environment("XILINX_VITIS_AIETOOLS", vitis_aietools_dir)
+
+        # System environment variables
+        llvm_config.with_system_environment(["HOME", "INCLUDE", "LIB", "TMP", "TEMP"])
+
+        # Let a headless caller force matplotlib's non-interactive backend so
+        # taplib visualize()'s plt.show() doesn't block a display-less runner.
+        llvm_config.with_system_environment(["MPLBACKEND"])
+
+        # JIT cache for compiled designs. NPU_CACHE_HOME is the current name;
+        # IRON_CACHE_HOME is kept as a no-op safety for any straggler caller.
+        llvm_config.with_system_environment(["NPU_CACHE_HOME", "IRON_CACHE_HOME"])
+
+        # A kernel-source override must reach the JIT, or a design test
+        # silently compiles the configure-time copy under build/include.
+        llvm_config.with_system_environment(["MLIR_AIE_KERNEL_SOURCES"])
+
+        # Compile-parallelism caps. Without them, every aiecc and every Python
+        # kernel-compile pool in every lit worker uses all cores.
+        llvm_config.with_system_environment(["AIECC_JOBS", "AIE_KERNEL_COMPILE_JOBS"])
+
+    @staticmethod
+    def setup_test_lib_substitutions(
+        config_obj, aie_obj_root: str, aie_host_target: str
+    ):
+        """
+        Set up test library substitutions.
+
+        Args:
+            config_obj: Config object with substitutions
+            aie_obj_root: AIE object root directory
+            aie_host_target: Host target architecture
+        """
+        test_lib_path = os.path.join(
+            aie_obj_root, "runtime_lib", aie_host_target, "test_lib"
+        )
+        test_lib_include = os.path.join(test_lib_path, "include")
+        test_lib_lib = os.path.join(test_lib_path, "lib")
+        config_obj.substitutions.append(
+            (
+                "%test_lib_flags",
+                f"-I{test_lib_include} -L{test_lib_lib} -ltest_lib",
+            )
+        )
+        test_utils_flags = f"-I{test_lib_include} -L{test_lib_lib} -ltest_utils"
+        config_obj.substitutions.append(
+            (
+                "%test_utils_flags",
+                test_utils_flags,
+            )
+        )
+
+    @staticmethod
+    def add_vitis_components_features(config_obj, vitis_components: List[str]):
+        """
+        Add Vitis component features.
+
+        Args:
+            config_obj: Config object with available_features
+            vitis_components: List of Vitis component names
+        """
+        for component in vitis_components:
+            config_obj.available_features.add(f"aietools_{component.lower()}")

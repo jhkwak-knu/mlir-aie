@@ -1,0 +1,161 @@
+# single_core.py -*- Python -*-
+#
+# Copyright (C) 2025-2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+#
+"""Single-core mixed bf16/bfp16 matmul — ``@iron.jit`` IRON design.
+
+One AIE2P core does a (bf16, bfp16) -> bf16 GEMM with on-shim shuffle
+into the bf16 mac layout via memtile to_stream. Strix-only;
+kernel is Peano-built.
+"""
+
+import argparse
+
+import aie.iron as iron
+import aie.iron.kernels as kernels
+import numpy as np
+from aie.dialects.aiex import v8bfp16ebs8
+from aie.helpers.taplib import TensorAccessPattern
+from aie.iron import (
+    CompileTime,
+    In,
+    ObjectFifo,
+    Out,
+    Program,
+    Runtime,
+    TaskGroup,
+    Worker,
+)
+from aie.iron.controlflow import range_
+from aie.utils.hostruntime.argparse import (
+    add_compile_args,
+    device_from_args,
+)
+from aie.utils.hostruntime.cli import run_design_cli
+from ml_dtypes import bfloat16
+
+
+@iron.jit(aiecc_flags=["--dynamic-objFifos"])
+def single_core_mixed(
+    A: In,
+    B: In,
+    C: Out,
+    *,
+    M: CompileTime[int] = 128,
+    K: CompileTime[int] = 128,
+    N: CompileTime[int] = 128,
+    m: CompileTime[int] = 64,
+    k: CompileTime[int] = 64,
+    n: CompileTime[int] = 64,
+):
+    M_div_m = M // m
+    K_div_k = K // k
+    N_div_n = N // n
+    tiles = M_div_m * N_div_n
+
+    a_ty = np.ndarray[(m * k,), np.dtype[bfloat16]]
+    b_ty = np.ndarray[(k * n // 8,), np.dtype[v8bfp16ebs8]]
+    c_ty = np.ndarray[(m * n,), np.dtype[bfloat16]]
+
+    matmul_kernel = kernels.mm_bfp(dim_m=m, dim_k=k, dim_n=n, mixed=True)
+    zero_kernel = kernels.zero(m * n, bfloat16)
+
+    inA = ObjectFifo(a_ty, name="inA")
+    a_dims = matmul_kernel.stream_dims.A
+    memA = inA.cons().forward(name="memA", to_stream=a_dims)
+    inB = ObjectFifo(b_ty, name="inB")
+    memB = inB.cons().forward(name="memB")
+    memC = ObjectFifo(c_ty, name="memC")
+    c_dims = matmul_kernel.stream_dims.C
+    outC = memC.cons().forward(name="outC", to_stream=c_dims)
+
+    def core_fn(of_a, of_b, of_c, zero, matmul):
+        for _ in range_(tiles) if tiles > 1 else range(1):
+            elem_out = of_c.acquire(1)
+            zero(elem_out)
+            for _ in range_(K_div_k) if K_div_k > 1 else range(1):
+                elem_in_a = of_a.acquire(1)
+                elem_in_b = of_b.acquire(1)
+                matmul(elem_in_a, elem_in_b, elem_out)
+                of_a.release(1)
+                of_b.release(1)
+            of_c.release(1)
+
+    worker = Worker(
+        core_fn,
+        [memA.cons(), memB.cons(), memC.prod(), zero_kernel, matmul_kernel],
+        stack_size=0xF00,
+    )
+
+    A_ty = np.ndarray[(M * K,), np.dtype[bfloat16]]
+    B_ty = np.ndarray[(K * N // 8,), np.dtype[v8bfp16ebs8]]
+    C_ty = np.ndarray[(M * N,), np.dtype[bfloat16]]
+
+    rows_per_block = 4
+
+    A_tiles = TensorAccessPattern.full((M, K)).tile((m, k))
+    b_tap = TensorAccessPattern.full((N, K // 8)).tile((n, k // 8))
+    C_tiles = TensorAccessPattern.full((M, N)).tile((m, n))
+
+    def sequence(a, b, c, inA_h, inB_h, outC_h):
+        tgs = []
+        for tile_row_block in range(iron.ceildiv(M_div_m, rows_per_block)):
+            for pingpong in [0, 1]:
+                row_base = (
+                    tile_row_block * rows_per_block + pingpong * rows_per_block // 2
+                )
+                num_tile_rows = min([rows_per_block // 2, M_div_m - row_base])
+                if num_tile_rows <= 0:
+                    break
+                tgs.append(TaskGroup())
+                for tile_row in range(num_tile_rows):
+                    a_tap = A_tiles[row_base + tile_row].repeat(N_div_n)
+                    inA_h.fill(a, tap=a_tap, group=tgs[-1])
+                    inB_h.fill(b, tap=b_tap, group=tgs[-1])
+                c_tap = C_tiles[row_base : row_base + num_tile_rows]
+                outC_h.drain(c, tap=c_tap, group=tgs[-1], wait=True)
+                if tile_row_block > 0 or (tile_row_block == 0 and pingpong > 0):
+                    tgs[-2].finish()
+                    del tgs[-2]
+        tgs[-1].finish()
+        del tgs[-1]
+
+    rt = Runtime(
+        sequence,
+        [A_ty, B_ty, C_ty, inA.prod(), inB.prod(), outC.cons()],
+    )
+
+    return Program(iron.get_current_device(), rt, workers=[worker]).resolve_program()
+
+
+def _make_argparser():
+    p = argparse.ArgumentParser(
+        prog="AIE Single-Core Mixed bf16/bfp16 Matmul",
+    )
+    add_compile_args(p, default_dev="npu2")
+    p.add_argument("-M", type=int, default=128)
+    p.add_argument("-K", type=int, default=128)
+    p.add_argument("-N", type=int, default=128)
+    p.add_argument("-m", type=int, default=64)
+    p.add_argument("-k", type=int, default=64)
+    p.add_argument("-n", type=int, default=64)
+    return p
+
+
+def _compile_kwargs(opts):
+    return dict(M=opts.M, K=opts.K, N=opts.N, m=opts.m, k=opts.k, n=opts.n)
+
+
+def main():
+    opts = _make_argparser().parse_args()
+    run_design_cli(
+        single_core_mixed,
+        opts,
+        compile_kwargs=_compile_kwargs,
+        device=device_from_args,
+    )
+
+
+if __name__ == "__main__":
+    main()

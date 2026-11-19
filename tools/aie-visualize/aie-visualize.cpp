@@ -1,10 +1,8 @@
 //===- aie-visualize.cpp ---------------------------------------*- C++ -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2022 Xilinx, Inc.
+// Copyright (C) 2022-2025 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2024 Xilinx Inc.
 //
 //===---------------------------------------------------------------------===//
 
@@ -38,7 +36,7 @@ using namespace mlir;
 using namespace xilinx;
 
 static cl::opt<std::string> fileName(cl::Positional, cl::desc("<input mlir>"),
-                              cl::Required);
+                                     cl::Required);
 
 const std::string bold("\033[0;1m");
 const std::string dim("\033[0;2m");

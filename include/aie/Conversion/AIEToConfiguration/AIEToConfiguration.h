@@ -1,10 +1,7 @@
 //===- AIEToConfiguration.h -------------------------------------*- C++ -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2024 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// Copyright (C) 2024, Advanced Micro Devices, Inc. All rights reserved.
 //
 //===----------------------------------------------------------------------===//
 
@@ -15,9 +12,23 @@
 #include "mlir/Pass/Pass.h"
 #include <memory>
 
+namespace xilinx::AIEX {
+class BlockwriteData;
+} // namespace xilinx::AIEX
+
 namespace xilinx::AIE {
 
 class DeviceOp;
+
+// --------------------------------------------------------------------------
+// Device configuration
+// --------------------------------------------------------------------------
+
+// an enum to represent the output type of the transaction binary
+enum AIEToConfigurationOutputType {
+  Transaction,
+  ControlPacket,
+};
 
 std::unique_ptr<mlir::OperationPass<xilinx::AIE::DeviceOp>>
 createConvertAIEToTransactionPass();
@@ -28,6 +39,85 @@ createConvertAIEToControlPacketsPass();
 std::optional<mlir::ModuleOp>
 convertTransactionBinaryToMLIR(mlir::MLIRContext *ctx,
                                std::vector<uint8_t> &binary);
+
+// Generate transaction binary and insert configuration operations at the
+// current insertion point, their blockwrite payloads in `blockwriteData`'s
+// device.
+mlir::LogicalResult generateAndInsertConfigOps(
+    mlir::OpBuilder &builder, xilinx::AIE::DeviceOp device,
+    xilinx::AIEX::BlockwriteData &blockwriteData, llvm::StringRef clElfDir = "",
+    AIEToConfigurationOutputType outputType =
+        AIEToConfigurationOutputType::Transaction,
+    bool skipCtrlPktOverlay = false);
+
+// Inserts, before each site in a runtime sequence, the configuration ops of
+// its device. They are generated once per device and sequence-holding device,
+// and a sequence's constants and payload globals are made once, at its head:
+// a device reloaded hundreds of times would otherwise repeat each per reload.
+// Control-packet output skips what is marked is_ctrl_pkt_overlay. A site that
+// is an aiex.npu.write_teardown gets the device's teardown ops instead.
+mlir::LogicalResult insertConfigOps(
+    llvm::ArrayRef<std::pair<mlir::Operation *, xilinx::AIE::DeviceOp>> sites,
+    AIEToConfigurationOutputType outputType);
+
+// Inlines each aiex.npu.write_config and write_teardown in `module`. The arith
+// and memref dialects must be loaded.
+mlir::LogicalResult inlineWriteConfigs(mlir::ModuleOp module);
+
+std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
+createAIEAnnotateCoreLockAcquiresPass();
+
+// Insert the ops of `device`'s teardown (see aiex.npu.write_teardown).
+mlir::LogicalResult
+generateAndInsertTeardownOps(mlir::OpBuilder &builder,
+                             xilinx::AIE::DeviceOp device,
+                             xilinx::AIEX::BlockwriteData &blockwriteData,
+                             AIEToConfigurationOutputType outputType =
+                                 AIEToConfigurationOutputType::Transaction,
+                             bool skipCtrlPktOverlay = false);
+
+// --------------------------------------------------------------------------
+// Device reset
+// --------------------------------------------------------------------------
+
+// Enum for specifying which tile types to reset
+enum class ResetTileType : unsigned {
+  None = 0,
+  ShimNOC = 1 << 0,
+  MemTile = 1 << 1,
+  CoreTile = 1 << 2,
+  All = ShimNOC | MemTile | CoreTile
+};
+
+inline bool hasFlag(ResetTileType value, ResetTileType flag) {
+  return (static_cast<unsigned>(value) & static_cast<unsigned>(flag)) != 0;
+}
+
+// Enum for specifying when to reset
+enum class ResetMode {
+  Never,             // Never perform reset
+  IfUsed,            // Reset only if the tile is used in the device
+  IfUsedFineGrained, // Reset only individual locks/connections that are used
+  IfChanged, // Reset only if the tile configuration changed from previous
+  IfChangedFineGrained, // Reset only individual locks/connections that changed
+  Always                // Reset all tiles of the specified type
+};
+
+// Configuration for different reset operations
+struct ResetConfig {
+  ResetTileType tileType;
+  ResetMode mode;
+
+  ResetConfig(ResetTileType tt = ResetTileType::None,
+              ResetMode m = ResetMode::Never)
+      : tileType(tt), mode(m) {}
+};
+
+// Insert reset operations at the current insertion point
+mlir::LogicalResult generateAndInsertResetOps(
+    mlir::OpBuilder &builder, xilinx::AIE::DeviceOp device,
+    ResetConfig dmaConfig, ResetConfig switchConfig, ResetConfig lockConfig,
+    ResetConfig coreConfig, xilinx::AIE::DeviceOp previousDevice);
 
 } // namespace xilinx::AIE
 

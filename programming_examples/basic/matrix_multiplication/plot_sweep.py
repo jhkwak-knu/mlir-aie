@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 # matrix_multiplication/plot_sweep.py -*- Python -*-
 #
-# This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-# See https://llvm.org/LICENSE.txt for license information.
+# Copyright (C) 2024 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #
-# (c) Copyright 2024 Advanced Micro Devices, Inc. or its affiliates
 
 import argparse
 import csv
 import os.path
 import re
-import numpy as np
-import matplotlib.pyplot as plt
 import sys
+
+import matplotlib.pyplot as plt  # pyright: ignore[reportMissingImports]
+import numpy as np
 
 
 def n_bytes(M, K, N):
@@ -176,8 +175,14 @@ def get_plot_values(csv_file, x_names, y_names, x_trans, y_trans, filters=[]):
             errors.append(i)
             continue
         try:
-            x_pieces = [float(row[x_name]) for x_name in x_names]
-            y_pieces = [float(row[y_name]) for y_name in y_names]
+            x_pieces = [
+                float(row[x_name])  # pyright: ignore[reportArgumentType]
+                for x_name in x_names
+            ]
+            y_pieces = [
+                float(row[y_name])  # pyright: ignore[reportArgumentType]
+                for y_name in y_names
+            ]
         except (TypeError, ValueError):
             errors.append(i)
             continue

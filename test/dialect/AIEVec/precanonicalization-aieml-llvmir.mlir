@@ -1,10 +1,13 @@
-// RUN: aie-opt %s -canonicalize-vector-for-aievec="aie-target=aie2 target-backend=llvmir" -split-input-file | FileCheck %s
+// Copyright (C) 2024-2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+// RUN: aie-opt %s -canonicalize-vector-for-aievec="aie-target=aie2" -split-input-file | FileCheck %s
 
 // CHECK-LABEL: @scalar_extsi_to_broadcast_swap(
 // CHECK-SAME: %[[SIN:.*]]: i8
 func.func @scalar_extsi_to_broadcast_swap(%s: i8) -> vector<32xi32> {
-    // CHECK: %[[SPLAT:.*]] = vector.splat %[[SIN]] : vector<32xi8>
-    // CHECK: %[[EXT:.*]] = arith.extsi %[[SPLAT]] : vector<32xi8> to vector<32xi32>
+    // CHECK: %[[BCAST:.*]] = vector.broadcast %[[SIN]] : i8 to vector<32xi8>
+    // CHECK: %[[EXT:.*]] = arith.extsi %[[BCAST]] : vector<32xi8> to vector<32xi32>
     %0 = arith.extsi %s : i8 to i32
     %1 = vector.broadcast %0 : i32 to vector<32xi32>
     return %1 : vector<32xi32>

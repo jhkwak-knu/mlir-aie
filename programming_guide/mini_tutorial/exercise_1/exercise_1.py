@@ -1,56 +1,57 @@
 # exercise_1.py -*- Python -*-
 #
-# This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-# See https://llvm.org/LICENSE.txt for license information.
+# Copyright (C) 2025 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #
-# (c) Copyright 2025 Advanced Micro Devices, Inc. or its affiliates
 
 import sys
 import numpy as np
 
-from aie.iron import Program, Runtime, Worker, ObjectFifo, LocalBuffer
-from aie.iron.placers import SequentialPlacer
+from aie.iron import Out, In, CompileTime, Program, Runtime, Worker, ObjectFifo, Buffer
 from aie.iron.controlflow import range_
 
 import aie.iron as iron
 
 
-@iron.jit(is_placed=False)
-def exercise_1(output):
-    data_size = output.numel()
-    element_type = output.dtype
+@iron.jit
+def exercise_1(
+    output: Out,
+    *,
+    data_size: CompileTime[int],
+    element_type: CompileTime[type],
+):
     data_ty = np.ndarray[(data_size,), np.dtype[element_type]]
 
     # Dataflow with ObjectFifos
     of_out = ObjectFifo(data_ty, name="out")
 
+    buffer = Buffer(
+        data_ty,
+        name="buff",
+        initial_value=np.array(range(data_size), dtype=element_type),
+    )
+
     # Task for the core to perform
-    def core_fn(of_out):
-        buff = LocalBuffer(
-            data_ty,
-            name="buff",
-            initial_value=np.array(range(data_size), dtype=element_type),
-        )
+    def core_fn(of_out, buff):
         elem_out = of_out.acquire(1)
         for i in range_(data_size):
             elem_out[i] = buff[i]
         of_out.release(1)
 
     # Create a worker to perform the task
-    my_worker = Worker(core_fn, [of_out.prod()])
+    my_worker = Worker(core_fn, [of_out.prod(), buffer])
 
     # To/from AIE-array runtime data movement
-    rt = Runtime()
-    with rt.sequence(data_ty) as (c_out):
-        rt.start(my_worker)
-        rt.drain(of_out.cons(), c_out, wait=True)
+    def sequence(c_out, out_h):
+        out_h.drain(c_out, wait=True)
+
+    rt = Runtime(sequence, [data_ty, of_out.cons()])
 
     # Create the program from the device type and runtime
-    my_program = Program(iron.get_current_device(), rt)
+    my_program = Program(iron.get_current_device(), rt, workers=[my_worker])
 
     # Place components (assign them resources on the device) and generate an MLIR module
-    return my_program.resolve_program(SequentialPlacer())
+    return my_program.resolve_program()
 
 
 def main():
@@ -65,7 +66,7 @@ def main():
 
     # JIT-compile the kernel then launches the kernel with the given arguments. Future calls
     # to the kernel will use the same compiled kernel and loaded code objects
-    exercise_1(output)
+    exercise_1(output, data_size=output.numel(), element_type=output.dtype)
 
     # Check the correctness of the result
     e = np.equal(input0.numpy(), output.numpy())

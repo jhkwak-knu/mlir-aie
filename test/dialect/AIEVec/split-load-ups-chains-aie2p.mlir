@@ -1,0 +1,219 @@
+//===- split-load-ups-chains-aie2p.mlir ------------------------*- MLIR -*-===//
+//
+// Copyright (C) 2025 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+// RUN: aie-opt %s --aievec-split-load-ups-chains | FileCheck %s
+
+// This test validates the optimization that splits vector.load + aievec.ups chains
+// for AIE2p targets to reduce the number of shuffle operations from 3 to 1.
+
+module {
+  // CHECK-LABEL: func.func @split_load_ups_v64i16_to_v64i32
+  func.func @split_load_ups_v64i16_to_v64i32(%arg0: memref<128xi16>) -> vector<64xi32> {
+    %c0 = arith.constant 0 : index
+    
+    // CHECK-NOT: vector.load{{.*}}vector<64xi16>
+    // CHECK: [[LOAD0:%.+]] = vector.load %arg0[%c0] : memref<128xi16>, vector<32xi16>
+    // CHECK: [[LOAD1:%.+]] = vector.load %arg0[%c32] : memref<128xi16>, vector<32xi16>
+    // CHECK: [[UPS0:%.+]] = aievec.ups [[LOAD0]] {shift = 0 : i8} : vector<32xi16>, vector<32xi32>
+    // CHECK: [[UPS1:%.+]] = aievec.ups [[LOAD1]] {shift = 0 : i8} : vector<32xi16>, vector<32xi32>
+    // CHECK: [[RESULT:%.+]] = vector.shuffle [[UPS0]], [[UPS1]]
+    // CHECK-SAME: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63]
+    // CHECK-SAME: : vector<32xi32>, vector<32xi32>
+    // CHECK: return [[RESULT]] : vector<64xi32>
+    
+    %0 = vector.load %arg0[%c0] : memref<128xi16>, vector<64xi16>
+    %1 = aievec.ups %0 {shift = 0 : i8} : vector<64xi16>, vector<64xi32>
+    return %1 : vector<64xi32>
+  }
+
+  // CHECK-LABEL: func.func @no_split_smaller_vector
+  // This should not be transformed (512-bit vector, not 1024-bit)
+  func.func @no_split_smaller_vector(%arg0: memref<64xi16>) -> vector<32xi32> {
+    %c0 = arith.constant 0 : index
+    
+    // CHECK: vector.load{{.*}}vector<32xi16>
+    // CHECK: aievec.ups{{.*}}vector<32xi16>, vector<32xi32>
+    // CHECK-NOT: vector.shuffle
+    
+    %0 = vector.load %arg0[%c0] : memref<64xi16>, vector<32xi16>
+    %1 = aievec.ups %0 {shift = 0 : i8} : vector<32xi16>, vector<32xi32>
+    return %1 : vector<32xi32>
+  }
+
+  // CHECK-LABEL: func.func @no_split_multiple_uses
+  // This should not be transformed (load has multiple uses)
+  func.func @no_split_multiple_uses(%arg0: memref<128xi16>) -> (vector<64xi32>, vector<64xi16>) {
+    %c0 = arith.constant 0 : index
+    
+    // CHECK: [[LOAD:%.+]] = vector.load{{.*}}vector<64xi16>
+    // CHECK: [[UPS:%.+]] = aievec.ups [[LOAD]]{{.*}}vector<64xi16>, vector<64xi32>
+    // CHECK-NOT: vector.shuffle
+    // CHECK: return [[UPS]], [[LOAD]]
+    
+    %0 = vector.load %arg0[%c0] : memref<128xi16>, vector<64xi16>
+    %1 = aievec.ups %0 {shift = 0 : i8} : vector<64xi16>, vector<64xi32>
+    return %1, %0 : vector<64xi32>, vector<64xi16>
+  }
+
+  // CHECK-LABEL: func.func @split_with_offset
+  func.func @split_with_offset(%arg0: memref<256xi16>) -> vector<64xi32> {
+    %c64 = arith.constant 64 : index
+    
+    // CHECK-DAG: [[C64:%.+]] = arith.constant 64 : index
+    // CHECK-DAG: [[C96:%.+]] = arith.constant 96 : index
+    // CHECK: [[LOAD0:%.+]] = vector.load %arg0{{\[}}[[C64]]] : memref<256xi16>, vector<32xi16>
+    // CHECK: [[LOAD1:%.+]] = vector.load %arg0{{\[}}[[C96]]] : memref<256xi16>, vector<32xi16>
+    // CHECK: [[UPS0:%.+]] = aievec.ups [[LOAD0]]
+    // CHECK: [[UPS1:%.+]] = aievec.ups [[LOAD1]]
+    // CHECK: [[RESULT:%.+]] = vector.shuffle [[UPS0]], [[UPS1]]
+    
+    %0 = vector.load %arg0[%c64] : memref<256xi16>, vector<64xi16>
+    %1 = aievec.ups %0 {shift = 0 : i8} : vector<64xi16>, vector<64xi32>
+    return %1 : vector<64xi32>
+  }
+
+  // CHECK-LABEL: func.func @split_srs_store_v64i32_to_v64i16
+  func.func @split_srs_store_v64i32_to_v64i16(%arg0: vector<64xi32>, %arg1: memref<128xi16>) {
+    %c0 = arith.constant 0 : index
+    %c0_i32 = arith.constant 0 : i32
+    
+    // CHECK-DAG: [[C32:%.+]] = arith.constant 32 : index
+    // CHECK-DAG: [[C0:%.+]] = arith.constant 0 : index
+    // CHECK-DAG: [[C0_I32:%.+]] = arith.constant 0 : i32
+    // CHECK: [[SHUFFLE0:%.+]] = vector.shuffle %arg0, %arg0
+    // CHECK-SAME: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
+    // CHECK: [[SHUFFLE1:%.+]] = vector.shuffle %arg0, %arg0
+    // CHECK-SAME: [32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63]
+    // CHECK: [[SRS0:%.+]] = aievec.srs [[SHUFFLE0]], [[C0_I32]] : vector<32xi32>, i32, vector<32xi16>
+    // CHECK: [[SRS1:%.+]] = aievec.srs [[SHUFFLE1]], [[C0_I32]] : vector<32xi32>, i32, vector<32xi16>
+    // CHECK: vector.store [[SRS0]], %arg1{{\[}}[[C0]]] : memref<128xi16>, vector<32xi16>
+    // CHECK: vector.store [[SRS1]], %arg1{{\[}}[[C32]]] : memref<128xi16>, vector<32xi16>
+    // CHECK-NOT: vector.store{{.*}}vector<64xi16>
+    
+    %0 = aievec.srs %arg0, %c0_i32 : vector<64xi32>, i32, vector<64xi16>
+    vector.store %0, %arg1[%c0] : memref<128xi16>, vector<64xi16>
+    return
+  }
+
+  // CHECK-LABEL: func.func @no_split_srs_store_smaller
+  // This should not be transformed (1024-bit, not 2048-bit)
+  func.func @no_split_srs_store_smaller(%arg0: vector<32xi32>, %arg1: memref<64xi16>) {
+    %c0 = arith.constant 0 : index
+    %c0_i32 = arith.constant 0 : i32
+    
+    // CHECK: [[SRS:%.+]] = aievec.srs %arg0{{.*}}vector<32xi32>, i32, vector<32xi16>
+    // CHECK: vector.store [[SRS]]{{.*}}vector<32xi16>
+    // CHECK-NOT: vector.shuffle
+    
+    %0 = aievec.srs %arg0, %c0_i32 : vector<32xi32>, i32, vector<32xi16>
+    vector.store %0, %arg1[%c0] : memref<64xi16>, vector<32xi16>
+    return
+  }
+
+  // CHECK-LABEL: func.func @no_split_srs_multiple_uses
+  // This should not be transformed (SRS has multiple uses)
+  func.func @no_split_srs_multiple_uses(%arg0: vector<64xi32>, %arg1: memref<128xi16>) -> vector<64xi16> {
+    %c0 = arith.constant 0 : index
+    %c0_i32 = arith.constant 0 : i32
+    
+    // CHECK: [[SRS:%.+]] = aievec.srs %arg0{{.*}}vector<64xi32>, i32, vector<64xi16>
+    // CHECK: vector.store [[SRS]]{{.*}}vector<64xi16>
+    // CHECK-NOT: vector.shuffle
+    // CHECK: return [[SRS]]
+    
+    %0 = aievec.srs %arg0, %c0_i32 : vector<64xi32>, i32, vector<64xi16>
+    vector.store %0, %arg1[%c0] : memref<128xi16>, vector<64xi16>
+    return %0 : vector<64xi16>
+  }
+}
+
+// A v64bf16 tile load that is converted only for the lhs of bfp16 matmuls
+// is split into two v32bf16 loads (the second at last index + 32) joined by
+// a shuffle.
+// CHECK-LABEL: func.func @split_matmul_lhs_load
+// CHECK-SAME: %[[BUF:.*]]: memref<4x128xbf16>, %[[I:.*]]: index
+// CHECK-DAG: %[[C32:.*]] = arith.constant 32 : index
+// CHECK-DAG: %[[HI_IDX:.*]] = arith.addi %[[I]], %[[C32]] : index
+// CHECK-DAG: %[[LO:.*]] = vector.load %[[BUF]][%{{.*}}, %[[I]]] : memref<4x128xbf16>, vector<32xbf16>
+// CHECK-DAG: %[[HI:.*]] = vector.load %[[BUF]][%{{.*}}, %[[HI_IDX]]] : memref<4x128xbf16>, vector<32xbf16>
+// CHECK: %[[CAT:.*]] = vector.shuffle %[[LO]], %[[HI]] [0, 1, {{.*}}, 62, 63] : vector<32xbf16>, vector<32xbf16>
+// CHECK: %[[A:.*]] = vector.shape_cast %[[CAT]] : vector<64xbf16> to vector<8x8xbf16>
+// CHECK: aievec.to_bfp16 %[[A]] :
+// CHECK-NOT: vector<64xbf16>, vector<64xbf16>
+func.func @split_matmul_lhs_load(%buf: memref<4x128xbf16>, %i: index, %bm: vector<64xi8>, %be: vector<8xi8>, %acc: vector<8x8xf32>) -> (vector<8x8xf32>, vector<8x8xf32>) {
+  %c1 = arith.constant 1 : index
+  %v = vector.load %buf[%c1, %i] : memref<4x128xbf16>, vector<64xbf16>
+  %a = vector.shape_cast %v : vector<64xbf16> to vector<8x8xbf16>
+  %am, %ae = aievec.to_bfp16 %a : vector<8x8xbf16> -> vector<64xi8>, vector<8xi8>
+  %r0 = aievec.matmul_aie2p_bfp16 %am, %ae, %bm, %be, %acc : vector<64xi8>, vector<8xi8>, vector<64xi8>, vector<8xi8> into vector<8x8xf32>
+  %r1 = aievec.matmul_aie2p_bfp16 %am, %ae, %bm, %be, %r0 : vector<64xi8>, vector<8xi8>, vector<64xi8>, vector<8xi8> into vector<8x8xf32>
+  return %r0, %r1 : vector<8x8xf32>, vector<8x8xf32>
+}
+
+// The tile is also converted for a matmul rhs, which reads the whole
+// vector, so the load is not split.
+// CHECK-LABEL: func.func @no_split_matmul_rhs_use
+// CHECK: vector.load {{.*}} : memref<128xbf16>, vector<64xbf16>
+// CHECK-NOT: vector<32xbf16>
+func.func @no_split_matmul_rhs_use(%buf: memref<128xbf16>, %bm: vector<64xi8>, %be: vector<8xi8>, %acc: vector<8x8xf32>) -> (vector<8x8xf32>, vector<8x8xf32>) {
+  %c0 = arith.constant 0 : index
+  %v = vector.load %buf[%c0] : memref<128xbf16>, vector<64xbf16>
+  %a = vector.shape_cast %v : vector<64xbf16> to vector<8x8xbf16>
+  %am, %ae = aievec.to_bfp16 %a : vector<8x8xbf16> -> vector<64xi8>, vector<8xi8>
+  %at, %ate = aievec.to_bfp16 %a transpose : vector<8x8xbf16> -> vector<64xi8>, vector<8xi8>
+  %r0 = aievec.matmul_aie2p_bfp16 %am, %ae, %bm, %be, %acc : vector<64xi8>, vector<8xi8>, vector<64xi8>, vector<8xi8> into vector<8x8xf32>
+  %r1 = aievec.matmul_aie2p_bfp16 %bm, %be, %at, %ate, %acc : vector<64xi8>, vector<8xi8>, vector<64xi8>, vector<8xi8> into vector<8x8xf32>
+  return %r0, %r1 : vector<8x8xf32>, vector<8x8xf32>
+}
+
+// A use other than a conversion keeps the full-width load.
+// CHECK-LABEL: func.func @no_split_other_use
+// CHECK: vector.load {{.*}} : memref<128xbf16>, vector<64xbf16>
+// CHECK-NOT: vector<32xbf16>
+func.func @no_split_other_use(%buf: memref<128xbf16>, %bm: vector<64xi8>, %be: vector<8xi8>, %acc: vector<8x8xf32>) -> (vector<8x8xf32>, vector<64xbf16>) {
+  %c0 = arith.constant 0 : index
+  %v = vector.load %buf[%c0] : memref<128xbf16>, vector<64xbf16>
+  %a = vector.shape_cast %v : vector<64xbf16> to vector<8x8xbf16>
+  %am, %ae = aievec.to_bfp16 %a : vector<8x8xbf16> -> vector<64xi8>, vector<8xi8>
+  %r = aievec.matmul_aie2p_bfp16 %am, %ae, %bm, %be, %acc : vector<64xi8>, vector<8xi8>, vector<64xi8>, vector<8xi8> into vector<8x8xf32>
+  return %r, %v : vector<8x8xf32>, vector<64xbf16>
+}
+
+// The 8x8x4 matmul does not convert its lhs to bfp16, so the load is not
+// split.
+// CHECK-LABEL: func.func @no_split_8x8x4
+// CHECK: vector.load {{.*}} : memref<128xbf16>, vector<64xbf16>
+// CHECK-NOT: vector<32xbf16>
+func.func @no_split_8x8x4(%buf: memref<128xbf16>, %b: vector<8x4xbf16>, %acc: vector<8x4xf32>) -> vector<8x4xf32> {
+  %c0 = arith.constant 0 : index
+  %v = vector.load %buf[%c0] : memref<128xbf16>, vector<64xbf16>
+  %a = vector.shape_cast %v : vector<64xbf16> to vector<8x8xbf16>
+  %r = aievec.matmul_aie2p %a, %b, %acc : vector<8x8xbf16>, vector<8x4xbf16> into vector<8x4xf32>
+  return %r : vector<8x4xf32>
+}
+
+// The same holds before the matmuls are expanded: a v64bf16 load used only as
+// the lhs of bf16 8x8x8 aievec.matmul_aie2p ops is split.
+// CHECK-LABEL: func.func @split_unexpanded_matmul_lhs_load
+// CHECK-SAME: %[[BUF:.*]]: memref<4x128xbf16>, %[[I:.*]]: index
+// CHECK-DAG: %[[C32:.*]] = arith.constant 32 : index
+// CHECK-DAG: %[[HI_IDX:.*]] = arith.addi %[[I]], %[[C32]] : index
+// CHECK-DAG: %[[LO:.*]] = vector.load %[[BUF]][%{{.*}}, %[[I]]] : memref<4x128xbf16>, vector<32xbf16>
+// CHECK-DAG: %[[HI:.*]] = vector.load %[[BUF]][%{{.*}}, %[[HI_IDX]]] : memref<4x128xbf16>, vector<32xbf16>
+// CHECK: %[[CAT:.*]] = vector.shuffle %[[LO]], %[[HI]] [0, 1, {{.*}}, 62, 63] : vector<32xbf16>, vector<32xbf16>
+// CHECK: %[[A:.*]] = vector.shape_cast %[[CAT]] : vector<64xbf16> to vector<8x8xbf16>
+// CHECK: aievec.matmul_aie2p %[[A]],
+// CHECK: aievec.matmul_aie2p %[[A]],
+// CHECK-NOT: vector<64xbf16>, vector<64xbf16>
+func.func @split_unexpanded_matmul_lhs_load(%buf: memref<4x128xbf16>, %i: index, %b0: vector<8x8xbf16>, %b1: vector<8x8xbf16>, %acc: vector<8x8xf32>) -> (vector<8x8xf32>, vector<8x8xf32>) {
+  %c1 = arith.constant 1 : index
+  %v = vector.load %buf[%c1, %i] : memref<4x128xbf16>, vector<64xbf16>
+  %a = vector.shape_cast %v : vector<64xbf16> to vector<8x8xbf16>
+  %r0 = aievec.matmul_aie2p %a, %b0, %acc : vector<8x8xbf16>, vector<8x8xbf16> into vector<8x8xf32>
+  %r1 = aievec.matmul_aie2p %a, %b1, %acc : vector<8x8xbf16>, vector<8x8xbf16> into vector<8x8xf32>
+  return %r0, %r1 : vector<8x8xf32>, vector<8x8xf32>
+}

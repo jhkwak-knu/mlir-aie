@@ -1,10 +1,7 @@
 //===- memtiledma.mlir -----------------------------------------*- MLIR -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2023 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2023 Advanced Micro Devices, Inc.
 //
 //===----------------------------------------------------------------------===//
 
@@ -25,10 +22,10 @@ aie.device(xcve2802) {
     ^dma1:
     aie.dma_start("MM2S", 1, ^bd1, ^dma1)
     ^bd0:
-      aie.dma_bd(%buf1 : memref<256xi32>, 0, 256)
+      aie.dma_bd(%buf1 : memref<256xi32> offset = 0 len = 256)
       aie.next_bd ^bd2
     ^bd1:
-      aie.dma_bd(%buf2 : memref<256xi32>, 0, 256)
+      aie.dma_bd(%buf2 : memref<256xi32> offset = 0 len = 256)
       aie.next_bd ^bd2
     ^bd2:
       aie.end

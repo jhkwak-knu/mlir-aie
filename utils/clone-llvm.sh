@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 ##===- utils/clone-llvm.sh - Build LLVM for github workflow --*- Script -*-===##
 #
-# This file licensed under the Apache License v2.0 with LLVM Exceptions.
-# See https://llvm.org/LICENSE.txt for license information.
+# Copyright (C) 2021 Xilinx, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #
 ##===----------------------------------------------------------------------===##
@@ -10,12 +9,15 @@
 # This script checks out LLVM.  We use this instead of a git submodule to avoid
 # excessive copies of the LLVM tree.
 #
+# As of the ROCm/llvm-project migration, LLVM is sourced from the ROCm fork
+# (github.com/ROCm/llvm-project) rather than upstream llvm/llvm-project.
+#
 ##===----------------------------------------------------------------------===##
 
 # The LLVM commit to use.
-LLVM_PROJECT_COMMIT=a8c6a5017de7076f3011b0ddba6f224f7e1f93f3
-DATETIME=2025061817
-WHEEL_VERSION=21.0.0.$DATETIME+${LLVM_PROJECT_COMMIT:0:8}
+LLVM_PROJECT_COMMIT=bdf04ebb32d7a5dce853f9b399dcbd3ed11a5aa7
+DATETIME=2026100106
+WHEEL_VERSION=24.0.0.$DATETIME+${LLVM_PROJECT_COMMIT:0:8}
 
 ############################################################################################
 # The way to bump `LLVM_PROJECT_COMMIT`
@@ -44,7 +46,7 @@ if [ x"$1" == x--llvm-worktree ]; then
   )
 else
   # Fetch main first just to clone
-  git clone --depth 1 https://github.com/llvm/llvm-project.git llvm
+  git clone --depth 1 https://github.com/ROCm/llvm-project.git llvm
   (
     cd llvm
     # Then fetch the interesting part

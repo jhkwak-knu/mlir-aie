@@ -1,10 +1,8 @@
 //===- test_mmap0.mlir -----------------------------------------*- MLIR -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2021-2022 Xilinx, Inc.
+// Copyright (C) 2022-2024 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2021 Xilinx Inc.
 //
 //===----------------------------------------------------------------------===//
 
@@ -75,8 +73,12 @@
 
 // LD44: MEMORY
 // LD44-NEXT: {
-// LD44-NEXT:    program (RX) : ORIGIN = 0, LENGTH = 0x0020000
-// LD44-NEXT:    data (!RX) : ORIGIN = 0x28450, LENGTH = 0x7BB0
+// LD44-NEXT:    program (RX) : ORIGIN = 0, LENGTH = 0x4000
+// LD44-NEXT:    data (!RX) : ORIGIN = [[DATA:MAX\(.*0x28450.*\)]], LENGTH = 0x30000 - [[DATA]]
+// LD44-NEXT:    bank0 (!RX) : ORIGIN = 0x28450, LENGTH = 0x1BB0
+// LD44-NEXT:    bank1 (!RX) : ORIGIN = 0x2A000, LENGTH = 0x2000
+// LD44-NEXT:    bank2 (!RX) : ORIGIN = 0x2C000, LENGTH = 0x2000
+// LD44-NEXT:    bank3 (!RX) : ORIGIN = 0x2E000, LENGTH = 0x2000
 // LD44-NEXT: }
 // LD44-NEXT: ENTRY(__start)
 // LD44-NEXT: SECTIONS
@@ -94,6 +96,10 @@
 // LD44-NEXT:     _dtors_end = .;
 // LD44-NEXT:     *(.text*)
 // LD44-NEXT:  } > program
+// LD44-NEXT:  .aie.bank0 : { *(.aie.bank0 .aie.bank0.*) *(*.DM_bankA*) } > bank0
+// LD44-NEXT:  .aie.bank1 : { *(.aie.bank1 .aie.bank1.*) *(*.DM_bankB*) } > bank1
+// LD44-NEXT:  .aie.bank2 : { *(.aie.bank2 .aie.bank2.*) *(*.DM_bankC*) } > bank2
+// LD44-NEXT:  .aie.bank3 : { *(.aie.bank3 .aie.bank3.*) *(*.DM_bankD*) } > bank3
 // LD44-NEXT:  .data : {
 // LD44-NEXT:     *(.data*)
 // LD44-NEXT:     *(.rodata*)
@@ -153,4 +159,3 @@ module @test_mmap0 {
   }
  }
 }
-

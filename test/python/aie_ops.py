@@ -1,4 +1,4 @@
-# Copyright (C) 2022, Advanced Micro Devices, Inc.
+# Copyright (C) 2022 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 import numpy as np
 
@@ -6,6 +6,7 @@ import numpy as np
 
 
 from aie.dialects.aie import (
+    Transport,
     AIEDevice,
     Core,
     Device,
@@ -15,15 +16,18 @@ from aie.dialects.aie import (
     external_buffer,
     bd_dim_layout,
     end,
+    logical_tile,
     object_fifo,
     object_fifo_link,
     tile,
     cascade_flow,
+    flow,
     WireBundle,
     packetflow,
     get_target_model,
-    dma_bd
+    dma_bd,
 )
+from aie.dialects._aie_enum_gen import AIETileType
 from aie.ir import InsertionPoint, Block
 from aie.extras.context import mlir_mod_ctx
 from aie.extras import types as T
@@ -37,11 +41,25 @@ def tileOp():
     t = tile(col=0, row=0)
 
 
+# CHECK-LABEL: tileOpControlPacket
+# CHECK: aie.tile(1, 2) {controller_id = #aie.packet_info<pkt_type = 3, pkt_id = 4>}
+@construct_and_print_module
+def tileOpControlPacket():
+    t = tile(col=1, row=2, packet_type=3, packet_id=4)
+
+
+# CHECK-LABEL: logicalTileOpControlPacket
+# CHECK: aie.logical_tile<CoreTile>(1, 2) {controller_id = #aie.packet_info<pkt_type = 3, pkt_id = 4>}
+@construct_and_print_module
+def logicalTileOpControlPacket():
+    t = logical_tile(AIETileType.CoreTile, col=1, row=2, packet_type=3, packet_id=4)
+
+
 # CHECK-LABEL: tileOpAllocationScheme
-# CHECK: aie.tile(2, 2) {allocation_scheme = "basic-sequential"}
+# CHECK: aie.tile(2, 2)
 @construct_and_print_module
 def tileOpAllocationScheme():
-    t = tile(col=2, row=2, allocation_scheme="basic-sequential")
+    t = tile(col=2, row=2)
 
 
 # CHECK-LABEL: coreOp
@@ -62,11 +80,11 @@ def coreOp():
 # CHECK: %[[VAL1:.*]] = aie.tile(1, 1)
 # CHECK: %[[VAL2:.*]] = aie.core(%[[VAL1]]) {
 # CHECK:   aie.end
-# CHECK: } {dynamic_objfifo_lowering = false, link_with = "test.elf", stack_size = 2048 : i32}
+# CHECK: } {dynamic_objfifo_lowering = false, stack_size = 2048 : i32}
 @construct_and_print_module
 def coreOpParameters():
     t = tile(col=1, row=1)
-    c = Core(t, link_with="test.elf", dynamic_objfifo_lowering=False, stack_size=2048)
+    c = Core(t, dynamic_objfifo_lowering=False, stack_size=2048)
     bb = Block.create_at_start(c.body)
     with InsertionPoint(bb):
         end()
@@ -126,7 +144,7 @@ def externalBufferOp():
 # CHECK-LABEL: objFifo
 # CHECK: %[[VAL0:.*]] = aie.tile(6, 6)
 # CHECK: %[[VAL1:.*]] = aie.tile(2, 2)
-# CHECK: aie.objectfifo @of0(%[[VAL0]] dimensionsToStream [<size = 1, stride = 2>], {%[[VAL1]] dimensionsFromStream [<size = 1, stride = 2>]}, 2 : i32) {via_DMA = true} : !aie.objectfifo<memref<4xf16>> = [dense<[0.000000e+00, 1.000000e+00, 2.000000e+00, 3.000000e+00]> : memref<4xf16>, dense<[0.000000e+00, 1.000000e+00, 2.000000e+00, 3.000000e+00]> : memref<4xf16>]
+# CHECK: aie.objectfifo @of0(%[[VAL0]] dimensionsToStream [<size = 1, stride = 2>], {%[[VAL1]] dimensionsFromStream [<size = 1, stride = 2>]}, 2 : i32) {transport = #aie.transport<dma>} : !aie.objectfifo<memref<4xf16>> = [dense<[0.000000e+00, 1.000000e+00, 2.000000e+00, 3.000000e+00]> : memref<4xf16>, dense<[0.000000e+00, 1.000000e+00, 2.000000e+00, 3.000000e+00]> : memref<4xf16>]
 @construct_and_print_module
 def objFifo():
     dev = Device(AIEDevice.xcvc1902)
@@ -142,7 +160,7 @@ def objFifo():
             np.ndarray[(4,), np.dtype[np.float16]],
             [bd_dim_layout(size=1, stride=2)],
             [[bd_dim_layout(size=1, stride=2)]],
-            via_DMA=True,
+            transport=Transport.dma(),
             initValues=[np.arange(4, dtype=np.float16), np.arange(4, dtype=np.float16)],
         )
         end()
@@ -173,7 +191,7 @@ def objFifoLink():
 # CHECK: %[[VAL_0:.*]] = aie.tile(6, 6)
 # CHECK: %[[VAL_1:.*]] = aie.tile(2, 2)
 # CHECK: aie.objectfifo @[[VAL_2:.*]](%[[VAL_0]], {%[[VAL_1]]}, 2 : i32) : !aie.objectfifo<memref<12xf16>>
-# CHECK: %[[VAL_3:.*]] = aie.objectfifo.acquire @[[VAL_2]](Consume, 1) : !aie.objectfifosubview<memref<12xf16>>
+# CHECK: %[[VAL_3:.*]] = aie.objectfifo.acquire @[[VAL_2]](Consume, 1) : memref<12xf16>
 @construct_and_print_module
 def objFifoAcquire():
     dev = Device(AIEDevice.xcvc1902)
@@ -194,8 +212,7 @@ def objFifoAcquire():
 # CHECK: %[[VAL_0:.*]] = aie.tile(6, 6)
 # CHECK: %[[VAL_1:.*]] = aie.tile(2, 2)
 # CHECK: aie.objectfifo @[[VAL_2:.*]](%[[VAL_0]], {%[[VAL_1]]}, 2 : i32) : !aie.objectfifo<memref<12xf16>>
-# CHECK: %[[VAL_3:.*]] = aie.objectfifo.acquire @[[VAL_2]](Consume, 1) : !aie.objectfifosubview<memref<12xf16>>
-# CHECK: %[[VAL_4:.*]] = aie.objectfifo.subview.access %[[VAL_3]][0] : !aie.objectfifosubview<memref<12xf16>> -> memref<12xf16>
+# CHECK: %[[VAL_3:.*]] = aie.objectfifo.acquire @[[VAL_2]](Consume, 1) : memref<12xf16>
 @construct_and_print_module
 def objFifoSubviewAccess():
     dev = Device(AIEDevice.xcvc1902)
@@ -260,22 +277,110 @@ def packetFlowOp():
         source=t0,
         source_port=WireBundle.Core,
         source_channel=0,
-        dest=t0,
-        dest_port=WireBundle.Core,
-        dest_channel=0,
+        dests={"dest": t0, "port": WireBundle.Core, "channel": 0},
         keep_pkt_header=True,
+    )
+
+
+# CHECK-LABEL: packetMultiFlowOp
+# CHECK: %[[VAL_0:.*]] = aie.tile(1, 3)
+# CHECK: %[[VAL_1:.*]] = aie.tile(2, 4)
+# CHECK: aie.packet_flow(16) {
+# CHECK:   aie.packet_source<%[[VAL_0]], DMA : 0>
+# CHECK:   aie.packet_dest<%[[VAL_0]], DMA : 1>
+# CHECK:   aie.packet_dest<%[[VAL_1]], DMA : 1>
+# CHECK: } {keep_pkt_header = true}
+@construct_and_print_module
+def packetMultiFlowOp():
+    t0 = tile(col=1, row=3)
+    t1 = tile(col=2, row=4)
+    packetflow(
+        pkt_id=0x10,
+        source=t0,
+        source_port=WireBundle.DMA,
+        source_channel=0,
+        dests=[
+            {"dest": t0, "port": WireBundle.DMA, "channel": 1},
+            {"dest": t1, "port": WireBundle.DMA, "channel": 1},
+        ],
+        keep_pkt_header=True,
+    )
+
+
+# CHECK-LABEL: packetPriorityFlowOp
+# CHECK: %[[VAL_0:.*]] = aie.tile(1, 3)
+# CHECK: %[[VAL_1:.*]] = aie.tile(2, 4)
+# CHECK: aie.packet_flow(3) {
+# CHECK:   aie.packet_source<%[[VAL_0]], DMA : 0>
+# CHECK:   aie.packet_dest<%[[VAL_1]], DMA : 1>
+# CHECK: } {priority_route = true}
+@construct_and_print_module
+def packetPriorityFlowOp():
+    t0 = tile(col=1, row=3)
+    t1 = tile(col=2, row=4)
+    packetflow(
+        pkt_id=3,
+        source=t0,
+        source_port=WireBundle.DMA,
+        source_channel=0,
+        dests={"dest": t1, "port": WireBundle.DMA, "channel": 1},
+        priority_route=True,
+    )
+
+
+# CHECK-LABEL: flowViaOp
+# CHECK: %[[SRC:.*]] = aie.tile(1, 3)
+# CHECK: %[[VIA:.*]] = aie.tile(1, 4)
+# CHECK: %[[DST:.*]] = aie.tile(1, 5)
+# CHECK: aie.flow(%[[SRC]], DMA : 0, %[[DST]], DMA : 1) via (%[[VIA]] : South : 2 -> North : 3)
+@construct_and_print_module
+def flowViaOp():
+    src = tile(col=1, row=3)
+    via = tile(col=1, row=4)
+    dst = tile(col=1, row=5)
+    flow(
+        src,
+        WireBundle.DMA,
+        0,
+        dst,
+        WireBundle.DMA,
+        1,
+        vias=[(via, WireBundle.South, 2, WireBundle.North, 3)],
+    )
+
+
+# CHECK-LABEL: packetFlowViaOp
+# CHECK: %[[SRC:.*]] = aie.tile(1, 3)
+# CHECK: %[[VIA:.*]] = aie.tile(1, 4)
+# CHECK: %[[DST:.*]] = aie.tile(1, 5)
+# CHECK: aie.packet_flow(3) {
+# CHECK:   aie.packet_source<%[[SRC]], DMA : 0>
+# CHECK:   aie.packet_dest<%[[DST]], DMA : 1>
+# CHECK: } via (%[[VIA]] : South : 2 -> North : 3)
+@construct_and_print_module
+def packetFlowViaOp():
+    src = tile(col=1, row=3)
+    via = tile(col=1, row=4)
+    dst = tile(col=1, row=5)
+    packetflow(
+        pkt_id=3,
+        source=src,
+        source_port=WireBundle.DMA,
+        source_channel=0,
+        dests={"dest": dst, "port": WireBundle.DMA, "channel": 1},
+        vias=[(via, WireBundle.South, 2, WireBundle.North, 3)],
     )
 
 
 # CHECK-LABEL: dmaBDOp
 # CHECK: %[[VAL_0:.*]] = aie.tile(1, 3)
 # CHECK: %[[VAL_1:.*]] = aie.buffer(%[[VAL_0]]) : memref<12xi32>
-# CHECK: aie.dma_bd(%[[VAL_1]] : memref<12xi32>) {packet = #aie.packet_info<pkt_type = 0, pkt_id = 4>}
+# CHECK: aie.dma_bd(%[[VAL_1]] : memref<12xi32>) {packet = #aie.packet_info<pkt_id = 4>}
 @construct_and_print_module
 def dmaBDOp():
     t0 = tile(col=1, row=3)
     b = buffer(t0, np.ndarray[(12,), np.dtype[np.int32]])
-    dma_bd(b,packet=(0,4))
+    dma_bd(b, packet=(0, 4))
 
 
 # CHECK-LABEL: test_module_context
@@ -321,3 +426,42 @@ def test_target_model():
 
 
 test_target_model()
+
+
+# CHECK-LABEL: test_target_model_dma_bd_bits
+# CHECK: npu1 (0, 0) wrap 10 step 20 iter 6
+# CHECK: npu1 (0, 1) wrap 10 step 17 iter 6
+# CHECK: npu1 (0, 2) wrap 8 step 13 iter 6
+# CHECK: npu1 granularity 32
+def test_target_model_dma_bd_bits():
+    print("test_target_model_dma_bd_bits")
+    d = AIEDevice.npu1
+    tm = get_target_model(d)
+    # (0, 0) ShimNOC, (0, 1) MemTile, (0, 2) Core: one of each tile type.
+    for col, row in [(0, 0), (0, 1), (0, 2)]:
+        wrap = tm.get_dma_bd_wrap_bits(col, row)
+        step = tm.get_dma_bd_step_bits(col, row)
+        it = tm.get_dma_bd_iter_bits(col, row)
+        print(f"{d} ({col}, {row}) wrap {wrap} step {step} iter {it}")
+    print(f"{d} granularity {tm.get_address_gen_granularity()}")
+
+
+test_target_model_dma_bd_bits()
+
+
+# CHECK-LABEL: test_target_model_dma_limits
+# CHECK: xcvc1902 lock max 1 repeat max 0 queue depth 0
+# CHECK: npu1 lock max 63 repeat max 255 queue depth 4
+# CHECK: npu2 lock max 63 repeat max 255 queue depth 4
+def test_target_model_dma_limits():
+    print("test_target_model_dma_limits")
+    for d in [AIEDevice.xcvc1902, AIEDevice.npu1, AIEDevice.npu2]:
+        tm = get_target_model(d)
+        print(
+            f"{d} lock max {tm.get_max_lock_value()} "
+            f"repeat max {tm.get_max_repeat_count()} "
+            f"queue depth {tm.get_dma_task_queue_depth()}"
+        )
+
+
+test_target_model_dma_limits()

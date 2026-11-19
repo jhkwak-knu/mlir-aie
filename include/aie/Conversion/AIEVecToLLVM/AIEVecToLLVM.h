@@ -1,16 +1,15 @@
 //===- AIEVecToLLVM.h - AIEVec to LLVM dialect conversion -------*- C++ -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2022 Xilinx, Inc.
+// Copyright (C) 2022-2026 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2022 Xilinx Inc.
 //
 //===----------------------------------------------------------------------===//
 
 #ifndef AIE_CONVERSION_AIEVECTOLLVM_AIEVECTOLLVM_H
 #define AIE_CONVERSION_AIEVECTOLLVM_AIEVECTOLLVM_H
 
+#include "aie/Dialect/AIEVec/Utils/TargetInfo.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 #include <memory>
@@ -23,11 +22,33 @@ class ModuleOp;
 
 namespace xilinx {
 namespace aievec {
-void populateAIEVecToLLVMConversionPatterns(mlir::LLVMTypeConverter &converter,
-                                            mlir::RewritePatternSet &patterns);
+
+enum class Aie2Fp32Emulation : uint32_t;
+
+void populateAIEVecToLLVMConversionPatterns(
+    mlir::LLVMTypeConverter &converter, mlir::RewritePatternSet &patterns,
+    Aie2Fp32Emulation aie2Fp32EmulationOption, AIEVecTargetInfo aieTarget);
+
+void populateAIEVecToLLVMCommonConversionPatterns(
+    mlir::LLVMTypeConverter &converter, mlir::RewritePatternSet &patterns);
+
+void populateAIEVecToLLVMAIE2ConversionPatterns(
+    mlir::LLVMTypeConverter &converter, mlir::RewritePatternSet &patterns);
+
+void populateAIEVecToLLVMAIE2pConversionPatterns(
+    mlir::LLVMTypeConverter &converter, mlir::RewritePatternSet &patterns);
 
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createConvertAIEVecToLLVMPass();
+} // namespace aievec
+
+// Forward declare options struct from generated code (in xilinx:: namespace)
+struct ConvertAIEVecToLLVMOptions;
+
+namespace aievec {
+std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
+createConvertAIEVecToLLVMPass(
+    const xilinx::ConvertAIEVecToLLVMOptions &options);
 } // namespace aievec
 } // namespace xilinx
 

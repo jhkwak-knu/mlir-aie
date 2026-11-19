@@ -1,0 +1,71 @@
+# Copyright (C) 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+import json
+
+import numpy as np
+import torch  # pyright: ignore[reportMissingImports]
+
+
+def convert_to_numpy(array):
+    if isinstance(array, np.ndarray):
+        return array
+    elif isinstance(array, torch.Tensor):
+        return array.cpu().numpy()
+    else:
+        raise TypeError("Unsupported array type")
+
+
+class ExpandChannels(object):
+    def __init__(self, target_channels):
+        self.target_channels = target_channels
+
+    def __call__(self, img):
+        img = torch.Tensor(img)
+        channels, height, width = img.shape
+        if channels == self.target_channels:
+            return img
+        elif channels > self.target_channels:
+            return img[: self.target_channels, :, :]
+        else:
+            # Repeat the existing channels to match the target_channels
+            repeats = self.target_channels // channels
+            remainder = self.target_channels % channels
+            img = img.repeat(repeats, 1, 1)
+            if remainder > 0:
+                img = torch.cat([img, img[:remainder, :, :]], dim=0)
+            return img
+
+
+# Function to read scale factors from JSON file
+def read_scale_factors(file_path):
+    with open(file_path, "r") as file:
+        return json.load(file)
+
+
+# Function to write scale factors to JSON file
+def write_scale_factors(file_path, scale_factors):
+    with open(file_path, "w") as file:
+        json.dump(scale_factors, file, indent=4)
+        file.write("\n")
+
+
+def shift_of(combined: torch.Tensor, what: str) -> int:
+    """Return the integer shift a combined scale, ``-log2`` of a scale ratio, stands for.
+
+    Args:
+        combined: The ``-log2`` of a ratio of power-of-two scales.
+        what: The layer it shifts, for the error.
+
+    Returns:
+        ``combined`` rounded to the nearest integer.
+
+    Raises:
+        ValueError: If ``combined`` is not an integer to within float error,
+            so no shift implements the ratio.
+    """
+    value = combined.item()
+    shift = round(value)
+    if abs(value - shift) > 1e-6:
+        raise ValueError(f"{what}: combined scale {value} is not an integer shift")
+    return shift

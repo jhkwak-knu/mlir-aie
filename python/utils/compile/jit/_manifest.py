@@ -1,0 +1,464 @@
+# _manifest.py -*- Python -*-
+#
+# Copyright (C) 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+#
+"""Recorded dependency manifest for the JIT cache.
+
+The cache key cannot know a design's kernel sources: they are registered while
+MLIR is generated, which happens after the key is computed and not at all on a
+hit. So instead of predicting inputs, record the ones a build actually consumed
+and check them on the next lookup.
+
+**Peano only.** Inputs are recorded when every kernel in the design was compiled
+by Peano, because Peano is asked for a depfile and so reports exactly which files
+it opened. The Chess front-end is driven through ``xchesscc_wrapper`` and emits
+nothing equivalent, so for a Chess design the consumed set is unknowable from
+here. Recording a set that is silently short would read as verified and is worse
+than recording nothing.
+
+Such a build still writes a manifest, marked ``complete: false``. That is not the
+same as a manifest with no inputs -- a design that genuinely consumes nothing
+records ``complete: true`` and an empty list, and is checked like any other. The
+distinction matters because the two must behave differently: an unverifiable
+design has to keep the cache behaviour it had before this file existed, whereas
+writing nothing at all would make every lookup discard the entry and rebuild,
+which is strictly worse than the status quo it is meant to preserve.
+
+Everything here fails closed: an absent, unparsable, misshapen or partial
+manifest is a miss. A manifest is checked for shape rather than trusted, since a
+lookup that raises on a corrupt one fails neither open nor closed.
+
+Where a build path cannot report its inputs, the manifest says so -- an
+unreadable depfile, a depfile naming something that is not a file, and an
+undigestable input all record ``complete: false``, never nothing at all.
+Unverifiable is not uncacheable.
+
+Recorded paths are absolute: an entry is written by one process and checked by
+another that need not share a working directory. Depfile tokens anchor against
+``kernel_dir`` (the cwd Peano runs in, so what their relative paths mean),
+declared sources against the caller's cwd.
+
+A build whose outputs the caller names, outside the cache, has no key to be
+found by, so it also records those outputs (``outputs.json``) with a key for
+everything else it read. The outputs are reused only while the key matches,
+each output is exactly as the build left it, and every recorded input is
+unchanged.
+
+**Known limits.** Two paths fail open rather than closed -- they can report a
+valid entry that is actually stale -- so they are worth knowing before relying
+on this. Both are shared with ccache and neither is fixable by recording inputs
+more carefully, because in both cases the recorded inputs are genuinely
+unchanged.
+
+1. *Include resolution.* Only files the compiler opened are recorded. A file
+   that later appears earlier in the ``-I`` search order and shadows a recorded
+   header changes what the next compile would resolve, while every recorded
+   input still matches.
+
+2. *Size and mtime agreement.* ``is_valid`` skips the digest when both size and
+   mtime match a record. An edit that preserves byte count, after something has
+   reset mtimes -- a fresh clone, a checkout, an extracted archive -- therefore
+   reads as unchanged. The digest is what catches a same-size edit; this
+   shortcut is what makes the common case cheap.
+
+   No clock reset is needed for this to bite: two same-size writes inside one
+   timestamp tick are indistinguishable, and the tick belongs to the
+   filesystem. On NFS it can be a whole second, and the client attribute cache
+   may serve a stale size and mtime for ``acregmax`` on top. ``ccache`` gates
+   the same shortcut behind ``sloppiness``.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import os
+import re
+import stat
+from pathlib import Path
+
+from aie.utils.compile.utils import _is_dispatch_library_name, _staged
+
+logger = logging.getLogger(__name__)
+
+MANIFEST_NAME = "deps.json"
+OUTPUTS_NAME = "outputs.json"
+_VERSION = 1
+# clang writes a colon inside a target verbatim, so the targets end at the first
+# colon followed by whitespace, as ninja reads them.
+_DEPFILE_TARGET_END = re.compile(r":(?=\s|$)")
+# A token is a run of escaped characters, lone backslashes and non-space
+# characters; a backslash-newline belongs to no token, so it separates.
+_DEPFILE_TOKEN = re.compile(r"(?:\\[ #]|\\(?!\n)|[^\s\\])+")
+_DEPFILE_UNESCAPE = re.compile(r"\\([ #])|\$\$")
+
+
+def _digest(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _entry(path: Path, st: os.stat_result, digests: dict[str, str] | None) -> dict:
+    if digests is None:
+        sha256 = _digest(path)
+    else:
+        # Within one build the file's content is what this build read; a
+        # later build digests it afresh.
+        sha256 = digests.get(str(path))
+        if sha256 is None:
+            sha256 = digests[str(path)] = _digest(path)
+    return {
+        "path": str(path),
+        "size": st.st_size,
+        "mtime": st.st_mtime,
+        "sha256": sha256,
+    }
+
+
+def _absolute(base: Path, path: Path) -> Path:
+    """Anchor a possibly-relative path against `base`, keeping the path opened.
+
+    Not ``resolve()``: keeping the path the compiler opened means repointing a
+    symlink is caught, since stat and the digest follow the link. Not
+    ``normpath`` either: ``a/link/../h.h`` names what the compiler opened only
+    when ``..`` is taken after following ``link``, and collapsing it lexically
+    can name a different file.
+    """
+    return base / path
+
+
+def _parse_depfile(depfile: Path) -> list[Path]:
+    r"""Read a make-style depfile: 'target: a b \\\n  c d'.
+
+    Make quoting is undone rather than split through: a space arrives as ``\\ ``
+    and a dollar as ``$$``, so splitting on bare whitespace would turn one real
+    dependency into two tokens naming no file -- and those are dropped, leaving
+    a manifest silently short while still calling itself complete.
+    """
+    text = depfile.read_text()
+    colon = _DEPFILE_TARGET_END.search(text)
+    if not colon:
+        return []
+    return [
+        Path(_DEPFILE_UNESCAPE.sub(lambda m: m.group(1) or "$", tok))
+        for tok in _DEPFILE_TOKEN.findall(text, colon.end())
+    ]
+
+
+def record(
+    kernel_dir,
+    external_kernels,
+    source_files,
+    used_chess=False,
+    dispatch_library=None,
+    full_elf_kernel=None,
+    digests: dict[str, str] | None = None,
+    full_elf_init_entry: bool = False,
+    entries: tuple[str, ...] = (),
+) -> None:
+    """Record the inputs this build consumed, if they can be known exactly.
+
+    Every kernel compiled through Peano leaves a depfile naming what the
+    compiler actually opened.  A kernel compiled any other way -- today, the
+    Chess path, which takes no -MD -- leaves none, and its includes are
+    therefore unknown.  Rather than record a set that is silently short, mark
+    the manifest ``complete: false``: the entry stays usable, so such a design
+    keeps exactly the behaviour it has now, but nothing claims it was checked.
+
+    ``digests`` is one build's record of the inputs it has digested, by path.
+    The records of a build's kernels and of the design share it, so a header
+    every kernel reads is digested once. It must not outlive the build.
+    """
+    kernel_dir = Path(kernel_dir)
+    compiled = [
+        f.object_file._source
+        for f in external_kernels
+        if f.object_file._source is not None
+    ]
+    depfiles = list(kernel_dir.glob("*.d"))
+    if used_chess or (compiled and not depfiles):
+        logger.debug(
+            "cache manifest: %d kernel(s) compiled without a depfile; recording "
+            "an incomplete manifest, inputs will not be checked",
+            len(compiled),
+        )
+        _write(
+            kernel_dir,
+            {},
+            complete=False,
+            dispatch_library=dispatch_library,
+            full_elf_kernel=full_elf_kernel,
+            full_elf_init_entry=full_elf_init_entry,
+            entries=entries,
+        )
+        return
+
+    found: dict[Path, os.stat_result] = {}
+    for dep in depfiles:
+        try:
+            # Peano runs with cwd=kernel_dir, so that is what a relative token means.
+            read = {_absolute(kernel_dir, p) for p in _parse_depfile(dep)}
+            found.update((p, p.stat()) for p in read - found.keys())
+        except OSError:
+            read = None
+        # The compiler opened every entry, so one that is not a file now cannot
+        # be checked: it has gone since, or was renamed in the writing -- clang
+        # writes a backslash in a path as a slash.
+        if read is None or not all(stat.S_ISREG(found[p].st_mode) for p in read):
+            # Unknowable, as for Chess. Writing nothing would instead read as a
+            # miss, and the caller answers a miss by discarding the entry.
+            logger.debug(
+                "cache manifest: %s could not be read or names an input that is "
+                "not a file; recording an incomplete manifest, inputs will not "
+                "be checked",
+                dep,
+            )
+            _write(
+                kernel_dir,
+                {},
+                complete=False,
+                dispatch_library=dispatch_library,
+                full_elf_kernel=full_elf_kernel,
+                full_elf_init_entry=full_elf_init_entry,
+                entries=entries,
+            )
+            return
+
+    # Declared paths are the caller's, read where the caller stands -- the same
+    # reading compile_external_kernel gives them. A missing one is already in
+    # the cache key, so it is left out rather than making the set incomplete.
+    cwd = Path.cwd()
+    declared = [
+        _absolute(cwd, Path(recipe.source_file))
+        for recipe in compiled
+        if recipe.source_file
+    ]
+    declared += [_absolute(cwd, Path(sf)) for sf in source_files]
+    for path in declared:
+        if path not in found:
+            try:
+                found[path] = path.stat()
+            except OSError:
+                pass
+    _write(
+        kernel_dir,
+        {
+            path: st
+            for path, st in sorted(found.items(), key=lambda item: str(item[0]))
+            if stat.S_ISREG(st.st_mode)
+        },
+        dispatch_library=dispatch_library,
+        full_elf_kernel=full_elf_kernel,
+        full_elf_init_entry=full_elf_init_entry,
+        digests=digests,
+        entries=entries,
+    )
+
+
+def _write(
+    kernel_dir: Path,
+    inputs: dict[Path, os.stat_result],
+    complete: bool = True,
+    dispatch_library: str | None = None,
+    full_elf_kernel: str | None = None,
+    full_elf_init_entry: bool = False,
+    digests: dict[str, str] | None = None,
+    entries: tuple[str, ...] = (),
+) -> None:
+    recorded: list[dict] = []
+    for path, st in inputs.items():
+        try:
+            recorded.append(_entry(path, st, digests))
+        except OSError:
+            # Unverifiable, but not uncacheable: mark it incomplete rather than
+            # writing nothing and costing the entry on every later lookup.
+            logger.warning(
+                "cache manifest: %s unreadable; recording an incomplete manifest",
+                path,
+            )
+            recorded, complete = [], False
+            break
+    payload = {"version": _VERSION, "complete": complete, "inputs": recorded}
+    if dispatch_library is not None:
+        payload["dispatch_library"] = dispatch_library
+    if full_elf_kernel is not None:
+        payload["full_elf_kernel"] = full_elf_kernel
+    if full_elf_init_entry:
+        payload["full_elf_init_entry"] = True
+    if entries:
+        payload["entries"] = list(entries)
+    with _staged(str(Path(kernel_dir) / MANIFEST_NAME)) as tmp:
+        Path(tmp).write_text(json.dumps(payload))
+
+
+def write_for_test(kernel_dir, inputs) -> None:
+    """Write a manifest directly. For tests that fabricate a cache entry."""
+    _write(Path(kernel_dir), {Path(i): Path(i).stat() for i in inputs})
+
+
+def resolve_dispatch_library(kernel_dir: Path) -> Path | None:
+    """Resolve the published generation under the caller's kernel-directory lock."""
+    try:
+        payload = json.loads((kernel_dir / MANIFEST_NAME).read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict) or payload.get("version") != _VERSION:
+        return None
+    name = payload.get("dispatch_library")
+    if not isinstance(name, str) or not _is_dispatch_library_name(name):
+        return None
+    path = kernel_dir / name
+    return path if path.is_file() else None
+
+
+def resolve_full_elf_kernel(kernel_dir: Path) -> str | None:
+    """Return the `"device:sequence"` kernel the build chose to run its full ELF."""
+    try:
+        payload = json.loads((kernel_dir / MANIFEST_NAME).read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict) or payload.get("version") != _VERSION:
+        return None
+    name = payload.get("full_elf_kernel")
+    return name if isinstance(name, str) else None
+
+
+def resolve_full_elf_init_entry(kernel_dir: Path) -> bool:
+    """Return whether the full ELF's build made a ``reconfig_init`` entry."""
+    try:
+        payload = json.loads((kernel_dir / MANIFEST_NAME).read_text())
+    except (OSError, ValueError):
+        return False
+    if not isinstance(payload, dict) or payload.get("version") != _VERSION:
+        return False
+    return payload.get("full_elf_init_entry") is True
+
+
+def resolve_entries(kernel_dir: Path) -> tuple[str, ...]:
+    """Return the build's ``"device:sequence"`` entries when it has several, else ``()``."""
+    try:
+        payload = json.loads((kernel_dir / MANIFEST_NAME).read_text())
+    except (OSError, ValueError):
+        return ()
+    if not isinstance(payload, dict) or payload.get("version") != _VERSION:
+        return ()
+    names = payload.get("entries")
+    if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+        return ()
+    return tuple(names)
+
+
+def is_valid(kernel_dir: Path) -> bool:
+    """Return True only if every recorded input is still exactly as recorded.
+
+    Fails closed: a missing, unparsable or partial manifest is a miss, never a
+    hit.  Anything this cannot verify, it does not trust.
+
+    The one exception is a manifest that declares itself incomplete, which is
+    how a build path that cannot report its inputs (today, Chess) records
+    itself.  There is nothing to check, so this reports the entry usable and
+    leaves it exactly as cacheable as it was before manifests existed.  Treating
+    it as a miss would be worse than the status quo, not safer: the caller
+    discards the directory on a miss, so every lookup would wipe a valid entry
+    and rebuild it.
+    """
+    path = Path(kernel_dir) / MANIFEST_NAME
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return False
+    # Shape is an input to check, not an invariant to assume: raising on a
+    # malformed manifest fails neither open nor closed.
+    if not isinstance(payload, dict) or payload.get("version") != _VERSION:
+        return False
+    if not payload.get("complete", True):
+        logger.debug(
+            "cache manifest: %s records no verifiable inputs; not checking", path
+        )
+        return True
+    inputs = payload.get("inputs", ())
+    if not isinstance(inputs, list):
+        return False
+    for rec in inputs:
+        if not isinstance(rec, dict):
+            return False
+        recorded_path = rec.get("path")
+        size = rec.get("size")
+        mtime = rec.get("mtime")
+        sha256 = rec.get("sha256")
+        if (
+            not isinstance(recorded_path, str)
+            or not isinstance(size, int)
+            or not isinstance(mtime, (int, float))
+            or not isinstance(sha256, str)
+        ):
+            return False
+        f = Path(recorded_path)
+        try:
+            st = f.stat()
+        except OSError:
+            return False
+        # tsbuildinfo pattern: size+mtime agree -> trust it, skip the hash.
+        if st.st_size == size and st.st_mtime == mtime:
+            continue
+        try:
+            if _digest(f) != sha256:
+                return False
+        except OSError:
+            return False
+    return True
+
+
+def _output_entry(path: Path) -> dict:
+    st = path.stat()
+    return {"path": str(path), "size": st.st_size, "mtime_ns": st.st_mtime_ns}
+
+
+def record_outputs(kernel_dir: Path, key: str, outputs: list[Path]) -> None:
+    """Record that the build named by ``key`` wrote ``outputs``, as they are now.
+
+    For builds whose outputs the caller places, outside the cache. Written
+    after the build, beside the manifest of what it consumed.
+    """
+    payload = {
+        "version": _VERSION,
+        "key": key,
+        "outputs": [_output_entry(Path(p)) for p in outputs],
+    }
+    with _staged(str(Path(kernel_dir) / OUTPUTS_NAME)) as tmp:
+        Path(tmp).write_text(json.dumps(payload))
+
+
+def forget_outputs(kernel_dir: Path) -> None:
+    """Drop the output record before a build starts to overwrite the outputs."""
+    (Path(kernel_dir) / OUTPUTS_NAME).unlink(missing_ok=True)
+
+
+def outputs_current(kernel_dir: Path, key: str, outputs: list[Path]) -> bool:
+    """Return True only if the build ``key`` wrote ``outputs`` and nothing since has.
+
+    Each output must be exactly as that build left it, and every input it
+    recorded unchanged (see ``is_valid``). An output rewritten by anything
+    else, even to the same bytes, is a miss: it is no longer known to be what
+    this build made.
+    """
+    try:
+        payload = json.loads((Path(kernel_dir) / OUTPUTS_NAME).read_text())
+    except (OSError, ValueError):
+        return False
+    if (
+        not isinstance(payload, dict)
+        or payload.get("version") != _VERSION
+        or payload.get("key") != key
+    ):
+        return False
+    try:
+        current = [_output_entry(Path(p)) for p in outputs]
+    except OSError:
+        return False
+    return payload.get("outputs") == current and is_valid(kernel_dir)

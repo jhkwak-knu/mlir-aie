@@ -1,0 +1,112 @@
+//===- cpp_multi_device_sequence.mlir --------------------------*- MLIR -*-===//
+//
+// Copyright (C) 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+// REQUIRES: peano
+
+// Test device and sequence filtering (mirrors test/npu-xrt/add_one_two pattern).
+// Each device is compiled separately with --device-name.
+
+// RUN: aiecc --device-name=device1 --get-scratchpad-parameters --verbose --tmpdir=%t.dev1 %s 2>&1 | FileCheck %s --check-prefix=DEV1
+// RUN: aiecc --device-name=device2 --get-scratchpad-parameters --verbose --tmpdir=%t.dev2 %s 2>&1 | FileCheck %s --check-prefix=DEV2
+// RUN: aiecc --device-name=device1 --sequence-name=seq_a --get-npu-insts --verbose --tmpdir=%t.seq_a %s 2>&1 | FileCheck %s --check-prefix=DEV1_SEQ_A
+// RUN: aiecc --get-scratchpad-parameters --verbose --tmpdir=%t.all %s 2>&1 | FileCheck %s --check-prefix=ALL
+// RUN: aie-opt -aie-generate-column-control-overlay="configuration=true " --aie-import-overlay %s -o %t.ctrlpkt_overlay.mlir && aiecc --device-name=device1 --get-ctrlpkt --verbose --tmpdir=%t.ctrlpkt %t.ctrlpkt_overlay.mlir 2>&1 | FileCheck %s --check-prefix=CTRLPKT_DEV1
+// RUN: aiecc --device-name=device1 --sequence-name=seq_a --get-xclbin --tmpdir=%t.count_a %s
+// RUN: FileCheck %s --check-prefix=COUNT_A --input-file=%t.count_a/kernels_device1.json
+// RUN: aiecc --device-name=device1 --sequence-name=seq_b --get-xclbin --tmpdir=%t.count_b %s
+// RUN: FileCheck %s --check-prefix=COUNT_B --input-file=%t.count_b/kernels_device1.json
+
+// The driver filters devices/sequences silently (no per-device progress logs).
+// Each filter mode is verified by driving it to successful completion; sequence
+// filtering is additionally verified via the per-sequence lowering edge.
+
+// DEV1: wrote edge 'params.txt'
+
+// DEV2: wrote edge 'params.txt'
+
+// DEV1_SEQ_A: ({{[0-9]+}}/{{[0-9]+}}) npu_seq_{{.*}}.mlir
+// DEV1_SEQ_A: wrote edge 'insts_
+
+// ALL: wrote edge 'params.txt'
+
+// CTRLPKT_DEV1: ({{[0-9]+}}/{{[0-9]+}}) ctrlpkt_lowered_{{.*}}.mlir
+// CTRLPKT_DEV1: wrote edge '{{.*}}ctrlpkt.bin'
+
+// seq_a: 6 host args -> bo0..bo5, no bo6.
+// COUNT_A: "name": "bo5"
+// COUNT_A-NOT: "name": "bo6"
+
+// seq_b: 7 host args -> bo0..bo6, no bo7.
+// COUNT_B: "name": "bo6"
+// COUNT_B-NOT: "name": "bo7"
+
+// device1 uses column 0, device2 uses column 1 so that both devices can be
+// compiled in the same pass manager invocation without tile address conflicts.
+module {
+  aie.device(npu1_2col) @device1 {
+    %tile00 = aie.tile(0, 0)
+    %tile02 = aie.tile(0, 2)
+
+    aie.objectfifo @in1(%tile00, {%tile02}, 2 : i32) : !aie.objectfifo<memref<16xi32>>
+    aie.objectfifo @out1(%tile02, {%tile00}, 2 : i32) : !aie.objectfifo<memref<16xi32>>
+
+    %core = aie.core(%tile02) {
+      %input = aie.objectfifo.acquire @in1 (Consume, 1) : memref<16xi32>
+      %output = aie.objectfifo.acquire @out1 (Produce, 1) : memref<16xi32>
+      aie.objectfifo.release @in1 (Consume, 1)
+      aie.objectfifo.release @out1 (Produce, 1)
+      aie.end
+    }
+
+    // seq_a and seq_b declare a DIFFERENT number of host arguments (6 vs 7,
+    // both above the kMinHostBOs=5 floor so the counts are distinguishable).
+    // This guards that --sequence-name drives the kernels.json boN count from
+    // the SELECTED sequence, not simply the first one on the device.
+    aie.runtime_sequence @seq_a(%arg0 : memref<16xi32>, %arg1 : memref<16xi32>, %arg2 : memref<16xi32>, %arg3 : memref<16xi32>, %arg4 : memref<16xi32>, %arg5 : memref<16xi32>) {
+      %c0 = arith.constant 0 : i64
+      %c1 = arith.constant 1 : i64
+      %c16 = arith.constant 16 : i64
+      aiex.npu.dma_memcpy_nd(%arg1[%c0,%c0,%c0,%c0][%c1,%c1,%c1,%c16][%c0,%c0,%c0,%c1]) {metadata = @out1, id = 1 : i64} : memref<16xi32>
+      aiex.npu.dma_memcpy_nd(%arg0[%c0,%c0,%c0,%c0][%c1,%c1,%c1,%c16][%c0,%c0,%c0,%c1]) {metadata = @in1, id = 0 : i64, issue_token = true} : memref<16xi32>
+      aiex.npu.dma_wait {symbol = @out1}
+    }
+
+    aie.runtime_sequence @seq_b(%arg0 : memref<16xi32>, %arg1 : memref<16xi32>, %arg2 : memref<16xi32>, %arg3 : memref<16xi32>, %arg4 : memref<16xi32>, %arg5 : memref<16xi32>, %arg6 : memref<16xi32>) {
+      %c0 = arith.constant 0 : i64
+      %c1 = arith.constant 1 : i64
+      %c16 = arith.constant 16 : i64
+      aiex.npu.dma_memcpy_nd(%arg1[%c0,%c0,%c0,%c0][%c1,%c1,%c1,%c16][%c0,%c0,%c0,%c1]) {metadata = @out1, id = 1 : i64} : memref<16xi32>
+      aiex.npu.dma_memcpy_nd(%arg0[%c0,%c0,%c0,%c0][%c1,%c1,%c1,%c16][%c0,%c0,%c0,%c1]) {metadata = @in1, id = 0 : i64, issue_token = true} : memref<16xi32>
+      aiex.npu.dma_wait {symbol = @out1}
+    }
+  }
+
+  aie.device(npu1_2col) @device2 {
+    %tile10 = aie.tile(1, 0)
+    %tile12 = aie.tile(1, 2)
+
+    aie.objectfifo @in2(%tile10, {%tile12}, 2 : i32) : !aie.objectfifo<memref<16xi32>>
+    aie.objectfifo @out2(%tile12, {%tile10}, 2 : i32) : !aie.objectfifo<memref<16xi32>>
+
+    %core = aie.core(%tile12) {
+      %input = aie.objectfifo.acquire @in2 (Consume, 1) : memref<16xi32>
+      %output = aie.objectfifo.acquire @out2 (Produce, 1) : memref<16xi32>
+      aie.objectfifo.release @in2 (Consume, 1)
+      aie.objectfifo.release @out2 (Produce, 1)
+      aie.end
+    }
+
+    aie.runtime_sequence @seq_c(%arg0 : memref<16xi32>, %arg1 : memref<16xi32>) {
+      %c0 = arith.constant 0 : i64
+      %c1 = arith.constant 1 : i64
+      %c16 = arith.constant 16 : i64
+      aiex.npu.dma_memcpy_nd(%arg1[%c0,%c0,%c0,%c0][%c1,%c1,%c1,%c16][%c0,%c0,%c0,%c1]) {metadata = @out2, id = 1 : i64} : memref<16xi32>
+      aiex.npu.dma_memcpy_nd(%arg0[%c0,%c0,%c0,%c0][%c1,%c1,%c1,%c16][%c0,%c0,%c0,%c1]) {metadata = @in2, id = 0 : i64, issue_token = true} : memref<16xi32>
+      aiex.npu.dma_wait {symbol = @out2}
+    }
+  }
+}

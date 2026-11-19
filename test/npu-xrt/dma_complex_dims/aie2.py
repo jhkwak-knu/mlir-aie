@@ -1,17 +1,15 @@
 # dma_complex_dims/aie2.py -*- Python -*-
 #
-# This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-# See https://llvm.org/LICENSE.txt for license information.
+# Copyright (C) 2025 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #
-# (c) Copyright 2025 Advanced Micro Devices, Inc. or its affiliates
 
 # REQUIRES: ryzen_ai_npu1, peano
 #
-# RUN: %python %S/aie2.py --m 8 --k 5 --K 20 --r 4 --s 5 > ./aie2.mlir
-# RUN: %python aiecc.py --no-aiesim --no-xchesscc --aie-generate-npu-insts --aie-generate-xclbin --no-compile-host --xclbin-name=final.xclbin --npu-insts-name=insts.bin ./aie2.mlir
-# RUN: clang %S/test.cpp -o test.exe -std=c++17 -Wall %xrt_flags -lrt -lstdc++ %test_utils_flags
-# RUN: %run_on_npu1% ./test.exe -x final.xclbin -i insts.bin -k MLIR_AIE --m 8 --k 5 --K 20 --r 4 --s 5
+# RUN: %python %S/aie2.py 8 5 20 4 5 > ./aie2.mlir
+# RUN: %aiecc --get-npu-insts --get-xclbin --xclbin-name=final.xclbin --npu-insts-name=insts.bin ./aie2.mlir
+# RUN: %host_clang %S/test.cpp -o test.exe -std=c++17 -Wall %xrt_flags %host_link_flags %test_utils_flags
+# RUN: %run_on_npu1% ./test.exe -x final.xclbin -i insts.bin -k MLIR_AIE -m 8 --tile-k 5 -K 20 -r 4 -s 5
 import argparse
 import numpy as np
 import sys
@@ -19,7 +17,7 @@ import sys
 from aie.dialects.aie import *
 from aie.dialects.aiex import *
 from aie.extras.context import mlir_mod_ctx
-from aie.helpers.dialects.ext.scf import _for as range_
+from aie.iron.controlflow import range_
 from aie.helpers.taplib import TensorAccessPattern
 
 

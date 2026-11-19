@@ -1,10 +1,7 @@
 //===- aie.mlir ------------------------------------------------*- MLIR -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2024 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2024 Advanced Micro Devices, Inc. or its affiliates
 //
 //===----------------------------------------------------------------------===//
 module {
@@ -31,7 +28,7 @@ module {
     aie.objectfifo @objFifo_out3(%4, {%1}, 2 : i32) : !aie.objectfifo<memref<128xui8>>
     aie.objectfifo @objFifo_out4(%5, {%1}, 2 : i32) : !aie.objectfifo<memref<128xui8>>
     aie.objectfifo.link [@objFifo_out1, @objFifo_out2, @objFifo_out3, @objFifo_out4] -> [@objFifo_out0] ([0, 128, 256, 384] [])
-    func.func private @thresholdLine(%in: memref<128xui8>, %out: memref<128xui8>, %lineWidth: i32,  %thresholdValue: i32, %maxValue: i32, %thresholdType: i8) -> ()
+    func.func private @thresholdLine(%in: memref<128xui8>, %out: memref<128xui8>, %lineWidth: i32,  %thresholdValue: i32, %maxValue: i32, %thresholdType: i8) -> () attributes {link_with = "threshold.o"}
     %24 = aie.core(%2) {
       %c0 = arith.constant 0 : index
       %c1 = arith.constant 1 : index
@@ -43,10 +40,8 @@ module {
       memref.store %th, %rtp0[%c0] : memref<16xi32>
       memref.store %v0, %rtp0[%c1] : memref<16xi32>
       scf.for %arg0 = %c0 to %c4096 step %c1 {
-        %subview0 = aie.objectfifo.acquire @objFifo_in1(Consume, 1) : !aie.objectfifosubview<memref<128xui8>>
-        %elem0 = aie.objectfifo.subview.access %subview0[0] : !aie.objectfifosubview<memref<128xui8>> -> memref<128xui8>
-        %subview1 = aie.objectfifo.acquire @objFifo_out1(Produce, 1) : !aie.objectfifosubview<memref<128xui8>>
-        %elem1 = aie.objectfifo.subview.access %subview1[0] : !aie.objectfifosubview<memref<128xui8>> -> memref<128xui8>
+        %elem0 = aie.objectfifo.acquire @objFifo_in1(Consume, 1) : memref<128xui8>
+        %elem1 = aie.objectfifo.acquire @objFifo_out1(Produce, 1) : memref<128xui8>
         %thresh = memref.load %rtp0[%c0] : memref<16xi32>
         %tt = memref.load %rtp0[%c1] : memref<16xi32>
         %threshType = arith.trunci %tt : i32 to i8
@@ -55,7 +50,7 @@ module {
         aie.objectfifo.release @objFifo_out1(Produce, 1)
       }
       aie.end
-    } {link_with = "threshold.o"}
+    }
     %34 = aie.core(%3) {
       %c0 = arith.constant 0 : index
       %c1 = arith.constant 1 : index
@@ -67,10 +62,8 @@ module {
       memref.store %th, %rtp1[%c0] : memref<16xi32>
       memref.store %v0, %rtp1[%c1] : memref<16xi32>
       scf.for %arg0 = %c0 to %c4096 step %c1 {
-        %subview0 = aie.objectfifo.acquire @objFifo_in2(Consume, 1) : !aie.objectfifosubview<memref<128xui8>>
-        %elem0 = aie.objectfifo.subview.access %subview0[0] : !aie.objectfifosubview<memref<128xui8>> -> memref<128xui8>
-        %subview1 = aie.objectfifo.acquire @objFifo_out2(Produce, 1) : !aie.objectfifosubview<memref<128xui8>>
-        %elem1 = aie.objectfifo.subview.access %subview1[0] : !aie.objectfifosubview<memref<128xui8>> -> memref<128xui8>
+        %elem0 = aie.objectfifo.acquire @objFifo_in2(Consume, 1) : memref<128xui8>
+        %elem1 = aie.objectfifo.acquire @objFifo_out2(Produce, 1) : memref<128xui8>
         %thresh = memref.load %rtp1[%c0] : memref<16xi32>
         %tt = memref.load %rtp1[%c1] : memref<16xi32>
         %threshType = arith.trunci %tt : i32 to i8
@@ -79,7 +72,7 @@ module {
         aie.objectfifo.release @objFifo_out2(Produce, 1)
       }
       aie.end
-    } {link_with = "threshold.o"}
+    }
     %44 = aie.core(%4) {
       %c0 = arith.constant 0 : index
       %c1 = arith.constant 1 : index
@@ -91,10 +84,8 @@ module {
       memref.store %th, %rtp2[%c0] : memref<16xi32>
       memref.store %v0, %rtp2[%c1] : memref<16xi32>
       scf.for %arg0 = %c0 to %c4096 step %c1 {
-        %subview0 = aie.objectfifo.acquire @objFifo_in3(Consume, 1) : !aie.objectfifosubview<memref<128xui8>>
-        %elem0 = aie.objectfifo.subview.access %subview0[0] : !aie.objectfifosubview<memref<128xui8>> -> memref<128xui8>
-        %subview1 = aie.objectfifo.acquire @objFifo_out3(Produce, 1) : !aie.objectfifosubview<memref<128xui8>>
-        %elem1 = aie.objectfifo.subview.access %subview1[0] : !aie.objectfifosubview<memref<128xui8>> -> memref<128xui8>
+        %elem0 = aie.objectfifo.acquire @objFifo_in3(Consume, 1) : memref<128xui8>
+        %elem1 = aie.objectfifo.acquire @objFifo_out3(Produce, 1) : memref<128xui8>
         %thresh = memref.load %rtp2[%c0] : memref<16xi32>
         %tt = memref.load %rtp2[%c1] : memref<16xi32>
         %threshType = arith.trunci %tt : i32 to i8
@@ -103,7 +94,7 @@ module {
         aie.objectfifo.release @objFifo_out3(Produce, 1)
       }
       aie.end
-    } {link_with = "threshold.o"}
+    }
     %54 = aie.core(%5) {
       %c0 = arith.constant 0 : index
       %c1 = arith.constant 1 : index
@@ -115,10 +106,8 @@ module {
       memref.store %th, %rtp3[%c0] : memref<16xi32>
       memref.store %v0, %rtp3[%c1] : memref<16xi32>
       scf.for %arg0 = %c0 to %c4096 step %c1 {
-        %subview0 = aie.objectfifo.acquire @objFifo_in4(Consume, 1) : !aie.objectfifosubview<memref<128xui8>>
-        %elem0 = aie.objectfifo.subview.access %subview0[0] : !aie.objectfifosubview<memref<128xui8>> -> memref<128xui8>
-        %subview1 = aie.objectfifo.acquire @objFifo_out4(Produce, 1) : !aie.objectfifosubview<memref<128xui8>>
-        %elem1 = aie.objectfifo.subview.access %subview1[0] : !aie.objectfifosubview<memref<128xui8>> -> memref<128xui8>
+        %elem0 = aie.objectfifo.acquire @objFifo_in4(Consume, 1) : memref<128xui8>
+        %elem1 = aie.objectfifo.acquire @objFifo_out4(Produce, 1) : memref<128xui8>
         %thresh = memref.load %rtp3[%c0] : memref<16xi32>
         %tt = memref.load %rtp3[%c1] : memref<16xi32>
         %threshType = arith.trunci %tt : i32 to i8
@@ -127,23 +116,30 @@ module {
         aie.objectfifo.release @objFifo_out4(Produce, 1)
       }
       aie.end
-    } {link_with = "threshold.o"}
-    aiex.runtime_sequence(%in : memref<2048xi32>, %buf : memref<32xi32>, %out : memref<2048xi32>) {
+    }
+    aie.runtime_sequence(%in : memref<2048xi32>, %buf : memref<32xi32>, %out : memref<2048xi32>) {
       %c0 = arith.constant 0 : i64
       %c1 = arith.constant 1 : i64
       %c2048 = arith.constant 2048 : i64
-      aiex.npu.rtp_write(@rtp0, 0, 50)
-      aiex.npu.rtp_write(@rtp1, 0, 50)
-      aiex.npu.rtp_write(@rtp2, 0, 50)
-      aiex.npu.rtp_write(@rtp3, 0, 50)
-      aiex.npu.rtp_write(@rtp0, 1, 0)
-      aiex.npu.rtp_write(@rtp1, 1, 0)
-      aiex.npu.rtp_write(@rtp2, 1, 0)
-      aiex.npu.rtp_write(@rtp3, 1, 0)
+      %cst_npu_0 = arith.constant 50 : i32
+      aiex.npu.rtp_write(@rtp0, 0, %cst_npu_0) : i32
+      %cst_npu_1 = arith.constant 50 : i32
+      aiex.npu.rtp_write(@rtp1, 0, %cst_npu_1) : i32
+      %cst_npu_2 = arith.constant 50 : i32
+      aiex.npu.rtp_write(@rtp2, 0, %cst_npu_2) : i32
+      %cst_npu_3 = arith.constant 50 : i32
+      aiex.npu.rtp_write(@rtp3, 0, %cst_npu_3) : i32
+      %cst_npu_4 = arith.constant 0 : i32
+      aiex.npu.rtp_write(@rtp0, 1, %cst_npu_4) : i32
+      %cst_npu_5 = arith.constant 0 : i32
+      aiex.npu.rtp_write(@rtp1, 1, %cst_npu_5) : i32
+      %cst_npu_6 = arith.constant 0 : i32
+      aiex.npu.rtp_write(@rtp2, 1, %cst_npu_6) : i32
+      %cst_npu_7 = arith.constant 0 : i32
+      aiex.npu.rtp_write(@rtp3, 1, %cst_npu_7) : i32
       aiex.npu.dma_memcpy_nd (%out[%c0,%c0,%c0,%c0][%c1,%c1,%c1,%c2048][%c0,%c0,%c0, %c1]) { metadata = @objFifo_out0, id = 1 : i64, issue_token = true } : memref<2048xi32>
       aiex.npu.dma_memcpy_nd (%in[%c0,%c0,%c0,%c0][%c1,%c1,%c1,%c2048][%c0,%c0,%c0, %c1]) { metadata = @objFifo_in0, id = 0 : i64 } : memref<2048xi32>
       aiex.npu.dma_wait {symbol = @objFifo_out0}
     }
   }
 }
-

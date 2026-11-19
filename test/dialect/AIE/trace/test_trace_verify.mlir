@@ -1,0 +1,145 @@
+//===- test_trace_verify.mlir ----------------------------------*- MLIR -*-===//
+//
+// Copyright (C) 2025 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+// RUN: aie-opt %s -split-input-file -verify-diagnostics
+
+// Test: Too many events (max 8)
+module {
+  aie.device(npu1_1col) {
+    %tile = aie.tile(0, 2)
+    
+    // expected-error@+1 {{trace unit supports maximum 8 events}}
+    aie.trace @test_too_many_events(%tile) {
+      aie.trace.event<"INSTR_EVENT_0">
+      aie.trace.event<"INSTR_EVENT_1">
+      aie.trace.event<"INSTR_VECTOR">
+      aie.trace.event<"LOCK_STALL">
+      aie.trace.event<"MEMORY_STALL">
+      aie.trace.event<"STREAM_STALL">
+      aie.trace.event<"CASCADE_STALL">
+      aie.trace.event<"ACTIVE">
+      aie.trace.event<"DISABLED">
+    }
+  }
+}
+
+// -----
+
+// Test: Invalid typed enum case must fail parsing
+module {
+  aie.device(npu1_1col) {
+    %tile = aie.tile(0, 2)
+
+    aie.trace @test_invalid_enum_case(%tile) {
+      // expected-error@+1 {{unknown CoreEventAIE2 value}}
+      aie.trace.event<CoreEventAIE2::NOT_A_REAL_EVENT>
+    }
+  }
+}
+
+// -----
+
+// Test: Packet ID out of range (too low)
+module {
+  aie.device(npu1_1col) {
+    %tile = aie.tile(0, 2)
+    
+    aie.trace @test_packet_id_low(%tile) {
+      // expected-error@+1 {{attribute 'id' failed to satisfy constraint: 32-bit signless integer attribute whose minimum value is 1 whose maximum value is 31}}
+      aie.trace.packet id=0 type="core"
+    }
+  }
+}
+
+// -----
+
+// Test: Packet ID out of range (too high)
+module {
+  aie.device(npu1_1col) {
+    %tile = aie.tile(0, 2)
+    
+    aie.trace @test_packet_id_high(%tile) {
+      // expected-error@+1 {{attribute 'id' failed to satisfy constraint: 32-bit signless integer attribute whose minimum value is 1 whose maximum value is 31}}
+      aie.trace.packet id=32 type="core"
+    }
+  }
+}
+
+// -----
+
+// Test: Start event - must specify broadcast or event
+module {
+  aie.device(npu1_1col) {
+    %tile = aie.tile(0, 2)
+    
+    aie.trace @test_start_missing(%tile) {
+      // expected-error@+1 {{must specify either broadcast or event}}
+      aie.trace.start
+    }
+  }
+}
+
+// -----
+
+// Test: Start event - cannot specify both
+module {
+  aie.device(npu1_1col) {
+    %tile = aie.tile(0, 2)
+    
+    aie.trace @test_start_both(%tile) {
+      // expected-error@+1 {{cannot specify both broadcast and event}}
+      aie.trace.start broadcast=15 event=<"TRUE">
+    }
+  }
+}
+
+// -----
+
+// Test: Valid trace configuration (should pass)
+module {
+  aie.device(npu1_1col) {
+    %tile = aie.tile(0, 2)
+
+    aie.trace @test_valid(%tile) {
+      aie.trace.mode "Event-Time"
+      aie.trace.packet id=1 type="core"
+      aie.trace.event<"INSTR_EVENT_0">
+      aie.trace.event<"INSTR_VECTOR">
+      aie.trace.event<"LOCK_STALL">
+      aie.trace.start broadcast=15
+      aie.trace.stop broadcast=14
+    }
+  }
+}
+
+// -----
+
+// Test: Typed event enum must match target architecture
+module {
+  aie.device(npu1_1col) {
+    %tile = aie.tile(0, 2)
+
+    aie.trace @test_enum_arch_mismatch(%tile) {
+      // expected-error@+1 {{event 'CoreEventAIE2P::INSTR_EVENT_0' is not valid for core tile (AIE2) at (0, 2)}}
+      aie.trace.event<CoreEventAIE2P::INSTR_EVENT_0>
+    }
+  }
+}
+
+// -----
+
+// Test: Typed event enum mismatch with logical tile (half-known coordinates)
+module {
+  aie.device(npu1_1col) {
+    %tile = aie.logical_tile<CoreTile>(0, ?)
+
+    aie.trace @test_enum_arch_mismatch_logical(%tile) {
+      // expected-error@+1 {{event 'CoreEventAIE2P::INSTR_EVENT_0' is not valid for core tile (AIE2) at (0, ?)}}
+      aie.trace.event<CoreEventAIE2P::INSTR_EVENT_0>
+    }
+  }
+}

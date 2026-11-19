@@ -1,10 +1,7 @@
 //===-  vec_math.h -====//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2023 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2023 Advanced Micro Devices, Inc.
 //
 //===----------------------------------------------------------------------===//
 
@@ -31,6 +28,19 @@
 //
 //	return y;
 //}
+//
+// Scalar form of the above. aie::invsqrt lowers to sqrtf on AIE2, which does
+// not link.
+inline __attribute__((always_inline)) float invsqrt(float in) {
+  float x2 = in * 0.5f;
+  int32_t i;
+  __builtin_memcpy(&i, &in, sizeof(in));
+  i = 0x5f3759df - (i >> 1);
+  float y;
+  __builtin_memcpy(&y, &i, sizeof(y));
+  return y * (1.5f - (x2 * y * y));
+}
+
 inline __attribute__((always_inline)) v32bfloat16 getRsqrtBf16(v32bfloat16 in) {
   aie::vector<bfloat16, 32> x = in;
   aie::accum<accfloat, 32> x2 =

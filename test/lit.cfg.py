@@ -1,17 +1,16 @@
 # ./lit.cfg.py -*- Python -*-
 #
-# This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-# See https://llvm.org/LICENSE.txt for license information.
+# Copyright (C) 2021-2022 Xilinx, Inc.
+# Copyright (C) 2022-2026 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #
-# (c) Copyright 2021 Xilinx Inc.
 
 import os
-import platform
-import re
 import shutil
-import subprocess
-import tempfile
+import sys
+
+# Add shared AIE lit utilities to path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
 
 import lit.formats
 import lit.util
@@ -19,16 +18,14 @@ import lit.util
 from lit.llvm import llvm_config
 from lit.llvm.subst import ToolSubst
 from lit.llvm.subst import FindTool
+from aie_lit_utils import LitConfigHelper, SanitizerLogShTest
 
 # Configuration file for the 'lit' test runner.
 
 # name: The name of this test suite.
 config.name = "AIE_TEST"
 
-config.test_format = lit.formats.ShTest(not llvm_config.use_lit_shell)
-config.environment["PYTHONPATH"] = "{}".format(
-    os.path.join(config.aie_obj_root, "python")
-)
+config.test_format = lit.formats.ShTest()
 
 # suffixes: A list of file extensions to treat as test files.
 config.suffixes = [".mlir", ".py", ".test"]
@@ -36,168 +33,110 @@ config.suffixes = [".mlir", ".py", ".test"]
 # test_source_root: The root path where tests are located.
 config.test_source_root = os.path.dirname(__file__)
 
-config.substitutions.append(("%PATH%", config.environment["PATH"]))
-config.substitutions.append(("%AIE_SRC_ROOT", config.aie_src_root))
-config.substitutions.append(("%PYTHON", config.python_executable))
-config.substitutions.append(("%shlibext", config.llvm_shlib_ext))
+# Setup standard environment (PYTHONPATH, AIETOOLS, system env, etc.)
+LitConfigHelper.setup_standard_environment(
+    llvm_config, config, config.aie_obj_root, config.vitis_aietools_dir
+)
+
+# Forward the install prefix when tests are run against wheel-installed tools.
+if "MLIR_AIE_INSTALL_DIR" in os.environ:
+    llvm_config.with_system_environment("MLIR_AIE_INSTALL_DIR")
+
+# HRX discovery runs during lit configuration, but dispatch runs in test
+# subprocesses. Keep both in the same provisioned runtime environment.
+llvm_config.with_system_environment(
+    [
+        "AIE_XCLBINUTIL",
+        "CMAKE_PREFIX_PATH",
+        "HRX_DIR",
+        "HRX_LIBHRX",
+        "LIBHRX_DIR",
+        "LD_LIBRARY_PATH",
+        "ROCM_PATH",
+        "IRON_HSA_DEVICE",
+        "IRON_HSA_TIMEOUT",
+    ]
+)
+
+# A CI job that must not skip the kernel checks page's node tests sets this.
+llvm_config.with_system_environment("MLIR_AIE_REQUIRE_NODE")
+
+# Basic substitutions
+# lit runs many Python/JIT tests in one suite; give each test file its own
+# NPU cache namespace so cache state cannot leak between unrelated tests while
+# still allowing multiple RUN lines from one test to share that test-local cache.
+_python_with_test_cache = LitConfigHelper._run_with_test_cache_wrap(config.aie_src_root)
+# A sanitized build (nightlyCodeHealth.yml) links its tools and the aie
+# extension against the shared sanitizer runtime; the interpreter itself is
+# not instrumented, so the runtime must be loaded before it imports aie.
+# Preloaded through the test environment, so every interpreter a RUN line
+# starts gets it (%PYTHON, %pytest and lit's own %python alike).
+llvm_config.with_system_environment(
+    ["ASAN_OPTIONS", "UBSAN_OPTIONS", "TSAN_OPTIONS", "LSAN_OPTIONS"]
+)
+if os.environ.get("AIE_SANITIZER_PRELOAD"):
+    config.environment["LD_PRELOAD"] = os.environ["AIE_SANITIZER_PRELOAD"]
+if os.environ.get("AIE_SANITIZER_LOG_DIR"):
+    config.test_format = SanitizerLogShTest(
+        os.path.abspath(os.environ["AIE_SANITIZER_LOG_DIR"])
+    )
+_pytest_wrapper = os.path.join(config.aie_src_root, "utils", "run_pytest.py")
+config.substitutions.append(
+    (
+        "%PYTHON",
+        f"{_python_with_test_cache} "
+        f"{LitConfigHelper._quote_lit_arg(config.python_executable)}",
+    )
+)
 config.substitutions.append(("%extraAieCcFlags%", config.extraAieCcFlags))
 config.substitutions.append(
     ("%aie_runtime_lib%", os.path.join(config.aie_obj_root, "aie_runtime_lib"))
 )
 config.substitutions.append(("%aietools", config.vitis_aietools_dir))
-
-test_lib_path = os.path.join(
-    config.aie_obj_root, "runtime_lib", config.aieHostTarget, "test_lib"
-)
+# Show only failures
+# --maxfail=1 is scoped to lit: the kernel-check sweep runs the same wrapper and
+# must reach every case before it publishes.
 config.substitutions.append(
     (
-        "%test_lib_flags",
-        f"-I{test_lib_path}/include -L{test_lib_path}/lib -ltest_lib",
-    )
-)
-config.substitutions.append(
-    (
-        "%test_utils_flags",
-        f"-I{test_lib_path}/include -L{test_lib_path}/lib -ltest_utils",
+        "%pytest",
+        f"{_python_with_test_cache} "
+        f"{LitConfigHelper._quote_lit_arg(config.python_executable)} "
+        f"{LitConfigHelper._quote_lit_arg(_pytest_wrapper)} -rA --maxfail=1",
     )
 )
 
-# for xchesscc_wrapper
-llvm_config.with_environment("AIETOOLS", config.vitis_aietools_dir)
-# for peano clang
-llvm_config.with_environment("XILINX_VITIS_AIETOOLS", config.vitis_aietools_dir)
+# Setup test library substitutions
+LitConfigHelper.setup_test_lib_substitutions(
+    config, config.aie_obj_root, config.aieHostTarget
+)
 
 # Not using run_on_board anymore, need more specific per-platform commands
 config.substitutions.append(("%run_on_board", "echo"))
 
-if config.hsa_dir and (not ("NOTFOUND" in config.hsa_dir)):
-    if not "hsa" in config.aieHostTarget:
-        print(
-            "ROCm found, but disabled because host target {}".format(
-                config.aieHostTarget
-            )
-        )
-        config.substitutions.append(("%run_on_vck5000", "echo"))
-        config.substitutions.append(("%link_against_hsa%", ""))
-        config.substitutions.append(("%HSA_DIR%", ""))
-    else:
-        # Getting the path to the ROCm directory. hsa-runtime64 points to the cmake
-        # directory so need to go up three directories
-        rocm_root = os.path.join(config.hsa_dir, "..", "..", "..")
-        print("Found ROCm:", rocm_root)
-        config.available_features.add("hsa")
-        config.substitutions.append(("%HSA_DIR%", "{}".format(rocm_root)))
-        config.substitutions.append(("%link_against_hsa%", "--link_against_hsa"))
-        found_vck5000 = False
+# VCK5000/HSA support has been removed; these substitutions are permanent
+# no-ops kept so existing RUN lines referencing them keep working.
+config.substitutions.append(("%run_on_vck5000", "echo"))
+config.substitutions.append(("%link_against_hsa%", ""))
+config.substitutions.append(("%HSA_DIR%", ""))
 
-        if config.enable_board_tests:
-            # If board tests are enabled, make sure there is an AIE ROCm device that we can find
-            try:
-                # Making sure that we use the experimental ROCm install that can see the AIE device
-                my_env = os.environ.copy()
-                my_env.update(LD_LIBRARY_PATH="{}/lib/".format(rocm_root))
-                result = subprocess.run(
-                    ["rocminfo"],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    env=my_env,
-                )
-                result = result.stdout.decode("utf-8").split("\n")
+# Add Vitis components as features
+LitConfigHelper.add_vitis_components_features(config, config.vitis_components)
+LitConfigHelper.setup_host_compiler_substitutions(config)
+LitConfigHelper.add_makefile_examples_feature(config)
 
-                # Go through result and look for the VCK5000
-                for l in result:
-                    if "Versal VCK5000" in l:
-                        print("Found VCK500 in rocminfo. Enabling on board tests")
-                        found_vck5000 = True
-                        config.substitutions.append(
-                            ("%run_on_vck5000", "flock /tmp/vck5000.lock")
-                        )
-                        break
+# Detect Peano before XRT feature gating for systems without Chess/AIETOOLS.
+early_peano_tools_dir = os.path.join(config.peano_install_dir, "bin")
+early_peano_config = LitConfigHelper.detect_peano(
+    early_peano_tools_dir, config.peano_install_dir, llvm_config
+)
 
-                if not found_vck5000:
-                    config.substitutions.append(("%run_on_vck5000", "echo"))
-                    print(
-                        "Enable board set and HSA found but couldn't find device using rocminfo"
-                    )
-
-            except:
-                print("Enable board set and HSA found but unable to run rocminfo")
-                pass
-        else:
-            print("Skipping execution of unit tests (ENABLE_BOARD_TESTS=OFF)")
-            config.substitutions.append(("%run_on_vck5000", "echo"))
-else:
-    print("ROCm not found")
-    config.substitutions.append(("%run_on_vck5000", "echo"))
-    config.substitutions.append(("%link_against_hsa%", ""))
-    config.substitutions.append(("%HSA_DIR%", ""))
-
-run_on_npu1 = "echo"
-run_on_npu2 = "echo"
-xrt_flags = ""
-
-if config.xrt_lib_dir:
-    print("xrt found at", os.path.dirname(config.xrt_lib_dir))
-    xrt_flags = "-I{} -L{} -luuid -lxrt_coreutil".format(
-        config.xrt_include_dir, config.xrt_lib_dir
-    )
-    try:
-        # xbutil is deprecated/renamed to xrt-smi, leaving it xbutil for now for
-        # compatibility with older versions of XRT
-        # xrtsmi = os.path.join(config.xrt_bin_dir, "xrt-smi")
-        xrtsmi = os.path.join(config.xrt_bin_dir, "xbutil")
-        result = subprocess.run(
-            [xrtsmi, "examine"], stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
-        result = result.stdout.decode("utf-8").split("\n")
-        # Older format is "|[0000:41:00.1]  ||RyzenAI-npu1  |"
-        # Newer format is "|[0000:41:00.1]  |NPU Phoenix  |"
-        p = re.compile(r"[\|]?(\[.+:.+:.+\]).+\|(RyzenAI-(npu\d)|NPU (\w+))\W*\|")
-        for l in result:
-            m = p.match(l)
-            if not m:
-                continue
-            print("Found Ryzen AI device:", m.group(1))
-            model = "unknown"
-            if m.group(3):
-                model = str(m.group(3))
-            if m.group(4):
-                model = str(m.group(4))
-            print(f"\tmodel: '{model}'")
-            config.available_features.add("ryzen_ai")
-            run_on_npu = f"{config.aie_src_root}/utils/run_on_npu.sh"
-            if model in ["npu1", "Phoenix"]:
-                run_on_npu1 = run_on_npu
-                config.available_features.add("ryzen_ai_npu1")
-                print("Running tests on NPU1 with command line: ", run_on_npu1)
-            elif model in ["npu4", "Strix", "npu5", "Strix Halo", "npu6", "Krackan"]:
-                run_on_npu2 = run_on_npu
-                config.available_features.add("ryzen_ai_npu2")
-                print("Running tests on NPU4 with command line: ", run_on_npu2)
-            else:
-                print("WARNING: xrt-smi reported unknown NPU model '{model}'.")
-            break
-    except:
-        print("Failed to run xrt-smi")
-        pass
-else:
-    print("xrt not found")
-
-config.substitutions.append(("%run_on_npu1%", run_on_npu1))
-config.substitutions.append(("%run_on_npu2%", run_on_npu2))
-config.substitutions.append(("%xrt_flags", xrt_flags))
-
-VitisSysrootFlag = ""
-if "x86_64" in config.aieHostTarget:
-    config.substitutions.append(("%aieHostTargetTriplet%", "x86_64-unknown-linux-gnu"))
-elif config.aieHostTarget == "aarch64":
-    config.substitutions.append(("%aieHostTargetTriplet%", "aarch64-linux-gnu"))
-    VitisSysrootFlag = "--sysroot=" + config.vitis_sysroot
-
-config.substitutions.append(("%VitisSysrootFlag%", VitisSysrootFlag))
+# Setup host target triplet and sysroot
+triplet, sysroot_flag = LitConfigHelper.setup_host_target_triplet(
+    config.aieHostTarget, config.vitis_sysroot
+)
+config.substitutions.append(("%aieHostTargetTriplet%", triplet))
+config.substitutions.append(("%VitisSysrootFlag%", sysroot_flag))
 config.substitutions.append(("%aieHostTargetArch%", config.aieHostTarget))
-
-llvm_config.with_system_environment(["HOME", "INCLUDE", "LIB", "TMP", "TEMP"])
 
 llvm_config.use_default_substitutions()
 
@@ -205,137 +144,222 @@ llvm_config.use_default_substitutions()
 # subdirectories contain auxiliary inputs for various tests in their parent
 # directories.
 config.excludes = [
-    "Inputs",
-    "Examples",
-    "CMakeLists.txt",
-    "README.txt",
-    "LICENSE.txt",
-    "aie.mlir.prj",
     "lit.cfg.py",
+    "Inputs",
 ]
 
 config.aie_tools_dir = os.path.join(config.aie_obj_root, "bin")
+LitConfigHelper.setup_aiecc_substitution(config)
 
-
-def prepend_path(path):
-    global llvm_config
-    paths = [path]
-
-    current_paths = llvm_config.config.environment.get("PATH", None)
-    if current_paths:
-        paths.extend(current_paths.split(os.path.pathsep))
-        paths = [os.path.normcase(os.path.normpath(p)) for p in paths]
-    else:
-        paths = []
-
-    llvm_config.config.environment["PATH"] = os.pathsep.join(paths)
-
-
-# Setup the path.
+# Setup the PATH with all necessary tool directories
 if config.vitis_root:
     config.vitis_aietools_bin = os.path.join(config.vitis_aietools_dir, "bin")
-    prepend_path(config.vitis_aietools_bin)
+    LitConfigHelper.prepend_path(llvm_config, config.vitis_aietools_bin)
     llvm_config.with_environment("VITIS", config.vitis_root)
 
+# Prepend path to XRT installation, which contains a more recent `aiebu-asm` than the Vitis installation.
+LitConfigHelper.prepend_path(llvm_config, config.xrt_bin_dir)
+
 peano_tools_dir = os.path.join(config.peano_install_dir, "bin")
-prepend_path(config.llvm_tools_dir)
-prepend_path(peano_tools_dir)
-# Certainly the prepend works but I would rather be explicit
+# Keep generic tool substitutions working by making both Peano tools and host
+# LLVM tools discoverable. Host-side tests use %host_clang instead of relying on
+# PATH order to choose the host compiler.
+LitConfigHelper.prepend_path(llvm_config, config.llvm_tools_dir)
+LitConfigHelper.prepend_path(llvm_config, peano_tools_dir)
+LitConfigHelper.prepend_path(llvm_config, config.aie_tools_dir)
 config.substitutions.append(("%LLVM_TOOLS_DIR", config.llvm_tools_dir))
 
-prepend_path(config.aie_tools_dir)
+tool_dirs = [config.aie_tools_dir]
+if early_peano_config.found:
+    tool_dirs.append(peano_tools_dir)
+tool_dirs.append(config.llvm_tools_dir)
 
-tool_dirs = [config.aie_tools_dir, config.llvm_tools_dir]
+# Reuse the earlier Peano probe after path setup.
+peano_config = early_peano_config
 
-# Test to see if we have the peano backend.
-try:
-    result = subprocess.run(
-        [os.path.join(peano_tools_dir, "llc"), "-mtriple=aie", "--version"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    if re.search("Xilinx AI Engine", result.stdout.decode("utf-8")) is not None:
-        config.available_features.add("peano")
-        config.substitutions.append(("%PEANO_INSTALL_DIR", config.peano_install_dir))
-        print("Peano found: " + os.path.join(peano_tools_dir, "llc"))
-        tool_dirs.append(os.path.join(peano_tools_dir, "bin"))
-    else:
-        print("Peano not found, but expected at ", peano_tools_dir)
-except Exception as e:
-    print("Peano not found, but expected at ", peano_tools_dir)
+# Detect Chess compiler
+chess_config = LitConfigHelper.detect_chess(
+    config.vitis_root, config.enable_chess_tests, llvm_config
+)
 
-if not config.enable_chess_tests:
-    print("Chess tests disabled")
-else:
-    print("Looking for Chess...")
-    result = None
-    if config.vitis_root:
-        result = shutil.which("xchesscc")
+# Peano may gate Ryzen AI features only when it is the active fallback backend.
+can_use_peano_feature_gate = early_peano_config.found and not chess_config.found
 
-    if result != None:
-        print("Chess found: " + result)
-        config.available_features.add("chess")
-        config.available_features.add("valid_xchess_license")
-        lm_license_file = os.getenv("LM_LICENSE_FILE")
-        if lm_license_file != None:
-            llvm_config.with_environment("LM_LICENSE_FILE", lm_license_file)
-        xilinxd_license_file = os.getenv("XILINXD_LICENSE_FILE")
-        if xilinxd_license_file != None:
-            llvm_config.with_environment("XILINXD_LICENSE_FILE", xilinxd_license_file)
+# Detect XRT and Ryzen AI NPU devices
+xrt_config = LitConfigHelper.detect_xrt(
+    config.xrt_lib_dir,
+    config.xrt_include_dir,
+    config.xrt_bin_dir,
+    config.aie_src_root,
+    llvm_config,
+    config.vitis_components,
+    can_use_peano_feature_gate=can_use_peano_feature_gate,
+)
 
-        # test if LM_LICENSE_FILE valid
-        validate_chess = False
-        if validate_chess:
-            import subprocess
+# Detect aiesimulator
+aiesim_config = LitConfigHelper.detect_aiesimulator(config.aie_obj_root)
 
-            result = subprocess.run(
-                ["xchesscc", "+v"], stdout=subprocess.PIPE, stderr=subprocess.PIPE
-            )
-            validLMLicense = len(result.stderr.decode("utf-8")) == 0
-        else:
-            validLMLicense = lm_license_file or xilinxd_license_file
+# Apply all hardware/tool configurations
+LitConfigHelper.apply_config_to_lit(
+    config,
+    {
+        "xrt": xrt_config,
+        "peano": peano_config,
+        "chess": chess_config,
+        "aiesim": aiesim_config,
+    },
+)
 
-        if not lm_license_file and not xilinxd_license_file:
-            print(
-                "WARNING: no valid xchess license that is required by some of the lit tests"
-            )
-    elif os.getenv("XILINXD_LICENSE_FILE") is not None:
-        print("Chess license found")
-        llvm_config.with_environment(
-            "XILINXD_LICENSE_FILE", os.getenv("XILINXD_LICENSE_FILE")
-        )
-    else:
-        print("Chess not found")
-
-# look for aiesimulator
-result = shutil.which("aiesimulator")
-if result != None:
-    print("aiesimulator found: " + result)
-    config.available_features.add("aiesimulator")
-else:
-    print("aiesimulator not found")
-
-# add vitis components as available features
-for c in config.vitis_components:
-    config.available_features.add(f"aietools_{c.lower()}")
+LitConfigHelper.setup_host_link_substitution(config)
 
 tools = [
     "aie-opt",
     "aie-translate",
-    "aiecc.py",
     "ld.lld",
     "llc",
     "llvm-objdump",
     "opt",
     "xchesscc_wrapper",
-    "txn2mlir.py",
 ]
 
+if os.name != "nt":
+    tools.extend(["txn2mlir.py"])
+
 llvm_config.add_tool_substitutions(tools, tool_dirs)
+
+if os.name == "nt":
+    LitConfigHelper.add_python_tool_substitutions(config, ["txn2mlir.py"])
 
 if config.enable_board_tests:
     lit_config.parallelism_groups["board"] = 1
     config.parallelism_group = "board"
+
+# Concurrency tests control their own parallelism, so run them serially
+lit_config.parallelism_groups["concurrency"] = 1
+
+# NPU XRT tests should run serially to avoid resource contention
+lit_config.parallelism_groups["npu-xrt"] = 1
+
+if config.enable_assertions:
+    config.available_features.add("asserts")
+
+# shutil.which picks up the platform's executable suffix (.exe on Windows
+# via PATHEXT) so the feature gate fires correctly on every OS.
+if shutil.which("aie-lsp-server", path=config.llvm_tools_dir) is not None:
+    config.available_features.add("aie-lsp-server")
+
+LitConfigHelper.add_hrxxclbinutil_feature(config)
+
+# aiebu ELF packager: gate tests that feed a runtime-assembled TXN blob to the
+# real `aiebu-asm` (the downstream tool that enforces invariants plain XRT
+# dispatch does not, e.g. block-write-covers-patch). It ships with XRT. Prefer
+# the configured XRT bin dir (config.xrt_bin_dir, also prepended to PATH above),
+# then PATH, then the standard install location so the feature still fires on a
+# host that has XRT installed but was not built with it wired into cmake. The
+# %aiebu_asm substitution wraps the binary with the LD_LIBRARY_PATH its shared
+# libaiebu needs so RUN lines invoke it directly. Tests carry
+# `// REQUIRES: aiebu` so they skip (not silently pass) where the tool is
+# absent, e.g. on a CI runner without XRT installed.
+_aiebu_asm = None
+for _cand_dir in [config.xrt_bin_dir, None, "/opt/xilinx/xrt/bin"]:
+    if _cand_dir == "":
+        continue
+    _aiebu_asm = shutil.which("aiebu-asm", path=_cand_dir)
+    if _aiebu_asm is not None:
+        break
+if _aiebu_asm is not None:
+    config.available_features.add("aiebu")
+    # libaiebu lives next to the bin dir; use the configured XRT lib dir when
+    # cmake provided one, else derive it from the located binary.
+    _aiebu_libdir = config.xrt_lib_dir or os.path.join(
+        os.path.dirname(os.path.dirname(_aiebu_asm)), "lib"
+    )
+    config.substitutions.append(
+        (
+            "%aiebu_asm",
+            f"env LD_LIBRARY_PATH={_aiebu_libdir}:$LD_LIBRARY_PATH {_aiebu_asm}",
+        )
+    )
+
+# HRX Python runtime: gate the HRX-only Python tests (test/python/npu-hrx) on
+# libhrx being locatable, so they only run where the HRX backend can load. This
+# checks a runtime value (aie.utils.has_hrx), not just importability.
+if LitConfigHelper.python_expr_is_true(
+    config, config.python_executable, "__import__('aie.utils').utils.has_hrx"
+):
+    config.available_features.add("hrx_python_bindings")
+
+# The pure-HRX hardware job has no XRT probe. Its explicit NPU declaration
+# enables only HRX hardware tests; XRT tests remain unsupported.
+hrx_npu = os.environ.get("AIE_HRX_NPU")
+if hrx_npu:
+    if hrx_npu not in {"npu1", "npu2"}:
+        lit_config.fatal(f"AIE_HRX_NPU must be 'npu1' or 'npu2', got {hrx_npu!r}")
+    config.available_features.add(f"hrx_{hrx_npu}")
+    if hrx_npu == "npu2":
+        llvm_config.with_environment("NPU2", "1")
+
+# HSA hardware is explicitly provisioned, independently of the XRT probe.
+# Finding ROCm alone is insufficient: GPU-only hosts also have libhsa.
+hsa_npu = os.environ.get("AIE_HSA_NPU")
+if hsa_npu:
+    if hsa_npu not in {"npu1", "npu2"}:
+        lit_config.fatal(f"AIE_HSA_NPU must be 'npu1' or 'npu2', got {hsa_npu!r}")
+    if not LitConfigHelper.python_expr_is_true(
+        config, config.python_executable, "__import__('aie.utils').utils.has_hsa"
+    ):
+        lit_config.fatal("AIE_HSA_NPU requires an AIE-capable HSA/ROCR installation")
+    config.available_features.add("hsa_npu")
+    if hsa_npu == "npu2":
+        llvm_config.with_environment("NPU2", "1")
+
+if config.xrt_python_bindings and LitConfigHelper.can_import_python_module(
+    config, config.python_executable, "pyxrt"
+):
+    config.available_features.add("xrt_python_bindings")
+    if LitConfigHelper.python_module_has_attribute(
+        config,
+        config.python_executable,
+        "pyxrt",
+        ("run", "get_ctrl_scratchpad_bo"),
+    ):
+        config.available_features.add("xrt_python_ctrl_scratchpad_bo")
+
+if config.has_mlir_runtime_libraries:
+    config.available_features.add("has_mlir_runtime_libraries")
+
+if config.pytorch:
+    config.available_features.add("pytorch")
+
+# Per-backend, per-RUN-line device runners for the runtime-agnostic on-device
+# Python tests (test/python/npu). lit's REQUIRES is file-level, but those tests
+# carry both XRT and HRX RUN lines, and the two backends run on separate CI
+# runners with mutually exclusive Python bindings (the pure-HRX runner has no
+# pyxrt). So gate each RUN line via a dedicated substitution instead:
+#   * %run_on_npu1_xrt% / %run_on_npu2_xrt% -> the XRT device wrapper only when
+#     pyxrt is importable, else a no-op "echo" (so the XRT lines skip cleanly on
+#     an XRT-free HRX host rather than dispatching CPU tensors on the NPU);
+#   * %run_on_npu2_hrx% -> plain "env NPU_RUNTIME=hrx" when libhrx is locatable,
+#     else a no-op "echo".
+# The HRX substitution deliberately does NOT reuse the XRT %run_on_npu2% device
+# wrapper: that wrapper probes for an *XRT* NPU and collapses to "echo" on the
+# XRT-free pure-HRX runner, which would silently turn every HRX RUN line into a
+# no-op (the tests would appear to pass without ever dispatching). The HRX
+# hardware job instead declares its device explicitly via AIE_HRX_NPU (the
+# hrx_npu2 feature above), matching the device-decoupled gating the pure-HRX
+# npu-hrx tests use, so this line only needs the libhrx capability check.
+_xrt_ok = "xrt_python_bindings" in config.available_features
+_hrx_ok = "hrx_python_bindings" in config.available_features
+_run_on_npu1 = xrt_config.substitutions.get("%run_on_npu1%", "echo")
+_run_on_npu2 = xrt_config.substitutions.get("%run_on_npu2%", "echo")
+config.substitutions.append(("%run_on_npu1_xrt%", _run_on_npu1 if _xrt_ok else "echo"))
+config.substitutions.append(("%run_on_npu2_xrt%", _run_on_npu2 if _xrt_ok else "echo"))
+config.substitutions.append(
+    ("%run_on_npu2_hrx%", "env NPU_RUNTIME=hrx" if _hrx_ok else "echo")
+)
+config.substitutions.append(
+    ("%run_on_npu_hsa%", "env NPU_RUNTIME=hsa" if hsa_npu else "echo")
+)
 
 if "LIT_AVAILABLE_FEATURES" in os.environ:
     for feature in os.environ["LIT_AVAILABLE_FEATURES"].split():

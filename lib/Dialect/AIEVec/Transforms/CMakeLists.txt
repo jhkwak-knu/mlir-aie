@@ -1,13 +1,11 @@
 #
-# This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-# See https://llvm.org/LICENSE.txt for license information.
+# Copyright (C) 2022 Xilinx, Inc.
+# Copyright (C) 2022-2025 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #
-# (c) Copyright 2022 Xilinx Inc.
 
 add_mlir_dialect_library(MLIRAIEVecTransforms
-  IntervalReuse.cpp
-  AIEVectorize.cpp
+  AIE2PShufflePlanner.cpp
   ConvertVectorToAIEVec.cpp
   VectorToVectorConversions.cpp
   VectorToAIEVecConversions.cpp
@@ -15,6 +13,8 @@ add_mlir_dialect_library(MLIRAIEVecTransforms
   FoldMulAddChainToConvOp.cpp
   CopyRemoval.cpp
   DynamicSizeNoImplicitBroadcast.cpp
+  SplitVectorLoadUpsChains.cpp
+  BFP16MatMulOperands.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${CMAKE_CURRENT_SOURCE_DIR}/../../../include/aie/Dialect/AIEVec/Transforms
@@ -26,8 +26,7 @@ add_mlir_dialect_library(MLIRAIEVecTransforms
   MLIRAIEVecAnalysisPassIncGen
 
   LINK_LIBS PUBLIC
+  AIE
   MLIRIR
   MLIRPass
-  MLIRAIEVecUtils
-  MLIRCopyOpInterface
-  )
+  MLIRAIEVecUtils)

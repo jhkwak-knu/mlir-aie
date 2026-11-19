@@ -1,11 +1,8 @@
 //===- aie.mlir ------------------------------------------------*- MLIR -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2022-2024 Advanced Micro Devices, Inc.
+// Copyright (C) 2020-2022 Xilinx, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2022-2024 Advanced Micro Devices, Inc. or its affiliates
-// Copyright (C) 2020-2022, Xilinx Inc.
 //
 //===----------------------------------------------------------------------===//
 
@@ -35,15 +32,19 @@ module {
       // the core op
       %c256_i32 = arith.constant 256 : i32
       affine.for %arg0 = 0 to 4 step 1 {
-        aie.use_lock(%lock_0_2_1, AcquireGreaterEqual, 1)
-        aie.use_lock(%lock_0_2_2, AcquireGreaterEqual, 1)
+        %c1_ul0 = arith.constant 1 : i32
+        aie.use_lock(%lock_0_2_1, AcquireGreaterEqual, %c1_ul0)
+        %c1_ul1 = arith.constant 1 : i32
+        aie.use_lock(%lock_0_2_2, AcquireGreaterEqual, %c1_ul1)
         affine.for %arg1 = 0 to 16 step 1 {
           %0 = memref.load %buffer_0_2[%arg1] : memref<16xi32>
           %1 = arith.addi %0, %c256_i32: i32
           memref.store %1, %buffer_0_2_1[%arg1] : memref<16xi32>
         }
-        aie.use_lock(%lock_0_2_0, Release, 1)
-        aie.use_lock(%lock_0_2_3, Release, 1)
+        %c1_ul2 = arith.constant 1 : i32
+        aie.use_lock(%lock_0_2_0, Release, %c1_ul2)
+        %c1_ul3 = arith.constant 1 : i32
+        aie.use_lock(%lock_0_2_3, Release, %c1_ul3)
       }
       aie.end
     }
@@ -58,25 +59,33 @@ module {
 
       // forward
       %0 = aie.dma(S2MM, 0) [{
-        aie.use_lock(%lock_0_1_0, AcquireGreaterEqual, 1)
+        %c1_ul4 = arith.constant 1 : i32
+        aie.use_lock(%lock_0_1_0, AcquireGreaterEqual, %c1_ul4)
         aie.dma_bd(%buffer_0_1 : memref<16xi32>)
-        aie.use_lock(%lock_0_1_1, Release, 1)
+        %c1_ul5 = arith.constant 1 : i32
+        aie.use_lock(%lock_0_1_1, Release, %c1_ul5)
       }]
       %1 = aie.dma(MM2S, 0) [{
-        aie.use_lock(%lock_0_1_1, AcquireGreaterEqual, 1)
+        %c1_ul6 = arith.constant 1 : i32
+        aie.use_lock(%lock_0_1_1, AcquireGreaterEqual, %c1_ul6)
         aie.dma_bd(%buffer_0_1 : memref<16xi32>)
-        aie.use_lock(%lock_0_1_0, Release, 1)
+        %c1_ul7 = arith.constant 1 : i32
+        aie.use_lock(%lock_0_1_0, Release, %c1_ul7)
       }]
       // backward
       %2 = aie.dma(S2MM, 1) [{
-        aie.use_lock(%lock_0_1_2, AcquireGreaterEqual, 1)
+        %c1_ul8 = arith.constant 1 : i32
+        aie.use_lock(%lock_0_1_2, AcquireGreaterEqual, %c1_ul8)
         aie.dma_bd(%buffer_0_1_0 : memref<16xi32>)
-        aie.use_lock(%lock_0_1_3, Release, 1)
+        %c1_ul9 = arith.constant 1 : i32
+        aie.use_lock(%lock_0_1_3, Release, %c1_ul9)
       }]
       %3 = aie.dma(MM2S, 1) [{
-        aie.use_lock(%lock_0_1_3, AcquireGreaterEqual, 1)
+        %c1_ul10 = arith.constant 1 : i32
+        aie.use_lock(%lock_0_1_3, AcquireGreaterEqual, %c1_ul10)
         aie.dma_bd(%buffer_0_1_0 : memref<16xi32>)
-        aie.use_lock(%lock_0_1_2, Release, 1)
+        %c1_ul11 = arith.constant 1 : i32
+        aie.use_lock(%lock_0_1_2, Release, %c1_ul11)
       }]
       aie.end
     }
@@ -84,25 +93,26 @@ module {
     %mem_0_2 = aie.mem(%tile_0_2) {
      // in
       %0 = aie.dma(S2MM, 0) [{
-        aie.use_lock(%lock_0_2_0, AcquireGreaterEqual, 1)
+        %c1_ul12 = arith.constant 1 : i32
+        aie.use_lock(%lock_0_2_0, AcquireGreaterEqual, %c1_ul12)
         aie.dma_bd(%buffer_0_2 : memref<16xi32>)
-        aie.use_lock(%lock_0_2_1, Release, 1)
+        %c1_ul13 = arith.constant 1 : i32
+        aie.use_lock(%lock_0_2_1, Release, %c1_ul13)
       }]
       // out
       %1 = aie.dma(MM2S, 0) [{
-        aie.use_lock(%lock_0_2_3, AcquireGreaterEqual, 1)
+        %c1_ul14 = arith.constant 1 : i32
+        aie.use_lock(%lock_0_2_3, AcquireGreaterEqual, %c1_ul14)
         aie.dma_bd(%buffer_0_2_1 : memref<16xi32>)
-        aie.use_lock(%lock_0_2_2, Release, 1)
+        %c1_ul15 = arith.constant 1 : i32
+        aie.use_lock(%lock_0_2_2, Release, %c1_ul15)
       }]
       aie.end
     }
 
-    // the absolutely only thing that's relevant here is (MM2S, 0, 0) and (S2MM, 0, 0)
-    memref.global "public" @data_in : memref<1xi32>
-    memref.global "public" @data_out : memref<1xi32>
-    aie.shim_dma_allocation @data_in(MM2S, 0, 0)
-    aie.shim_dma_allocation @data_out(S2MM, 0, 0)
-    aiex.runtime_sequence(%arg0: memref<64xi32>, %arg1: memref<32xi32>, %arg2: memref<64xi32>) {
+    aie.shim_dma_allocation @data_in (%tile_0_0, MM2S, 0)
+    aie.shim_dma_allocation @data_out (%tile_0_0, S2MM, 0)
+    aie.runtime_sequence(%arg0: memref<64xi32>, %arg1: memref<32xi32>, %arg2: memref<64xi32>) {
       aiex.npu.dma_memcpy_nd (%arg0[0, 0, 0, 0][1, 1, 1, 64][0, 0, 0, 1]) {id = 0 : i64, metadata = @data_in} : memref<64xi32>
       aiex.npu.dma_memcpy_nd (%arg2[0, 0, 0, 0][1, 1, 1, 64][0, 0, 0, 1]) {id = 1 : i64, metadata = @data_out, issue_token = true} : memref<64xi32>
       aiex.npu.dma_wait {symbol = @data_out}

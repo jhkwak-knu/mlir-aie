@@ -1,41 +1,29 @@
 #
-# This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-# See https://llvm.org/LICENSE.txt for license information.
+# Copyright (C) 2024-2026 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #
-# Copyright (C) 2024, Advanced Micro Devices, Inc.
 
-import torch
-import torch.nn as nn
-import sys
-import math
-from aie.utils.ml import DataShaper
-import time
+import argparse
 import os
+import sys
+
+import aie.iron as iron
 import numpy as np
-from aie.utils.xrt import setup_aie, extract_trace, write_out_trace, execute
-import aie.utils.test as test_utils
+import torch  # pyright: ignore[reportMissingImports]
+import torch.nn as nn  # pyright: ignore[reportMissingImports]
+from aie.utils.benchmark import print_benchmark, run_iters
+from aie.utils.hostruntime.argparse import add_benchmark_args
+from aie.utils.ml import DataShaper
+from resnet import resnet_conv2_x
 
 torch.use_deterministic_algorithms(True)
 torch.manual_seed(0)
 
 
 def main(opts):
-    design = "resnet_conv2_x_int8"
-    xclbin_path = opts.xclbin
-    insts_path = opts.instr
-
     log_folder = "log/"
     if not os.path.exists(log_folder):
         os.makedirs(log_folder)
-
-    num_iter = 1
-    npu_time_total = 0
-    npu_time_min = 9999999
-    npu_time_max = 0
-    trace_size = 16384
-    enable_trace = False
-    trace_file = "log/trace_" + design + ".txt"
     # ------------------------------------------------------
     # Configure this to match your design's buffer size
     # ------------------------------------------------------
@@ -43,8 +31,6 @@ def main(opts):
     dtype_wts = np.dtype("int8")
     dtype_out = np.dtype("uint8")
 
-    shape_in_act = (32, 8, 32, 8)
-    shape_total_wts = (212992, 1)
     shape_out = (32, 32, 32, 8)
 
     # ------------------------------------------------------
@@ -93,7 +79,6 @@ def main(opts):
     block_1_weight_scale1 = 0.5
     block_1_weight_scale2 = 0.5
     block_1_weight_scale3 = 0.5
-    block_1_quant_add_1 = 0.5
 
     block_2_relu_1 = 0.5
     block_2_relu_2 = 0.5
@@ -102,68 +87,9 @@ def main(opts):
     block_2_weight_scale1 = 0.5
     block_2_weight_scale2 = 0.5
     block_2_weight_scale3 = 0.5
-    block_2_quant_add_1 = 0.5
-
-    block_0_combined_scale1 = -math.log2(
-        init_scale * block_0_weight_scale1 / block_0_relu_1
-    )  # RHS after first conv1x1 | clip 0-->255
-    block_0_combined_scale2 = -math.log2(
-        block_0_relu_1 * block_0_weight_scale2 / block_0_relu_2
-    )  # RHS after second conv3x3 | clip 0-->255
-    block_0_combined_scale3 = -math.log2(
-        block_0_relu_2 * block_0_weight_scale3 / init_scale
-    )  # RHS after third conv1x1 | clip -128-->+127
-    block_0_combined_scale_skip = -math.log2(
-        init_scale * block_0_weight_scale_skip / init_scale
-    )  # LHS after conv1x1 | clip -128-->+127
-    block_0_combined_scale4 = -math.log2(
-        init_scale / block_0_relu_3
-    )  # After addition | clip 0-->255
-
-    block_1_combined_scale1 = -math.log2(
-        block_0_relu_3 * block_1_weight_scale1 / block_1_relu_1
-    )  # RHS after first conv1x1 | clip 0-->255
-    block_1_combined_scale2 = -math.log2(
-        block_1_relu_1 * block_1_weight_scale2 / block_1_relu_2
-    )  # RHS after second conv3x3 | clip 0-->255
-    block_1_combined_scale3 = -math.log2(
-        block_1_relu_2 * block_1_weight_scale3 / block_1_quant_add_1
-    )  # RHS after third conv1x1 | clip -128-->+127
-    block_1_combined_scale4 = -math.log2(
-        block_1_quant_add_1 / block_1_relu_3
-    )  # After addition | clip 0-->255
-
-    block_2_combined_scale1 = -math.log2(
-        block_1_relu_3 * block_2_weight_scale1 / block_2_relu_1
-    )  # RHS after first conv1x1 | clip 0-->255
-    block_2_combined_scale2 = -math.log2(
-        block_2_relu_1 * block_2_weight_scale2 / block_2_relu_2
-    )  # RHS after second conv3x3 | clip 0-->255
-    block_2_combined_scale3 = -math.log2(
-        block_2_relu_2 * block_2_weight_scale3 / block_2_quant_add_1
-    )  # RHS after third conv1x1 | clip -128-->+127
-    block_2_combined_scale4 = -math.log2(
-        block_2_quant_add_1 / block_2_relu_3
-    )  # After addition | clip 0-->255
 
     min = 0
     max = 255
-
-    # ------------------------------------------------------
-    # Get device, load the xclbin & kernel and register them
-    # ------------------------------------------------------
-    app = setup_aie(
-        xclbin_path,
-        insts_path,
-        shape_in_act,
-        dtype_in,
-        shape_total_wts,
-        dtype_wts,
-        shape_out,
-        dtype_out,
-        enable_trace=enable_trace,
-        trace_size=trace_size,
-    )
 
     # ------------------------------------------------------
     # Define your golden reference
@@ -438,21 +364,16 @@ def main(opts):
     total_wts3.tofile(log_folder + "/weights_mem_fmt_final.txt", sep=",", format="%d")
 
     # ------------------------------------------------------
-    # Main run loop
+    # Main run loop — JIT-compile + run the @iron.jit design directly
     # ------------------------------------------------------
-    for i in range(num_iter):
-        start = time.time_ns()
-        aie_output = execute(app, ifm_mem_fmt, total_wts3) * block_2_relu_3
-        stop = time.time_ns()
+    in1 = iron.tensor(ifm_mem_fmt, dtype=dtype_in)
+    in2 = iron.tensor(total_wts3, dtype=dtype_wts)
+    out = iron.zeros(shape_out, dtype=dtype_out)
 
-        if enable_trace:
-            aie_output, trace = extract_trace(
-                aie_output, shape_out, dtype_out, trace_size
-            )
-            write_out_trace(trace, trace_file)
-
-        npu_time = stop - start
-        npu_time_total = npu_time_total + npu_time
+    bench = run_iters(
+        resnet_conv2_x, in1, in2, out, warmup=opts.warmup, iters=opts.iters
+    )
+    aie_output = out.numpy().reshape(-1) * block_2_relu_3
 
     # ------------------------------------------------------
     # Reorder output data-layout
@@ -468,7 +389,8 @@ def main(opts):
     # ------------------------------------------------------
     # Compare the AIE output and the golden reference
     # ------------------------------------------------------
-    print("\nAvg NPU time: {}us.".format(int((npu_time_total / num_iter) / 1000)))
+    print()
+    print_benchmark(bench)
 
     if np.allclose(
         ofm_mem_fmt_out.detach().numpy(),
@@ -477,13 +399,13 @@ def main(opts):
         atol=block_2_relu_3,
     ):
         print("\nPASS!\n")
-        exit(0)
+        sys.exit(0)
     else:
         print("\nFailed.\n")
-        exit(-1)
+        sys.exit(-1)
 
 
 if __name__ == "__main__":
-    p = test_utils.create_default_argparser()
-    opts = p.parse_args(sys.argv[1:])
-    main(opts)
+    p = argparse.ArgumentParser(prog="ResNet conv2_x layers test")
+    add_benchmark_args(p)
+    main(p.parse_args())

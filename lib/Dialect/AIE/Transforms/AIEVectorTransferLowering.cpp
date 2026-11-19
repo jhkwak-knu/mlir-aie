@@ -1,0 +1,72 @@
+//===- AIEVectorTransferLowering.cpp -----------------------------*- C++-*-===//
+//
+// Copyright (C) 2025 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+#include "aie/Dialect/AIE/IR/AIEDialect.h"
+#include "aie/Dialect/AIE/Transforms/AIEPasses.h"
+
+#include "mlir/Conversion/LLVMCommon/ConversionTarget.h"
+#include "mlir/Conversion/LLVMCommon/Pattern.h"
+#include "mlir/Conversion/LLVMCommon/TypeConverter.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/Dialect/Vector/Transforms/LoweringPatterns.h"
+#include "mlir/Dialect/Vector/Transforms/VectorRewritePatterns.h"
+#include "mlir/IR/PatternMatch.h"
+#include "mlir/Pass/Pass.h"
+#include "mlir/Transforms/DialectConversion.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+
+namespace xilinx::AIE {
+#define GEN_PASS_DEF_AIEVECTORTRANSFERLOWERING
+#include "aie/Dialect/AIE/Transforms/AIEPasses.h.inc"
+} // namespace xilinx::AIE
+
+#define DEBUG_TYPE "aie-vector-transfer-opt"
+
+using namespace mlir;
+using namespace xilinx;
+using namespace xilinx::AIE;
+
+namespace {
+
+struct AIEVectorTransferLoweringPass
+    : xilinx::AIE::impl::AIEVectorTransferLoweringBase<
+          AIEVectorTransferLoweringPass> {
+  AIEVectorTransferLoweringPass() = default;
+  AIEVectorTransferLoweringPass(const AIEVectorTransferLoweringPass &pass)
+      : AIEVectorTransferLoweringPass() {}
+  AIEVectorTransferLoweringPass(unsigned maxTransferRank) {
+    this->maxTransferRank = maxTransferRank;
+  }
+
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<LLVM::LLVMDialect>();
+  }
+
+  void runOnOperation() override {
+    DeviceOp deviceOp = getOperation();
+    MLIRContext *context = &getContext();
+
+    std::optional<unsigned> maxRank = std::nullopt;
+    if (maxTransferRank != static_cast<unsigned>(-1))
+      maxRank = maxTransferRank;
+
+    RewritePatternSet patterns(context);
+    vector::populateVectorTransferLoweringPatterns(patterns, maxRank);
+
+    if (failed(applyPatternsGreedily(deviceOp, std::move(patterns))))
+      signalPassFailure();
+  }
+};
+} // namespace
+
+std::unique_ptr<OperationPass<DeviceOp>>
+AIE::createAIEVectorTransferLoweringPass() {
+  return std::make_unique<AIEVectorTransferLoweringPass>();
+}

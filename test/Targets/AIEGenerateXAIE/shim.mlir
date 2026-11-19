@@ -1,10 +1,7 @@
 //===- shim.mlir -----------------------------------------------*- MLIR -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2023-2024 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2023-2024 Advanced Micro Devices, Inc. or its affiliates
 //
 //===----------------------------------------------------------------------===//
 
@@ -12,30 +9,30 @@
 
 // CHECK: mlir_aie_configure_shimdma_20
 // CHECK: XAie_DmaDesc [[bd0:.*]];
-// CHECK: __mlir_aie_try(XAie_DmaDescInit(&(ctx->DevInst), &([[bd0]]), XAie_TileLoc(2,0)));
+// CHECK: __mlir_aie_try(XAie_DmaDescInit(ctx->XAieDevInst, &([[bd0]]), XAie_TileLoc(2,0)));
 // CHECK: __mlir_aie_try(XAie_DmaSetLock(&([[bd0]]), XAie_LockInit(0,0),XAie_LockInit(0,1)));
 // CHECK: __mlir_aie_try(XAie_DmaSetAddrLen(&([[bd0]]), {{.*}} mlir_aie_external_get_addr_myBuffer_20_0(), {{.*}} 64));
-// CHECK: __mlir_aie_try(XAie_DmaSetAxi(&([[bd0]]), {{.*}} 0, {{.*}} 4, {{.*}} 0, {{.*}} 0, {{.*}} XAIE_ENABLE));
+// CHECK: __mlir_aie_try(XAie_DmaSetAxi(&([[bd0]]), {{.*}} 0, {{.*}} 4, {{.*}} 0, {{.*}} 2, {{.*}} XAIE_ENABLE));
 // CHECK: __mlir_aie_try(XAie_DmaSetNextBd(&([[bd0]]), {{.*}} 0, {{.*}} 1));
 // CHECK: __mlir_aie_try(XAie_DmaEnableBd(&([[bd0]])));
-// CHECK: __mlir_aie_try(XAie_DmaWriteBd(&(ctx->DevInst), &([[bd0]]), XAie_TileLoc(2,0), {{.*}} 0));
+// CHECK: __mlir_aie_try(XAie_DmaWriteBd(ctx->XAieDevInst, &([[bd0]]), XAie_TileLoc(2,0), {{.*}} 0));
 // CHECK: XAie_DmaDesc [[bd1:.*]];
-// CHECK: __mlir_aie_try(XAie_DmaDescInit(&(ctx->DevInst), &([[bd1]]), XAie_TileLoc(2,0)));
+// CHECK: __mlir_aie_try(XAie_DmaDescInit(ctx->XAieDevInst, &([[bd1]]), XAie_TileLoc(2,0)));
 // CHECK: __mlir_aie_try(XAie_DmaSetAddrLen(&([[bd1]]), {{.*}} mlir_aie_external_get_addr_myBuffer_20_1(), {{.*}} 16));
-// CHECK: __mlir_aie_try(XAie_DmaSetAxi(&([[bd1]]), {{.*}} 0, {{.*}} 4, {{.*}} 0, {{.*}} 0, {{.*}} XAIE_ENABLE));
+// CHECK: __mlir_aie_try(XAie_DmaSetAxi(&([[bd1]]), {{.*}} 0, {{.*}} 4, {{.*}} 0, {{.*}} 2, {{.*}} XAIE_ENABLE));
 // CHECK: __mlir_aie_try(XAie_DmaSetNextBd(&([[bd1]]), {{.*}} 1, {{.*}} 1));
 // CHECK: __mlir_aie_try(XAie_DmaEnableBd(&([[bd1]])));
-// CHECK: __mlir_aie_try(XAie_DmaWriteBd(&(ctx->DevInst), &([[bd1]]), XAie_TileLoc(2,0), {{.*}} 1));
-// CHECK: __mlir_aie_try(XAie_DmaChannelPushBdToQueue(&(ctx->DevInst), XAie_TileLoc(2,0), {{.*}}0, {{.*}} DMA_S2MM, {{.*}}0));
-// CHECK: __mlir_aie_try(XAie_DmaChannelEnable(&(ctx->DevInst), XAie_TileLoc(2,0), {{.*}} 0, {{.*}} DMA_S2MM));
-// CHECK: __mlir_aie_try(XAie_DmaChannelPushBdToQueue(&(ctx->DevInst), XAie_TileLoc(2,0), {{.*}}0, {{.*}} DMA_MM2S, {{.*}}1));
-// CHECK: __mlir_aie_try(XAie_DmaChannelEnable(&(ctx->DevInst), XAie_TileLoc(2,0), {{.*}} 0, {{.*}} DMA_MM2S));
+// CHECK: __mlir_aie_try(XAie_DmaWriteBd(ctx->XAieDevInst, &([[bd1]]), XAie_TileLoc(2,0), {{.*}} 1));
+// CHECK: __mlir_aie_try(XAie_DmaChannelPushBdToQueue(ctx->XAieDevInst, XAie_TileLoc(2,0), {{.*}}0, {{.*}} DMA_S2MM, {{.*}}0));
+// CHECK: __mlir_aie_try(XAie_DmaChannelEnable(ctx->XAieDevInst, XAie_TileLoc(2,0), {{.*}} 0, {{.*}} DMA_S2MM));
+// CHECK: __mlir_aie_try(XAie_DmaChannelPushBdToQueue(ctx->XAieDevInst, XAie_TileLoc(2,0), {{.*}}0, {{.*}} DMA_MM2S, {{.*}}1));
+// CHECK: __mlir_aie_try(XAie_DmaChannelEnable(ctx->XAieDevInst, XAie_TileLoc(2,0), {{.*}} 0, {{.*}} DMA_MM2S));
 
 // CHECK: mlir_aie_configure_switchboxes
 // CHECK: x = 2;
 // CHECK: y = 0;
-// CHECK: __mlir_aie_try(XAie_StrmConnCctEnable(&(ctx->DevInst), XAie_TileLoc(x,y), NORTH, 0, SOUTH, 2));
-// CHECK: __mlir_aie_try(XAie_EnableAieToShimDmaStrmPort(&(ctx->DevInst), XAie_TileLoc(x,y), 2));
+// CHECK: __mlir_aie_try(XAie_StrmConnCctEnable(ctx->XAieDevInst, XAie_TileLoc(x,y), NORTH, 0, SOUTH, 2));
+// CHECK: __mlir_aie_try(XAie_EnableAieToShimDmaStrmPort(ctx->XAieDevInst, XAie_TileLoc(x,y), 2));
 
 
 module {
@@ -63,14 +60,16 @@ module {
     ^dma0:
       aie.dma_start(MM2S, 0, ^bd1, ^end)
     ^bd0:
-      aie.use_lock(%lock0, Acquire, 0)
-      aie.dma_bd(%buffer : memref<16 x f32>, 0, 16)
-      aie.use_lock(%lock0, Release, 1)
+      %c0_ul1 = arith.constant 0 : i32
+      aie.use_lock(%lock0, Acquire, %c0_ul1)
+      aie.dma_bd(%buffer : memref<16 x f32> offset = 0 len = 16)
+      %c1_ul2 = arith.constant 1 : i32
+      aie.use_lock(%lock0, Release, %c1_ul2)
       aie.next_bd ^bd0
     ^bd1:
-      // aie.use_lock(%lock1, Acquire, 1)
-      aie.dma_bd(%buffer : memref<16 x f32>, 0, 4)
-      // aie.use_lock(%lock1, Release, 0)
+      // aie.use_lock(%lock1, Acquire, %{{.*}})
+      aie.dma_bd(%buffer : memref<16 x f32> offset = 0 len = 4)
+      // aie.use_lock(%lock1, Release, %{{.*}})
       aie.next_bd ^bd1
     ^end:
       aie.end

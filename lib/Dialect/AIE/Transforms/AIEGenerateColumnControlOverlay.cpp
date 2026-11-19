@@ -1,21 +1,30 @@
 //===- AIEGenerateColumnControlOverlay.cpp ----------------------*- C++ -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2024 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2024 Advanced Micro Devices Inc.
 //
 //===----------------------------------------------------------------------===//
 
-#include "aie/Dialect/AIE/Transforms/AIEGenerateColumnControlOverlay.h"
 #include "aie/Dialect/AIE/IR/AIEDialect.h"
 #include "aie/Dialect/AIE/Transforms/AIEPasses.h"
+#include "aie/Dialect/AIE/Transforms/AIEPathFinder.h"
+#include "aie/Dialect/AIEX/IR/AIEXDialect.h"
 
 #include "mlir/IR/Attributes.h"
-#include "mlir/Pass/Pass.h"
+#include "mlir/Pass/PassManager.h"
 
 #include "llvm/ADT/SmallSet.h"
+
+#include <map>
+#include <optional>
+#include <set>
+#include <tuple>
+
+namespace xilinx::AIE {
+#define GEN_PASS_DEF_AIEGENERATECOLUMNCONTROLOVERLAY
+#define GEN_PASS_DEF_AIEASSIGNTILECTRLIDS
+#include "aie/Dialect/AIE/Transforms/AIEPasses.h.inc"
+} // namespace xilinx::AIE
 
 #define DEBUG_TYPE "aie-generate-column-control-overlay"
 
@@ -23,122 +32,13 @@ using namespace mlir;
 using namespace xilinx;
 using namespace xilinx::AIE;
 
-int getUnusedPacketIdFrom(DeviceOp device) {
-  int unusedPacketIdFrom = 0;
-  device.walk([&](AIE::PacketFlowOp pOp) {
-    unusedPacketIdFrom = std::max(unusedPacketIdFrom, pOp.IDInt());
-  });
-  device.walk([&](AIE::TileOp tOp) {
-    if (!tOp->hasAttr("controller_id"))
-      return;
-    auto controllerIdPkt =
-        tOp->getAttrOfType<AIE::PacketInfoAttr>("controller_id");
-    unusedPacketIdFrom =
-        std::max(unusedPacketIdFrom, (int)controllerIdPkt.getPktId());
-  });
-  return unusedPacketIdFrom + 1;
-}
-
-// AIE arch-specific tile id to controller id mapping. Users can use those
-// packet ids for design but run into risk of deadlocking control packet flows.
-DenseMap<AIE::TileID, int>
-getTileToControllerIdMap6RowsOrLess(bool clColumnWiseUniqueIDs,
-                                    const AIETargetModel &targetModel) {
-  // Below column controller id combinations were chosen to avoid packet flow
-  // deadlock due to single-level LUT bit-masking on packet header, which could
-  // fail to differentiate certain packet id combinations. Controller ids for
-  // shim tiles were chosen to be < 16, because when they act as actor id in TCT
-  // tokens, the actor id field only has 4 bits.
-  // FIXME
-  SmallVector<SmallVector<int>> validTileIds = {{15, 26, 27, 29, 30, 31},
-                                                {14, 21, 22, 23, 24, 25},
-                                                {13, 11, 17, 18, 19, 20},
-                                                {12, 28, 7, 8, 9, 10}};
-  DenseMap<AIE::TileID, int> tileIDMap;
-  for (int col = 0; col < targetModel.columns(); col++) {
-    for (int row = 0; row < targetModel.rows(); row++) {
-      if (clColumnWiseUniqueIDs)
-        tileIDMap[{col, row}] = validTileIds[0][row];
-      else
-        tileIDMap[{col, row}] = validTileIds[col][row];
-    }
-  }
-
-  return tileIDMap;
-}
-DenseMap<AIE::TileID, int>
-getTileToControllerIdMap(bool clColumnWiseUniqueIDs,
-                         const AIETargetModel &targetModel) {
-  if (targetModel.rows() <= 6)
-    return getTileToControllerIdMap6RowsOrLess(clColumnWiseUniqueIDs,
-                                               targetModel);
-
-  // Controller id assignment strategy for devices with more than 6 rows.
-  if (!clColumnWiseUniqueIDs)
-    assert(false && "Device has more tiles than the total number of candidate "
-                    "packet ids permitted by the device. Please switch to "
-                    "clColumnWiseUniqueIDs mode for AIEAssignTileCtrlIDsPass.");
-  DenseMap<AIE::TileID, int> tileIDMap;
-
-  int unusedPacketIdFrom = 0;
-  for (int col = 0; col < targetModel.columns(); col++) {
-    if (clColumnWiseUniqueIDs)
-      unusedPacketIdFrom = 0;
-    for (int row = 0; row < targetModel.rows(); row++)
-      tileIDMap[{col, row}] = unusedPacketIdFrom++;
-  }
-
-  return tileIDMap;
-}
-
-// AIE arch-specific row id to shim dma mm2s channel mapping. All shim mm2s
-// channels were assumed to be available for control packet flow routing (i.e.
-// not reserved by any aie.flow circuit-switched routing).
-DenseMap<int, int> getRowToShimChanMap(const AIETargetModel &targetModel,
-                                       WireBundle bundle) {
-  DenseMap<int, int> rowMap;
-  SmallVector<int>
-      thresholdsToNextShimChannel; // a list of thresholds on the number of
-                                   // control ports that the ith shim channel
-                                   // could connect to, before advancing to
-                                   // the next shim channel in round robin
-  TileID shimTile = {0, 0};
-  while (!targetModel.isShimNOCTile(shimTile.col, shimTile.row)) {
-    shimTile.col++;
-    if (shimTile.col == targetModel.columns()) {
-      shimTile.col = 0;
-      shimTile.row++;
-    }
-    assert(!(shimTile.col == targetModel.columns() &&
-             shimTile.row == targetModel.rows()));
-  }
-
-  int numShimChans = targetModel.getNumSourceShimMuxConnections(
-      shimTile.col, shimTile.row, AIE::WireBundle::DMA);
-  for (int i = 1; i < numShimChans + 1; i++)
-    thresholdsToNextShimChannel.push_back(targetModel.rows() / numShimChans *
-                                          i);
-
-  if (bundle == WireBundle::DMA) { // Ctrl packets
-    int shimChanIdx = 0;
-    for (int r = 0; r < targetModel.rows(); r++) {
-      if (r >= thresholdsToNextShimChannel[shimChanIdx])
-        shimChanIdx++;
-      rowMap[r] = shimChanIdx;
-    }
-  } else if (bundle == WireBundle::South) { // TCT
-    for (int r = 0; r < targetModel.rows(); r++)
-      rowMap[r] = 0;
-  }
-
-  return rowMap;
+static std::string getCtrlPktAllocName(int col, int chan) {
+  return "ctrlpkt_col" + std::to_string(col) + "_mm2s_chan" +
+         std::to_string(chan);
 }
 
 struct AIEAssignTileCtrlIDsPass
-    : AIEAssignTileCtrlIDsBase<AIEAssignTileCtrlIDsPass> {
-  void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<AIEDialect>();
-  }
+    : xilinx::AIE::impl::AIEAssignTileCtrlIDsBase<AIEAssignTileCtrlIDsPass> {
   void runOnOperation() override {
     DeviceOp device = getOperation();
     const auto &targetModel = device.getTargetModel();
@@ -146,257 +46,328 @@ struct AIEAssignTileCtrlIDsPass
     if (targetModel.getTargetArch() == AIEArch::AIE1)
       return; // Disable this pass for AIE1; AIE1 support NYI.
 
-    // Collect all TileOps in columns occupied by the design.
-    llvm::MapVector<AIE::TileID, AIE::TileOp> tiles;
-    llvm::SmallSet<int, 1> occupiedCols;
-    for (auto tile : device.getOps<AIE::TileOp>()) {
-      int colIndex = tile.colIndex();
-      int rowIndex = tile.rowIndex();
-      tiles[{colIndex, rowIndex}] = tile;
-      occupiedCols.insert(colIndex);
-    }
-
     auto tileIDMap =
-        getTileToControllerIdMap(clColumnWiseUniqueIDs, targetModel);
-    for (int col : occupiedCols) {
-      SmallVector<AIE::TileOp> tilesOnCol;
-      for (auto &[tId, tOp] : tiles) {
-        if (tId.col != col)
-          continue;
-        tilesOnCol.push_back(tOp);
-      }
-
-      for (auto tOp : tilesOnCol) {
-        if (tOp->hasAttr("controller_id"))
-          continue;
-        auto pktInfoAttr = AIE::PacketInfoAttr::get(
-            tOp->getContext(), /*pkt_type*/ 0,
-            /*pkt_id*/ tileIDMap[{tOp.colIndex(), tOp.rowIndex()}]);
-        tOp->setAttr("controller_id", pktInfoAttr);
-      }
+        targetModel.getTileToControllerIdMap(clColumnWiseUniqueIDs);
+    for (auto tile : device.getOps<TileOp>()) {
+      if (!tile->hasAttr("controller_id"))
+        tile->setAttr("controller_id",
+                      PacketInfoAttr::get(tile.getContext(), 0,
+                                          tileIDMap[tile.getTileID()]));
     }
   }
 };
 
 struct AIEGenerateColumnControlOverlayPass
-    : AIEGenerateColumnControlOverlayBase<AIEGenerateColumnControlOverlayPass> {
-  void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<AIEDialect>();
-    registry.insert<memref::MemRefDialect>();
-  }
+    : xilinx::AIE::impl::AIEGenerateColumnControlOverlayBase<
+          AIEGenerateColumnControlOverlayPass> {
+  using Base::Base;
+  DenseMap<std::pair<int, int>, unsigned> packetDemand;
+  DenseMap<int, llvm::SmallSet<int, 2>> fixedCircuits;
+
   void runOnOperation() override {
-    DeviceOp device = getOperation();
-    const auto &targetModel = device.getTargetModel();
-    OpBuilder builder = OpBuilder::atBlockTerminator(device.getBody());
-
-    if (targetModel.getTargetArch() == AIEArch::AIE1)
-      return; // Disable this pass for AIE1; AIE1 support NYI.
-
-    // Collect existing TileOps
-    llvm::MapVector<AIE::TileID, AIE::TileOp> tiles;
-    llvm::SmallSet<int, 1> occupiedCols;
-    for (auto tile : device.getOps<AIE::TileOp>()) {
-      int colIndex = tile.colIndex();
-      int rowIndex = tile.rowIndex();
-      tiles[{colIndex, rowIndex}] = tile;
-      occupiedCols.insert(colIndex);
-    }
-
-    auto tileIDMap = getTileToControllerIdMap(true, targetModel);
-    for (int col : occupiedCols) {
-      builder.setInsertionPointToStart(device.getBody());
-      AIE::TileOp shimTile = TileOp::getOrCreate(builder, device, col, 0);
-
-      if (clRouteShimCTRLToTCT == "all-tiles" ||
-          clRouteShimCTRLToTCT == "shim-only") {
-        // Get all tile ops on column col
-        SmallVector<AIE::TileOp> tilesOnCol;
-        for (auto &[tId, tOp] : tiles) {
-          if (tId.col != col)
-            continue;
-          if (clRouteShimCTRLToTCT == "shim-only" && !tOp.isShimNOCorPLTile())
-            continue;
-          tilesOnCol.push_back(tOp);
-        }
-
-        generatePacketFlowsForControl(
-            builder, device, shimTile, AIE::WireBundle::South, tilesOnCol,
-            AIE::WireBundle::TileControl, 0, tileIDMap, false);
-      }
-      if (clRouteShimDmaToTileCTRL) {
-        // Get all tile ops on column col
-        SmallVector<AIE::TileOp> tilesOnCol;
-        for (auto &[tId, tOp] : tiles) {
-          if (tId.col != col)
-            continue;
-          tilesOnCol.push_back(tOp);
-        }
-
-        generatePacketFlowsForControl(
-            builder, device, shimTile, AIE::WireBundle::DMA, tilesOnCol,
-            AIE::WireBundle::TileControl, 0, tileIDMap, true);
-      }
-    }
+    llvm::MapVector<AIEDevice, SmallVector<DeviceOp>> groups;
+    AIEDialect::IsCtrlPktOverlayAttrHelper marker(&getContext());
+    for (DeviceOp device : getOperation().getOps<DeviceOp>())
+      if (!marker.isAttrPresent(device) && !device.getOverlayAttr() &&
+          device.getTargetModel().getTargetArch() != AIEArch::AIE1 &&
+          (configuration || !collectTokenIssuingTiles({device}).empty()))
+        groups[device.getDevice()].push_back(device);
+    for (auto &[target, users] : groups)
+      if (failed(generate(users)))
+        return signalPassFailure();
   }
 
-  AIE::PacketFlowOp createPacketFlowOp(OpBuilder &builder, int &flowID,
-                                       Value source,
-                                       xilinx::AIE::WireBundle sourceBundle,
-                                       uint32_t sourceChannel, Value dest,
-                                       xilinx::AIE::WireBundle destBundle,
-                                       uint32_t destChannel,
-                                       mlir::BoolAttr keep_pkt_header = nullptr,
-                                       mlir::BoolAttr ctrl_pkt_flow = nullptr) {
-    OpBuilder::InsertionGuard guard(builder);
-
-    AIE::PacketFlowOp pktFlow = builder.create<AIE::PacketFlowOp>(
-        builder.getUnknownLoc(), flowID++, keep_pkt_header, ctrl_pkt_flow);
-    Region &r_pktFlow = pktFlow.getPorts();
-    Block *b_pktFlow = builder.createBlock(&r_pktFlow);
-    builder.setInsertionPointToStart(b_pktFlow);
-    builder.create<AIE::PacketSourceOp>(builder.getUnknownLoc(), source,
-                                        sourceBundle, sourceChannel);
-    builder.create<AIE::PacketDestOp>(builder.getUnknownLoc(), dest, destBundle,
-                                      destChannel);
-    builder.create<AIE::EndOp>(builder.getUnknownLoc());
-    return pktFlow;
-  }
-
-  // Get a vector of shim channels not reserved by any circuit-switched aie.flow
-  // op
-  SmallVector<int> getAvailableShimChans(DeviceOp device, TileOp shimTile,
-                                         WireBundle shimWireBundle,
-                                         bool isShimMM2S) {
-    SmallVector<int> availableShimChans;
-    DenseMap<int, AIE::FlowOp> flowOpUsers;
-    const auto &targetModel = device.getTargetModel();
-
-    for (auto user : shimTile.getResult().getUsers()) {
-      auto fOp = dyn_cast<AIE::FlowOp>(user);
-      if (!fOp)
+  LogicalResult generate(ArrayRef<DeviceOp> users) {
+    ModuleOp module = getOperation();
+    AIEDialect::IsCtrlPktOverlayAttrHelper marker(&getContext());
+    DeviceOp first = users.front();
+    auto target = first.getDevice();
+    auto tokenTiles = collectTokenIssuingTiles(users);
+    std::set<int> columns;
+    if (configuration)
+      for (DeviceOp device : users)
+        for (TileOp tile : device.getOps<TileOp>())
+          columns.insert(tile.colIndex());
+    for (TileID tile : tokenTiles)
+      columns.insert(tile.col);
+    if (configuration) {
+      for (DeviceOp device : users)
+        device.walk([&](AIEX::NpuControlPacketOp packet) {
+          columns.insert(packet.getColumnFromAddr());
+        });
+      columns.insert(coverColumns.begin(), coverColumns.end());
+      collectShimMM2SUses(users);
+    }
+    SymbolTable symbols(module);
+    OpBuilder builder(module.getContext());
+    builder.setInsertionPointToEnd(module.getBody());
+    DeviceOp overlay =
+        DeviceOp::create(builder, module.getLoc(), target,
+                         builder.getStringAttr("ctrl_pkt_overlay"), nullptr);
+    symbols.insert(overlay);
+    overlay.getRegion().emplaceBlock();
+    builder.setInsertionPointToEnd(overlay.getBody());
+    EndOp::create(builder, overlay.getLoc());
+    marker.setAttr(overlay, builder.getUnitAttr());
+    builder.setInsertionPointToStart(overlay.getBody());
+    for (DeviceOp device : users)
+      for (TileOp tile : device.getOps<TileOp>()) {
+        TileOp dest = TileOp::getOrCreate(builder, overlay, tile.colIndex(),
+                                          tile.rowIndex());
+        if (auto id = tile->getAttr("controller_id")) {
+          if (auto other = dest->getAttr("controller_id");
+              other && other != id) {
+            tile.emitOpError(
+                "has a different controller ID in another configuration");
+            return failure();
+          }
+          dest->setAttr("controller_id", id);
+        }
+      }
+    const auto &model = overlay.getTargetModel();
+    auto ids = model.getTileToControllerIdMap(true);
+    auto flow = [&](TileOp source, Port src, TileOp dest, Port dst,
+                    TileOp controller) {
+      builder.setInsertionPoint(overlay.getBody()->getTerminator());
+      int id = ids[controller.getTileID()];
+      if (auto attr =
+              controller->getAttrOfType<PacketInfoAttr>("controller_id"))
+        id = attr.assignedId();
+      auto packet = PacketFlowOp::create(builder, controller.getLoc(), id,
+                                         builder.getBoolAttr(true),
+                                         builder.getBoolAttr(true));
+      OpBuilder::InsertionGuard guard(builder);
+      builder.createBlock(&packet.getPorts());
+      PacketSourceOp::create(builder, packet.getLoc(), source, src.bundle,
+                             src.channel);
+      PacketDestOp::create(builder, packet.getLoc(), dest, dst.bundle,
+                           dst.channel);
+      EndOp::create(builder, packet.getLoc());
+    };
+    for (int col : columns) {
+      if (col < 0 || col >= model.columns()) {
+        overlay.emitOpError("control coverage column is outside the target");
+        return failure();
+      }
+      builder.setInsertionPointToStart(overlay.getBody());
+      TileOp shim = TileOp::getOrCreate(builder, overlay, col, 0);
+      flow(shim, {WireBundle::TileControl, 0}, shim, {WireBundle::South, 0},
+           shim);
+      for (TileID tile : tokenTiles)
+        if (tile.col == col && tile.row != 0) {
+          builder.setInsertionPointToStart(overlay.getBody());
+          TileOp source = TileOp::getOrCreate(builder, overlay, col, tile.row);
+          flow(source, {WireBundle::TileControl, 0}, shim,
+               {WireBundle::South, 0}, source);
+        }
+      if (!configuration)
         continue;
-      if (isShimMM2S && fOp.getSource() == shimTile &&
-          fOp.getSourceBundle() == shimWireBundle)
-        flowOpUsers[fOp.getSourceChannel()] = fOp;
-      else if (!isShimMM2S && fOp.getDest() == shimTile &&
-               fOp.getDestBundle() == shimWireBundle)
-        flowOpUsers[fOp.getDestChannel()] = fOp;
-    }
-    int numShimChans = 0;
-    if (isShimMM2S)
-      numShimChans = targetModel.getNumSourceShimMuxConnections(
-          shimTile.colIndex(), shimTile.rowIndex(), shimWireBundle);
-    else
-      numShimChans = targetModel.getNumDestShimMuxConnections(
-          shimTile.colIndex(), shimTile.rowIndex(), shimWireBundle);
-    for (int i = 0; i < numShimChans; i++) {
-      if (!flowOpUsers.count(i))
-        availableShimChans.push_back(i);
-    }
-
-    return availableShimChans;
-  }
-
-  // Create packet flows per col which moves control packets to and from shim
-  // dma
-  void generatePacketFlowsForControl(OpBuilder builder, DeviceOp device,
-                                     TileOp shimTile, WireBundle shimWireBundle,
-                                     SmallVector<AIE::TileOp> ctrlTiles,
-                                     WireBundle ctrlWireBundle,
-                                     int coreOrMemChanId,
-                                     DenseMap<TileID, int> tileIDMap,
-                                     bool isShimMM2S) {
-    int ctrlPktFlowID = 0;
-    auto rowToShimChanMap =
-        getRowToShimChanMap(device.getTargetModel(), shimWireBundle);
-    // Get all available shim channels, to verify that the one being used is
-    // available
-    auto availableShimChans =
-        getAvailableShimChans(device, shimTile, shimWireBundle, isShimMM2S);
-
-    builder.setInsertionPoint(device.getBody()->getTerminator());
-    for (auto tOp : ctrlTiles) {
-      if (tOp->hasAttr("controller_id"))
-        ctrlPktFlowID =
-            (int)tOp->getAttrOfType<AIE::PacketInfoAttr>("controller_id")
-                .getPktId();
-      else
-        ctrlPktFlowID = tileIDMap[{tOp.colIndex(), tOp.rowIndex()}];
-      // Check shim channel availability
-      if (!llvm::is_contained(availableShimChans,
-                              rowToShimChanMap[tOp.rowIndex()]))
-        device->emitOpError(
-            "failed to generate column control overlay from shim dma to tile "
-            "ctrl ports, because some shim mm2s dma channels were reserved "
-            "from routing control packets.");
-
-      auto keep_pkt_header = builder.getBoolAttr(true);
-      auto ctrl_pkt_flow = builder.getBoolAttr(true);
-      if (isShimMM2S)
-        (void)createPacketFlowOp(
-            builder, ctrlPktFlowID, shimTile, shimWireBundle,
-            rowToShimChanMap[tOp.rowIndex()], tOp, ctrlWireBundle,
-            coreOrMemChanId, keep_pkt_header, ctrl_pkt_flow);
-      else
-        (void)createPacketFlowOp(builder, ctrlPktFlowID, tOp, ctrlWireBundle,
-                                 coreOrMemChanId, shimTile, shimWireBundle,
-                                 rowToShimChanMap[tOp.rowIndex()],
-                                 keep_pkt_header, ctrl_pkt_flow);
-
-      // Generate shim dma alloc ops as handle for runtime sequence to pickup,
-      // when issuing control packets
-      if (shimWireBundle != WireBundle::DMA)
-        continue;
-
-      AIE::DMAChannelDir dir =
-          isShimMM2S ? AIE::DMAChannelDir::MM2S : AIE::DMAChannelDir::S2MM;
-      int chan = rowToShimChanMap[tOp.rowIndex()];
-      int col = shimTile.colIndex();
-      std::string dma_name = "ctrlpkt";
-      dma_name += "_col" + std::to_string(col);   // col
-      dma_name += isShimMM2S ? "_mm2s" : "_s2mm"; // dir
-      dma_name += "_chan" + std::to_string(chan); // chan
-
-      // check to see if ShimDMAAllocationOp already exists
-      if (device.lookupSymbol(dma_name))
-        continue;
-
-      builder.create<AIE::ShimDMAAllocationOp>(
-          builder.getUnknownLoc(), StringRef(dma_name), dir,
-          rowToShimChanMap[tOp.rowIndex()], shimTile.colIndex(), false);
-      MemRefType memref_ty = MemRefType::get(
-          ArrayRef<int64_t>{2048}, IntegerType::get(builder.getContext(), 32),
-          nullptr, 0);
-      builder.create<memref::GlobalOp>(builder.getUnknownLoc(), dma_name,
-                                       builder.getStringAttr("public"),
-                                       memref_ty, nullptr, false, nullptr);
-    }
-  }
-
-  // Get packet-flow op with the same source or destination
-  AIE::PacketFlowOp getPktFlowWithSameSrcOrDst(DeviceOp device, TileOp srcTile,
-                                               WireBundle srcBundle,
-                                               int srcChan, TileOp destTile,
-                                               WireBundle destBundle,
-                                               int destChan) {
-    AIE::PacketFlowOp result = nullptr;
-    device.walk([&](AIE::PacketFlowOp fOp) {
-      for (auto srcOp : fOp.getOps<AIE::PacketSourceOp>()) {
-        if (srcOp.getTile() == srcTile && srcOp.getBundle() == srcBundle &&
-            srcOp.channelIndex() == srcChan) {
-          result = fOp;
-          return;
+      int channel = -1;
+      unsigned best = std::numeric_limits<unsigned>::max();
+      int count =
+          adaptive
+              ? model.getNumSourceShimMuxConnections(col, 0, WireBundle::DMA)
+              : 1;
+      for (int ch = 0; ch < count; ++ch)
+        if (!fixedCircuits.lookup(col).contains(ch) &&
+            packetDemand.lookup({col, ch}) < best) {
+          channel = ch;
+          best = packetDemand.lookup({col, ch});
         }
+      if (channel < 0) {
+        overlay.emitOpError("failed to generate control overlay: no available "
+                            "shim MM2S channel in column ")
+            << col;
+        return failure();
       }
-      for (auto destOp : fOp.getOps<AIE::PacketDestOp>()) {
-        if (destOp.getTile() == destTile && destOp.getBundle() == destBundle &&
-            destOp.channelIndex() == destChan) {
-          result = fOp;
-          return;
-        }
+      builder.setInsertionPoint(overlay.getBody()->getTerminator());
+      auto alloc = ShimDMAAllocationOp::create(
+          builder, shim.getLoc(), getCtrlPktAllocName(col, channel), shim,
+          DMAChannelDir::MM2S, channel, false, nullptr);
+      marker.setAttr(alloc, builder.getUnitAttr());
+      for (int row = 0; row < model.rows(); ++row) {
+        builder.setInsertionPointToStart(overlay.getBody());
+        TileOp dest = TileOp::getOrCreate(builder, overlay, col, row);
+        flow(shim, {WireBundle::DMA, channel}, dest,
+             {WireBundle::TileControl, 0}, dest);
       }
+    }
+    for (DeviceOp device : users) {
+      device.setOverlayAttr(FlatSymbolRefAttr::get(overlay.getSymNameAttr()));
+      if (configuration)
+        AIEDialect::ReserveControllerPacketIdsAttrHelper(&getContext())
+            .setAttr(device, builder.getUnitAttr());
+    }
+    if (!configuration)
+      return success();
+    std::vector<std::pair<TileID, Port>> avoided;
+    if (adaptive && failed(applicationPorts(module, avoided)))
+      return failure();
+    OpPassManager routing(DeviceOp::getOperationName());
+    routing.addPass(createAIEAssignTileCtrlIDsPass());
+    routing.addPass(createAIEPathfinderPass({}, avoided));
+    if (failed(runPipeline(routing, overlay)))
+      return failure();
+    // Reprogramming another master set of an active arbiter can stall control
+    // packets.
+    for (auto box : overlay.getOps<SwitchboxOp>()) {
+      auto amsels = llvm::to_vector(box.getConnections().getOps<AMSelOp>());
+      std::set<std::pair<int, int>> slots;
+      for (auto amsel : amsels)
+        slots.emplace(amsel.arbiterIndex(), amsel.getMselValue());
+      builder.setInsertionPoint(box.getConnections().front().getTerminator());
+      for (auto amsel : amsels)
+        for (unsigned msel = 0; msel < model.getNumMselsPerArbiter(); ++msel)
+          if (slots.emplace(amsel.arbiterIndex(), msel).second)
+            AMSelOp::create(builder, amsel.getLoc(), amsel.arbiterIndex(),
+                            msel);
+    }
+    overlay.walk([&](Operation *op) {
+      op->removeAttr("aie.priority_route");
+      if (!isa<DeviceOp, EndOp, PacketRulesOp>(op))
+        marker.setAttr(op, builder.getUnitAttr());
     });
-    return result;
+    return success();
+  }
+  void collectShimMM2SUses(ArrayRef<DeviceOp> devices) {
+    packetDemand.clear();
+    fixedCircuits.clear();
+    auto shimCol = [](Value tile) -> std::optional<int> {
+      auto tOp = dyn_cast_or_null<TileOp>(tile.getDefiningOp());
+      if (!tOp || !tOp.isShimNOCorPLTile())
+        return std::nullopt;
+      return tOp.colIndex();
+    };
+    for (DeviceOp device : devices) {
+      for (auto endpoint : device.getOps<RouteEndpointOp>()) {
+        auto col = shimCol(endpoint.getTile());
+        auto channel = endpoint.getChannelIndex();
+        if (!col || endpoint.getBundle() != WireBundle::DMA ||
+            endpoint.getRouteDirection() != DMAChannelDir::MM2S || !channel)
+          continue;
+        bool packet =
+            llvm::any_of(device.getOps<RouteOp>(), [&](RouteOp route) {
+              return route.namesAsSource(endpoint.getSymName()) &&
+                     route.getPacket();
+            });
+        if (packet)
+          ++packetDemand[{*col, *channel}];
+        else
+          fixedCircuits[*col].insert(*channel);
+      }
+      for (auto alloc : device.getOps<AIE::ShimDMAAllocationOp>()) {
+        if (alloc.getChannelDir() != AIE::DMAChannelDir::MM2S)
+          continue;
+        int col = alloc.getTileOp().colIndex();
+        int chan = static_cast<int>(alloc.getChannelIndex());
+        fixedCircuits[col].insert(chan);
+      }
+      for (auto flow : device.getOps<AIE::FlowOp>())
+        if (flow.getSourceBundle() == WireBundle::DMA)
+          if (auto col = shimCol(flow.getSource())) {
+            fixedCircuits[*col].insert(flow.getSourceChannel());
+          }
+      for (auto flow : device.getOps<AIE::PacketFlowOp>()) {
+        for (auto src : flow.getOps<AIE::PacketSourceOp>())
+          if (src.getBundle() == WireBundle::DMA)
+            if (auto col = shimCol(src.getTile())) {
+              ++packetDemand[{*col, src.channelIndex()}];
+            }
+      }
+      for (auto mux : device.getOps<AIE::ShimMuxOp>())
+        for (auto connect :
+             mux.getConnections().front().getOps<AIE::ConnectOp>())
+          if (connect.getSourceBundle() == WireBundle::DMA) {
+            int col = mux.getTileOp().colIndex();
+            fixedCircuits[col].insert(connect.sourceIndex());
+          }
+    }
+  }
+
+  static llvm::SmallSet<AIE::TileID, 4>
+  collectTokenIssuingTiles(ArrayRef<DeviceOp> devices) {
+    llvm::SmallSet<AIE::TileID, 4> tiles;
+    auto addTile = [&](Value tileValue) {
+      if (!tileValue)
+        return;
+      if (auto tile = dyn_cast_or_null<TileOp>(tileValue.getDefiningOp()))
+        tiles.insert({tile.colIndex(), tile.rowIndex()});
+    };
+    for (DeviceOp device : devices) {
+      for (TileOp tile : device.getOps<TileOp>())
+        if (tile.isShimNOCorPLTile())
+          tiles.insert(tile.getTileID());
+      device.walk([&](Operation *op) {
+        if (auto task = dyn_cast<AIEX::DMAConfigureTaskOp>(op)) {
+          if (task.getIssueToken())
+            addTile(task.getTile());
+        } else if (auto task = dyn_cast<AIEX::DMAConfigureTaskForOp>(op)) {
+          if (!task.getIssueToken())
+            return;
+          Operation *endpoint =
+              SymbolTable::lookupSymbolIn(device, task.getAlloc());
+          if (auto route = dyn_cast_or_null<RouteEndpointOp>(endpoint))
+            addTile(route.getTile());
+          else if (auto alloc = dyn_cast_or_null<ShimDMAAllocationOp>(endpoint))
+            addTile(alloc.getTile());
+        } else if (auto push = dyn_cast<AIEX::NpuPushQueueOp>(op)) {
+          if (push.getIssueToken())
+            tiles.insert({static_cast<int>(push.getColumn()),
+                          static_cast<int>(push.getRow())});
+        }
+      });
+    }
+    return tiles;
+  }
+
+  LogicalResult
+  applicationPorts(ModuleOp module,
+                   std::vector<std::pair<TileID, Port>> &avoided) {
+    OwningOpRef<ModuleOp> trial = cast<ModuleOp>(module->clone());
+    for (DeviceOp device :
+         llvm::make_early_inc_range(trial->getOps<DeviceOp>())) {
+      if (device->hasAttr("aie.is_ctrl_pkt_overlay"))
+        device.erase();
+      else
+        device.removeOverlayAttr();
+    }
+    PassManager pm(&getContext());
+    auto &dpm = pm.nest<DeviceOp>();
+    dpm.addPass(createAIEAssignPacketIdsPass());
+    dpm.addPass(createAIEObjectFifoAllocatePass());
+    dpm.addPass(createAIEObjectFifoLowerDMAsPass());
+    if (failed(pm.run(*trial))) {
+      module.emitError("failed to analyze application resources for adaptive "
+                       "control overlay");
+      return failure();
+    }
+    std::set<std::pair<TileID, Port>> ports;
+    for (DeviceOp device : trial->getOps<DeviceOp>()) {
+      for (SwitchboxOp box : device.getOps<SwitchboxOp>()) {
+        for (ConnectOp connect : box.getOps<ConnectOp>())
+          ports.insert({box.getTileOp().getTileID(), connect.destPort()});
+        for (MasterSetOp master : box.getOps<MasterSetOp>())
+          ports.insert({box.getTileOp().getTileID(), master.destPort()});
+      }
+      DynamicTileAnalysis analysis;
+      llvm::Error error = analysis.runAnalysis(device);
+      if (error) {
+        device.emitOpError("cannot plan adaptive control overlay: ")
+            << llvm::toString(std::move(error));
+        return failure();
+      }
+      auto collect = [&](const SwitchSettings &settings) {
+        for (const auto &[tile, setting] : settings)
+          for (Port output : setting.dsts)
+            ports.insert({tile, output});
+      };
+      for (const auto &[_, settings] : analysis.routing.settings)
+        collect(settings);
+      for (const auto &[_, settings] : analysis.routing.idSettings)
+        collect(settings);
+    }
+    avoided.assign(ports.begin(), ports.end());
+    return success();
   }
 };
 
@@ -404,9 +375,13 @@ std::unique_ptr<OperationPass<DeviceOp>> AIE::createAIEAssignTileCtrlIDsPass() {
   return std::make_unique<AIEAssignTileCtrlIDsPass>();
 }
 
-std::unique_ptr<OperationPass<DeviceOp>>
+std::unique_ptr<OperationPass<mlir::ModuleOp>>
 AIE::createAIEGenerateColumnControlOverlayPass() {
   return std::make_unique<AIEGenerateColumnControlOverlayPass>();
 }
 
-void populateAIEColumnControlOverlay(DeviceOp &device) {}
+std::unique_ptr<OperationPass<mlir::ModuleOp>>
+AIE::createAIEGenerateColumnControlOverlayPass(
+    const AIEGenerateColumnControlOverlayOptions &options) {
+  return std::make_unique<AIEGenerateColumnControlOverlayPass>(options);
+}

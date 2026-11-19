@@ -1,142 +1,148 @@
 <!---//===- README.md ---------------------------------------*- Markdown -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2025-2026 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Copyright (C) 2024, Advanced Micro Devices, Inc.
-// 
 //===----------------------------------------------------------------------===//-->
 
-# <ins>Section 2g - Runtime Data Movement</ins>
+# Section 2d - Runtime Data Movement
 
-* [Section 2 - Data Movement (Object FIFOs)](../../section-2/)
-    * [Section 2a - Introduction](../section-2a/)
-    * [Section 2b - Key Object FIFO Patterns](../section-2b/)
-    * [Section 2c - Data Layout Transformations](../section-2c/)
-    * [Section 2d - Programming for multiple cores](../section-2d/)
-    * [Section 2e - Practical Examples](../section-2e/)
-    * [Section 2f - Data Movement Without Object FIFOs](../section-2f/)
-    * Section 2g - Runtime Data Movement
+* [Section 2 - Data Movement (ObjectFifos)](../../section-2/README.md)
+    * [Section 2a - Introduction](../section-2a/README.md)
+    * [Section 2b - Key ObjectFifo Patterns](../section-2b/README.md)
+    * [Section 2c - Data Layout Transformations](../section-2c/README.md)
+    * Section 2d - Runtime Data Movement
+    * [Section 2e - Programming for multiple cores](../section-2e/README.md)
+    * [Section 2f - Practical Examples](../section-2f/README.md)
+    * [Section 2g - Data Movement Without ObjectFifos](../section-2g/README.md)
 
 -----
 
-IRON proposes a `Runtime` class with a `sequence()` function which can be programmed with `RuntimeTasks` that will launch Workers, fill and drain Object FIFOs with data from/to external memory. All IRON constructs introduced in this section are available [here](../../../python/iron/runtime/).
+IRON provides a `Runtime` class whose *sequence body* — a plain Python function — describes how host-side buffers are moved into and out of the AIE-array while one or more `Worker`s run. All IRON constructs introduced in this section are available [here](../../../python/iron/runtime/).
 
-To create a Runtime sequence users can write:
+A `Runtime` is created from its sequence body and `fn_args`, mirroring how a `Worker` is created from a `core_fn` and its `fn_args`:
 ```python
 # To/from AIE-array runtime data movement
-rt = Runtime()
-with rt.sequence(data_ty_a, data_ty_b, data_ty_c) as (a, b, c):
+def sequence(a, b, c):
     # runtime tasks
+    ...
+
+rt = Runtime(sequence, [data_ty_a, data_ty_b, data_ty_c])
 ```
-The arguments to this function describe buffers that will be available on the host side; the body of the function describes how those buffers are moved into the AIE-array.
+Here every `fn_args` entry (`data_ty_a`, ...) is a **type**, which declares a host-side buffer: the body receives one argument per entry and describes how those buffers move into the AIE-array. The body runs later, inside the lowered `aie.runtime_sequence`, so it executes with a live MLIR context — meaning native `range_`/`if_` control flow and data-movement verbs work directly inside it.
+
+#### **Passing ObjectFifos to the body: `fn_args`**
+
+The body moves data by calling `fill`/`drain` on `ObjectFifoHandle`s. Those handles are passed to the `Runtime` as trailing `fn_args` entries — exactly like a `Worker`'s `fn_args` — and are received as trailing parameters of the body, after the type-declared buffers:
+```python
+def sequence(a, b, c, in_h, out_h):
+    in_h.fill(a)
+    out_h.drain(c, wait=True)
+
+rt = Runtime(
+    sequence,
+    [data_ty_a, data_ty_b, data_ty_c, of_in.prod(), of_out.cons()],
+)
+```
+Passing the handles through `fn_args` (rather than capturing them by closure) lets the `Runtime` bind each ObjectFifo's shim endpoint up front, so the design resolves cleanly regardless of where the body appears.
 
 #### **Runtime Tasks**
 
-Runtime tasks are performed during runtime and they may be synchronous or asynchronous. Tasks can be added to the runtime sequence during the creation of the IRON design, and they can also be queued during runtime.
+`Runtime` tasks are the data-movement operations performed at runtime; they may be synchronous or asynchronous.
 
-The `start()` operation is used to start one or multiple Workers that were declared in the IRON design. It is shown below and defined in [runtime.py](../../../python/iron/runtime/runtime.py):
+`Worker`s are **not** started from inside the sequence — they are handed to the `Program` directly:
 ```python
-def start(self, *args: Worker)
-```
-If more than one Worker is given as input, they will be started in order.
-
-The code snippet below shows how one `my_worker` Worker is started:
-```python
-rt = Runtime()
-with rt.sequence(data_ty, data_ty, data_ty) as (_, _, _):
-    rt.start(my_worker)
+Program(device, rt, workers=[my_worker]).resolve_program()
 ```
 
-To start multiple Workers with a single use of this operation users can write:
+To run multiple `Worker`s, pass them all:
 ```python
 workers = []
 # create and append Workers to the "workers" array
 
-rt = Runtime()
-with rt.sequence(data_ty, data_ty, data_ty) as (_, _, _):
-    rt.start(*workers)
+Program(device, rt, workers=workers).resolve_program()
 ```
 
-The `fill()` operation is used to fill an `in_fifo` `ObjectFifoHandle` of type producer with data from a `source` runtime buffer. It is shown below and defined in [runtime.py](../../../python/iron/runtime/runtime.py):
+The `fill()` operation is a method on a *producer* `ObjectFifoHandle` that fills it with data from a `source` runtime buffer. It is defined in [objectfifo.py](../../../python/iron/dataflow/objectfifo.py):
 ```python
 def fill(
         self,
-        in_fifo: ObjectFifoHandle,
-        source: RuntimeData,
-        tap: TensorAccessPattern | None = None,
-        task_group: RuntimeTaskGroup | None = None,
+        source,
+        tap=None,
         wait: bool = False,
-        placement: PlacementTile = AnyShimTile,
+        group=None,
+        ...
     )
 ```
-When the `wait` input is set to `True` this operation will be waited upon, i.e., a token will be produced when the operation is finished that a controller is waiting on. A `placement` Shim tile can also be explicitly specified, otherwise the compiler will choose one based on the placement algorithm. The `task_group` is explained further in this section.
+When the `wait` input is set to `True` this operation will be waited upon, i.e., a token will be produced when the operation is finished that a controller is waiting on. The `group` is explained further in this section. The Shim tile is chosen by the compiler, or pinned via `prod(tile=...)` on the handle (see below).
 
-The code snippet below shows how data from a source runtime buffer `a_in` is sent to the producer `ObjectFifoHandle` of `of_in`. This data could then be read via a consumer `ObjectFifoHandle` of the same Object FIFO.
+The code snippet below shows how data from a source runtime buffer `a_in` is sent to the producer `ObjectFifoHandle` of `of_in`. This data could then be read via a consumer `ObjectFifoHandle` of the same ObjectFifo.
 ```python
-rt = Runtime()
-with rt.sequence(data_ty, data_ty, data_ty) as (a_in, _, _):
-    rt.fill(of_in.prod(), a_in)
+def sequence(a_in, in_h):
+    in_h.fill(a_in)
+
+rt = Runtime(sequence, [data_ty, of_in.prod()])
 ```
 
-The `drain()` operation is used to fill an `out_fifo` `ObjectFifoHandle` of type consumer of data and write that data to a `dest` runtime buffer. It is shown below and defined in [runtime.py](../../../python/iron/runtime/runtime.py):
+The `drain()` operation is a method on a *consumer* `ObjectFifoHandle` that reads its data and writes it to a `dest` runtime buffer. It is defined in [objectfifo.py](../../../python/iron/dataflow/objectfifo.py):
 ```python
 def drain(
     self,
-    out_fifo: ObjectFifoHandle,
-    dest: RuntimeData,
-    tap: TensorAccessPattern | None = None,
-    task_group: RuntimeTaskGroup | None = None,
+    dest,
+    tap=None,
     wait: bool = False,
-    placement: PlacementTile = AnyShimTile,
+    group=None,
+    ...
 )
 ```
-When the `wait` input is set to `True` this operation will be waited upon, i.e., a token will be produced when the operation is finished that a controller is waiting on. A `placement` Shim tile can also be explicitly specified, otherwise the compiler will choose one based on the placement algorithm. The `task_group` is explained further in this section.
+When the `wait` input is set to `True` this operation will be waited upon, i.e., a token will be produced when the operation is finished that a controller is waiting on. The `group` is explained further in this section.
 
 The code snippet below shows how data from a consumer `ObjectFifoHandle` of `of_out` is drained into a destination runtime buffer `c_out`. Data could be produced into `of_out` via its producer `ObjectFifoHandle`. Additionally, the `wait` input of the `drain()` task is set meaning that this task will be waited on until completion, i.e., until the `c_out` runtime buffer had received enough data as described by the `data_ty`.
 ```python
-rt = Runtime()
-with rt.sequence(data_ty, data_ty, data_ty) as (_, _, c_out):
-    rt.drain(of_out.cons(), c_out, wait=True)
+def sequence(c_out, out_h):
+    out_h.drain(c_out, wait=True)
+
+rt = Runtime(sequence, [data_ty, of_out.cons()])
 ```
 
-#### **Inline Operations into a Runtime Sequence**
-
-In some cases it may be desirable to insert a Python function that generates arbitrary MLIR operations into the runtime sequence. One such example is when users want to set runtime parameters, which will be loaded into the local memory modules of the Workers at runtime.
-
-To inline operations into the runtime sequence, users can use the `inline_ops()` operation. It is shown below and defined in [runtime.py](../../../python/iron/runtime/runtime.py):
+To pin the Shim tile a handle's host-side DMA uses, pass `tile=` to `prod()`/`cons()` where the handle is created (not to `fill`/`drain`):
 ```python
-def inline_ops(self, inline_func: Callable, inline_args: list)
+rt = Runtime(sequence, [data_ty, of_in.prod(tile=Tile(0, 0))])
 ```
-The `inline_func` is the function to execute within an MLIR context and the `inline_args` are state the function needs to execute.
 
-In the following code snippet, an array of `GlobalBuffers` is created where each of the buffers will hold a runtime parameter of type `16xi32`. A [`GlobalBuffer`](../../../python/iron/globalbuffer.py) is a memory region declared at the top-level of the IRON design that is available both to the Workers and to the runtime for operations. When `use_write_rtp` is set, runtime parameter specific operations will be generated within the runtime sequence at lower-levels of compiler abstraction.
+The `fill()`/`drain()` methods return a `Task` handle. Prefer the default managed transfers and `TaskGroup` for ordinary data movement; the runtime handles their waits and frees.
+
+For software-pipelined data movement with manual lifetime control, issue the transfer with `managed=False` and do not pass `group=`. Use `range_` and `yield_` from `aie.iron.controlflow` to carry a `Task` through `iter_args` across loop iterations (see [Control flow in the body](#control-flow-in-the-body)). Call `.await_()` only on transfers issued with `wait=True` (which requests a completion token), then call `.free()` when it is safe to reuse the descriptor. Awaiting alone does not free it. An unwaited transfer may be freed only after a dependent waited transfer proves it has completed. Do not manually free managed tasks: their task group already owns that responsibility. See [dmataskhandle.py](../../../python/iron/runtime/dmataskhandle.py).
+
+Compiled with `aiecc --reclaim-runtime-bds` (for a JIT design, `aiecc_flags=["--reclaim-runtime-bds"]`), a sequence whose loops all have compile-time trip counts can skip freeing: when a tile runs out of BDs, the compiler takes them back from started tasks it can prove finished (see [Running Out of Buffer Descriptors](./DMATasks.md#running-out-of-buffer-descriptors)). A pipelined sequence can then issue every transfer with `managed=False`, set `wait=True` only on the transfers the host must wait for, and `.await_()` just those. Issue a task after the transfers it depends on, e.g. a block's fills before its drain, since the compiler may have to wait for it to finish before issuing anything else.
+
+#### **Setting Runtime Parameters in the Body**
+
+Because the sequence body runs inside a live MLIR context, you can write operations directly in it — there is no separate escape hatch. A common example is setting runtime parameters, which are loaded into the local memory modules of the Workers at runtime.
+
+In the following code snippet, an array of `Buffer`s are created where each of the buffers will hold a runtime parameter of type `16xi32`. A [`Buffer`](../../../python/iron/buffer.py) is a memory region declared at the top-level of the IRON design that is available both to the `Worker`s and to the runtime for operations. When `use_write_rtp` is set, runtime parameter specific operations will be generated within the `Runtime`'s `sequence` at lower-levels of compiler abstraction.
 ```python
 # Runtime parameters
 rtps = []
 for i in range(4):
     rtps.append(
-        GlobalBuffer(
+        Buffer(
             np.ndarray[(16,), np.dtype[np.int32]],
             name=f"rtp{i}",
             use_write_rtp=True,
         )
     )
 ```
-The actual values of the runtime parameters will be loaded into each of the buffers at runtime:
+The values are written to each buffer by indexing it directly in the body. The body runs after the `Worker`s (and the `Buffer`s they own) are placed, so these writes resolve correctly:
 ```python
-rt = Runtime()
-with rt.sequence(data_ty, data_ty, data_ty) as (_, _, _):
-
+def sequence(a, b, c):
     # Set runtime parameters
-    def set_rtps(*args):
-        for rtp in args:
-            rtp[0] = 50
-            rtp[1] = 255
-            rtp[2] = 0
+    for rtp in rtps:
+        rtp[0] = 50
+        rtp[1] = 255
+        rtp[2] = 0
 
-    rt.inline_ops(set_rtps, rtps)
+rt = Runtime(sequence, [data_ty, data_ty, data_ty])
 ```
 The propagation of data to these global buffers is not instantaneous and may lead to workers reading runtime parameters before they are available. To solve this, it is possible to instantiate `WorkerRuntimeBarrier`s defined in [worker.py](../../../python/iron/worker.py):
 ```python
@@ -144,7 +150,7 @@ class WorkerRuntimeBarrier:
     def __init__(self, initial_value: int = 0)
 ```
 
-These barriers allow individual workers to synchronize with the runtime sequence:
+These barriers allow individual workers to synchronize with the `Runtime`'s `sequence` at runtime. A barrier is set from the body with `barrier.set(value)`:
 ```python
 workerBarriers = []
 for i in range(4):
@@ -154,48 +160,296 @@ for i in range(4):
 
 def core_fn(of_in, of_out, rtp, barrier):
     barrier.wait_for_value(1)
-    runtime_parameter = rtp
+    runtime_parameter = rtp[0]
+    barrier.release_with_value(1)
 
 ...
 
-rt = Runtime()
-with rt.sequence(data_ty, data_ty, data_ty) as (_, _, _):
+def sequence(a, b, c):
+    # Set runtime parameters, then release the barriers.
+    for rtp in rtps:
+        rtp[0] = 50
 
+    for i in range(4):
+        workerBarriers[i].set(1)
+
+rt = Runtime(sequence, [data_ty, data_ty, data_ty])
+```
+`wait_for_value` does not change the barrier, so `release_with_value` moves it off `1` once the parameters are read. Without it, a worker that loops back for a second dispatch sees the barrier still at `1` and reads the previous dispatch's parameters before the `sequence` has rewritten them.
+
+A `WorkerRuntimeBarrier` may take any value between 0 and the device's `max_lock_value` (63 on current devices). This is due to the fact that these barriers leverage the lock mechanism of the architecture under-the-hood.
+
+> **NOTE:**  Similar to the `Buffer` it is possible to create a single barrier and pass it as input to multiple workers. At lower stages of compiler abstraction this will result in a different lock being employed for each worker.
+
+#### **Scratchpad Parameters — an Alternative to RTP Buffers**
+
+[`ScratchpadParameter`](../../../python/iron/scratchpad_parameter.py) is a newer, simpler way
+to pass a named scalar from host to core, without a dedicated RTP `Buffer`/lock pair:
+
+```python
+from aie.iron import ScratchpadParameter
+
+seq_len = ScratchpadParameter("seq_len", np.int32)
+
+def core_fn(p, of_in, of_out, k):
+    v = p.read()                          # inside the Worker core
     ...
 
-    rt.inline_ops(set_rtps, rtps)
-    
-    for i in range(4):
-        rt.set_barrier(workerBarriers[i], 1)
-```
-Currently, a `WorkerRuntimeBarrier` may take any value between 0 and 63. This is due to the fact that these barriers leverage the lock mechansim of the architecture under-the-hood.
+w = Worker(core_fn, [seq_len, of_in.cons(), of_out.prod(), k])
 
-> **NOTE:**  Similar to the `GlobalBuffer` it is possible to create a single barrier and pass it as input to multiple workers. At lower stages of compiler abstraction this will result in a different lock being employed for each worker.
+def sequence(a_in, c_out, in_h, out_h):
+    sync_parameters()                     # emits the host→scratchpad sync; call before workers read it
+    in_h.fill(a_in)
+    out_h.drain(c_out, wait=True)
+```
+
+From the host, an `@iron.jit(full_elf=True)` design takes the values per call, by name:
+`design(a, c, parameters={"seq_len": np.int32(128)})`. A design that declares no
+`ScratchpadParameter` refuses `parameters=`, and a generator may not name one of its own
+parameters `parameters`. A lower-level pyxrt flow writes the same values through
+`aie.utils.hostruntime.xrtruntime.parameter_scratchpad.ParameterScratchpad` before `run.start()`.
+`test/python/npu-xrt/scratchpad_params/test.py` runs both forms against
+[`aie_design.py`](../../../test/python/npu-xrt/scratchpad_params/aie_design.py) in the same
+directory.
+
+Reach for `Buffer(..., use_write_rtp=True)` + `WorkerRuntimeBarrier` for the common case above
+(matches most existing examples); use `ScratchpadParameter` when you specifically want to avoid
+a dedicated RTP buffer/lock.
+
+Note that `ScratchpadParameter`s depend on the full-ELF flow (`aiecc --get-full-elf`) and are
+not available on the Phoenix/Hawk Point architectures.
 
 #### **Runtime Task Groups**
 
-It may be desirable to reconfigure the runtime sequence and reuse some of the resources from a previous configuration, especially given that some of these resources, like the BDs in a DMA task queue, are limited.
+It may be desirable to reconfigure a `Runtime`'s `sequence` and reuse some of the resources from a previous configuration, especially given that some of these resources, like the BDs in a DMA task queue, are limited. The compiler already reuses the BDs of tasks it can prove finished, so a task group is not needed just to stay within the BD pool; use one to say when the sequence should wait.
 
-To facilitate this reconfiguration step, IRON introduces `RuntimeTaskGroup`s which can be created using the `task_group()` function as defined in [runtime.py](../../../python/iron/runtime/runtime.py).
+To facilitate this reconfiguration step, IRON introduces `TaskGroup`s, created with the `TaskGroup()` constructor as defined in [taskgroup.py](../../../python/iron/runtime/taskgroup.py).
 
-`RuntimeTask`s can be added to a task group by specifying their `task_group` input. Tasks in the same group will be appended to the runtime sequence and executed in order. The `finish_task_group()` operation is used to mark the end of a task group, i.e., after this operation all of the tasks in the group will be waited on for completion after which they will be freed at the same time and the runtime sequence will be reconfigured by the next task group.
+A task is added to a group by passing `group=` to `fill`/`drain`. Transfers are submitted in sequence order and may overlap. The `finish()` method marks the end of a task group: it waits for tasks in the group annotated with `wait=True` to complete, then frees _all_ resources used by the group.
+If no group is specified for managed DMA tasks in a body, a single default task group is used and finished at the end of the sequence. By default, `Runtime` rejects mixing explicit groups with this default group; assign all managed transfers to explicit groups when using them.
 
-> **NOTE:**  Because of their ability to wait on runtime tasks until completion and free all the resources at the same time, task groups are well-placed to handle the asynchronous nature of runtime data movement tasks.
+> **NOTE:**  A call to  `finish()` blocks the runtime sequence until all of the group's tasks annotated with `wait=True`  ("awaited tasks") have completed. After waiting, all resources of the task group -- including those _not_ annotated with `wait=True` ("unawaited tasks") -- will be freed and reused for subsequent tasks.
+>
+> To avoid race conditions, any unawaited tasks in the group should form a dependency of an awaited task.
+> It is only safe to remove a `wait=True` if you can reason that another, awaited task in the same group can only complete if the awaited task also completed.
+> For example, you may choose to set `wait=False` on an input fill if you can guarantee that a later (awaited) output drain depends on the input and completes only if the input fill completed as well.
+>
+> If you suspect a race condition, the safest (but possibly slower) solution is to annotated _all_ tasks (including inputs) with `wait=True`.
 
-The runtime sequence in the code snippet below has two task groups. We can observe that the creation of the second task group happens at the end of execution of the first task group.
+The body in the code snippet below has two task groups. Each group is finished before the next iteration submits its transfers.
 ```python
-rt = Runtime()
-with rt.sequence(data_ty, data_ty, data_ty) as (a_in, _, c_out):
-    rt.start(*workers)
+def sequence(a_in, b, c_out, in_h, out_h):
+    for _ in range(2):
+        tg = TaskGroup()
+        in_h.fill(a_in, group=tg)
+        out_h.drain(c_out, group=tg, wait=True)
+        tg.finish()
 
-    tg = rt.task_group() # start first task group
-    for groups in [0, 1]:
-        rt.fill(of_in.prod(), a_in, task_group=tg)
-        rt.drain(of_out.cons(), c_out, task_group=tg, wait=True)
-        rt.finish_task_group(tg)
-        tg = rt.task_group() # start second task group
-    rt.finish_task_group(tg)
+rt = Runtime(
+    sequence,
+    [data_ty, data_ty, data_ty, of_in.prod(), of_out.cons()],
+)
 ```
 
+### Pipelining task groups
+
+A software pipeline starts the next step's transfers before finishing the
+previous step's. `TaskGroup.pipelined(n_steps, depth=2)` hands out one fresh
+group per step and finishes each group once the next `depth - 1` steps have
+been issued, so `depth` steps are in flight at a time:
+
+```python
+for step, tg in TaskGroup.pipelined(n_steps):
+    in_h.fill(a_in, tap=in_tiles[step], group=tg)
+    out_h.drain(c_out, tap=out_tiles[step], group=tg, wait=True)
+```
+
+The body is the same whether `n_steps` is a Python `int` or a dispatch-time
+value. With an `int` the steps unroll. With a dispatch-time value the loop
+stays rolled: the first `depth - 1` steps run under an `if_(n_steps > step)`
+guard, and the rest run in a `range_` that carries the groups in flight from
+one iteration to the next. The body is therefore traced `depth` times, with
+`step` a Python `int` in the guarded copies and the loop index in the last,
+and every step must issue the same transfers, waited the same way, in the
+same order.
+`programming_examples/basic/matrix_multiplication/whole_array/whole_array.py`
+keeps four row blocks in flight this way.
+
+### Control flow in the body
+
+`range_`, `if_` and `else_` from `aie.iron.controlflow` emit `scf` control
+flow in the body, for loops and branches on dispatch-time values:
+
+```python
+with if_(n_ragged > 0) as branch:
+    ...
+with else_(branch):
+    ...
+```
+
+`range_` can carry values from one iteration to the next: with `iter_args` it
+yields `(iv, args, results)`, where `args` holds the carried values the body
+sees and `results` what the loop returns, each a tuple with one entry per
+`iter_args` entry, and the body ends with `yield_([...])` of the next
+iteration's values. A `Task` or a `TaskGroup` can be carried this way; this is
+what `TaskGroup.pipelined` is built on. A carried group's Python object is
+spent: finish the group the loop hands back. A group is finished in the body
+its transfers were issued in, or in an `if_` inside that body; `finish()`
+raises otherwise.
+
+## Dispatch-time scalars
+
+`DispatchTime[T]` rebuilds the instruction stream for each call using a compiled
+host builder. `T` must be a supported NumPy integer scalar type, such as
+`np.int32` or `np.int64`; built-in `int`/`bool` and floating-point types are
+rejected.
+
+- **Call-time value:** overrides the signature default without recompiling.
+  If omitted, the default is used; without a default, the value is required.
+- **Explicit specialization:** `iron.jit(generator, count=3)` or
+  `design.specialize(count=3)` fixes the value and includes it in the cache key.
+  Calls cannot override it; use another specialization to change it.
+
+Defaults do not specialize parameters. Tensor capacities and worker tiling
+remain compile-time properties. A design checks that dispatch values fit its
+buffer capacities and tiling with `require` guards, and the host refuses a
+call that breaks one.
+
+`DispatchTime` parameters must be keyword-only, even when defaulted or
+explicitly specialized. Prefer tensors first, then dispatch scalars, then
+compile-time configuration; group ordering is a convention, not a restriction:
+
+```python
+import numpy as np
+import aie.iron as iron
+
+@iron.jit
+def copy(a: iron.In, b: iron.Out, *,
+         count: iron.DispatchTime[np.int32] = 3,
+         tile_size: iron.CompileTime[int] = 256):
+    ...  # Build the design.
+
+copy(a, b)                        # Dispatch with the default count=3.
+copy(a, b, count=6)               # Same compiled design; a different dispatch.
+copy.specialize(count=3)(a, b)    # Compile with count fixed to 3.
+```
+
+Inside the sequence body a dispatch scalar is an ordinary staged value: it can
+bound a `range_`, feed `if_`, be written to a worker's RTP buffer, and stand
+in for any size, stride, offset or index in a taplib access pattern, which
+then emits the pattern as arithmetic on it and turns its shape checks into
+`require` guards (see [Staged patterns](../../../docs/api/taplib.md#staged-patterns-in-a-dispatch-time-sequence)).
+`programming_examples/basic/matrix_multiplication/whole_array/whole_array.py`
+is a whole-array GEMM with dispatch-time `M`, `K` and `N` built this way;
+[Inspecting the instruction stream](#inspecting-the-instruction-stream) shows
+how to check what it issues without an NPU.
+
+### Generator-side binding and scope
+
+The generator receives an identity-bearing symbolic parameter for each unbound
+`DispatchTime[T]`, or a typed NumPy constant for a specialized one. Forward each
+symbolic parameter exactly once as a direct `Runtime` argument, **in any order**.
+The callback receives the corresponding SSA values:
+
+```python
+@iron.jit
+def design(*, bar: iron.DispatchTime[np.int32],
+           baz: iron.DispatchTime[np.int32]):
+    def seq(baz_value, bar_value):
+        ...  # baz_value corresponds to baz, bar_value to bar.
+
+    rt = iron.Runtime(seq, fn_args=[baz, bar])
+    ...  # Build and resolve the Program with rt.
+```
+
+Aliases preserve identity. Missing or duplicate bindings, bare scalar-type
+substitutes, and bindings to multiple sequences are rejected.
+
+Use the **callback argument**, not the captured symbolic parameter, for runtime
+arithmetic and MLIR control flow. Generation-time arithmetic, comparisons,
+`if bar`, `range(bar)`, NumPy value/dtype conversion, and `Worker.fn_args` reject
+symbolic parameters with `TypeError`. Shapes and worker configuration require
+`CompileTime[T]` or explicit specialization; storing or forwarding a symbolic
+parameter is valid.
+
+### Compilation scope
+
+The JIT requests device artifacts and a C++ transaction builder from the same
+`aiecc` invocation and lowering pipeline. Python validates the scalar ABI and
+compiles the host library. This requires a
+[host C++17 compiler](../../iron_configuration.md#dispatch-time-scalar-compilation),
+including with wheel installations; subsequent dispatches call the library
+without compiling.
+
+By default, artifacts live in the JIT cache. For explicit outputs, use
+`compile(xclbin_path=..., pdi_path=...)` (`pdi_path` is optional). Retain the
+builder library in the adjacent `<xclbin stem>.prj` directory with the device
+artifacts; `design.compilable.get_dispatch_lib_path()` returns its path.
+
+The Python bridge supports one runtime sequence and rejects remaining
+`load_pdi` operations because its runtimes cannot supply those resources.
+While any parameters remain dynamic, `inst_path`, `elf_path`, and
+`full_elf=True` are unsupported: full ELF embeds static instructions, with no
+per-call replacement API. Fully specialized designs retain normal full-ELF
+support. Native hosts can request C++ builders, including reconfiguration
+builders, directly from [`aiecc`](../../../tools/aiecc/README.md#parameterized-c-transaction-builders).
+
+### Inspecting the instruction stream
+
+The runtime sequence reaches the NPU as a stream of transaction (TXN)
+instructions: register writes, BD images, queue pushes and token waits.
+`design.instructions(**dispatch_values)` returns the stream one call would
+issue, without an NPU; a fully specialized design takes no arguments.
+`aie.utils.txn_trace` reduces a stream to the events the hardware acts on:
+DMA pushes (with the BDs they run), token waits, and the other register writes
+such as runtime parameters and locks. `explain(words)` lists them and
+`compare(a, b)` returns their differences, empty when the streams are
+equivalent. `python -m aie.utils.txn_trace insts.bin [other.bin]` does the
+same for streams on disk.
+
+```python
+import sys
+
+import aie.iron as iron
+import numpy as np
+from aie.iron.device import from_name
+from aie.utils.txn_trace import compare, explain
+
+sys.path.insert(0, "programming_examples/basic/matrix_multiplication/whole_array")
+from whole_array import whole_array
+
+iron.set_current_device(from_name("npu2"))
+tile = dict(m=32, k=32, n=32, n_aie_cols=1)
+buffers = dict(
+    A=np.ndarray[(512, 256), np.dtype[np.int16]],
+    B=np.ndarray[(256, 256), np.dtype[np.int16]],
+    C=np.ndarray[(512, 256), np.dtype[np.int32]],
+)
+dyn = whole_array.specialize(**buffers, **tile)
+words = dyn.instructions(M=256, K=128, N=128)
+print(explain(words))
+```
+
+## <u>Exercises</u>
+1. Run the code above from the repository root. Before the first `push`, every core in the column (rows 2 to 5) gets the same three `write` events. What are they?
+    <details markdown="1"><summary>Show answer</summary>
+    The sequence writes the worker's two runtime parameters, `K // k = 4` at `0x8800` and the core's output-tile count `(M // m) * (N // n) // 4 = 8` at `0x8804`, then sets the worker's barrier lock to 1 (`0x1f060`). The worker waits on that barrier before it reads them.
+    </details>
+
+2. Compare `w = dyn.instructions(M=512, K=256, N=256)` with `s = whole_array.specialize(M=512, K=256, N=256, **buffers, **tile).instructions()`. Are the streams the same words? Does `compare(w, s)` find a difference?
+    <details markdown="1"><summary>Show answer</summary>
+    The words differ: the dynamic stream is 494 words and the static one 480. The dispatch-time builder takes BD ids from a pool, polls a channel's status register until its task queue has room (`explain(w, raw=True)` shows two `maskpoll` ops), and leaves each BD's address word to the address patch where the static stream also writes the offset there. `compare(w, s)` returns `[]` because both streams program the same transfers.
+    </details>
+
+3. `compare(words, dyn.instructions(M=256, K=128, N=64))` reports only the first difference. Which event is it, and why that one?
+    <details markdown="1"><summary>Show answer</summary>
+    Event 1, the first core's output-tile count, is `0x8` against `0x4`: half of `N` gives each core half as many output tiles. The DMA pushes differ too, but the parameter write comes first in the stream.
+    </details>
+
+4. What does `dyn.instructions(M=100, K=128, N=128)` do?
+    <details markdown="1"><summary>Show answer</summary>
+    It raises `HostRuntimeError`: `M must be a multiple of m * n_aie_rows`. The design's `require` guard rejects the shape before any instruction is built.
+    </details>
+
 -----
-[[Up](./README.md)]
+[Up](./README.md)

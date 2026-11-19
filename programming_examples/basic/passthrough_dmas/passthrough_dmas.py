@@ -1,53 +1,107 @@
 # passthrough_dmas/passthrough_dmas.py -*- Python -*-
 #
-# This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-# See https://llvm.org/LICENSE.txt for license information.
+# Copyright (C) 2024-2026 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #
-# (c) Copyright 2024 Advanced Micro Devices, Inc. or its affiliates
-import numpy as np
+"""Passthrough DMAs — IRON API design with ``@iron.jit`` compilation.
+
+No compute tile: data flows shim → memtile → shim via
+``ObjectFifo.forward()``, exercising the implicit-copy DMA path.
+
+Two invocation modes:
+
+  * standalone:   ``python3 passthrough_dmas.py``
+  * compile-only: ``... --xclbin-path=PATH --insts-path=PATH``       (NPU)
+"""
+
+import argparse
 import sys
 
-from aie.iron import ObjectFifo, Program, Runtime
-from aie.iron.placers import SequentialPlacer
-from aie.iron.device import NPU1Col1, NPU2Col1, XCVC1902
+import aie.iron as iron
+import numpy as np
+from aie.iron import CompileTime, In, ObjectFifo, Out, Program, Runtime
+from aie.iron.device import AnyShimTile
+from aie.utils.hostruntime.argparse import add_compile_args, device_from_args
+from aie.utils.hostruntime.cli import run_design_cli
+from aie.utils.verify import assert_pass
 
-N = 4096
-line_size = 1024
+LINE_SIZE = 1024  # transfer chunk; N must be a multiple of this
 
-if len(sys.argv) > 1:
-    N = int(sys.argv[1])
-    assert N % line_size == 0
 
-if len(sys.argv) > 2:
-    if sys.argv[2] == "npu":
-        dev = NPU1Col1()
-    elif sys.argv[2] == "npu2":
-        dev = NPU2Col1()
-    elif sys.argv[2] == "xcvc1902":
-        dev = XCVC1902()
-    else:
-        raise ValueError("[ERROR] Device name {} is unknown".format(sys.argv[2]))
+@iron.jit
+def passthrough_dmas(
+    a_in: In,
+    _b_unused: In,
+    c_out: Out,
+    *,
+    n: CompileTime[int] = 4096,
+):
+    vector_ty = np.ndarray[(n,), np.dtype[np.int32]]
+    line_ty = np.ndarray[(LINE_SIZE,), np.dtype[np.int32]]
 
-# Define tensor types
-vector_ty = np.ndarray[(N,), np.dtype[np.int32]]
-line_ty = np.ndarray[(line_size,), np.dtype[np.int32]]
+    of_in = ObjectFifo(line_ty, name="in")
+    of_out = of_in.cons().forward()
 
-# Data movement with ObjectFifos
-of_in = ObjectFifo(line_ty, name="in")
-of_out = of_in.cons().forward()
+    def sequence(a, _, c, in_h, out_h):
+        in_h.fill(a)
+        out_h.drain(c, wait=True)
 
-# Runtime operations to move data to/from the AIE-array
-rt = Runtime()
-with rt.sequence(vector_ty, vector_ty, vector_ty) as (a_in, _, c_out):
-    rt.fill(of_in.prod(), a_in)
-    rt.drain(of_out.cons(), c_out, wait=True)
+    rt = Runtime(
+        sequence,
+        [
+            vector_ty,
+            vector_ty,
+            vector_ty,
+            of_in.prod(tile=AnyShimTile),
+            of_out.cons(tile=AnyShimTile),
+        ],
+    )
 
-# Create the program from the device type and runtime
-my_program = Program(dev, rt)
+    return Program(iron.get_current_device(), rt).resolve_program()
 
-# Place components (assign them resources on the device) and generate an MLIR module
-module = my_program.resolve_program(SequentialPlacer())
 
-# Print the generated MLIR
-print(module)
+def _make_argparser():
+    p = argparse.ArgumentParser(prog="AIE Passthrough DMAs")
+    add_compile_args(
+        p,
+        dev_choices=("npu", "npu2"),
+        with_emit_mlir=True,
+        with_elf=True,
+    )
+    p.add_argument("-n", "--length", type=int, default=4096, help="elements")
+    return p
+
+
+def _validate(opts):
+    if opts.length % LINE_SIZE != 0:
+        sys.exit(f"--length ({opts.length}) must be a multiple of {LINE_SIZE}")
+
+
+def _compile_kwargs(opts):
+    return dict(n=opts.length)
+
+
+def _run_and_verify(opts):
+    a_t = iron.arange(1, opts.length + 1, dtype=np.int32, device="npu")
+    b_t = iron.zeros_like(a_t)  # unused 2nd buffer
+    c_t = iron.zeros_like(a_t)
+
+    passthrough_dmas(a_t, b_t, c_t, **_compile_kwargs(opts))
+
+    assert_pass(c_t.numpy(), a_t.numpy(), fail_msg="output does not match input")
+
+
+def main():
+    opts = _make_argparser().parse_args()
+    run_design_cli(
+        passthrough_dmas,
+        opts,
+        compile_kwargs=_compile_kwargs,
+        run_and_verify=_run_and_verify,
+        device=device_from_args,
+        validate=_validate,
+    )
+
+
+if __name__ == "__main__":
+    main()

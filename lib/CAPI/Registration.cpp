@@ -1,10 +1,7 @@
 //===- Registration.cpp -----------------------------------------*- C++ -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2022-2024 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2022-2024 Advanced Micro Devices, Inc. or its affiliates
 //
 //===----------------------------------------------------------------------===//
 
@@ -19,6 +16,7 @@
 #include "aie/InitialAllDialect.h"
 #include "aie/Target/LLVMIR/Dialect/All.h"
 
+#include "mlir/Dialect/DLTI/DLTI.h"
 #include "mlir/IR/Dialect.h"
 #include "mlir/InitAllDialects.h"
 #include "mlir/InitAllExtensions.h"
@@ -30,7 +28,9 @@ using namespace mlir;
 void aieRegisterAllPasses() {
   xilinx::registerConversionPasses();
   xilinx::AIE::registerAIEPasses();
+  xilinx::AIE::registerAIEObjectFifoPipeline();
   xilinx::AIEX::registerAIEXPasses();
+  xilinx::AIEX::registerAIEResourceStagesPipeline();
   xilinx::aievec::registerAIEVecAnalysisPasses();
   xilinx::aievec::registerAIEVecPasses();
   xilinx::aievec::registerAIEVecPipelines();

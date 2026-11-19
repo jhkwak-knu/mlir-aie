@@ -1,10 +1,8 @@
 //===- Passes.h - AIE Vector Passes -----------------------------*- C++ -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2022 Xilinx, Inc.
+// Copyright (C) 2022-2026 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2022 Xilinx Inc.
 //
 //===----------------------------------------------------------------------===//
 // Register all the AIE vectorization passes
@@ -31,7 +29,6 @@ namespace xilinx {
 namespace aievec {
 
 #define GEN_PASS_DECL
-#define GEN_PASS_CLASSES
 #include "aie/Dialect/AIEVec/Analysis/Passes.h.inc"
 
 std::unique_ptr<mlir::Pass> createAIEVecConvolutionAnalysisPass();

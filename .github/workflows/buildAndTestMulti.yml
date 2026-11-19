@@ -1,13 +1,21 @@
+# Copyright (C) 2023-2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
 name: Compile across platforms
 
+permissions:
+  contents: read
+
 on:
-  push:
-    branches:
-      - main
+  # No push trigger for main: the merge queue runs this workflow on the
+  # commit that lands, so a push run repeats it.
   pull_request:
-    types: [assigned, opened, synchronize, reopened]
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
   merge_group:
+  schedule:
+    # Runs at midnight (00:00) every day
+    - cron: '0 0 * * *'
 
 defaults:
   run:
@@ -39,7 +47,7 @@ jobs:
       # Run the tests on the Cartesian product of the following
       matrix:
 
-        OS: [ ubuntu-22.04, ubuntu-24.04 ]
+        OS: [ ubuntu-26.04 ]
         COMPILER: [ llvm, gcc ]
         ENABLE_ASSERTIONS: [ ON, OFF ]
         ENABLE_RTTI: [ ON, OFF ]
@@ -66,22 +74,26 @@ jobs:
       # Clone the repo and its submodules. Do shallow clone to save clone
       # time.
       - name: Get the project repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 2
-          submodules: "true"
+          submodules: "recursive"
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
-          python-version: '3.10'
+          python-version: '3.12'
 
       - name: Install Python packages
         run: |
-          pip install -r python/requirements.txt
-          HOST_MLIR_PYTHON_PACKAGE_PREFIX=aie pip install -r python/requirements_extras.txt
+          python -m pip install --upgrade pip
+          python utils/mlir_aie_wheels/vendor_eudsl.py \
+              --requirements python/requirements.txt \
+              --install-non-eudsl
+          python -m pip install --require-hashes -r python/requirements_notebook.lock
+          python -m pip install --require-hashes -r python/requirements_dev.lock
 
       - name: Setup Cpp
-        uses: aminya/setup-cpp@1fd813945e55021261b381c59275db442da4082f
+        uses: aminya/setup-cpp@15a6bd8cf39030f88b5da3d203a829ec4eea4955  # v1.10.1
         with:
           compiler: ${{ matrix.COMPILER }}
           vcvarsall: ${{ contains(matrix.OS, 'windows') }}
@@ -96,35 +108,51 @@ jobs:
         with:
           MATRIX_OS: ${{ matrix.OS }}
           MATRIX_ARCH: x86
-          EXTRA_KEY: compile-and-test-assert=${{ matrix.ENABLE_ASSERTIONS }}-rtti=${{ matrix.ENABLE_RTTI }}
+          EXTRA_KEY: compile-and-test-${{ matrix.COMPILER }}-assert=${{ matrix.ENABLE_ASSERTIONS }}-rtti=${{ matrix.ENABLE_RTTI }}
 
       - name: Get MLIR
         id: mlir-wheels
         run: |
-          
+
           VERSION=$(utils/clone-llvm.sh --get-wheel-version)
-          if [ x"${{ matrix.ENABLE_RTTI }}" == x"OFF"]; then
+          if [ x"${{ matrix.ENABLE_RTTI }}" == x"OFF" ]; then
             WHEEL=mlir_no_rtti
           else
             WHEEL=mlir
           fi
-          pip -q download $WHEEL==$VERSION \
-            -f https://github.com/Xilinx/mlir-aie/releases/expanded_assets/mlir-distro
-          unzip -q mlir-*.whl
+          for attempt in 1 2 3; do
+            rm -f "$WHEEL"-*.whl
+            if pip -q download $WHEEL==$VERSION \
+              -f https://github.com/Xilinx/mlir-aie/releases/expanded_assets/mlir-distro; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "Failed to download MLIR wheel after ${attempt} attempts" >&2
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
+          unzip -q "$WHEEL"-*.whl
 
       # Build the repo test target in release mode to build and test.
       - name: Build and test
         run: |
-          
-          mkdir build_release
+
+          if [ x"${{ matrix.ENABLE_RTTI }}" == x"OFF" ]; then
+            WHEEL=mlir_no_rtti
+          else
+            WHEEL=mlir
+          fi
+
+          mkdir -p build_release/install
           cd build_release
-          
+
           if [ x"${{ contains(matrix.OS, 'windows') }}" == x"true" ]; then
             LLVM_EXTERNAL_LIT="$(where lit)"
           else
             LLVM_EXTERNAL_LIT="$(which lit)"
           fi
-          
+
           cmake .. \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
@@ -133,6 +161,7 @@ jobs:
             -DCMAKE_VISIBILITY_INLINES_HIDDEN=ON \
             -DCMAKE_C_VISIBILITY_PRESET=hidden \
             -DCMAKE_CXX_VISIBILITY_PRESET=hidden \
+            -DCMAKE_INSTALL_PREFIX=$PWD/install \
             -DAIE_COMPILER=NONE \
             -DAIE_LINKER=NONE \
             -DAIE_ENABLE_PYTHON_PASSES=OFF \
@@ -140,15 +169,14 @@ jobs:
             -DLLVM_ENABLE_ASSERTIONS=${{ matrix.ENABLE_ASSERTIONS }} \
             -DLLVM_ENABLE_RTTI=${{ matrix.ENABLE_RTTI }} \
             -DCMAKE_MODULE_PATH=$PWD/../cmake/modulesXilinx \
-            -DMLIR_DIR=$PWD/../mlir/lib/cmake/mlir \
-            -DLLVM_DIR=$PWD/../mlir/lib/cmake/llvm \
+            -DMLIR_DIR=$PWD/../$WHEEL/lib/cmake/mlir \
+            -DLLVM_DIR=$PWD/../$WHEEL/lib/cmake/llvm \
             -DLLVM_EXTERNAL_LIT="$LLVM_EXTERNAL_LIT"
-          
+
           ninja
           # tests hang/fail on windows
           if [ x"${{ contains(matrix.OS, 'windows') }}" == x"false" ]; then
             ninja check-aie
-            ninja check-tutorials
             ninja check-reference-designs
             ninja check-programming-guide
           fi

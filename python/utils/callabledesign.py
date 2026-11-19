@@ -1,0 +1,690 @@
+# callabledesign.py -*- Python -*-
+#
+# Copyright (C) 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+#
+"""CallableDesign: JIT-compiles on first call and runs on the NPU.
+
+``CallableDesign`` wraps a ``CompilableDesign`` (or creates one implicitly)
+and provides a ``__call__`` interface that:
+
+1. Compiles the MLIR generator on first invocation (or returns a cached kernel
+   on subsequent calls with the same compile configuration).
+2. Supports two usage patterns for ``CompileTime[T]`` parameters:
+
+   * **Pre-bound** (``@iron.jit(M=512)``): compile params fixed at decoration
+     time; no extra kwargs needed at call time.
+   * **Call-time** (bare ``@iron.jit``): ``CompileTime[T]``-annotated params
+     passed as kwargs at each call site; different values produce independently
+     cached kernels.
+
+   When both are supplied for the same name, the call-time value wins.
+
+3. Splits runtime arguments into tensor args (``In``/``Out``/``InOut``
+   annotated) and scalar kwargs (everything else) using the generator's type
+   annotations — no heuristic type-checking needed.
+4. Validates tensor shapes/dtypes against the compiled kernel specification.
+5. Invokes the ``NPUKernel`` with the tensor args and scalar kwargs.
+"""
+
+from __future__ import annotations
+
+import inspect as _inspect
+import logging
+from collections.abc import Mapping
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable, Sequence
+
+import numpy as np
+from aie.helpers.errors import hide_internal_frames
+from aie.utils.compile.cache.utils import _create_function_cache_key
+from aie.utils.compile.jit.compilabledesign import CompilableDesign
+from aie.utils.hostruntime.tensor_class import NpuTensor, TensorRegion
+from aie.utils.trace.parse import DEFAULT_KERNEL
+
+if TYPE_CHECKING:
+    from aie.utils.npukernel import NPUKernel
+
+# NPUKernel and DefaultNPURuntime pull in the XRT runtime stack on import.
+# Defer to first call so importing CallableDesign on machines without an NPU
+# (e.g. CI nodes that only need as_mlir / generate_mlir for inspection) does
+# not fail at module load.
+
+logger = logging.getLogger(__name__)
+
+
+class CallableDesign:
+    """JIT-compiling, callable wrapper around a ``CompilableDesign``.
+
+    Supports two ``CompileTime[T]`` binding patterns:
+
+    * **Pre-bound** — pass compile params at decoration time:
+
+      ```python
+      @iron.jit(M=512, K=512, N=512)
+      def gemm(a: In, b: In, c: Out,
+               M: CompileTime[int], K: CompileTime[int], N: CompileTime[int]):
+          ...
+
+      gemm(a, b, c)  # compiles once, cached thereafter
+      ```
+
+    * **Call-time** — pass compile params as kwargs at each call site:
+
+      ```python
+      @iron.jit
+      def gemm(a: In, b: In, c: Out,
+               M: CompileTime[int], K: CompileTime[int], N: CompileTime[int]):
+          ...
+
+      gemm(a, b, c, M=512, K=512, N=512)  # compiled for this shape
+      gemm(a2, b2, c2, M=1024, K=1024, N=1024)  # separate cached kernel
+      ```
+
+    Args:
+        mlir_generator: A callable, ``Path`` to a ``.mlir`` file, or an
+            existing ``CompilableDesign`` instance.
+        compile_kwargs: Values for ``CompileTime[T]``-annotated parameters.
+            Ignored when *mlir_generator* is already a ``CompilableDesign``.
+        use_cache: Enable filesystem caching. Forwarded to ``CompilableDesign``.
+        source_files: C++ kernel source files. Forwarded to ``CompilableDesign``.
+        aiecc_flags: Extra ``aiecc`` flags. Forwarded to ``CompilableDesign``.
+        compile_flags: Extra Peano compiler flags. Forwarded to ``CompilableDesign``.
+        include_paths: Extra ``-I`` paths. Forwarded to ``CompilableDesign``.
+        object_files: Pre-compiled ``.o`` files. Forwarded to ``CompilableDesign``.
+        trace_config: Optional ``TraceConfig`` for hardware trace collection.
+            When set, ``trace_config.trace_size`` is injected as a
+            ``trace_size`` compile kwarg so generators can use
+            ``trace_size: CompileTime[int] = 0`` instead of receiving the full
+            ``TraceConfig`` object.
+        full_elf: When ``True``, the design compiles to a single self-contained
+            full ELF (PDIs + TXN control code) and runs through the full-ELF
+            ``XRTHostRuntime`` path.  Forwarded to ``CompilableDesign``.
+    """
+
+    def __init__(
+        self,
+        mlir_generator: Callable | Path | CompilableDesign,
+        *,
+        compile_kwargs: dict[str, Any] | None = None,
+        use_cache: bool = True,
+        source_files: list[str | Path] | None = None,
+        aiecc_flags: list[str] | None = None,
+        compile_flags: list[str] | None = None,
+        include_paths: list[str | Path] | None = None,
+        object_files: list[str | Path] | None = None,
+        trace_config=None,
+        full_elf: bool = False,
+    ):
+        if isinstance(mlir_generator, CompilableDesign):
+            self.compilable = mlir_generator
+        else:
+            self.compilable = CompilableDesign(
+                mlir_generator,
+                compile_kwargs=compile_kwargs,
+                use_cache=use_cache,
+                source_files=source_files,
+                aiecc_flags=aiecc_flags,
+                compile_flags=compile_flags,
+                include_paths=include_paths,
+                object_files=object_files,
+                full_elf=full_elf,
+            )
+
+        self.trace_config = trace_config
+        if callable(self.compilable.mlir_generator):
+            declaration = self.compilable.declaration
+            assert declaration is not None and declaration.signature is not None
+            signature = declaration.signature
+            if "parameters" in signature.parameters:
+                raise TypeError(
+                    f"{self.compilable.generator_name!r} names a parameter "
+                    "'parameters', which a call takes for its ScratchpadParameter "
+                    "values; name it otherwise"
+                )
+            if "entry" in signature.parameters:
+                raise TypeError(
+                    f"{self.compilable.generator_name!r} names a parameter "
+                    "'entry', which a call takes for the entry runtime it "
+                    "dispatches; name it otherwise"
+                )
+
+        # Pre-build the named wrapper object used as the cache-key identity for
+        # Path-based generators.  Creating it once here avoids allocating a new
+        # anonymous class and instance on every __call__ invocation.
+        if isinstance(self.compilable.mlir_generator, Path):
+            self._path_cache_fn = type(
+                "_PathKernel", (), {"__name__": str(self.compilable.mlir_generator)}
+            )()
+        else:
+            self._path_cache_fn = None
+
+        self._kernel_cache: dict = {}
+
+        if (
+            logger.isEnabledFor(logging.DEBUG)
+            and callable(self.compilable.mlir_generator)
+            and not self.compilable.compile_kwargs
+        ):
+            sig = _inspect.signature(self.compilable.mlir_generator)
+            unbound_required = [
+                name
+                for name in self.compilable.compile_params
+                if sig.parameters[name].default is _inspect.Parameter.empty
+            ]
+            if unbound_required:
+                logger.debug(
+                    "%r has CompileTime[T] parameters with no defaults and no "
+                    "pre-bound values: %s. Pass these as keyword arguments at "
+                    "every call site: kernel(..., %s).",
+                    self.compilable.generator_name,
+                    unbound_required,
+                    ", ".join(f"{n}=..." for n in unbound_required),
+                )
+
+    def _extract_compile_kwargs(
+        self, runtime_kwargs: dict[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        """Split runtime_kwargs into call-time compile params and scalar kwargs.
+
+        Returns:
+            (call_compile_kwargs, scalar_runtime_kwargs, effective_compile_kwargs)
+        """
+        call_compile_kwargs: dict[str, Any] = {}
+        scalar_runtime_kwargs: dict[str, Any] = {}
+
+        compile_param_names = set(self.compilable.compile_params)
+        for name, val in runtime_kwargs.items():
+            if name in self.compilable.bound_dispatch_params:
+                raise TypeError(
+                    f"DispatchTime parameter {name!r} is specialized; use "
+                    "specialize() to create a design with a different constant."
+                )
+            if name in compile_param_names:
+                call_compile_kwargs[name] = val
+            else:
+                scalar_runtime_kwargs[name] = val
+
+        # Call-time compile_kwargs win, matching Triton (and CompilableDesign
+        # .specialize() — pre-bound is the starting set, the call-site kwarg
+        # overrides). __call__ and as_mlir share these semantics.
+        effective_compile_kwargs = {
+            **self.compilable.compile_kwargs,
+            **call_compile_kwargs,
+        }
+
+        return call_compile_kwargs, scalar_runtime_kwargs, effective_compile_kwargs
+
+    def _build_compilable(
+        self,
+        call_compile_kwargs: dict[str, Any],
+        tensor_args: Sequence = (),
+    ) -> CompilableDesign:
+        """Return a compilable for this call's effective compile kwargs.
+
+        Each named tensor's type, ``np.ndarray[shape, np.dtype[T]]``, is bound
+        to its parameter so the generator sees it. If anything is bound a
+        transient ``CompilableDesign`` is created so the original
+        ``self.compilable`` remains unchanged for future calls.  Otherwise
+        ``self.compilable`` is returned directly.
+        """
+        call_compile_kwargs = dict(call_compile_kwargs)
+        named = [
+            n
+            for n in self.compilable.tensor_params
+            if n != self.compilable.variadic_tensor_param
+        ]
+        for name, tensor in zip(named, tensor_args):
+            if isinstance(tensor, (NpuTensor, TensorRegion, np.ndarray)):
+                call_compile_kwargs[name] = np.ndarray[
+                    tuple(tensor.shape), np.dtype[np.dtype(tensor.dtype).type]
+                ]
+        if call_compile_kwargs:
+            return self.compilable.specialize(**call_compile_kwargs)
+        return self.compilable
+
+    def _compile_and_build_kernel(
+        self,
+        compilable: CompilableDesign,
+        cache_key,
+        trace_config,
+        entry: str | None = None,
+    ) -> NPUKernel:
+        from aie.utils.npukernel import NPUKernel
+
+        xclbin_path, inst_path = compilable.compile()
+        if entry is not None and not compilable.full_elf:
+            inst_path = compilable.entry_insts_path(entry)
+        if trace_config is not None and compilable._kernel_dir is not None:
+            physical_mlir = compilable._kernel_dir / "input_with_addresses.mlir"
+            if physical_mlir.exists():
+                trace_config.physical_mlir_path = str(physical_mlir)
+            trace_config.kernel = compilable._dispatched_entry(entry) or DEFAULT_KERNEL
+        # The lowered runtime_sequence operand list is the true host-buffer
+        # contract (one operand per host BO, including any trace/ctrl-packet
+        # buffer the lowering appended). Its length is floor-independent, unlike
+        # the kernels.json boN slot count which aiecc floors to the firmware
+        # command-chain minimum -- so this is what host buffer counts are
+        # validated against.
+        expected_sizes = (
+            compilable.expected_tensor_sizes
+            if entry is None
+            else compilable.entry_tensor_sizes(entry)
+        )
+        num_host_bos = len(expected_sizes) if expected_sizes is not None else None
+        if compilable.full_elf:
+            # Full-ELF: compile() returns (elf_path, None). The kernel is loaded
+            # standalone from the ELF and addressed by its "<device>:<sequence>"
+            # name (there is no xclbin/insts pair). compile() always sets both
+            # of these on the full-ELF path.
+            assert (
+                compilable._elf_path is not None
+                and compilable._full_elf_kernel_name is not None
+            )
+            cache_entry = compilable.get_cache_entry()
+            kernel = NPUKernel(
+                elf_path=compilable._elf_path,
+                kernel_name=(
+                    compilable.entry_kernel_name(entry)
+                    if entry is not None
+                    else compilable._full_elf_kernel_name
+                ),
+                init_entry=compilable._full_elf_init_entry,
+                trace_config=trace_config,
+                num_host_bos=num_host_bos,
+                params_path=cache_entry.params if cache_entry is not None else None,
+            )
+        else:
+            kernel = NPUKernel(
+                xclbin_path,
+                inst_path,
+                kernel_name="MLIR_AIE",
+                trace_config=trace_config,
+                num_host_bos=num_host_bos,
+                dispatch_params=compilable.dispatch_params,
+                dispatch_lib_path=compilable.get_dispatch_lib_path(),
+            )
+        return kernel
+
+    def __call__(self, *runtime_args, **runtime_kwargs):
+        """Compile (if needed), then run the kernel.
+
+        ``CompileTime[T]``-annotated kwargs in *runtime_kwargs* are extracted and
+        merged with any pre-bound ``compile_kwargs``; remaining kwargs are
+        forwarded to the NPU kernel as scalar arguments.
+
+        Positional args fill tensor params (``In``/``Out``/``InOut``) in the
+        order they appear in the generator signature.
+
+        Args:
+            *runtime_args: Runtime tensor and/or scalar positional arguments.
+            **runtime_kwargs: Mix of call-time ``CompileTime[T]`` params and
+                runtime scalar kernel arguments; ``parameters``: the
+                design's ScratchpadParameter values for this call, a mapping
+                by name, written to the run's ctrl scratchpad before it
+                starts (the design compiles to a full ELF, ``full_elf=True``);
+                and ``entry``: the Program entry runtime to dispatch from the
+                same build, by ``"device:sequence"`` or, when no other entry
+                shares it, by sequence name (default: its first).
+
+        Returns:
+            The result of ``NPUKernel.__call__``.
+
+        Raises:
+            TypeError: ``parameters`` is not a mapping, or ``entry`` not a string.
+        """
+        try:
+            parameters = runtime_kwargs.pop("parameters", None)
+            if parameters is not None and not isinstance(parameters, Mapping):
+                raise TypeError(
+                    f"parameters must map ScratchpadParameter names to values, not "
+                    f"{type(parameters).__name__}"
+                )
+            entry = runtime_kwargs.pop("entry", None)
+            if entry is not None and not isinstance(entry, str):
+                raise TypeError(
+                    f"entry names an entry runtime, not a {type(entry).__name__}"
+                )
+            # --- Split call-time CompileTime[T] params from runtime scalar kwargs ---
+            # trace_config is handled specially: if annotated as CompileTime[object] on
+            # the generator, it flows through the normal CompileTime[T] classification so
+            # the generator receives it and can conditionally enable tracing in the
+            # generated MLIR.  We extract it from effective_compile_kwargs after the
+            # merge (below) rather than popping it here.
+            call_compile_kwargs, scalar_runtime_kwargs, effective_compile_kwargs = (
+                self._extract_compile_kwargs(runtime_kwargs)
+            )
+
+            # Guard 3-A: tensor params must not appear as runtime kwargs.
+            tensor_names = set(self.compilable.tensor_params)
+            confused_tensor_kwargs = set(scalar_runtime_kwargs.keys()) & tensor_names
+            if confused_tensor_kwargs:
+                raise TypeError(
+                    f"{self.compilable.generator_name!r} received tensor "
+                    f"param(s) as keyword arguments: {confused_tensor_kwargs}.\n"
+                    f"  Params annotated In/Out/InOut must be passed positionally.\n"
+                    f"  CompileTime[T] params (passed as kwargs): "
+                    f"{self.compilable.compile_params}."
+                )
+
+            # Guard 3-C: too many positional args. A variadic tensor list takes
+            # any number; the lowered sequence's operand count checks it later.
+            if (
+                callable(self.compilable.mlir_generator)
+                and self.compilable.variadic_tensor_param is None
+            ):
+                max_positional = (
+                    len(self.compilable.tensor_params)
+                    + len(self.compilable.dispatch_params)
+                    + len(self.compilable.scalar_params)
+                )
+                if len(runtime_args) > max_positional:
+                    raise TypeError(
+                        f"{self.compilable.generator_name!r} takes at most "
+                        f"{max_positional} positional argument(s) "
+                        f"(tensor: {len(self.compilable.tensor_params)}, "
+                        f"dispatch: {len(self.compilable.dispatch_params)}, "
+                        f"scalar: {len(self.compilable.scalar_params)}) "
+                        f"but {len(runtime_args)} were given.\n"
+                        f"  CompileTime[T] parameters {self.compilable.compile_params} "
+                        f"must be keyword arguments, not positional."
+                    )
+
+            trace_config = self.trace_config
+            if trace_config is not None:
+                if "trace_size" not in effective_compile_kwargs:
+                    effective_compile_kwargs["trace_size"] = trace_config.trace_size
+                    call_compile_kwargs["trace_size"] = trace_config.trace_size
+            else:
+                trace_config = effective_compile_kwargs.get("trace_config", None)
+
+            # The TraceConfig carries mutable per-call state, so keying on it would
+            # miss every call; its size must be in the key even so, because a traced
+            # build is a different program. Keying on neither let a traced run reuse
+            # the untraced kernel and come back with an empty trace.
+            cache_compile_kwargs = {
+                k: v for k, v in effective_compile_kwargs.items() if k != "trace_config"
+            }
+            if trace_config is not None:
+                cache_compile_kwargs["trace_size"] = trace_config.trace_size
+
+            from aie.utils import ensure_current_device
+
+            ensure_current_device()
+
+            tensor_args, remaining_scalars = self.compilable.split_runtime_args(
+                runtime_args, scalar_runtime_kwargs
+            )
+            compilable = self._build_compilable(call_compile_kwargs, tensor_args)
+            from aie.utils.npukernel import NPUKernel
+
+            # A misspelled keyword fails here, not after a fresh design compiles.
+            NPUKernel.check_keywords(compilable.dispatch_params, remaining_scalars)
+
+            generator = compilable.mlir_generator
+            if callable(generator):
+                cache_fn = generator
+            else:
+                cache_fn = self._path_cache_fn
+
+            # Tensor args are the whole runtime half of the key: a DispatchTime[T]
+            # value is not part of the compiled artifact, so keying on it would
+            # build one kernel per distinct value.
+            cache_key = _create_function_cache_key(
+                cache_fn,
+                tuple(tensor_args),
+                cache_compile_kwargs,
+                extra_key=compilable._generation_cache_key(
+                    full_elf=compilable.full_elf_requested
+                ),
+            )
+
+            # A traced call skips the in-process cache. Decoding a trace needs the
+            # physical MLIR, and only going through compile() tells the design which
+            # directory holds it -- an in-process hit returns the kernel without
+            # ever asking. The on-disk cache still serves the artifacts, so this
+            # re-reads rather than rebuilds.
+            use_kernel_cache = compilable.use_cache and trace_config is None
+            kernel_key = (cache_key, entry)
+            kernel = self._kernel_cache.get(kernel_key) if use_kernel_cache else None
+            if kernel is not None:
+                if kernel.elf_path is not None:
+                    artifacts_present = Path(kernel.elf_path).is_file()
+                elif compilable.dispatch_params:
+                    # A dispatch design has no insts.bin at all -- the instruction
+                    # stream is rebuilt per call from its bridge, so that is the
+                    # artifact whose disappearance has to invalidate the kernel.
+                    lib = kernel.dispatch_lib_path
+                    artifacts_present = (
+                        Path(kernel.xclbin_path).is_file()
+                        and lib is not None
+                        and Path(lib).is_file()
+                    )
+                else:
+                    artifacts_present = (
+                        Path(kernel.xclbin_path).is_file()
+                        and Path(kernel.insts_path).is_file()
+                    )
+                if not artifacts_present:
+                    self._kernel_cache.pop(kernel_key, None)
+                    kernel = None
+            if kernel is None:
+                kernel = self._compile_and_build_kernel(
+                    compilable, cache_key, trace_config, entry
+                )
+                if use_kernel_cache:
+                    self._kernel_cache[kernel_key] = kernel
+
+            # After compile(): validation reads expected_tensor_sizes.
+            implicit_tensor_count = 0
+            if trace_config is not None:
+                if not trace_config.reuse_output_buffer:
+                    implicit_tensor_count = 1 + int(trace_config.enable_ctrl_pkts)
+                elif not tensor_args:
+                    implicit_tensor_count = 1
+            compilable.validate_tensor_args(
+                tensor_args,
+                num_host_bos=kernel.num_host_bos,
+                implicit_tensor_count=implicit_tensor_count,
+                entry=entry,
+            )
+
+            try:
+                return kernel(*tensor_args, parameters=parameters, **remaining_scalars)
+            except RuntimeError as exc:
+                # IOCTL EINVAL → stale XRT hw_context. Match libxrt's "err=-22"
+                # or xrt::error's "XRT...Invalid argument"; bare "Invalid argument"
+                # is too generic and is not treated as EINVAL.
+                msg = str(exc)
+                is_xrt_einval = "err=-22" in msg or (
+                    "Invalid argument" in msg and ("XRT" in msg or "xrt" in msg)
+                )
+                if not is_xrt_einval:
+                    raise
+                logger.warning(
+                    "XRT IOCTL EINVAL detected for %r; evicting hw_context and "
+                    "retrying once. Original error: %s",
+                    self.compilable.generator_name,
+                    msg,
+                )
+
+                self._kernel_cache.pop(kernel_key, None)
+                # compile() returns the primary artifact path first (xclbin, or the
+                # full ELF in full-ELF mode) -- the same path the context cache is
+                # keyed on, so it is the correct eviction key either way.
+                primary_artifact, _ = compilable.compile()
+                # Evict the stale cached context so the retry rebuilds a fresh one.
+                # Runtimes without an evictable context cache (e.g. HRX) inherit the
+                # base no-op, so this needs no backend-specific branching here.
+                from aie.utils import DefaultNPURuntime
+
+                if DefaultNPURuntime is not None:
+                    DefaultNPURuntime.evict_context(primary_artifact)
+                kernel = self._compile_and_build_kernel(
+                    compilable, cache_key, trace_config, entry
+                )
+                if use_kernel_cache:
+                    self._kernel_cache[kernel_key] = kernel
+                return kernel(*tensor_args, parameters=parameters, **remaining_scalars)
+        except Exception as exc:
+            raise hide_internal_frames(exc)
+
+    def specialize(self, **overrides) -> "CallableDesign":
+        """Return a new ``CallableDesign`` with overrides applied.
+
+        Overrides are split by name: those matching a configuration parameter
+        (``use_cache``, ``aiecc_flags``, ``full_elf``, ``trace_config``, …)
+        replace that config; all others are treated as ``CompileTime[T]`` values
+        and merged onto any pre-bound ``compile_kwargs`` (call-time values
+        winning — matching ``__call__`` / ``as_mlir`` semantics).  Every other
+        config is preserved.
+
+        Config is thus as retargetable as ``CompileTime[T]`` kwargs — e.g.
+        ``design.specialize(full_elf=True)`` re-aims an existing design at the
+        full-ELF path, symmetric with ``@iron.jit(full_elf=True)``.
+
+        Use together with ``compile`` to perform ahead-of-time compilation
+        of a JIT-decorated design at known shapes:
+
+        ```python
+        @iron.jit
+        def matmul(...): ...
+
+        matmul.specialize(M=256, K=256, N=256, element_type=np.int16).compile()
+        ```
+        """
+        # trace_config is dual-natured: it configures the CallableDesign wrapper
+        # (buffer read-back after the run) AND, for designs that declare it as a
+        # CompileTime[T] generator param, it must reach the generator so trace
+        # flows are baked into the MLIR.  So capture it for the wrapper but leave
+        # it in `overrides` -- compilable.specialize() routes it into the
+        # generator's compile_kwargs (it is not a CompilableDesign config key).
+        # Popping it here would silently drop tracing from the compile-only path
+        # (specialize(...).compile(xclbin_path=...)), yielding an empty trace
+        # buffer downstream ("No valid trace data found").
+        trace_config = overrides.get("trace_config", self.trace_config)
+        return CallableDesign(
+            self.compilable.specialize(**overrides),
+            trace_config=trace_config,
+        )
+
+    def compile(
+        self,
+        xclbin_path: Path | str | None = None,
+        inst_path: Path | str | None = None,
+        elf_path: Path | str | None = None,
+        full_elf_path: Path | str | None = None,
+        pdi_path: Path | str | None = None,
+        npu_cpp_path: Path | str | None = None,
+    ) -> tuple[Path | None, Path | None]:
+        """Eagerly compile this design and return ``(xclbin_path, inst_path)``.
+
+        With no arguments, pre-warms the on-disk cache so subsequent calls with
+        matching ``compile_kwargs`` hit the cache instead of paying ``aiecc``
+        time on first invocation.
+
+        With both ``xclbin_path`` and ``inst_path`` set, writes artifacts
+        directly to those paths instead of the cache, rebuilding them only
+        when they are out of date — useful for build systems (e.g. Makefiles)
+        that name their own outputs.
+        Non-dispatch designs require both paths or neither, unless
+        ``npu_cpp_path`` replaces ``inst_path`` (returning ``(xclbin_path, None)``).
+        Active ``DispatchTime[T]`` designs accept ``xclbin_path`` alone,
+        return ``(xclbin_path, None)``, and reject ``inst_path`` and ``elf_path``
+        (there is no static instruction stream). The immutable dispatch library
+        remains in ``<xclbin stem>.prj``; use ``get_dispatch_lib_path()``.
+
+        ``elf_path`` is optional: when set, aiecc also wraps the NPU
+        instructions into an ELF (via ``aiebu-asm``) at that path.  Needed by
+        C++ testbenches that load instructions through ``xrt::elf`` +
+        ``xrt::module``; requires explicit ``xclbin_path`` + ``inst_path``.
+
+        ``full_elf_path`` (or ``full_elf=True`` on the design) selects full-ELF
+        mode: a single self-contained ELF is written there instead of an
+        xclbin + insts pair, and the return value is ``(elf_path, None)``.
+
+        ``pdi_path`` is optional: when set, aiecc writes the Programmable
+        Device Image to that path. Requires explicit ``xclbin_path``.
+        In cache mode, use ``get_pdi_path`` to locate the ``main.pdi`` aiecc emits.
+
+        ``npu_cpp_path`` is optional: when set, aiecc emits the runtime
+        sequence as a parameterized C++ TXN builder at that path instead of
+        (or alongside) the static instruction stream -- one compiled overlay's
+        sequence re-expressed as a function a native caller can invoke with
+        its own runtime values, without recompiling. Requires explicit
+        ``xclbin_path`` but not ``inst_path``; omit ``inst_path`` for
+        runtime-valued sequences that cannot produce static instructions.
+        It is not available for ``DispatchTime[T]`` designs,
+        which already build their own C++ builder as the dispatch bridge
+        (retrieve it with ``get_dispatch_lib_path()``).
+        """
+        try:
+            return self.compilable.compile(
+                xclbin_path=xclbin_path,
+                inst_path=inst_path,
+                elf_path=elf_path,
+                full_elf_path=full_elf_path,
+                pdi_path=pdi_path,
+                npu_cpp_path=npu_cpp_path,
+            )
+        except Exception as exc:
+            raise hide_internal_frames(exc)
+
+    def get_pdi_path(self, device_name: str | None = None) -> Path | None:
+        """Return one cache-directory PDI, or ``None`` if none is present.
+
+        Thin passthrough to ``CompilableDesign.get_pdi_path``; pass
+        ``device_name`` to pick a specific ``aie.device``'s PDI in a
+        multi-device design.
+        """
+        return self.compilable.get_pdi_path(device_name)
+
+    def get_dispatch_lib_path(self) -> Path | None:
+        """Return the immutable dispatch library after compile(), or ``None``."""
+        return self.compilable.get_dispatch_lib_path()
+
+    def get_pdi_paths(self) -> list[Path]:
+        """Return every cache-directory PDI aiecc emitted, sorted by name.
+
+        Thin passthrough to ``CompilableDesign.get_pdi_paths`` — use this
+        for a multi-device design where a single return is ambiguous.
+        """
+        return self.compilable.get_pdi_paths()
+
+    def instructions(self, **kwargs) -> np.ndarray:
+        """Compile (if needed) and return the instruction words a call would run.
+
+        ``kwargs`` takes call-time ``CompileTime[T]`` values and, for a design
+        with ``DispatchTime[T]`` parameters, the dispatch values whose
+        instruction stream to build. Nothing runs on an NPU, so this is how a
+        dispatch-time design is checked against a static specialization with
+        ``aie.utils.txn_trace``.
+        """
+        call_compile_kwargs, dispatch_scalars, _ = self._extract_compile_kwargs(kwargs)
+        compilable = self._build_compilable(call_compile_kwargs)
+        kernel = self._compile_and_build_kernel(compilable, None, None)
+        return kernel.instructions(**dispatch_scalars)
+
+    def as_mlir(self, *runtime_args, **runtime_kwargs) -> str:
+        """Return the resolved MLIR text for this kernel without compiling.
+
+        Accepts the same arguments as ``__call__``. Tensor contents are not
+        read, only their shapes and dtypes; a tensor argument may be ``None``
+        when the generator does not need its operand. ``DispatchTime[T]`` scalar values
+        are still used during generation.
+
+        Returns:
+            The MLIR module as a string (suitable for inspection, debugging,
+            or feeding to a separate aiecc invocation).
+        """
+        call_compile_kwargs, _scalar_runtime_kwargs, _ = self._extract_compile_kwargs(
+            runtime_kwargs
+        )
+        tensor_args, _ = self.compilable.split_runtime_args(
+            runtime_args, _scalar_runtime_kwargs
+        )
+        compilable = self._build_compilable(call_compile_kwargs, tensor_args)
+        return str(compilable.generate_mlir())
+
+    def __repr__(self) -> str:
+        return f"CallableDesign({self.compilable!r})"

@@ -1,76 +1,133 @@
 # matrix_scalar_add/matrix_scalar_add.py -*- Python -*-
 #
-# This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-# See https://llvm.org/LICENSE.txt for license information.
+# Copyright (C) 2024-2026 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #
-# (c) Copyright 2024 Advanced Micro Devices, Inc. or its affiliates
+"""Matrix scalar add — IRON API design with ``@iron.jit`` compilation.
+
+A single AIE compute core reads one ``TILE_HEIGHT x TILE_WIDTH`` tile from
+the top-left corner of a ``MATRIX_HEIGHT x MATRIX_WIDTH`` matrix (via
+``TensorAccessPattern.full(...).tile(...)``), adds 1 to each element of that tile, and
+writes it to the corresponding output tile. The remaining output positions
+retain their initial values — a subtile-region DMA access pattern. Default
+config: 16x128 matrix, 8x16 tile.
+
+Two invocation modes:
+
+  * standalone:   ``python3 matrix_scalar_add.py``
+  * compile-only: ``... --xclbin-path=PATH --insts-path=PATH``  (NPU Makefile)
+"""
+
+import argparse
+
+import aie.iron as iron
 import numpy as np
-import sys
-
-from aie.iron import ObjectFifo, Program, Runtime, Worker
-from aie.iron.placers import SequentialPlacer
-from aie.iron.device import NPU1Col1, NPU2, XCVC1902
+from aie.helpers.taplib import TensorAccessPattern
+from aie.iron import CompileTime, In, ObjectFifo, Out, Program, Runtime, Worker
 from aie.iron.controlflow import range_
-from aie.helpers.taplib import TensorTiler2D
+from aie.utils.hostruntime.argparse import add_compile_args, device_from_args
+from aie.utils.hostruntime.cli import run_design_cli
+from aie.utils.verify import assert_pass
 
-# Size of the entire matrix
-MATRIX_HEIGHT = 16
-MATRIX_WIDTH = 128
-MATRIX_SHAPE = (MATRIX_HEIGHT, MATRIX_WIDTH)
-
-# Size of the tile to process
-TILE_HEIGHT = 8
-TILE_WIDTH = 16
-TILE_SHAPE = (TILE_HEIGHT, TILE_WIDTH)
+OUTPUT_SENTINEL = np.int32(0x00DEFACE)
 
 
-def my_matrix_add_one():
+@iron.jit
+def matrix_scalar_add(
+    inp: In,
+    out: Out,
+    *,
+    matrix_height: CompileTime[int] = 16,
+    matrix_width: CompileTime[int] = 128,
+    tile_height: CompileTime[int] = 8,
+    tile_width: CompileTime[int] = 16,
+):
+    matrix_shape = (matrix_height, matrix_width)
+    tile_shape = (tile_height, tile_width)
 
-    if len(sys.argv) != 3:
-        raise ValueError("[ERROR] Need 2 command line arguments (Device name, Col)")
-    if sys.argv[1] == "npu":
-        dev = NPU1Col1()
-    elif sys.argv[1] == "npu2":
-        dev = NPU2()
-    elif sys.argv[1] == "xcvc1902":
-        dev = XCVC1902()
-    else:
-        raise ValueError(f"[ERROR] Device name {sys.argv[1]} is unknown")
+    matrix_ty = np.ndarray[matrix_shape, np.dtype[np.int32]]
+    tile_ty = np.ndarray[tile_shape, np.dtype[np.int32]]
 
-    # Define tensor types
-    matrix_ty = np.ndarray[MATRIX_SHAPE, np.dtype[np.int32]]
-    tile_ty = np.ndarray[TILE_SHAPE, np.dtype[np.int32]]
-
-    # AIE-array data movement with object fifos
     of_in = ObjectFifo(tile_ty, name="in0")
     of_out = ObjectFifo(tile_ty, name="out0")
 
-    # Define a task to perform
     def core_fn(of_in1, of_out1):
         elem_in = of_in1.acquire(1)
         elem_out = of_out1.acquire(1)
-        for i in range_(TILE_HEIGHT):
-            for j in range_(TILE_WIDTH):
+        for i in range_(tile_height):
+            for j in range_(tile_width):
                 elem_out[i, j] = elem_in[i, j] + 1
         of_in1.release(1)
         of_out1.release(1)
 
-    # Create a worker to perform the task
-    my_worker = Worker(core_fn, fn_args=[of_in.cons(), of_out.prod()])
+    worker = Worker(core_fn, fn_args=[of_in.cons(), of_out.prod()])
 
-    # Define the data access pattern for input/output
-    tap = TensorTiler2D.simple_tiler(MATRIX_SHAPE, TILE_SHAPE)[0]
+    tap = TensorAccessPattern.full(matrix_shape).tile(tile_shape)[0, 0]
 
-    # Runtime operations to move data to/from the AIE-array
-    rt = Runtime()
-    with rt.sequence(matrix_ty, matrix_ty, matrix_ty) as (in_tensor, _, out_tensor):
-        rt.start(my_worker)
-        rt.fill(of_in.prod(), in_tensor, tap)
-        rt.drain(of_out.cons(), out_tensor, tap, wait=True)
+    def sequence(in_tensor, out_tensor, in_h, out_h):
+        in_h.fill(in_tensor, tap)
+        out_h.drain(out_tensor, tap, wait=True)
 
-    # Place components (assign them resources on the device) and generate an MLIR module
-    return Program(dev, rt).resolve_program(SequentialPlacer())
+    rt = Runtime(
+        sequence,
+        [matrix_ty, matrix_ty, of_in.prod(), of_out.cons()],
+    )
+
+    return Program(iron.get_current_device(), rt, workers=[worker]).resolve_program()
 
 
-print(my_matrix_add_one())
+def _make_argparser():
+    p = argparse.ArgumentParser(prog="AIE Matrix Scalar Add")
+    add_compile_args(p, dev_choices=("npu", "npu2"), with_emit_mlir=True)
+    p.add_argument("--matrix-height", type=int, default=16)
+    p.add_argument("--matrix-width", type=int, default=128)
+    p.add_argument("--tile-height", type=int, default=8)
+    p.add_argument("--tile-width", type=int, default=16)
+    return p
+
+
+def _compile_kwargs(opts):
+    return dict(
+        matrix_height=opts.matrix_height,
+        matrix_width=opts.matrix_width,
+        tile_height=opts.tile_height,
+        tile_width=opts.tile_width,
+    )
+
+
+def _run_and_verify(opts):
+    rng = np.random.default_rng(0)
+    in_np = rng.integers(
+        -1000, 1000, size=(opts.matrix_height, opts.matrix_width), dtype=np.int32
+    )
+    in_t = iron.tensor(in_np, dtype=np.int32, device="npu")
+    initial_out = np.full_like(in_np, OUTPUT_SENTINEL)
+    out_t = iron.tensor(initial_out, dtype=np.int32, device="npu")
+
+    matrix_scalar_add(in_t, out_t, **_compile_kwargs(opts))
+
+    expected = initial_out.copy()
+    expected[: opts.tile_height, : opts.tile_width] = (
+        in_np[: opts.tile_height, : opts.tile_width] + 1
+    )
+    actual = out_t.numpy().reshape(opts.matrix_height, opts.matrix_width)
+    assert_pass(
+        actual,
+        expected,
+        fail_msg="output does not match the subtile DMA contract",
+    )
+
+
+def main():
+    opts = _make_argparser().parse_args()
+    run_design_cli(
+        matrix_scalar_add,
+        opts,
+        compile_kwargs=_compile_kwargs,
+        run_and_verify=_run_and_verify,
+        device=device_from_args,
+    )
+
+
+if __name__ == "__main__":
+    main()

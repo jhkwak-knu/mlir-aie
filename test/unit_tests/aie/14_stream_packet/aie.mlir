@@ -1,18 +1,17 @@
 //===- aie.mlir ------------------------------------------------*- MLIR -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2021-2022 Xilinx, Inc.
+// Copyright (C) 2022-2025 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2021 Xilinx Inc.
 //
 //===----------------------------------------------------------------------===//
 
-// REQUIRES: !hsa
-// RUN: %PYTHON aiecc.py %VitisSysrootFlag% --host-target=%aieHostTargetTriplet% %link_against_hsa% %s %test_lib_flags %extraAieCcFlags% %S/test.cpp -o test.elf
+// RUN: %aiecc --xchesscc --xbridge %VitisSysrootFlag% --host-target=%aieHostTargetTriplet% %link_against_hsa% %s %test_lib_flags %extraAieCcFlags% -o test.elf -- %S/test.cpp
 // RUN: %run_on_vck5000 ./test.elf
 
 module @test14_stream_packet {
+aie.device(xcvc1902) {
+
   %t73 = aie.tile(7, 3)
   %t72 = aie.tile(7, 2)
   %t62 = aie.tile(6, 2)
@@ -50,24 +49,32 @@ module @test14_stream_packet {
   %l71 = aie.lock(%t71, 0) {sym_name = "lock71" }
 
   %m73 = aie.mem(%t73) {
+    %c0_i32 = arith.constant 0 : i32
+    %c256_i32 = arith.constant 256 : i32
       %srcDma = aie.dma_start("MM2S", 0, ^bd0, ^end)
     ^bd0:
-      aie.use_lock(%l73, "Acquire", 0)
+      %c0_ul1 = arith.constant 0 : i32
+      aie.use_lock(%l73, "Acquire", %c0_ul1)
       aie.dma_bd_packet(0x5, 0xD)
-      aie.dma_bd(%buf73 : memref<256xi32>, 0, 256)
-      aie.use_lock(%l73, "Release", 1)
+      aie.dma_bd(%buf73 : memref<256xi32> offset = 0 len = 256)
+      %c1_ul2 = arith.constant 1 : i32
+      aie.use_lock(%l73, "Release", %c1_ul2)
       aie.next_bd ^end
     ^end:
       aie.end
   }
 
   %m71 = aie.mem(%t71) {
+    %c0_i32 = arith.constant 0 : i32
+    %c256_i32 = arith.constant 256 : i32
       %srcDma = aie.dma_start("MM2S", 0, ^bd0, ^end)
     ^bd0:
-      aie.use_lock(%l71, "Acquire", 0)
+      %c0_ul3 = arith.constant 0 : i32
+      aie.use_lock(%l71, "Acquire", %c0_ul3)
       aie.dma_bd_packet(0x4, 0xC)
-      aie.dma_bd(%buf71 : memref<256xi32>, 0, 256)
-      aie.use_lock(%l71, "Release", 1)
+      aie.dma_bd(%buf71 : memref<256xi32> offset = 0 len = 256)
+      %c1_ul4 = arith.constant 1 : i32
+      aie.use_lock(%l71, "Release", %c1_ul4)
       aie.next_bd ^end
     ^end:
       aie.end
@@ -81,21 +88,26 @@ module @test14_stream_packet {
   %l62 = aie.lock(%t62, 0)
 
   %m62 = aie.mem(%t62) {
+    %c0_i32 = arith.constant 0 : i32
+    %c256_i32 = arith.constant 256 : i32
       %srcDma0 = aie.dma_start("S2MM", 0, ^bd0, ^end)
     //^dma:
     //  %srcDma1 = aie.dma_start("S2MM", 1, ^bd1, ^end)
     ^bd0:
-      aie.use_lock(%l62, "Acquire", 0)
-      aie.dma_bd(%buf62 : memref<512xi32>, 0, 512)
-      aie.use_lock(%l62, "Release", 1)
+      %c0_ul5 = arith.constant 0 : i32
+      aie.use_lock(%l62, "Acquire", %c0_ul5)
+      aie.dma_bd(%buf62 : memref<512xi32> offset = 0 len = 512)
+      %c1_ul6 = arith.constant 1 : i32
+      aie.use_lock(%l62, "Release", %c1_ul6)
       aie.next_bd ^end
     //^bd1:
-    //  aie.use_lock(%l62_1, "Acquire", 0)
-    //  aie.dma_bd(%buf62_1 : memref<256xi32>, 0, 256)
-    //  aie.use_lock(%l62_1, "Release", 1)
+    //  aie.use_lock(%l62_1, "Acquire", %{{.*}})
+    //  aie.dma_bd(%buf62_1 : memref<256xi32> offset = 0 len = 256)
+    //  aie.use_lock(%l62_1, "Release", %{{.*}})
     //  aie.next_bd ^bd0
     ^end:
       aie.end
   }
 
+}
 }

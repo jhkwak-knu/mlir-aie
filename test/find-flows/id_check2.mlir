@@ -1,17 +1,15 @@
 //===- id_check2.mlir ------------------------------------------*- MLIR -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2021-2022 Xilinx, Inc.
+// Copyright (C) 2022-2023 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2021 Xilinx Inc.
 //
 //===----------------------------------------------------------------------===//
 
 // RUN: aie-opt -aie-find-flows %s | FileCheck %s
 // CHECK: %[[T23:.*]] = aie.tile(2, 3)
 // CHECK: %[[T22:.*]] = aie.tile(2, 2)
-// CHECK: aie.packet_flow(13) {
+// CHECK: aie.packet_flow(13, mask = 15) {
 // CHECK:   aie.packet_source<%[[T22]], DMA : 0>
 // CHECK:   aie.packet_dest<%[[T23]], DMA : 1>
 // CHECK: }

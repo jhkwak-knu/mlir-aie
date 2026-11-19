@@ -1,10 +1,7 @@
 //===- test.cpp -------------------------------------------000---*- C++ -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2023 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// Copyright (C) 2023, Advanced Micro Devices, Inc.
 //
 //===----------------------------------------------------------------------===//
 
@@ -127,7 +124,7 @@ int main(int argc, const char *argv[]) {
   uint8_t *bufOut = bo_out.map<uint8_t *>();
 
   int errors = 0;
-  int max_errors = 64000;
+  int max_errors = 50;
 
   /*
    ****************************************************************************

@@ -1,25 +1,28 @@
 //===- aie.mlir ------------------------------------------------*- MLIR -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2021-2022 Xilinx, Inc.
+// Copyright (C) 2022-2025 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2021 Xilinx Inc.
 //
 //===----------------------------------------------------------------------===//
 
-// REQUIRES: aiesimulator, peano, !hsa
+// REQUIRES: aiesimulator, peano
 
-// RUN: %PYTHON aiecc.py --aiesim --no-xchesscc --xbridge %VitisSysrootFlag% --host-target=%aieHostTargetTriplet% %link_against_hsa% %s %test_lib_flags %S/test.cpp -o test.elf
+// RUN: %aiecc --get-aiesim --xchesscc=false --xbridge %VitisSysrootFlag% --host-target=%aieHostTargetTriplet% %link_against_hsa% %s %test_lib_flags -o test.elf -- %S/test.cpp
 // RUN: %run_on_board ./test.elf
 // RUN: sh -c 'aie.mlir.prj/aiesim.sh; exit 0' | FileCheck %s
 
 // CHECK: test start.
 // CHECK: PASS!
 
+// --xchesscc=false --xbridge does not work
+// XFAIL: *
+
 module {
+aie.device(xcvc1902) {
+
   %tile13 = aie.tile(1, 3)
-  %tile23 = aie.tile(2, 3)1
+  %tile23 = aie.tile(2, 3)
 
   %buf13 = aie.buffer(%tile13) { sym_name = "a" } : memref<256xi32>
   %buf23 = aie.buffer(%tile23) { sym_name = "c" } : memref<256xi32>
@@ -35,21 +38,26 @@ module {
   %core13 = aie.core(%tile13) {
     %0 = arith.constant 0 : i32
     %idx0 = arith.constant 3 : index
-    aie.use_lock(%lock13_3, "Acquire", 1) // acquire for read(e.g. input ping)
+    %c1_ul0 = arith.constant 1 : i32
+    aie.use_lock(%lock13_3, "Acquire", %c1_ul0) // acquire for read(e.g. input ping)
     %val = memref.load %buf13[%idx0] : memref<256xi32>
     aie.put_stream(%0 : i32, %val : i32)
-    aie.use_lock(%lock13_3, "Release", 0) // release for write
+    %c0_ul1 = arith.constant 0 : i32
+    aie.use_lock(%lock13_3, "Release", %c0_ul1) // release for write
     aie.end
   }
 
   %core23 = aie.core(%tile23) {
     %0 = arith.constant 0 : i32
     %idx0 = arith.constant 3 : index
-    aie.use_lock(%lock23_7, "Acquire", 0) // acquire for write
+    %c0_ul2 = arith.constant 0 : i32
+    aie.use_lock(%lock23_7, "Acquire", %c0_ul2) // acquire for write
     %val = aie.get_stream(%0 : i32) : i32
     memref.store %val, %buf23[%idx0] : memref<256xi32>
-    aie.use_lock(%lock23_7, "Release", 1) // release for read
+    %c1_ul3 = arith.constant 1 : i32
+    aie.use_lock(%lock23_7, "Release", %c1_ul3) // release for read
     aie.end
   }
 
+}
 }

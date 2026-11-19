@@ -1,0 +1,59 @@
+//===- sequence_with_configures_bad.mlir -----------------------*- MLIR -*-===//
+//
+// Copyright (C) 2025 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+
+// RUN: aie-opt --verify-diagnostics --split-input-file %s
+
+module {
+    aie.device(npu1) @dev_a {
+        aie.runtime_sequence @run_a (%x: memref<1xi32>) {
+        }
+        aie.runtime_sequence @run_b () {
+        }
+    }
+    aie.device(npu2) { // main
+        aie.runtime_sequence (%x : memref<1xi32>) {
+            // expected-error@+1 {{Device types do not match: 'npu2' vs. 'npu1'}}
+            aiex.configure @dev_a {
+                aiex.run @run_a (%x) : (memref<1xi32>)
+            }
+        }
+    }
+}
+
+// -----
+
+module {
+    aie.device(npu1) @dev_a {
+        aie.runtime_sequence @run_a (%x: memref<1xi32>) {
+        }
+        aie.runtime_sequence @run_b () {
+        }
+    }
+    aie.device(npu2) { // main
+        aie.runtime_sequence (%x : memref<1xi32>) {
+            // expected-error@+1 {{No such device: '@dev_x'}}
+            aiex.configure @dev_x {
+                aiex.run @run_a (%x) : (memref<1xi32>)
+            }
+        }
+    }
+}
+
+// -----
+
+module {
+    memref.global "public" @in0 : memref<1024xi32>
+    aie.device(npu2) { // main
+        aie.runtime_sequence (%x : memref<1xi32>) {
+            // expected-error@+1 {{Not a device: '@in0'}}
+            aiex.configure @in0 {
+                aiex.run @run_x (%x) : (memref<1xi32>)
+            }
+        }
+    }
+}

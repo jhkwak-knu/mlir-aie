@@ -1,15 +1,15 @@
 //===- aie.mlir ------------------------------------------------*- MLIR -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2021-2022 Xilinx, Inc.
+// Copyright (C) 2022-2024 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2021 Xilinx Inc.
 //
 //===----------------------------------------------------------------------===//
 
-// RUN: %PYTHON aiecc.py --no-unified %s
-// RUN: %PYTHON aiecc.py --unified    %s
+// REQUIRES: peano
+
+// RUN: %aiecc --no-unified %s
+// RUN: %aiecc --unified    %s
 
 module @test00_itsalive {
   aie.device(xcve2802) {

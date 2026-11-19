@@ -1,17 +1,15 @@
 //===- aie.mlir ------------------------------------------------*- MLIR -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2021-2022 Xilinx, Inc.
+// Copyright (C) 2022-2026 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2021 Xilinx Inc.
 //
 //===----------------------------------------------------------------------===//
 
-// REQUIRES: aiesimulator, valid_xchess_license, !hsa
+// REQUIRES: aiesimulator, valid_xchess_license
 // RUN: xchesscc_wrapper aie2 -c %S/kernel.cc
-// RUN: %PYTHON aiecc.py --aiesim --xchesscc --xbridge --no-compile-host %s %test_lib_flags %S/test.cpp
-// RUN: aie.mlir.prj/aiesim.sh | FileCheck %s
+// RUN: %aiecc --get-aiesim --xchesscc --xbridge %s %test_lib_flags -- %S/test.cpp
+// RUN: ./aie.mlir.prj/aiesim.sh | FileCheck %s
 
 // CHECK: AIE2 ISS
 // CHECK: test start.
@@ -28,22 +26,24 @@ module {
     %lock13_3 = aie.lock(%tile13, 3) { sym_name = "input_lock" } // input buffer lock
     %lock23_7 = aie.lock(%tile23, 7) { sym_name = "output_lock" } // output buffer lock
 
-    func.func private @do_mul(%A: memref<256xi32>) -> ()
-    func.func private @do_mac(%A: memref<256xi32>) -> ()
+    func.func private @do_mul(%A: memref<256xi32>) -> () attributes {link_with = "kernel.o"}
+    func.func private @do_mac(%A: memref<256xi32>) -> () attributes {link_with = "kernel.o"}
 
     %core13 = aie.core(%tile13) {
-      aie.use_lock(%lock13_3, AcquireGreaterEqual, 1) // acquire for read(e.g. input ping)
+      %c1_ul0 = arith.constant 1 : i32
+      aie.use_lock(%lock13_3, AcquireGreaterEqual, %c1_ul0) // acquire for read(e.g. input ping)
       func.call @do_mul(%buf13_0) : (memref<256xi32>) -> ()
       aie.end
-    } { link_with="kernel.o" }
+    }
 
     %core23 = aie.core(%tile23) {
   //    %val1 = arith.constant 7 : i32
   //    %idx1 = arith.constant 0 : index
   //    memref.store %val1, %buf14_0[%idx1] : memref<256xi32>
       func.call @do_mac(%buf23_0) : (memref<256xi32>) -> ()
-      aie.use_lock(%lock23_7, Release, 1) // release for read
+      %c1_ul1 = arith.constant 1 : i32
+      aie.use_lock(%lock23_7, Release, %c1_ul1) // release for read
       aie.end
-    } { link_with="kernel.o" }
+    }
   }
 }

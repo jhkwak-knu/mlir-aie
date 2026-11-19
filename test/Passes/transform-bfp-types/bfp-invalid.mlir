@@ -1,10 +1,7 @@
 //===- bfp-invalid.mlir ----------------------------------------*- MLIR -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2025 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2025 Advanced Micro Devices Inc.
 //
 //===----------------------------------------------------------------------===//
 
@@ -19,6 +16,7 @@ module {
     aie.objectfifo @in1(%shim_noc_tile_1_0, {%tile_1_2}, 2 : i32) : !aie.objectfifo<memref<16x!aiex.bfp<"v16bfp16ebs16">>>
   }
 }
+
 
 // -----
 
@@ -37,12 +35,12 @@ module {
     %tile_1_2 = aie.tile(1, 2)
     aie.objectfifo @in1(%shim_noc_tile_1_0, {%tile_1_2}, 2 : i32) : !aie.objectfifo<memref<16x!aiex.bfp<"v8bfp16ebs8">>>
     %core_1_2 = aie.core(%tile_1_2) {
-      %0 = aie.objectfifo.acquire @in1(Consume, 1) : !aie.objectfifosubview<memref<16x!aiex.bfp<"v8bfp16ebs8">>>
-      %1 = aie.objectfifo.subview.access %0[0] : !aie.objectfifosubview<memref<16x!aiex.bfp<"v8bfp16ebs8">>> -> memref<16x!aiex.bfp<"v8bfp16ebs8">>
+      %1 = aie.objectfifo.acquire @in1(Consume, 1) : memref<16x!aiex.bfp<"v8bfp16ebs8">>
       aie.end
     }
   }
 }
+
 
 // -----
 
@@ -52,14 +50,15 @@ module {
   aie.device(npu2) {
     %tile_0_0 = aie.tile(2, 2)
 
-    aiex.runtime_sequence(%arg0: memref<8x!aiex.bfp<"v32bfp16ebz8">>, %arg1: memref<10x!aiex.bfp<"v8bfp16ebs8">>) {
+    aie.runtime_sequence(%arg0: memref<8x!aiex.bfp<"v32bfp16ebz8">>, %arg1: memref<10x!aiex.bfp<"v8bfp16ebs8">>) {
       %t1 = aiex.dma_configure_task(%tile_0_0, MM2S, 0) {
-        aie.dma_bd(%arg0 : memref<8x!aiex.bfp<"v8bfp16ebs8">>, 0, 8) {bd_id = 7 : i32}
+        aie.dma_bd(%arg0 : memref<8x!aiex.bfp<"v8bfp16ebs8">> offset = 0 len = 8) {bd_id = 7 : i32}
         aie.end
       } {issue_token = true}
     }
   }
 }
+
 
 // -----
 
@@ -72,9 +71,11 @@ module {
       %lock_0_1_0 = aie.lock(%tile_0_1) {init = 0 : i32}
       %buffer_0_1 = aie.buffer(%tile_0_1) {address = 0 : i32} : memref<7x!aiex.bfp<"v8bfp16ebs8">>
       %0 = aie.dma(S2MM, 0) [{
-        aie.use_lock(%lock_0_1, AcquireGreaterEqual)
-        aie.dma_bd(%buffer_0_1 : memref<7x!aiex.bfp<"v8bfp16ebs8">>, 0)
-        aie.use_lock(%lock_0_1_0, Release)
+        %c1_ul1 = arith.constant 1 : i32
+        aie.use_lock(%lock_0_1, AcquireGreaterEqual, %c1_ul1)
+        aie.dma_bd(%buffer_0_1 : memref<7x!aiex.bfp<"v8bfp16ebs8">>)
+        %c1_ul2 = arith.constant 1 : i32
+        aie.use_lock(%lock_0_1_0, Release, %c1_ul2)
       }]
       aie.end
     }

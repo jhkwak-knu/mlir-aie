@@ -1,101 +1,102 @@
-#
-# This file is licensed under the Apache License v2.0 with LLVM Exceptions. See
-# https://llvm.org/LICENSE.txt for license information. SPDX-License-Identifier:
-# Apache-2.0 WITH LLVM-exception
-#
-# (c) Copyright 2024 Xilinx Inc.
+# Copyright (C) 2022 Xilinx, Inc.
+# Copyright (C) 2024-2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 set(BOOTGEN_SOURCE ${PROJECT_SOURCE_DIR}/third_party/bootgen)
-set(libsources
-  cdo-alloc.c
-  cdo-binary.c
-  cdo-command.c
-  cdo-load.c
-  cdo-metadata.c
-  cdo-npi.c
-  cdo-overlay.c
-  cdo-raw.c
-  cdo-source.c
-  cJSON.c
-  authentication.cpp
-  authentication-versal.cpp
-  authentication-zynq.cpp
-  authentication-zynqmp.cpp
-  authkeys.cpp
-  authkeys-versal.cpp
-  bifoptions.cpp
-  bif.tab.cpp
-  bif.yy.cpp
-  binary.cpp
-  binary-versal.cpp
-  binfile.cpp
-  bitutils.cpp
-  bitutils-versal.cpp
-  bootheader.cpp
-  bootheader-versal.cpp
-  bootheader-zynq.cpp
-  bootheader-zynqmp.cpp
-  bootimage.cpp
-  bootimage-versal.cpp
-  bootimage-zynq.cpp
-  bootimage-zynqmp.cpp
-  checksum.cpp
-  checksum-versal.cpp
-  cmdoptions.tab.cpp
-  cmdoptions.yy.cpp
-  elftools.cpp
-  encryption.cpp
-  encryption-versal.cpp
-  encryption-versalnet.cpp
-  encryption-zynq.cpp
-  encryption-zynqmp.cpp
-  encryptutils.cpp
-  hash.cpp
-  imageheadertable.cpp
-  imageheadertable-versal.cpp
-  imageheadertable-zynq.cpp
-  imageheadertable-zynqmp.cpp
-  kdf.cpp
-  Keccak-compact.cpp
-  Keccak-compact-versal.cpp
-  logger.cpp
-  # main.cpp
-  mcsfile.cpp
-  options.cpp
-  outputfile.cpp
-  outputfile-versal.cpp
-  parsing.cpp
-  partition.cpp
-  partitionheadertable.cpp
-  partitionheadertable-versal.cpp
-  partitionheadertable-zynq.cpp
-  partitionheadertable-zynqmp.cpp
-  partition-versal.cpp
-  postprocess.cpp
-  readimage.cpp
-  readimage-versal.cpp
-  readimage-zynq.cpp
-  readimage-zynqmp.cpp
-  reginit.cpp
-  reginit.tab.cpp
-  reginit.yy.cpp
-  verifyimage-versal.cpp
-  verifyimage-zynqmp.cpp)
-list(TRANSFORM libsources PREPEND ${BOOTGEN_SOURCE}/)
+
+# Avoid retriggering compilation when configuration produces identical sources.
+function(write_bootgen_source_if_changed path contents)
+  set(current_contents)
+  if(EXISTS "${path}")
+    file(READ "${path}" current_contents)
+  endif()
+  if(NOT current_contents STREQUAL contents)
+    file(WRITE "${path}" "${contents}")
+  endif()
+endfunction()
+
+# Upstream (xilinx_v2026.1) splits sources into per-architecture <dir>/src
+# trees; glob each one, matching upstream's own Makefile.
+set(bootgen_src_dirs
+  common
+  spartanup
+  versal
+  versal_2ve_2vm
+  zynq
+  zynqmp
+  utils)
+set(libsources)
+foreach(dir ${bootgen_src_dirs})
+  file(GLOB dir_sources CONFIGURE_DEPENDS
+    ${BOOTGEN_SOURCE}/${dir}/src/*.cpp ${BOOTGEN_SOURCE}/${dir}/src/*.c)
+  list(APPEND libsources ${dir_sources})
+endforeach()
+# main.cpp holds the CLI entry point and is only used by the bootgen
+# executable below, not by bootgen-lib.
+list(REMOVE_ITEM libsources ${BOOTGEN_SOURCE}/common/src/main.cpp)
+# Pregenerated bison/flex grammar sources.
+list(APPEND libsources
+  ${BOOTGEN_SOURCE}/bisonflex/bif.tab.cpp
+  ${BOOTGEN_SOURCE}/bisonflex/bif.yy.cpp
+  ${BOOTGEN_SOURCE}/bisonflex/cmdoptions.tab.cpp
+  ${BOOTGEN_SOURCE}/bisonflex/cmdoptions.yy.cpp
+  ${BOOTGEN_SOURCE}/bisonflex/reginit.tab.cpp
+  ${BOOTGEN_SOURCE}/bisonflex/reginit.yy.cpp)
+# C API for exception-safe PDI generation, so tools like aiecc can call
+# bootgen as a library instead of shelling out.
+list(APPEND libsources ${CMAKE_CURRENT_SOURCE_DIR}/bootgen_c_api.cpp)
+
+# BifOptions leaves lastPartitionBifOption uninitialized. A fresh bootgen
+# process zeroes it, but aiecc's in-process calls can inherit a stale pointer
+# equal to the first partition, so Add() pops an empty list and aborts.
+# Compile a copy that initializes it, leaving the submodule untouched, until
+# https://github.com/Xilinx/bootgen/pull/57 lands.
+set(bifoptions_source ${BOOTGEN_SOURCE}/common/src/bifoptions.cpp)
+set(bifoptions_patched ${CMAKE_CURRENT_BINARY_DIR}/bifoptions.cpp)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${bifoptions_source})
+file(READ ${bifoptions_source} FILE_CONTENTS)
+string(REPLACE "    , spkRevokeId(0x00000000)\n{"
+  "    , spkRevokeId(0x00000000)\n    , lastPartitionBifOption(NULL)\n{"
+  PATCHED_CONTENTS "${FILE_CONTENTS}")
+if(PATCHED_CONTENTS STREQUAL FILE_CONTENTS)
+  message(FATAL_ERROR "BifOptions constructor changed in ${bifoptions_source}; "
+    "re-check the lastPartitionBifOption initialization patch")
+endif()
+write_bootgen_source_if_changed(${bifoptions_patched} "${PATCHED_CONTENTS}")
+list(REMOVE_ITEM libsources ${bifoptions_source})
+list(APPEND libsources ${bifoptions_patched})
+
+set(bootgen_include_dirs
+  ${BOOTGEN_SOURCE}/bisonflex
+  ${BOOTGEN_SOURCE}/common/include
+  ${BOOTGEN_SOURCE}/spartanup/include
+  ${BOOTGEN_SOURCE}/versal/include
+  ${BOOTGEN_SOURCE}/versal_2ve_2vm/include
+  ${BOOTGEN_SOURCE}/zynq/include
+  ${BOOTGEN_SOURCE}/zynqmp/include
+  ${BOOTGEN_SOURCE}/utils/include
+  ${BOOTGEN_SOURCE}/lms-hash-sigs
+  ${BOOTGEN_SOURCE}/win_include)
 
 # malloc.h is deprecated and should not be used
 # https://stackoverflow.com/a/56463133
 # If you want to use malloc, then include stdlib.h
-file(READ ${BOOTGEN_SOURCE}/cdo-npi.c FILE_CONTENTS)
+file(READ ${BOOTGEN_SOURCE}/utils/src/cdo-npi.c FILE_CONTENTS)
 string(REPLACE "#include <malloc.h>" "" FILE_CONTENTS "${FILE_CONTENTS}")
-file(WRITE ${BOOTGEN_SOURCE}/cdo-npi.c "${FILE_CONTENTS}")
+write_bootgen_source_if_changed(${BOOTGEN_SOURCE}/utils/src/cdo-npi.c "${FILE_CONTENTS}")
 
-file(READ ${BOOTGEN_SOURCE}/cdo-alloc.c FILE_CONTENTS)
+file(READ ${BOOTGEN_SOURCE}/utils/src/cdo-alloc.c FILE_CONTENTS)
 string(REPLACE "#include <malloc.h>" "" FILE_CONTENTS "${FILE_CONTENTS}")
-file(WRITE ${BOOTGEN_SOURCE}/cdo-alloc.c "${FILE_CONTENTS}")
+write_bootgen_source_if_changed(${BOOTGEN_SOURCE}/utils/src/cdo-alloc.c "${FILE_CONTENTS}")
 
+# Strip the per-CDO-file "Generating: ..." printf: cdo_driver_mlir_aie is
+# called directly (not via the bootgen executable)
+file(READ ${BOOTGEN_SOURCE}/cdo-driver/cdo_driver.c FILE_CONTENTS)
+string(REGEX REPLACE "\n[ \t]*printf\\(\"Generating: %s\\\\n\", cdoFileName\\);"
+  "" FILE_CONTENTS "${FILE_CONTENTS}")
+write_bootgen_source_if_changed(${BOOTGEN_SOURCE}/cdo-driver/cdo_driver.c "${FILE_CONTENTS}")
 
-find_package(OpenSSL REQUIRED)
+find_package(OpenSSL REQUIRED COMPONENTS SSL)
 if (OPENSSL_FOUND)
   message (STATUS "OpenSSL found")
   message (STATUS "OpenSSL include directories:" ${OPENSSL_INCLUDE_DIR})
@@ -103,12 +104,71 @@ else()
   message (FATAL_ERROR "OpenSSL Not found.")
 endif()
 
+find_package(Threads REQUIRED)
+
 # since we explicitly link OpenSSL::applink
-file(READ ${BOOTGEN_SOURCE}/main.cpp FILE_CONTENTS)
+file(READ ${BOOTGEN_SOURCE}/common/src/main.cpp FILE_CONTENTS)
 string(REPLACE "#include \"openssl/ms/applink.c\"" "" FILE_CONTENTS "${FILE_CONTENTS}")
-file(WRITE ${BOOTGEN_SOURCE}/main.cpp "${FILE_CONTENTS}")
+write_bootgen_source_if_changed(${BOOTGEN_SOURCE}/common/src/main.cpp "${FILE_CONTENTS}")
+
+# Vendored LMS/HSS post-quantum signature library upstream added for newer
+# secure-boot support; built as a static lib instead of shelling out to its
+# own Makefile.
+#
+# Only the pthread threading backend is vendored (upstream's Makefile is
+# Linux-only). MSVC has no <pthread.h>
+set(lms_hash_sigs_dir ${BOOTGEN_SOURCE}/lms-hash-sigs)
+if(CMAKE_USE_PTHREADS_INIT)
+  set(bootgen_hss_thread_source ${lms_hash_sigs_dir}/hss_thread_pthread.c)
+else()
+  set(bootgen_hss_thread_source ${CMAKE_CURRENT_SOURCE_DIR}/hss_thread_single.c)
+endif()
+add_library(bootgen-lms-hash-sigs STATIC
+  ${lms_hash_sigs_dir}/endian.c
+  ${lms_hash_sigs_dir}/fips202.c
+  ${lms_hash_sigs_dir}/hss.c
+  ${lms_hash_sigs_dir}/hss_alloc.c
+  ${lms_hash_sigs_dir}/hss_aux.c
+  ${lms_hash_sigs_dir}/hss_common.c
+  ${lms_hash_sigs_dir}/hss_compute.c
+  ${lms_hash_sigs_dir}/hss_derive.c
+  ${lms_hash_sigs_dir}/hss_generate.c
+  ${lms_hash_sigs_dir}/hss_keygen.c
+  ${lms_hash_sigs_dir}/hss_param.c
+  ${lms_hash_sigs_dir}/hss_reserve.c
+  ${lms_hash_sigs_dir}/hss_sign.c
+  ${lms_hash_sigs_dir}/hss_sign_inc.c
+  ${bootgen_hss_thread_source}
+  ${lms_hash_sigs_dir}/hss_verify.c
+  ${lms_hash_sigs_dir}/hss_verify_inc.c
+  ${lms_hash_sigs_dir}/hss_zeroize.c
+  ${lms_hash_sigs_dir}/lm_common.c
+  ${lms_hash_sigs_dir}/lm_ots_common.c
+  ${lms_hash_sigs_dir}/lm_ots_sign.c
+  ${lms_hash_sigs_dir}/lm_ots_verify.c
+  ${lms_hash_sigs_dir}/lm_verify.c
+  ${lms_hash_sigs_dir}/lms_hash.c
+  ${lms_hash_sigs_dir}/lms_keys.c
+  ${lms_hash_sigs_dir}/lms_sign.c
+  ${lms_hash_sigs_dir}/sha256.c)
+set_target_properties(bootgen-lms-hash-sigs PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(bootgen-lms-hash-sigs PRIVATE ${lms_hash_sigs_dir} ${OPENSSL_INCLUDE_DIR})
+# PUBLIC: static-lib consumers need these transitively on their link line.
+target_link_libraries(bootgen-lms-hash-sigs PUBLIC OpenSSL::Crypto Threads::Threads)
+if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+  target_compile_options(bootgen-lms-hash-sigs PRIVATE
+    -Wno-deprecated-declarations
+    -Wno-sign-compare
+    -Wno-type-limits
+    -Wno-unused
+    # See bootgen-lib below for why -fPIC is also passed explicitly here.
+    -fPIC)
+endif()
 
 add_library(bootgen-lib STATIC ${libsources})
+# bootgen must be compiled with PIE/PIC, auditwheel repair's
+# patchelf-based RPATH rewrite corrupts the non-PIE binary.
+set_target_properties(bootgen-lib PROPERTIES POSITION_INDEPENDENT_CODE ON)
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
   set(bootgen_warning_ignores
     -Wno-cast-qual
@@ -119,7 +179,10 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     -Wno-deprecated-register
     -Wno-dynamic-class-memaccess
     -Wno-implicit-fallthrough
-    -Wno-incompatible-pointer-types-discards-qualifiers
+    # C-only diagnostics: passing these while compiling C++ sources is an
+    # unused command-line argument, which is fatal under -Werror=unused.
+    $<$<COMPILE_LANGUAGE:C>:-Wno-incompatible-pointer-types>
+    $<$<COMPILE_LANGUAGE:C>:-Wno-incompatible-pointer-types-discards-qualifiers>
     -Wno-misleading-indentation
     -Wno-non-virtual-dtor
     -Wno-overloaded-virtual
@@ -136,18 +199,47 @@ else()
 endif()
 if (CMAKE_CXX_COMPILER_ID MATCHES "MSVC")
   target_compile_definitions(bootgen-lib PRIVATE YY_NO_UNISTD_H)
+  # Enable correct unwind semantics on MSVC
+  target_compile_options(bootgen-lib PRIVATE /EHsc)
+  # Suppress MSVC warning noise
+  target_compile_options(bootgen-lib PRIVATE /wd4996 /wd4840 /wd4005 /wd5033)
 endif()
 target_compile_options(bootgen-lib PRIVATE ${bootgen_warning_ignores})
-target_include_directories(bootgen-lib PRIVATE ${BOOTGEN_SOURCE} ${OPENSSL_INCLUDE_DIR})
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU" AND NOT MSVC)
+  # The POSITION_INDEPENDENT_CODE property above doesn't reliably force PIC
+  # so pass -fPIC explicitly, last, so it wins over any inherited -fno-PIC.
+  target_compile_options(bootgen-lib PRIVATE -fPIC)
+endif()
+target_include_directories(bootgen-lib PRIVATE ${bootgen_include_dirs} ${OPENSSL_INCLUDE_DIR})
+# Make C API header available publicly
+target_include_directories(bootgen-lib PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+  $<INSTALL_INTERFACE:include>)
+# PUBLIC: same reason as bootgen-lms-hash-sigs above.
+target_link_libraries(bootgen-lib PUBLIC bootgen-lms-hash-sigs Threads::Threads)
 install(
   TARGETS bootgen-lib
   DESTINATION lib
   EXPORT bootgen-lib)
+install(
+  FILES ${CMAKE_CURRENT_SOURCE_DIR}/bootgen_c_api.h
+  DESTINATION include)
 
-add_executable(bootgen ${BOOTGEN_SOURCE}/main.cpp)
-target_include_directories(bootgen PUBLIC ${BOOTGEN_SOURCE} ${OPENSSL_INCLUDE_DIR}
+add_executable(bootgen ${BOOTGEN_SOURCE}/common/src/main.cpp)
+set_target_properties(bootgen PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(bootgen PUBLIC ${bootgen_include_dirs} ${OPENSSL_INCLUDE_DIR}
   ${CMAKE_CURRENT_BINARY_DIR}/include)
 target_compile_options(bootgen PRIVATE ${bootgen_warning_ignores})
+if (CMAKE_CXX_COMPILER_ID MATCHES "MSVC")
+  target_compile_options(bootgen PRIVATE /EHsc)
+  target_compile_options(bootgen PRIVATE /wd4996 /wd4840 /wd4005 /wd5033)
+endif()
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU" AND NOT MSVC)
+  # See bootgen-lib above. -fPIE is compile-only; -pie is the link-mode
+  # switch (kept separate since some toolchains don't accept -fPIE at link).
+  target_compile_options(bootgen PRIVATE -fPIE)
+  target_link_options(bootgen PRIVATE -pie)
+endif()
 target_compile_definitions(bootgen PRIVATE OPENSSL_USE_APPLINK)
 target_link_libraries(bootgen PRIVATE bootgen-lib OpenSSL::SSL OpenSSL::applink)
 install(TARGETS bootgen)
@@ -160,6 +252,9 @@ if (NOT CMAKE_CXX_COMPILER_ID MATCHES "MSVC")
   target_compile_options(cdo_driver_mlir_aie PRIVATE -Wno-cast-qual -Wno-sign-compare)
 endif()
 
+if (CMAKE_CXX_COMPILER_ID MATCHES "MSVC")
+  target_compile_options(cdo_driver_mlir_aie PRIVATE /wd4996 /wd4840 /wd4005 /wd5033)
+endif()
 install(
   TARGETS cdo_driver_mlir_aie
   DESTINATION lib

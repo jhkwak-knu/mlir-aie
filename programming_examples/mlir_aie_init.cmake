@@ -1,0 +1,92 @@
+# Copyright (C) 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+#
+
+# Encapsulates the pre-project() preamble shared by every example
+# CMakeLists.txt under programming_examples/. Must be a macro (not a
+# function) so that CMAKE_*_COMPILER settings and the cache/local
+# variables it sets are visible in the caller's scope before project()
+# runs.
+#
+# Intended usage in a template:
+#
+#   cmake_minimum_required(VERSION 3.30)
+#   include(<path-to>/mlir_aie_init.cmake)
+#   mlir_aie_init_example()       # host detect + compilers + ProjectName/currentTarget
+#   project(${ProjectName})       # MUST be a literal call in the top-level
+#                                 # CMakeLists.txt (CMake requirement)
+#   include(<path-to>/common.cmake)
+#
+# Why this exists: common.cmake calls find_package(XRT), which loads
+# xrt-targets.cmake and runs add_library(... SHARED IMPORTED). That
+# requires project() to have been called first. Centralising the
+# preamble here keeps the ordering rule in one place rather than
+# duplicated across ~50 templates. See Xilinx/mlir-aie#3048.
+#
+# Templates that need to override anything (extra cache vars, a
+# different default TARGET_NAME, custom XRT paths, etc.) should set it
+# BEFORE calling this macro. The CACHE-form set() calls below are no-ops
+# if the value is already in the cache.
+
+macro(mlir_aie_init_example)
+  # CMAKE_HOST_WIN32, not find_program(WSL NAMES powershell.exe): the examples
+  # reach a Windows host either natively or, from a WSL shell, through
+  # `powershell.exe cmake` -- both are a Windows-native CMake, so
+  # CMAKE_HOST_WIN32 is TRUE for both. The old powershell probe additionally
+  # fired for a *Linux* cmake run from a WSL shell, where powershell.exe is on
+  # PATH via WSL interop; that configure then selected cl.exe and C:/ XRT paths
+  # and could not work. CMAKE_HOST_WIN32 is set before project(), so it is
+  # available this early.
+  if(NOT CMAKE_HOST_WIN32)
+    if(NOT DEFINED CMAKE_C_COMPILER)
+      set(CMAKE_C_COMPILER gcc-13)
+    endif()
+    if(NOT DEFINED CMAKE_CXX_COMPILER)
+      set(CMAKE_CXX_COMPILER g++-13)
+    endif()
+  else()
+    # Default to Release, matching the `cmake --build . --config Release` that
+    # makefile-common has always used. Without this, project() takes MSVC's
+    # CMAKE_BUILD_TYPE_INIT (Debug) on single-config generators like Ninja and
+    # links the host exe against the debug CRT. The runner has no debug CRT, so
+    # the exe dies in the loader with STATUS_DLL_NOT_FOUND -- no output, no
+    # message, just a nonzero exit a fraction of a second in.
+    if(NOT CMAKE_BUILD_TYPE)
+      set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type (single-config generators)")
+    endif()
+
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR})
+
+    # Default the host compiler to MSVC. Otherwise CMake takes the first
+    # clang++ on PATH, which in the IRON environment is llvm-aie's -- a
+    # bare-metal AIE cross-compiler. It gets far enough to be selected and
+    # then dies including MSVC's <intrin.h>, because its own xmmintrin.h
+    # expects an mm_malloc.h that the bare-metal toolchain does not ship:
+    #
+    #   llvm-aie/lib/clang/21/include/xmmintrin.h:31:10:
+    #     fatal error: 'mm_malloc.h' file not found
+    #
+    # Under WSL this is a no-op: `powershell.exe cmake` already selects MSVC,
+    # and cl.exe is the right answer there too. An explicit -DCMAKE_CXX_COMPILER
+    # still wins, which is how the vision examples pass gcc/g++ under WSL.
+    if(NOT DEFINED CMAKE_C_COMPILER)
+      set(CMAKE_C_COMPILER cl)
+    endif()
+    if(NOT DEFINED CMAKE_CXX_COMPILER)
+      set(CMAKE_CXX_COMPILER cl)
+    endif()
+
+    # NOTE: /Zc:__cplusplus is NOT added here. It is MSVC-only, and this macro
+    # runs before project(), so the compiler is not yet known -- MSVC is still
+    # undefined at this point. common.cmake adds it after project() has done
+    # language detection, guarded on MSVC. See the note there.
+  endif()
+
+  # Not "test": CTest reserves that target name once enable_testing() is in
+  # effect, and common.cmake enables testing at directory scope. Every real
+  # invocation passes -DTARGET_NAME anyway (build_host_exe and the run_cmake
+  # lits both do), so this is only the fallback for a bare `cmake <example>`.
+  set(TARGET_NAME test_exe CACHE STRING "Target to be built")
+  set(ProjectName proj_${TARGET_NAME})
+  set(currentTarget ${TARGET_NAME})
+endmacro()

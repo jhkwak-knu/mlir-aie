@@ -1,7 +1,9 @@
-import numpy as np
+# Copyright (C) 2024 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-from aie.helpers.taplib import TensorTiler2D
-from util import construct_test
+import numpy as np
+from aie.helpers.taplib import TensorAccessPattern
+from util import construct_test, grid_steps, accesses
 
 # RUN: %python %s | FileCheck %s
 
@@ -9,8 +11,10 @@ from util import construct_test
 # CHECK-LABEL: square_tiler_col_major_tile
 @construct_test
 def square_tiler_col_major_tile():
-    tiler = TensorTiler2D.simple_tiler((32, 32), (4, 4), tile_col_major=True)
-    access_order, access_count = tiler.accesses()
+    tiler = grid_steps(
+        TensorAccessPattern.full((32, 32)).tile((4, 4)).permute((0, 1, 3, 2))
+    )
+    access_order, access_count = accesses(tiler)
     reference_access = np.array(
         # fmt: off
         [

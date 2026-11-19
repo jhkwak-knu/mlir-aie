@@ -1,11 +1,7 @@
 //===- bad_npu_nd.mlir -----------------------------------------*- MLIR -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2023 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// Copyright (C) 2023, Advanced Micro Devices, Inc.
-// Copyright (C) 2024, Advanced Micro Devices, Inc.
 //
 //===----------------------------------------------------------------------===//
 
@@ -13,25 +9,7 @@
 
 module {
   aie.device(npu1) {
-    memref.global "public" @of_fromMem : memref<32xi32, 1 : i32>
-    aiex.runtime_sequence(%in : memref<1920x1080xi32>, %buf : memref<32xi32>, %out : memref<1920x1080xi32>) {
-      %c0 = arith.constant 0 : i64
-      %c1 = arith.constant 1 : i64
-      %c1920 = arith.constant 1920 : i64
-      %c1080 = arith.constant 1080 : i64
-      // expected-error@+1 {{Size 0 exceeds the [0:1023] range}}
-      aiex.npu.dma_memcpy_nd (%in[%c0,%c0,%c0,%c0][%c1,%c1,%c1080,%c1920][%c0,%c0,%c1920,%c1]) { metadata = @of_fromMem, id = 0 : i64 } : memref<1920x1080xi32>
-    }
-    aie.shim_dma_allocation @of_fromMem(MM2S, 0, 0)
-  }
-}
-
-// -----
-
-module {
-  aie.device(npu1) {
-    memref.global "public" @of_fromMem : memref<32xi32, 1 : i32>
-    aiex.runtime_sequence(%in : memref<128x4x2x8xi32>, %buf : memref<32xi32>, %out : memref<8192xi32>) {
+    aie.runtime_sequence(%in : memref<128x4x2x8xi32>, %buf : memref<32xi32>, %out : memref<8192xi32>) {
       %c0 = arith.constant 0 : i64
       %c1 = arith.constant 1 : i64
       %c2 = arith.constant 2 : i64
@@ -40,10 +18,31 @@ module {
       %c16 = arith.constant 16 : i64
       %c32 = arith.constant 32 : i64
       %c128 = arith.constant 128 : i64
-      // expected-error@+1 {{Size 3 exceeds the [1:64] range}}
+      // With a zero outermost stride the outermost size is a repeat count, so
+      // 128 is fine; with a nonzero stride it is a BD iteration count, [1:64].
       aiex.npu.dma_memcpy_nd (%in[%c0,%c0,%c0,%c0][%c128,%c2,%c2,%c8][%c0,%c16,%c8,%c1]) { metadata = @of_fromMem, id = 0 : i64 } : memref<128x4x2x8xi32>
+      // expected-error@+1 {{iteration count 128 exceeds the [1:64] range.}}
+      aiex.npu.dma_memcpy_nd (%in[%c0,%c0,%c0,%c0][%c128,%c2,%c2,%c8][%c32,%c16,%c8,%c1]) { metadata = @of_fromMem, id = 1 : i64 } : memref<128x4x2x8xi32>
     }
-    aie.shim_dma_allocation @of_fromMem (MM2S, 0, 0)
+    %tile_0_0 = aie.tile(0, 0)
+    aie.shim_dma_allocation @of_fromMem (%tile_0_0, MM2S, 0)
+  }
+}
+
+// -----
+
+// A zero-stride outermost size is a repeat count, carried by the queue push's
+// 8-bit repeat_count rather than the 6-bit iteration wrap: 256 runs fit, 257
+// do not.
+module {
+  aie.device(npu1) {
+    aie.runtime_sequence(%in : memref<32xi32>) {
+      aiex.npu.dma_memcpy_nd (%in[0, 0, 0, 0][256, 1, 2, 16][0, 0, 16, 1]) { metadata = @of_fromMem, id = 0 : i64 } : memref<32xi32>
+      // expected-error@+1 {{repeat count 257 exceeds the [1:256] range.}}
+      aiex.npu.dma_memcpy_nd (%in[0, 0, 0, 0][257, 1, 2, 16][0, 0, 16, 1]) { metadata = @of_fromMem, id = 1 : i64 } : memref<32xi32>
+    }
+    %tile_0_0 = aie.tile(0, 0)
+    aie.shim_dma_allocation @of_fromMem (%tile_0_0, MM2S, 0)
   }
 }
 
@@ -51,16 +50,16 @@ module {
 
 module {
   aie.device(npu1) {
-    memref.global "public" @of_fromMem : memref<32xi32, 1 : i32>
-    aiex.runtime_sequence(%in : memref<8388608xi32>, %buf : memref<32xi32>, %out : memref<8388608xi32>) {
+    aie.runtime_sequence(%in : memref<8388608xi32>, %buf : memref<32xi32>, %out : memref<8388608xi32>) {
       %c0 = arith.constant 0 : i64
       %c1 = arith.constant 1 : i64
       %c2 = arith.constant 2 : i64
       %c2097152 = arith.constant 2097152 : i64
-      // expected-error@+1 {{Stride 1 exceeds the [1:1048576] range}}
+      // The decomposition pass can split this oversized stride into legal BDs.
       aiex.npu.dma_memcpy_nd (%in[%c0,%c0,%c0,%c0][%c1,%c1,%c2,%c2][%c0,%c0,%c2097152,%c1]) { metadata = @of_fromMem, id = 0 : i64 } : memref<8388608xi32>
     }
-    aie.shim_dma_allocation @of_fromMem(MM2S, 0, 0)
+    %tile_0_0 = aie.tile(0, 0)
+    aie.shim_dma_allocation @of_fromMem (%tile_0_0, MM2S, 0)
   }
 }
 
@@ -70,7 +69,7 @@ module {
 
 module {
   aie.device(npu1) {
-    aiex.runtime_sequence(%a : memref<8xi8>) {
+    aie.runtime_sequence(%a : memref<8xi8>) {
       %c0 = arith.constant 0 : i64
       %c1 = arith.constant 1 : i64
       %c2 = arith.constant 2 : i64
@@ -85,41 +84,22 @@ module {
 
 // Strides and sizes expressed in types other than i32 should not overflow hardware limitations when converted to 4-byte granularity.
 // The following tests check this.
-  
-module {
-  aie.device(npu1) {
-    memref.global "public" @objectfifo : memref<8xi8, 1 : i8>
-    aiex.runtime_sequence(%a : memref<8xi8>) {
-      %c0 = arith.constant 0 : i64
-      %c1 = arith.constant 1 : i64
-      %c2 = arith.constant 2 : i64
-      %c4 = arith.constant 4 : i64 
-      %c8 = arith.constant 8 : i64
-      %c2048 = arith.constant 2048 : i64
-      // Although 2048 exceeds the 0:1023 limit for size 0, since the elements are i8s,
-      // this should be a size of 512 in address granularity (4 bytes) and hence pass the test.
-      aiex.npu.dma_memcpy_nd (%a[%c0,%c0,%c0,%c0][%c1,%c1,%c2,%c2048][%c0,%c0,%c4,%c1]) { metadata = @objectfifo, id = 0 : i64 } : memref<8xi8>
-    }
-    aie.shim_dma_allocation @objectfifo (MM2S, 0, 0)
-  }
-}
-
-// -----
 
 module {
   aie.device(npu1) {
-    memref.global "public" @objectfifo : memref<8xi16, 1 : i16>
-    aiex.runtime_sequence(%a : memref<8xi16>) {
+    aie.runtime_sequence(%a : memref<8xi8>) {
       %c0 = arith.constant 0 : i64
       %c1 = arith.constant 1 : i64
       %c2 = arith.constant 2 : i64
       %c4 = arith.constant 4 : i64
       %c8 = arith.constant 8 : i64
       %c2048 = arith.constant 2048 : i64
-      // expected-error@+1 {{Size 0 exceeds the [0:1023] range}}
-      aiex.npu.dma_memcpy_nd (%a[%c0,%c0,%c0,%c0][%c1,%c1,%c2,%c2048][%c0,%c0,%c4,%c1]) { metadata = @objectfifo, id = 0 : i64 } : memref<8xi16>
+      // Although 2048 exceeds the 0:1023 limit for size 0, since the elements are i8s,
+      // this should be a size of 512 in address granularity (4 bytes) and hence pass the test.
+      aiex.npu.dma_memcpy_nd (%a[%c0,%c0,%c0,%c0][%c1,%c1,%c2,%c2048][%c0,%c0,%c4,%c1]) { metadata = @objectfifo, id = 0 : i64 } : memref<8xi8>
     }
-    aie.shim_dma_allocation @objectfifo (MM2S, 0, 0)
+    %tile_0_0 = aie.tile(0, 0)
+    aie.shim_dma_allocation @objectfifo (%tile_0_0, MM2S, 0)
   }
 }
 
@@ -130,8 +110,7 @@ module {
 
 module {
   aie.device(npu1) {
-    memref.global "public" @objectfifo : memref<8xi8, 1 : i8>
-    aiex.runtime_sequence(%a : memref<8xi8>) {
+    aie.runtime_sequence(%a : memref<8xi8>) {
       %c0 = arith.constant 0 : i64
       %c1 = arith.constant 1 : i64
       %c2 = arith.constant 2 : i64  // Stride of 2 i8s = 2 bytes < 4 byte granularity, should not be possible
@@ -139,7 +118,8 @@ module {
       // expected-error@+1 {{Stride 1 is 2 elements * 1 bytes = 2 bytes, which is not divisible by 4}}
       aiex.npu.dma_memcpy_nd (%a[%c0,%c0,%c0,%c0][%c1,%c1,%c1,%c8][%c0,%c0,%c2,%c1]) { metadata = @objectfifo, id = 0 : i64 } : memref<8xi8>
     }
-    aie.shim_dma_allocation @objectfifo (MM2S, 0, 0)
+    %tile_0_0 = aie.tile(0, 0)
+    aie.shim_dma_allocation @objectfifo (%tile_0_0, MM2S, 0)
   }
 }
 
@@ -147,8 +127,7 @@ module {
 
 module {
   aie.device(npu1) {
-    memref.global "public" @objectfifo : memref<8xi8, 1 : i8>
-    aiex.runtime_sequence(%a : memref<8xi8>) {
+    aie.runtime_sequence(%a : memref<8xi8>) {
       %c0 = arith.constant 0 : i64
       %c1 = arith.constant 1 : i64
       %c2 = arith.constant 2 : i64
@@ -157,7 +136,8 @@ module {
       // expected-error@+1 {{2 elements at 1 bytes each equal 2 bytes, which is not divisible by 4}}
       aiex.npu.dma_memcpy_nd (%a[%c0,%c0,%c0,%c0][%c1,%c1,%c1,%c2][%c0,%c0,%c4,%c1]) { metadata = @objectfifo, id = 0 : i64 } : memref<8xi8>
     }
-    aie.shim_dma_allocation @objectfifo (MM2S, 0, 0)
+    %tile_0_0 = aie.tile(0, 0)
+    aie.shim_dma_allocation @objectfifo (%tile_0_0, MM2S, 0)
   }
 }
 
@@ -167,8 +147,7 @@ module {
 
 module {
   aie.device(npu1) {
-    memref.global "public" @objectfifo : memref<8xi8, 1 : i8>
-    aiex.runtime_sequence(%a : memref<8xi8>) {
+    aie.runtime_sequence(%a : memref<8xi8>) {
       %c0 = arith.constant 0 : i64
       %c1 = arith.constant 1 : i64
       %c2 = arith.constant 2 : i64
@@ -177,7 +156,28 @@ module {
       // expected-error@+1 {{Stride 0 is 2 elements * 1 bytes = 2 bytes, which is not divisible by 4}}
       aiex.npu.dma_memcpy_nd (%a[%c0,%c0,%c0,%c0][%c1,%c1,%c1,%c8][%c0,%c0,%c0,%c2]) { metadata = @objectfifo, id = 0 : i64 } : memref<8xi8>
     }
-    aie.shim_dma_allocation @objectfifo (MM2S, 0, 0)
+    %tile_0_0 = aie.tile(0, 0)
+    aie.shim_dma_allocation @objectfifo (%tile_0_0, MM2S, 0)
+  }
+}
+
+// -----
+
+// stride of 2 bf16 is a whole word, but the DMA steps whole words, so it would
+// move both halves of each word rather than every other element
+
+module {
+  aie.device(npu1) {
+    aie.runtime_sequence(%a : memref<16xbf16>) {
+      %c0 = arith.constant 0 : i64
+      %c1 = arith.constant 1 : i64
+      %c2 = arith.constant 2 : i64
+      %c8 = arith.constant 8 : i64
+      // expected-error@+1 {{Stride 0 is 2 elements, but must be 1 for 2-byte elements: the DMA moves whole 4-byte words.}}
+      aiex.npu.dma_memcpy_nd (%a[%c0,%c0,%c0,%c0][%c1,%c1,%c1,%c8][%c0,%c0,%c0,%c2]) { metadata = @objectfifo, id = 0 : i64 } : memref<16xbf16>
+    }
+    %tile_0_0 = aie.tile(0, 0)
+    aie.shim_dma_allocation @objectfifo (%tile_0_0, MM2S, 0)
   }
 }
 
@@ -187,8 +187,7 @@ module {
 
 module {
   aie.device(npu1) {
-    memref.global "public" @objectfifo : memref<8xi16, 1 : i16>
-    aiex.runtime_sequence(%a : memref<8xi16>) {
+    aie.runtime_sequence(%a : memref<8xi16>) {
       %c0 = arith.constant 0 : i64
       %c1 = arith.constant 1 : i64
       %c3 = arith.constant 3 : i64
@@ -196,7 +195,8 @@ module {
       // expected-error@+1 {{3 elements at 2 bytes each equal 6 bytes, which is not divisible by 4}}
       aiex.npu.dma_memcpy_nd (%a[%c0,%c0,%c0,%c0][%c1,%c1,%c1,%c3][%c0,%c0,%c0,%c1]) { metadata = @objectfifo, id = 0 : i64 } : memref<8xi16>
     }
-    aie.shim_dma_allocation @objectfifo (MM2S, 0, 0)
+    %tile_0_0 = aie.tile(0, 0)
+    aie.shim_dma_allocation @objectfifo (%tile_0_0, MM2S, 0)
   }
 }
 
@@ -206,8 +206,7 @@ module {
 
 module {
   aie.device(npu1) {
-    memref.global "public" @objectfifo : memref<8xi32, 1 : i32>
-    aiex.runtime_sequence(%a : memref<8xi32>) {
+    aie.runtime_sequence(%a : memref<8xi32>) {
       %c0 = arith.constant 0 : i64
       %c1 = arith.constant 1 : i64
       %c2 = arith.constant 2 : i64
@@ -215,10 +214,11 @@ module {
       %c8 = arith.constant 8 : i64
       %c1572864 = arith.constant 1572864 : i64
       aiex.npu.dma_memcpy_nd (%a[%c1,%c0,%c0,%c0][%c1,%c1,%c1,%c2][%c1572864,%c0,%c0,%c1]) { metadata = @objectfifo, id = 0 : i64 } : memref<8xi32>
-      // expected-error@+1 {{Stride 3 exceeds the [1:1048576] range.}}
+      // expected-error@+1 {{'aiex.npu.dma_memcpy_nd' op Stride 3 is 1572864 (encoded as 1572863), which exceeds the [1:1048576] range.}}
       aiex.npu.dma_memcpy_nd (%a[%c1,%c0,%c0,%c0][%c2,%c1,%c1,%c2][%c1572864,%c0,%c0,%c1]) { metadata = @objectfifo, id = 1 : i64 } : memref<8xi32>
     }
-    aie.shim_dma_allocation @objectfifo (MM2S, 0, 0)
+    %tile_0_0 = aie.tile(0, 0)
+    aie.shim_dma_allocation @objectfifo (%tile_0_0, MM2S, 0)
   }
 }
 
@@ -228,8 +228,7 @@ module {
 
 module {
   aie.device(npu1) {
-    memref.global "public" @objectfifo : memref<8xi32, 1 : i32>
-    aiex.runtime_sequence(%a : memref<8xi32>) {
+    aie.runtime_sequence(%a : memref<8xi32>) {
       %c0 = arith.constant 0 : i64
       %c1 = arith.constant 1 : i64
       %c2 = arith.constant 2 : i64
@@ -239,7 +238,8 @@ module {
       // expected-error@+1 {{Packet ID field can only hold 5 bits.}}
       aiex.npu.dma_memcpy_nd (%a[%c1,%c0,%c0,%c0][%c2,%c1,%c1,%c2][%c0,%c0,%c0,%c1], packet = <pkt_id = 32, pkt_type = 2>) { metadata = @objectfifo, id = 1 : i64 } : memref<8xi32>
     }
-    aie.shim_dma_allocation @objectfifo (MM2S, 0, 0)
+    %tile_0_0 = aie.tile(0, 0)
+    aie.shim_dma_allocation @objectfifo (%tile_0_0, MM2S, 0)
   }
 }
 
@@ -249,8 +249,7 @@ module {
 
 module {
   aie.device(npu1) {
-    memref.global "public" @objectfifo : memref<8xi32, 1 : i32>
-    aiex.runtime_sequence(%a : memref<8xi32>) {
+    aie.runtime_sequence(%a : memref<8xi32>) {
       %c0 = arith.constant 0 : i64
       %c1 = arith.constant 1 : i64
       %c2 = arith.constant 2 : i64
@@ -259,6 +258,22 @@ module {
       // expected-error@+1 {{Packet type field can only hold 3 bits.}}
       aiex.npu.dma_memcpy_nd (%a[%c1,%c0,%c0,%c0][%c2,%c1,%c1,%c2][%c0,%c0,%c0,%c1], packet = <pkt_id = 2, pkt_type = 8>) { metadata = @objectfifo, id = 1 : i64 } : memref<8xi32>
     }
-    aie.shim_dma_allocation @objectfifo (MM2S, 0, 0)
+    %tile_0_0 = aie.tile(0, 0)
+    aie.shim_dma_allocation @objectfifo (%tile_0_0, MM2S, 0)
+  }
+}
+
+// -----
+
+// AxCACHE is a raw 4-bit field
+
+module {
+  aie.device(npu1) {
+    aie.runtime_sequence(%a : memref<8xi32>) {
+      // expected-error@+1 {{attribute 'axcache' failed to satisfy constraint}}
+      aiex.npu.dma_memcpy_nd (%a[0,0,0,0][1,1,1,8][0,0,0,1]) { metadata = @objectfifo, id = 1 : i64, axcache = 16 : i64 } : memref<8xi32>
+    }
+    %tile_0_0 = aie.tile(0, 0)
+    aie.shim_dma_allocation @objectfifo (%tile_0_0, MM2S, 0)
   }
 }

@@ -1,0 +1,692 @@
+# test_callable_design_unit.py -*- Python -*-
+#
+# Copyright (C) 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+#
+
+# RUN: %pytest %s
+"""Unit tests for CallableDesign and @jit pure-logic surfaces — no NPU required.
+
+Tests that exercise compile() or actual NPU kernel execution live in
+test/python/npu/test_iron_jit_e2e.py (requires a host runtime backend).
+"""
+
+import subprocess
+import sys
+import warnings
+
+import aie.iron as iron
+import numpy as np
+import pytest
+from aie.helpers.npdtypes import np_ndarray_type_get_dtype, np_ndarray_type_get_shape
+from aie.iron import Buffer, ObjectFifo, Program, Runtime, Worker, kernels
+from aie.iron.algorithms._transform import transform
+from aie.iron.kernel import ExternalFunction, Kernel
+from aie.utils.callabledesign import CallableDesign
+from aie.utils.compile.jit.compilabledesign import CompilableDesign
+from aie.utils.compile.jit.markers import CompileTime, DispatchTime, In, InOut, Out
+from aie.utils.jit import _JIT_CONFIG_KEYS, jit
+from aie.utils.trace import TraceConfig
+from aie.utils.trace.parse import DEFAULT_KERNEL
+from ml_dtypes import bfloat16
+
+# ---------------------------------------------------------------------------
+# CallableDesign construction
+# ---------------------------------------------------------------------------
+#
+# Forwarding tests (CallableDesign correctly delegates to its inner
+# CompilableDesign) are covered by the @jit decorator block below, which
+# exercises the same paths via a more realistic surface.  Construction-
+# defaults and split_runtime_args semantics are pinned in
+# test_compilabledesign.py.
+
+
+def test_repr_contains_callable_design():
+    def gen(a: In, *, M: CompileTime[int]):
+        pass
+
+    cd = CallableDesign(gen, compile_kwargs={"M": 1})
+    assert "CallableDesign" in repr(cd)
+
+
+def test_jit_explicit_dispatch_specialization():
+    def gen(a: In, *, M: DispatchTime[np.int32] = 8):
+        pass
+
+    dynamic = jit(gen)
+    static = jit(gen, M=4)
+    assert dynamic.compilable.dispatch_params == ["M"]
+    assert static.compilable.dispatch_params == []
+    assert static.compilable.compile_kwargs == {"M": 4}
+    assert static.specialize(M=6).compilable.compile_kwargs == {"M": 6}
+    assert static.specialize(use_cache=False).compilable.bound_dispatch_params == ("M",)
+    assert dynamic._extract_compile_kwargs({"M": 7}) == ({}, {"M": 7}, {})
+    with pytest.raises(TypeError, match="specialized.*specialize"):
+        static._extract_compile_kwargs({"M": 7})
+    with pytest.raises(TypeError, match="specialized.*specialize"):
+        static.as_mlir(None, M=7)
+
+
+@pytest.mark.parametrize("factory", [CompilableDesign, CallableDesign, jit])
+@pytest.mark.parametrize("prebound", [False, True])
+@pytest.mark.parametrize(
+    "kind", ["positional", "positional-only", "defaulted", "args", "kwargs"]
+)
+def test_dispatch_requires_keyword_only(factory, prebound, kind):
+    def positional(a: In, count: DispatchTime[np.int32]):
+        pass
+
+    def positional_only(count: DispatchTime[np.int32], /, a: In):
+        pass
+
+    def defaulted(a: In, count: DispatchTime[np.int32] = 3):
+        pass
+
+    def args(a: In, *count: DispatchTime[np.int32]):
+        pass
+
+    def kwargs(a: In, **count: DispatchTime[np.int32]):
+        pass
+
+    gen = {
+        "positional": positional,
+        "positional-only": positional_only,
+        "defaulted": defaulted,
+        "args": args,
+        "kwargs": kwargs,
+    }[kind]
+    options = (
+        ({"count": 3} if factory is jit else {"compile_kwargs": {"count": 3}})
+        if prebound
+        else {}
+    )
+    with pytest.raises(TypeError, match=r"DispatchTime.*count.*keyword-only"):
+        factory(gen, **options)
+
+
+@pytest.mark.parametrize("factory", [CompilableDesign, CallableDesign, jit])
+def test_keyword_only_group_order_is_not_enforced(factory):
+    def gen(a: In, *, size: CompileTime[int] = 8, count: DispatchTime[np.int32] = 3):
+        pass
+
+    design = factory(gen)
+    compilable = design if isinstance(design, CompilableDesign) else design.compilable
+    assert compilable.dispatch_params == ["count"]
+    assert compilable.split_runtime_args(("tensor",), {}) == (["tensor"], {"count": 3})
+
+
+# ---------------------------------------------------------------------------
+# @jit decorator — construction-time behaviour only
+# ---------------------------------------------------------------------------
+
+
+class TestJitDecorator:
+
+    def test_bare_decorator_returns_callable_design(self):
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+
+            @jit
+            def gen(a: In, *, M: CompileTime[int]):
+                pass
+
+        assert isinstance(gen, CallableDesign)
+
+    def test_bare_decorator_empty_compile_kwargs(self):
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+
+            @jit
+            def gen(a: In, *, M: CompileTime[int]):
+                pass
+
+        assert gen.compilable.compile_kwargs == {}
+
+    def test_bare_decorator_default_use_cache(self):
+        @jit
+        def gen(a: In):
+            pass
+
+        assert gen.compilable.use_cache is True
+
+    def test_with_compile_params_only(self):
+        @jit(M=512, N=512)
+        def gen(a: In, b: In, c: Out, *, M: CompileTime[int], N: CompileTime[int]):
+            pass
+
+        assert isinstance(gen, CallableDesign)
+        assert gen.compilable.compile_kwargs == {"M": 512, "N": 512}
+
+    def test_with_config_only(self):
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+
+            @jit(use_cache=False)
+            def gen(a: In, *, M: CompileTime[int]):
+                pass
+
+        assert isinstance(gen, CallableDesign)
+        assert gen.compilable.compile_kwargs == {}
+        assert gen.compilable.use_cache is False
+
+    def test_with_mixed_config_and_compile_kwargs(self):
+        @jit(M=256, use_cache=False, aiecc_flags=["--verbose"])
+        def gen(a: In, *, M: CompileTime[int]):
+            pass
+
+        assert gen.compilable.compile_kwargs == {"M": 256}
+        assert gen.compilable.use_cache is False
+        assert "--verbose" in gen.compilable.aiecc_flags
+
+    def test_source_files_forwarded(self):
+        @jit(source_files=["kernel.cc"])
+        def gen(a: In):
+            pass
+
+        assert gen.compilable.source_files[0].name == "kernel.cc"
+
+    def test_compile_flags_forwarded(self):
+        @jit(compile_flags=["-O3"])
+        def gen(a: In):
+            pass
+
+        assert "-O3" in gen.compilable.compile_flags
+
+    def test_include_paths_forwarded(self):
+        @jit(include_paths=["/opt/inc"])
+        def gen(a: In):
+            pass
+
+        assert any(
+            "opt/inc" in str(p).replace("\\", "/") for p in gen.compilable.include_paths
+        )
+
+    def test_object_files_forwarded(self):
+        @jit(object_files=["add.o"])
+        def gen(a: In):
+            pass
+
+        assert gen.compilable.object_files[0].name == "add.o"
+
+    def test_partial_decorator_applied_later(self):
+        partial = jit(M=512)
+        assert callable(partial)
+
+        def gen(a: In, *, M: CompileTime[int]):
+            pass
+
+        result = partial(gen)
+        assert isinstance(result, CallableDesign)
+        assert result.compilable.compile_kwargs == {"M": 512}
+
+    def test_empty_compile_kwargs_stored_as_empty_dict(self):
+        @jit(use_cache=True)
+        def gen(a: In):
+            pass
+
+        assert gen.compilable.compile_kwargs == {}
+
+    def test_jit_config_keys_covers_all_compilable_design_params(self):
+        expected = {
+            "use_cache",
+            "source_files",
+            "aiecc_flags",
+            "compile_flags",
+            "include_paths",
+            "object_files",
+            "trace_config",
+            "full_elf",
+        }
+        assert _JIT_CONFIG_KEYS == expected
+
+    def test_unknown_key_becomes_compile_kwarg(self):
+        @jit(my_custom_param=42)
+        def gen(a: In, *, my_custom_param: CompileTime[int]):
+            pass
+
+        assert gen.compilable.compile_kwargs == {"my_custom_param": 42}
+
+    def test_multiple_compile_params_all_captured(self):
+        @jit(M=512, K=256, N=128)
+        def gen(
+            a: In, *, M: CompileTime[int], K: CompileTime[int], N: CompileTime[int]
+        ):
+            pass
+
+        assert gen.compilable.compile_kwargs == {"M": 512, "K": 256, "N": 128}
+
+    def test_guard_1a_unknown_kwarg_to_jit_raises(self):
+        """@iron.jit must raise TypeError when a kwarg matches neither a config key nor a CompileTime[T] param.
+
+        Fails fast at decoration time so a typo like @jit(TYPO=512) doesn't
+        silently run a kernel with no value bound.
+        """
+        import pytest
+
+        with pytest.raises(TypeError, match="TYPO"):
+
+            @jit(TYPO=512)
+            def gen(a: In, *, M: CompileTime[int]):
+                pass
+
+    def test_guard_1b_unbound_required_compile_params_logs_at_debug(self, caplog):
+        """Bare @iron.jit with required CompileTime[T] params and no pre-binding
+        must log at DEBUG (not warn) — TypeError is the actual safety net at
+        compile time, so decoration-time noise was demoted to debug.
+        """
+        import logging
+
+        with caplog.at_level(logging.DEBUG, logger="aie.utils.callabledesign"):
+
+            @jit  # bare — no pre-bound compile params
+            def gen(a: In, *, M: CompileTime[int], N: CompileTime[int]):
+                pass
+
+        relevant = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.DEBUG
+            and "no defaults and no pre-bound values" in r.getMessage()
+        ]
+        assert (
+            relevant
+        ), "Expected a DEBUG-level log for unbound required CompileTime[T] params"
+        msg = relevant[-1].getMessage()
+        assert (
+            "M" in msg or "N" in msg
+        ), f"DEBUG message should mention the unbound params; got: {msg}"
+
+    def test_guard_1b_unbound_required_compile_params_silent_at_default(self):
+        """Same scenario, default log level (WARNING): nothing should be
+        emitted to warnings.warn or to the default-level logger."""
+        import warnings
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+
+            @jit
+            def gen(a: In, *, M: CompileTime[int], N: CompileTime[int]):
+                pass
+
+        unbound_warnings = [
+            x
+            for x in w
+            if issubclass(x.category, UserWarning)
+            and "no defaults and no pre-bound values" in str(x.message)
+        ]
+        assert not unbound_warnings, (
+            "@jit decoration must not emit a UserWarning for unbound required "
+            "CompileTime[T] params at default log level (it should be DEBUG-only). "
+            f"Got: {[str(x.message) for x in unbound_warnings]}"
+        )
+
+    def test_guard_1c_unannotated_scalar_with_default_raises(self):
+        """An unannotated non-tensor param with a default value would silently
+        bake the default into the compiled MLIR and ignore per-call overrides.
+        @iron.jit must reject this at decoration time and point users at
+        CompileTime[T] = default (or, eventually, Rtp[T])."""
+        with pytest.raises(TypeError, match="silently ignored"):
+
+            @jit
+            def gen(x: In, y: Out, *, factor: int = 7, N: CompileTime[int]):
+                pass
+
+    def test_guard_1c_unannotated_scalar_no_default_is_allowed(self):
+        """No-default unannotated params already error naturally at compile
+        time (TypeError missing kwarg) — they're not silent.  Guard 1-C only
+        rejects the silent-default case, so this should decorate fine."""
+
+        # Should NOT raise at decoration time.
+        @jit
+        def gen(x: In, y: Out, *, factor: int, N: CompileTime[int]):
+            pass
+
+        assert isinstance(gen, CallableDesign)
+
+    def test_guard_1c_compile_t_with_default_is_allowed(self):
+        """CompileTime[T] with default IS the supported way to express 'I want a
+        default value, recompile on per-call change'.  Must not be rejected
+        by Guard 1-C."""
+
+        @jit
+        def gen(x: In, y: Out, *, N: CompileTime[int] = 1024):
+            pass
+
+        assert isinstance(gen, CallableDesign)
+
+    def test_jit_creates_distinct_designs_per_decoration(self):
+        @jit(M=256)
+        def gen_a(a: In, *, M: CompileTime[int]):
+            pass
+
+        @jit(M=512)
+        def gen_b(a: In, *, M: CompileTime[int]):
+            pass
+
+        assert gen_a.compilable.compile_kwargs != gen_b.compilable.compile_kwargs
+        assert hash(gen_a.compilable) != hash(gen_b.compilable)
+
+
+# ---------------------------------------------------------------------------
+# Fix 1: ExternalFunction/Kernel filtering in split_runtime_args
+# ---------------------------------------------------------------------------
+
+
+def test_external_function_positional_not_in_tensor_args():
+    """ExternalFunction passed positionally must not appear in tensor_args."""
+    # We cannot instantiate ExternalFunction (requires source_file/source_string),
+    # so use Kernel which is the base class checked by isinstance in the fix.
+    kernel_obj = Kernel("my_func", "my_func.o")
+
+    def f(a: In, b: Out):
+        pass
+
+    cd = CallableDesign(f)
+    a, b = object(), object()
+    # Pass the Kernel instance between the two tensor args positionally.
+    tensors, scalars = cd.compilable.split_runtime_args((a, kernel_obj, b), {})
+    assert (
+        kernel_obj not in tensors
+    ), "Kernel instance must be filtered from tensor_args"
+    assert a in tensors
+    assert b in tensors
+    assert (
+        kernel_obj not in scalars.values()
+    ), "Kernel instance must not appear in scalar_kwargs"
+
+
+def test_variadic_tensor_design_takes_any_number_of_positionals():
+    """A ``*tensors: In`` design has no positional maximum; the runtime checks the count."""
+
+    def stream(*tensors: In, N: CompileTime[int]):
+        pass
+
+    cd = jit(stream, N=2)
+    assert cd.compilable.variadic_tensor_param == "tensors"
+    assert cd.compilable.tensor_params == ["tensors"]
+    assert cd.compilable.split_runtime_args((1, 2, 3), {}) == ([1, 2, 3], {})
+    with pytest.raises(TypeError, match="keyword arguments"):
+        cd(1, tensors=2)
+
+
+# NOTE: trace_config end-to-end behaviour (forwarded to NPUKernel.__init__,
+# not to kernel.__call__) is covered by a real NPU run in
+# test/python/npu/test_iron_jit_e2e.py::test_trace_config_forwarded_to_kernel.
+# A pure-unit version was removed because it required mocking compile() in a
+# way that diverged from prod behaviour (left _kernel_dir unset, masking a
+# real defect).
+
+
+# ---------------------------------------------------------------------------
+# specialize(): trace_config must reach the generator, not just the wrapper
+# ---------------------------------------------------------------------------
+
+
+def test_specialize_forwards_trace_config_to_compilable():
+    """trace_config is dual-natured: a CallableDesign wrapper config AND a
+    generator CompileTime[T] param that bakes trace flows into the MLIR.
+
+    specialize() must forward it to the underlying compilable's compile_kwargs
+    (so the generator receives it) in addition to setting it on the wrapper.
+    Regression: an earlier version popped it out of the forwarded overrides, so
+    the compile-only path (specialize(...).compile(xclbin_path=...)) produced a
+    trace-less xclbin and downstream parsing failed with "No valid trace data
+    found".
+    """
+
+    def gen(a: In, *, trace_config: CompileTime[object] = None):
+        pass
+
+    cd = CallableDesign(gen)
+    sentinel = object()
+    spec = cd.specialize(trace_config=sentinel)
+
+    # Reaches the generator (compilable compile_kwargs)...
+    assert spec.compilable.compile_kwargs.get("trace_config") is sentinel
+    # ...and still configures the wrapper (buffer read-back).
+    assert spec.trace_config is sentinel
+
+
+def test_specialize_preserves_wrapper_trace_config_when_not_overridden():
+    """When specialize() is called without a trace_config override, the wrapper's
+    existing trace_config is preserved (unchanged pre-existing behaviour)."""
+
+    def gen(a: In, *, M: CompileTime[int]):
+        pass
+
+    sentinel = object()
+    cd = CallableDesign(gen, trace_config=sentinel)
+    spec = cd.specialize(M=512)
+
+    assert spec.trace_config is sentinel
+
+
+# ---------------------------------------------------------------------------
+# Guard 3-A: tensor param as runtime kwarg raises TypeError
+# ---------------------------------------------------------------------------
+
+
+def test_guard_3a_tensor_param_as_runtime_kwarg_raises():
+    """Tensor-annotated params passed as keyword args must raise TypeError."""
+
+    def gen(a: In, b: Out, *, M: CompileTime[int]):
+        pass
+
+    cd = CallableDesign(gen, compile_kwargs={"M": 1})
+    a_obj = object()
+    b_obj = object()
+    with pytest.raises(TypeError, match="tensor param"):
+        cd(a_obj, b=b_obj)  # 'b' is Out — must be positional
+
+
+# ---------------------------------------------------------------------------
+# Guard 3-C: too many positional args raises TypeError
+# ---------------------------------------------------------------------------
+
+
+def test_guard_3c_too_many_positional_raises():
+    """More positional args than tensor+scalar slots must raise TypeError."""
+
+    def gen(a: In, *, M: CompileTime[int]):
+        pass  # only 1 tensor slot, 0 scalar slots
+
+    cd = CallableDesign(gen, compile_kwargs={"M": 1})
+    with pytest.raises(TypeError, match="positional argument"):
+        cd(object(), object(), object())  # 3 positional, only 1 expected
+
+
+def _sized_copy(a: In, b: Out, *, N: CompileTime[int] = 1024):
+    """A copy whose host buffers are N int32s, so N shows in the MLIR."""
+    of_in = ObjectFifo(np.ndarray[(16,), np.dtype[np.int32]])
+    of_out = of_in.cons().forward()
+
+    def seq(src, dst, producer, consumer):
+        producer.fill(src)
+        consumer.drain(dst, wait=True)
+
+    tensor_ty = np.ndarray[(N,), np.dtype[np.int32]]
+    rt = Runtime(seq, [tensor_ty, tensor_ty, of_in.prod(), of_out.cons()])
+    return Program(iron.get_current_device(), rt).resolve_program()
+
+
+def test_as_mlir_call_time_kwarg_overrides_prebound(npu2_device):
+    """as_mlir() must let call-time CompileTime[T] kwargs override pre-bound values.
+
+    Call-time-wins semantics are shared with __call__ so the MLIR you
+    inspect matches the MLIR that would be compiled for the same kwargs.
+    """
+    cd = CallableDesign(_sized_copy, compile_kwargs={"N": 1024})
+
+    overridden = cd.as_mlir(N=512)
+    assert "memref<512xi32>" in overridden
+    assert "memref<1024xi32>" not in overridden
+    # The original CallableDesign must remain unchanged for future calls.
+    assert cd.compilable.compile_kwargs["N"] == 1024
+    assert "memref<1024xi32>" in cd.as_mlir()
+
+
+def test_as_mlir_no_warning_when_no_conflict(npu2_device):
+    """as_mlir() must not warn when call-time kwargs match pre-bound values."""
+    cd = CallableDesign(_sized_copy, compile_kwargs={"N": 1024})
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        cd.as_mlir(N=1024)  # same value — no conflict
+
+    conflict_warnings = [
+        w
+        for w in caught
+        if "ignored" in str(w.message).lower() or "pre-bound" in str(w.message).lower()
+    ]
+    assert (
+        not conflict_warnings
+    ), "as_mlir() must not warn when call-time and pre-bound values match"
+
+
+# Binding the runtime's device before the in-process cache lookup, rebuilding
+# a cached kernel whose artifacts were removed, and as_mlir()'s device binding
+# run real kernels: see test/python/npu/test_iron_jit_e2e.py.
+
+
+def test_function_cache_key_keeps_internal_identity_out_of_compile_kwargs():
+    """User compile keys cannot collide with internal cache dimensions."""
+    from aie.utils.compile.cache.utils import _create_function_cache_key
+
+    def gen():
+        pass
+
+    key = _create_function_cache_key(
+        gen,
+        (),
+        {"__iron_device__": "user-value"},
+        extra_key=("device", "NPU2Col1"),
+    )
+
+    assert "__iron_device__" in key[1]
+    assert key[2] == ("device", "NPU2Col1")
+
+
+def test_call_argument_errors_do_not_probe_runtime():
+    """Cheap call-shape errors are reported before runtime device probing.
+
+    In a fresh interpreter, so no earlier test has made the runtime already.
+    """
+    script = (
+        "import aie.utils as utils\n"
+        "from aie.utils.callabledesign import CallableDesign\n"
+        "from aie.utils.compile.jit.markers import In\n"
+        "def gen(a: In):\n"
+        "    pass\n"
+        "try:\n"
+        "    CallableDesign(gen)(object(), object())\n"
+        "except TypeError as error:\n"
+        "    print('at most 1 positional' in str(error), "
+        "utils._DefaultNPURuntime is None)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script], check=True, capture_output=True, text=True
+    )
+    assert result.stdout.split() == ["True", "True"]
+
+
+def test_as_mlir_generator_receives_tensor_operands(npu2_device):
+    seen = []
+
+    @jit
+    def copy(a: In, b: Out):
+        seen.append((a, b))
+        of_in = ObjectFifo(np.ndarray[(16,), np.dtype[np.int32]])
+        of_out = of_in.cons().forward()
+
+        def seq(src, dst, producer, consumer):
+            producer.fill(src)
+            consumer.drain(dst, wait=True)
+
+        rt = Runtime(seq, [a, b, of_in.prod(), of_out.cons()])
+        return Program(iron.get_current_device(), rt).resolve_program()
+
+    small = copy.as_mlir(np.zeros(64, np.int32), np.zeros(64, np.int32))
+    large = copy.as_mlir(np.zeros((4, 32), np.int32), np.zeros(128, np.int32))
+    (a, b), (wide, _) = seen
+    assert isinstance(a, In) and isinstance(b, Out)
+    assert (a.ndarray_type, b.ndarray_type) == (
+        np.ndarray[(64,), np.dtype[np.int32]],
+        np.ndarray[(64,), np.dtype[np.int32]],
+    )
+    assert wide.shape == (4, 32) and wide.dtype == np.int32
+    assert "memref<64xi32>" in small
+    assert "memref<4x32xi32>" in large
+
+
+def _copy_program(src_ty, dst_ty):
+    of_in = ObjectFifo(src_ty)
+    of_out = of_in.cons().forward()
+
+    def seq(src, dst, producer, consumer):
+        producer.fill(src)
+        consumer.drain(dst, wait=True)
+
+    rt = Runtime(seq, [src_ty, dst_ty, of_in.prod(), of_out.cons()])
+    return Program(iron.get_current_device(), rt).resolve_program()
+
+
+def test_an_operand_goes_wherever_its_tensor_type_goes(npu2_device):
+    @jit
+    def by_operand(a: In, b: Out):
+        assert np_ndarray_type_get_shape(a) == (64,)
+        assert np_ndarray_type_get_dtype(b) == np.int32
+        return _copy_program(a, b)
+
+    @jit
+    def by_type(a: In, b: Out):
+        return _copy_program(a.ndarray_type, b.ndarray_type)
+
+    tensors = (np.zeros(64, np.int32), np.zeros(64, np.int32))
+    assert by_operand.as_mlir(*tensors) == by_type.as_mlir(*tensors)
+
+
+def _kernel_program(src_ty, dst_ty):
+    copy_all = Kernel("copy_all", "copy_all.o", [src_ty, dst_ty])
+    scratch = Buffer(src_ty, name="scratch")
+    of_in, of_out = ObjectFifo(src_ty), ObjectFifo(dst_ty)
+
+    def core(of_in, of_out, scratch, kernel):
+        kernel(of_in.acquire(1), scratch)
+        kernel(scratch, of_out.acquire(1))
+        of_in.release(1)
+        of_out.release(1)
+
+    def seq(src, dst, producer, consumer):
+        producer.fill(src)
+        consumer.drain(dst, wait=True)
+
+    worker = Worker(core, [of_in.cons(), of_out.prod(), scratch, copy_all])
+    rt = Runtime(seq, [src_ty, dst_ty, of_in.prod(), of_out.cons()])
+    return Program(iron.get_current_device(), rt, workers=[worker]).resolve_program()
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        _kernel_program,
+        lambda a, b: transform(kernels.gelu(tile_size=1024), a, tile_size=1024),
+    ],
+    ids=["buffer-and-kernel", "transform"],
+)
+def test_an_operand_builds_what_its_tensor_type_builds(npu2_device, build):
+    @jit
+    def by_operand(a: In, b: Out):
+        return build(a, b)
+
+    @jit
+    def by_type(a: In, b: Out):
+        return build(a.ndarray_type, b.ndarray_type)
+
+    tensors = (np.zeros(4096, bfloat16), np.zeros(4096, bfloat16))
+    assert by_operand.as_mlir(*tensors) == by_type.as_mlir(*tensors)

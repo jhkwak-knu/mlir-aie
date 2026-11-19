@@ -1,109 +1,144 @@
 # single_column_designs/vector_reduce_max_memtile.py -*- Python -*-
 #
-# This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-# See https://llvm.org/LICENSE.txt for license information.
+# Copyright (C) 2025-2026 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #
-# (c) Copyright 2025 Advanced Micro Devices, Inc. or its affiliates
-import numpy as np
+"""Single-column vector reduce-max (memtile variant) — IRON + ``@iron.jit``.
+
+4 cores compute partial max in parallel; the memtile joins the 4 per-
+core scalars into a single 4-element vector that core 0 reduces with a
+scalar reduce_max for the final output.
+
+Kernels come from the iron kernel library: ``reduce_max(vectorized=True)``
+for per-core partial reduces, ``reduce_max(vectorized=False)`` for the
+final 4-element scalar reduce, and ``compute_max`` for the per-core
+running-max accumulator.  All three share one ``.o`` (compiled from the
+same ``reduce_max.cc``).
+
+Two invocation modes:
+
+  * standalone:   ``python3 vector_reduce_max_memtile.py``
+  * compile-only: ``... --xclbin-path=PATH --insts-path=PATH``  (Makefile)
+"""
+
 import argparse
 import sys
 
-from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker, LocalBuffer
-from aie.iron.placers import SequentialPlacer
-from aie.iron.device import NPU1Col2, NPU2Col2
-from aie.helpers.util import np_ndarray_type_get_shape
-from ml_dtypes import bfloat16
+import aie.iron as iron
+import numpy as np
+from aie.helpers.npdtypes import np_ndarray_type_get_shape
+from aie.iron import (
+    Buffer,
+    CompileTime,
+    In,
+    ObjectFifo,
+    Out,
+    Program,
+    Runtime,
+    Worker,
+    kernels,
+    str_to_dtype,
+)
 from aie.iron.controlflow import range_
+from aie.utils.hostruntime.argparse import (
+    add_compile_args,
+    add_trace_arg,
+    device_from_args,
+)
+from aie.utils.hostruntime.cli import run_design_cli
+from aie.utils.verify import assert_pass
+from ml_dtypes import bfloat16
 
-dtype_map = {
-    "bf16": bfloat16,
-    "i32": np.int32,
-}
+N_MEM_ELEMS = 2048
 
 
-def my_reduce_max(dev, in1_size, out_size, dtype_str, trace_size):
+@iron.jit
+def vector_reduce_max(
+    a_in: In,
+    c_out: Out,
+    *,
+    in1_size: CompileTime[int] = 524288,
+    out_size: CompileTime[int] = 4,
+    dtype_str: CompileTime[str] = "i32",
+    trace_size: CompileTime[int] = 0,
+):
+    if out_size != 4:
+        raise ValueError("Output buffer must be size 4 (4 bytes = 1 integer).")
+
     n_cores = 4
-    n_mem_elems = 2048
+    n_mem_elems = N_MEM_ELEMS
     elems_per_core = n_mem_elems // n_cores
 
-    dtype = dtype_map[dtype_str]
-
+    dtype = str_to_dtype(dtype_str)
     in_tensor_size = in1_size // dtype(0).nbytes
     out_tensor_size = out_size // dtype(0).nbytes
-
     num_iter = in_tensor_size // n_mem_elems
 
-    assert out_size == 4, "Output buffer must be size 4 (4 bytes = 1 integer)."
-
-    enable_trace = 1 if trace_size > 0 else 0
-
-    # Define tensor types
     in_ty = np.ndarray[(in_tensor_size,), np.dtype[dtype]]
     mem_ty = np.ndarray[(n_mem_elems,), np.dtype[dtype]]
     op_ty = np.ndarray[(elems_per_core,), np.dtype[dtype]]
     out_ty = np.ndarray[(out_tensor_size,), np.dtype[dtype]]
     int_ty = np.ndarray[(out_tensor_size * n_cores,), np.dtype[dtype]]
 
-    # AIE-array data movement with object fifos
-    in_fifos = []
-    out_fifos = []
-
     of_in = ObjectFifo(mem_ty, name="of_in")
-    outC = ObjectFifo(int_ty, name="outC", dims_to_stream=[(1, 2), (1, 1)])
+    outC = ObjectFifo(int_ty, name="outC")
     of_out = ObjectFifo(out_ty, name="of_out")
 
-    if n_cores > 1:
-        of_a_offsets = [
-            (np.prod(np_ndarray_type_get_shape(mem_ty)) // n_cores) * i
-            for i in range(n_cores)
-        ]
-        of_c_offsets = [(out_tensor_size * i) for i in range(n_cores)]
-    else:
-        of_a_offsets = [0]
-        of_c_offsets = [0]
+    of_a_offsets = [
+        int(np.prod(np_ndarray_type_get_shape(mem_ty)) // n_cores) * i
+        for i in range(n_cores)
+    ]
+    of_c_offsets = [(out_tensor_size * i) for i in range(n_cores)]
 
     in_fifos = of_in.cons().split(
         of_a_offsets,
         obj_types=[op_ty] * n_cores,
         names=[f"memA{i}" for i in range(n_cores)],
     )
-
     out_fifos = outC.prod().join(
         of_c_offsets,
         obj_types=[out_ty] * n_cores,
         names=[f"memC{i}" for i in range(n_cores)],
     )
 
-    # AIE Core Function declarations
-    suffix = "_bfloat16" if dtype_str == "bf16" else ""
-    reduce_max_vector = Kernel(
-        f"reduce_max_vector{suffix}", "reduce_max.cc.o", [op_ty, out_ty, np.int32]
+    reduce_max_vector = kernels.reduce_max(
+        tile_size=elems_per_core, dtype=dtype, vectorized=True
     )
-    reduce_max_scalar = Kernel(
-        f"reduce_max_scalar{suffix}", "reduce_max.cc.o", [int_ty, out_ty, np.int32]
+    # int_ty has n_cores elements -- scalar reduce over those.
+    reduce_max_scalar = kernels.reduce_max(
+        tile_size=out_tensor_size * n_cores, dtype=dtype, vectorized=False
     )
-    compute_max = Kernel(
-        f"compute_max{suffix}", "reduce_max.cc.o", [out_ty, out_ty, out_ty]
-    )
+    compute_max = kernels.compute_max(dtype=dtype)
+
     min_val = (
         np.array([bfloat16(float("-inf"))], dtype=dtype)
         if dtype_str == "bf16"
         else np.array([np.iinfo(dtype).min], dtype=dtype)
     )
+    nextC_buffers = []
+    tmp_buffers = []
+    for i in range(n_cores):
+        nextC_buffers.append(
+            Buffer(
+                type=np.ndarray[(out_tensor_size,), np.dtype[dtype]],
+                initial_value=min_val,
+            )
+        )
+        tmp_buffers.append(
+            Buffer(
+                type=np.ndarray[(out_tensor_size,), np.dtype[dtype]],
+                initial_value=min_val,
+            )
+        )
 
-    # Define a task to run
-    def start_core_body(of_in, of_out, reduce_max_vector, compute_max):
-        nextC_buffer = LocalBuffer(
-            type=np.ndarray[(out_tensor_size,), np.dtype[dtype]],
-            initial_value=min_val,
-        )
-        tmp_buffer = LocalBuffer(
-            type=np.ndarray[(out_tensor_size,), np.dtype[dtype]],
-            initial_value=min_val,
-        )
+    def start_core_body(
+        of_in, of_out, reduce_max_vector, compute_max, nextC_buffer, tmp_buffer
+    ):
         elem_out = of_out.acquire(1)
-        for _ in range_(num_iter):
+        elem_in = of_in.acquire(1)
+        reduce_max_vector(elem_in, nextC_buffer, elems_per_core)
+        of_in.release(1)
+        for _ in range_(num_iter - 1):
             elem_in = of_in.acquire(1)
             reduce_max_vector(elem_in, tmp_buffer, elems_per_core)
             compute_max(tmp_buffer, nextC_buffer, nextC_buffer)
@@ -119,17 +154,14 @@ def my_reduce_max(dev, in1_size, out_size, dtype_str, trace_size):
         reduce_max_vector,
         reduce_max_scalar,
         compute_max,
+        nextC_buffer,
+        tmp_buffer,
     ):
-        nextC_buffer = LocalBuffer(
-            type=np.ndarray[(out_tensor_size,), np.dtype[dtype]],
-            initial_value=min_val,
-        )
-        tmp_buffer = LocalBuffer(
-            type=np.ndarray[(out_tensor_size,), np.dtype[dtype]],
-            initial_value=min_val,
-        )
         elem_out = elemC_out.acquire(1)
-        for _ in range_(num_iter):
+        elem_in = of_in.acquire(1)
+        reduce_max_vector(elem_in, nextC_buffer, elems_per_core)
+        of_in.release(1)
+        for _ in range_(num_iter - 1):
             elem_in = of_in.acquire(1)
             reduce_max_vector(elem_in, tmp_buffer, elems_per_core)
             compute_max(tmp_buffer, nextC_buffer, nextC_buffer)
@@ -143,10 +175,9 @@ def my_reduce_max(dev, in1_size, out_size, dtype_str, trace_size):
         elemA_in.release(1)
         of_out.release(1)
 
-    # Define a worker to run the task on a core
     workers = []
     for i in range(n_cores):
-        if i != 0 and n_cores > 1:
+        if i != 0:
             workers.append(
                 Worker(
                     start_core_body,
@@ -155,68 +186,109 @@ def my_reduce_max(dev, in1_size, out_size, dtype_str, trace_size):
                         out_fifos[i].prod(),
                         reduce_max_vector,
                         compute_max,
+                        nextC_buffers[i],
+                        tmp_buffers[i],
                     ],
                     trace=True if i == 1 else None,
                 )
             )
         else:
-            fifo_args = [
-                in_fifos[i].cons(),
-                out_fifos[i].prod(),
-                outC.cons(),
-                of_out.prod(),
-                reduce_max_vector,
-                reduce_max_scalar,
-                compute_max,
-            ]
-            workers.append(Worker(core_body, fn_args=fifo_args, trace=None))
+            workers.append(
+                Worker(
+                    core_body,
+                    fn_args=[
+                        in_fifos[i].cons(),
+                        out_fifos[i].prod(),
+                        outC.cons(),
+                        of_out.prod(),
+                        reduce_max_vector,
+                        reduce_max_scalar,
+                        compute_max,
+                        nextC_buffers[i],
+                        tmp_buffers[i],
+                    ],
+                    trace=None,
+                )
+            )
 
-    # Runtime operations to move data to/from the AIE-array
-    rt = Runtime()
-    with rt.sequence(in_ty, out_ty) as (a_in, c_out):
-        rt.enable_trace(trace_size)
-        rt.start(*workers)
-        rt.fill(of_in.prod(), a_in)
-        rt.drain(of_out.cons(), c_out, wait=True)
+    def sequence(a, c, in_h, out_h):
+        in_h.fill(a)
+        out_h.drain(c, wait=True)
 
-    # Place program components (assign them resources on the device) and generate an MLIR module
-    return Program(dev, rt).resolve_program(SequentialPlacer())
-
-
-p = argparse.ArgumentParser()
-p.add_argument("-d", "--dev", required=True, dest="device", help="AIE Device")
-p.add_argument(
-    "-i1s", "--in1_size", required=True, dest="in1_size", help="Input 1 size"
-)
-p.add_argument("-os", "--out_size", required=True, dest="out_size", help="Output size")
-p.add_argument("-dt", "--dtype", required=True, dest="dtype", help="Datatype")
-p.add_argument(
-    "-t",
-    "--trace_size",
-    required=False,
-    dest="trace_size",
-    default=0,
-    help="Trace buffer size",
-)
-opts = p.parse_args(sys.argv[1:])
-
-if opts.device == "npu":
-    dev = NPU1Col2()
-elif opts.device == "npu2":
-    dev = NPU2Col2()
-else:
-    raise ValueError("[ERROR] Device name {} is unknown".format(opts.device))
-
-in1_size = int(opts.in1_size)
-if in1_size % 64 != 0 or in1_size < 512:
-    print(
-        "In1 buffer size ("
-        + str(in1_size)
-        + ") must be a multiple of 64 and greater than or equal to 512"
+    rt = Runtime(
+        sequence,
+        [in_ty, out_ty, of_in.prod(), of_out.cons()],
     )
-    raise ValueError
-out_size = int(opts.out_size)
-dtype = str(opts.dtype)
-trace_size = int(opts.trace_size)
+    prog = Program(iron.get_current_device(), rt, workers=workers)
+    if trace_size > 0:
+        prog.enable_trace(trace_size)
 
-print(my_reduce_max(dev, in1_size, out_size, dtype, trace_size))
+    return prog.resolve_program()
+
+
+def _make_argparser():
+    p = argparse.ArgumentParser(prog="AIE Single-Column Vector Reduce Max (memtile)")
+    add_compile_args(p)
+    p.add_argument("-i1s", "--in1_size", type=int, default=524288, help="bytes")
+    p.add_argument("-os", "--out_size", type=int, default=4, help="bytes (always 4)")
+    p.add_argument("-dt", "--dtype", type=str, default="i32", choices=["i32", "bf16"])
+    add_trace_arg(p)
+    return p
+
+
+def _compile_kwargs(opts):
+    return dict(
+        in1_size=opts.in1_size,
+        out_size=opts.out_size,
+        dtype_str=opts.dtype,
+        trace_size=opts.trace_size,
+    )
+
+
+def _run_and_verify(opts):
+    dtype = str_to_dtype(opts.dtype)
+    num_elements = opts.in1_size // dtype(0).nbytes
+    out_num_elements = opts.out_size // dtype(0).nbytes
+
+    rng = np.random.default_rng(0)
+    if opts.dtype == "i32":
+        in_np = rng.integers(-1000, 1000, size=(num_elements,), dtype=np.int32)
+    else:
+        in_np = rng.uniform(-1000.0, 1000.0, size=(num_elements,)).astype(dtype)
+    in_t = iron.tensor(in_np, dtype=dtype, device="npu")
+    out_t = iron.zeros(out_num_elements, dtype=dtype, device="npu")
+
+    vector_reduce_max(in_t, out_t, **_compile_kwargs(opts))
+
+    expected_max = in_np.max()
+    actual_max = out_t.numpy()[0]
+    assert_pass(
+        actual_max, expected_max, fail_msg=f"expected {expected_max}, got {actual_max}"
+    )
+
+
+def _validate(opts):
+    if opts.in1_size % 64 != 0:
+        sys.exit(f"in1_size ({opts.in1_size}) must be a multiple of 64")
+    elems = opts.in1_size // str_to_dtype(opts.dtype)(0).nbytes
+    if elems < N_MEM_ELEMS:
+        sys.exit(
+            f"in1_size ({opts.in1_size} bytes = {elems} {opts.dtype}) must hold at "
+            f"least one {N_MEM_ELEMS}-element tile"
+        )
+
+
+def main():
+    opts = _make_argparser().parse_args()
+    run_design_cli(
+        vector_reduce_max,
+        opts,
+        compile_kwargs=_compile_kwargs,
+        run_and_verify=_run_and_verify,
+        validate=_validate,
+        device=lambda o: device_from_args(o, n_cols=2),
+    )
+
+
+if __name__ == "__main__":
+    main()

@@ -1,11 +1,8 @@
 //===- sum.cc ----------------------------------------------*- C++
 ////-*-===//
 ////
-//// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-//// See https://llvm.org/LICENSE.txt for license information.
+//// Copyright (C) 2025 Advanced Micro Devices, Inc.
 //// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-////
-//// Copyright (C) 2025, Advanced Micro Devices, Inc.
 ////
 ////===----------------------------------------------------------------------===//
 
@@ -18,8 +15,8 @@
 
 template <typename T>
 void zero_vectorized(T *__restrict c) {
-    const aie::vector<T, 16> zeros = aie::zeros<T, 16>();
-    aie::store_v(c, zeros);
+  const aie::vector<T, 16> zeros = aie::zeros<T, 16>();
+  aie::store_v(c, zeros);
 }
 
 void sum_kernel(int32_t *a, int32_t *c) {
@@ -34,12 +31,8 @@ void sum_kernel(int32_t *a, int32_t *c) {
 }
 extern "C" {
 
-void sum(int32_t *a, int32_t *c) {
-    sum_kernel(a, c);
-}
+void sum(int32_t *a, int32_t *c) { sum_kernel(a, c); }
 
-void zero(int32_t *restrict c) {
-    zero_vectorized<int32_t>(c);
-}
+void zero(int32_t *restrict c) { zero_vectorized<int32_t>(c); }
 
 } // extern "C"

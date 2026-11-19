@@ -1,354 +1,922 @@
 # runtime.py -*- Python -*-
 #
-# This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-# See https://llvm.org/LICENSE.txt for license information.
+# Copyright (C) 2024-2026 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #
-# (c) Copyright 2024 Advanced Micro Devices, Inc.
+"""Runtime: orchestrates host-side data movement and worker execution for an IRON program.
+
+The runtime sequence is written as a *callback body* -- a plain Python function
+whose parameters are the runtime I/O buffers (and, optionally, runtime scalars).
+The body runs eagerly inside ``@runtime_sequence`` at resolve time, mirroring how
+``Worker.core_fn`` runs inside ``@core``. Because the body executes with live MLIR
+values in scope, it can use native ``range_``/``if_`` control flow with
+``fill``/``drain`` verbs nested inside -- the dynamic path lowers these to
+``scf.for``/``scf.if`` (EmitC C++ TXN), and the static path (Python ``range``/int
+bounds) elaborates to a flat binary sequence.
+"""
 
 from __future__ import annotations
-from collections import defaultdict
-from contextlib import contextmanager
+
+import inspect
+import itertools
+import logging
+from typing import TYPE_CHECKING, Callable, Sequence, get_origin
+
 import numpy as np
-from typing import Callable
 
-# import aie.utils.trace as trace_utils
-from ...utils import trace as trace_utils
-
-from ... import ir  # type: ignore
-
-from ...dialects.aie import tile
-from ...dialects.aiex import runtime_sequence
-from ...dialects._aiex_ops_gen import dma_await_task, dma_free_task  # type: ignore
-from ...helpers.taplib import TensorAccessPattern
-from ..dataflow import ObjectFifoHandle
-from ..device import PlacementTile, AnyShimTile
-from ..resolvable import Resolvable
-from ..worker import Worker, WorkerRuntimeBarrier, _BarrierSetOp
-from .dmatask import DMATask
-from .data import RuntimeData
-from .endpoint import RuntimeEndpoint
-from .taskgroup import RuntimeTaskGroup
-from .task import (
-    RuntimeTask,
-    RuntimeStartTask,
-    InlineOpRuntimeTask,
-    FinishTaskGroupTask,
+from ... import ir  # pyright: ignore[reportMissingImports, reportAttributeAccessIssue]
+from ...dialects._aie_ops_gen import (  # pyright: ignore[reportMissingImports]
+    RuntimeSequenceOp,
 )
+from ...dialects.aie import Port
+from ...dialects.aiex import (
+    dma_await_task,
+    dma_free_task,
+    npu_load_pdi,  # pyright: ignore[reportAttributeAccessIssue]
+    run,  # pyright: ignore[reportAttributeAccessIssue]
+    sync_scratchpad_parameters_from_host,  # pyright: ignore[reportAttributeAccessIssue]
+)
+from ...extras.dialects.arith import constant  # pyright: ignore[reportMissingImports]
+from ...helpers.npdtypes import np_ndarray_type_of
+from ...helpers.sourceloc import Declared, SourceSite, traced_body
+from ...helpers.util import (
+    flatten_fn_args,
+    np_dtype_to_mlir_type,
+    try_convert_np_type_to_mlir_type,
+)
+from ...utils import trace as trace_utils
+from ...utils.compile.jit.markers import _DispatchParameter
+from ..dataflow.objectfifo import ObjectFifoHandle, ObjectFifoLink
+from ..dataflow.objectfifopool import ObjectFifoPoolHandle
+from ..resolvable import DeviceResources, Resolvable
+from ..scratchpad_parameter import ScratchpadParameter
+from ._context import active_configuration, active_sequence, active_sequence_scope
+from .data import RuntimeData
+from .dmatask import DMATask
+from .endpoint import RuntimeEndpoint
+from .taskgroup import TaskGroup
+
+if TYPE_CHECKING:
+    from ..configuration import DeviceConfiguration
+    from ..device import Device
+
+logger = logging.getLogger(__name__)
 
 
-class Runtime(Resolvable):
-    """A Runtime contains that operations and structure of all operations that
-    need to be taken care of by the host/runtime in order to run a program.
+class IronRuntimeError(Exception):
+    """Raised by the IRON Runtime when resolution encounters an unrecoverable state."""
+
+
+class ActiveSequence:
+    """The state of a runtime sequence body while it is being emitted.
+
+    The body's data-movement verbs (``fifo.fill``/``fifo.drain``) and
+    ``TaskGroup`` reach this object through the active-sequence ContextVar
+    (see ``_context``) rather than a threaded ``rt`` reference, so the body
+    signature carries only the runtime buffers.
+
+    The body runs exactly once, inside the ``runtime_sequence`` op: each verb
+    both binds its ObjectFifo's shim endpoint and emits the shim DMA. The DMA
+    references the fifo by symbol name (a legal MLIR forward reference), so it
+    does not require the fifo to be resolved yet. DeviceConfiguration resolves
+    fifos and cores afterward, with every runtime endpoint already bound.
     """
 
-    """This is used to generate unique task group ids"""
-    __task_group_index = 0
+    def __init__(self, runtime: "Runtime", seq_op: RuntimeSequenceOp, device=None):
+        self._runtime = runtime
+        self._seq_op = seq_op
+        self._device = device
+        # The implicit group for fill/drain calls that pass no explicit group.
+        self._default_task_group = TaskGroup(next(runtime._task_group_index))
+        self._open_task_groups: list[TaskGroup] = []
+        self._used_default = False
+        self._used_explicit = False
+        # sync_parameters() calls so far; only the first emits a sync.
+        self.sync_requests = 0
+        # The merged step whose body is running, if any (Runtime.merge).
+        self.step: Runtime | None = None
+
+    @property
+    def runtime(self) -> "Runtime":
+        """The Runtime whose sequence body is running."""
+        return self._runtime
+
+    @property
+    def body(self) -> ir.Block:
+        """The sequence's entry block, which holds the body's top-level ops."""
+        return self._seq_op.body.blocks[0]
+
+    def note_fifo(self, handle: ObjectFifoHandle) -> None:
+        """Record that ``handle`` is driven from the runtime (its shim endpoint).
+
+        A merged step running records it as its own as well.
+        """
+        self._runtime._fifos[handle] = None
+        if self.step is not None:
+            self.step._fifos[handle] = None
+
+    def resolve_in_device(self, resolvable) -> None:
+        """Resolve a Buffer or Lock the body reaches first, ahead of the sequence.
+
+        DeviceConfiguration resolves discoverable objects before the body runs.
+        This method places an object named only by a runtime task at device scope.
+        """
+        configuration = self._runtime.configuration
+        if configuration is not None:
+            configuration.claim_runtime_resource(resolvable)
+        with ir.InsertionPoint(self._seq_op):
+            if self._device is not None:
+                self._device.resolve_tile(resolvable.tile)
+            resolvable.resolve()
+
+    def register_task_group(self, tg: TaskGroup) -> None:
+        self._open_task_groups.append(tg)
+
+    def finish_task_group(self, tg: TaskGroup) -> None:
+        """Close a task group: await its waited tasks, then free the rest.
+
+        Waits are ordered before frees within the group, matching the
+        hardware-safe order the old flat-list runtime used.
+        """
+        if tg in self._open_task_groups:
+            self._open_task_groups.remove(tg)
+        actions = tg._actions
+        if not actions:
+            return
+        wait_tasks = [(fn, a) for (fn, a) in actions if fn == dma_await_task]
+        free_tasks = [(fn, a) for (fn, a) in actions if fn == dma_free_task]
+        if len(wait_tasks) + len(free_tasks) != len(actions):
+            unknown = [
+                (fn, a)
+                for (fn, a) in actions
+                if fn != dma_await_task and fn != dma_free_task
+            ]
+            raise IronRuntimeError(
+                f"Unknown action type detected: {','.join(str(a) for a in unknown)}"
+            )
+        for fn, a in wait_tasks + free_tasks:
+            with a[0].location:
+                fn(*a)
+        tg._actions = []
+
+    def emit_transfer(self, task: DMATask, task_group: TaskGroup | None) -> None:
+        """Emit a DMA transfer and record its await/free action(s) for group close.
+
+        A waited transfer is both awaited and freed: the dynamic BD-pool pass
+        only returns an id to the runtime free-list on an explicit free (an
+        await is a pure TCT sync), so a waited-but-never-freed task would leak
+        a pool slot on every rolled-loop iteration. Matches the static path's
+        long-standing "await implies release" convention -- it just does so
+        with an explicit free instead of folding it into the await.
+        """
+        task.resolve()
+        if task_group is not None:
+            self._used_explicit = True
+            group = task_group
+        else:
+            self._used_default = True
+            group = self._default_task_group
+        if task.will_wait():
+            group._actions.append((dma_await_task, [task.task]))
+        group._actions.append((dma_free_task, [task.task]))
+
+    def finalize(self, strict: bool | None = None) -> None:
+        """Close bookkeeping after the body runs, or after one merged step's body.
+
+        A fresh default group then takes the next step's transfers.
+
+        Args:
+            strict: That body's ``strict_task_groups``; the runtime's when None.
+        """
+        if strict is None:
+            strict = self._runtime._strict_task_groups
+        explicit_open = [
+            tg for tg in self._open_task_groups if tg is not self._default_task_group
+        ]
+        if explicit_open:
+            tgs = ", ".join(str(t) for t in explicit_open)
+            raise IronRuntimeError(f"Failed to close task groups: {tgs}")
+        if strict and self._used_default and self._used_explicit:
+            raise IronRuntimeError(
+                "Mixing explicit task groups and the default task group is "
+                "prohibited. Please assign all tasks to a task group."
+            )
+        # Flush any transfers left in the default group (no explicit finish),
+        # and close it even when empty: a merged step makes a fresh one.
+        self.finish_task_group(self._default_task_group)
+        self._default_task_group = TaskGroup(next(self._runtime._task_group_index))
+        self._used_default = self._used_explicit = False
+
+
+class Runtime(Declared, DeviceResources, Resolvable):
+    """The host-side sequence of data-movement operations that execute an IRON design.
+
+    A Runtime describes what the host does at runtime: filling input
+    [`ObjectFifo`][aie.iron.ObjectFifo]s with data and draining results back to host
+    buffers. The sequence is the ``seq_fn`` callback passed to the
+    constructor; its body reads the runtime buffers as parameters and moves
+    data with ``fifo.fill(...)`` / ``fifo.drain(...)``.
+    """
 
     def __init__(
         self,
-    ) -> Runtime:
-        """Initialize a runtime object."""
-        self._rt_data = []
-        self._tasks: list[RuntimeTask] = []
-        self._fifos = set()
-        self._workers = []
-        self._open_task_groups = []
-        self._trace_size = None
-        self._trace_offset = None
-        self._trace_workers = None
-        self.ddr_id = None
+        seq_fn: Callable,
+        fn_args: "Sequence | None" = None,
+        *,
+        name: str | None = None,
+        strict_task_groups: bool = True,
+        implicit_configure: bool = True,
+    ) -> None:
+        """Create a runtime from its sequence body and fn_args.
 
-    @contextmanager
-    def sequence(self, *input_types: type[np.ndarray]):
-        """A RuntimeSequence is a sequence of operations that are performed in
-        support of a program. Common operations include input and output data movement.
+        Mirrors [`Worker`][aie.iron.Worker]``(core_fn, fn_args)``: ``seq_fn`` runs
+        inside ``@runtime_sequence`` at resolve time, called as
+        ``seq_fn(*fn_args)``, and can use native ``range_``/``if_`` and
+        ``fifo.fill``/``fifo.drain``. Objects in ``fn_args`` (ObjectFifoHandles,
+        Buffers, ...) are registered eagerly at construction -- fifo shim
+        endpoints bind now (from ``prod(tile=)``/``cons(tile=)``) so the Program
+        resolves fifos and cores before the body emits, letting body verbs read
+        resolved worker state (e.g. ``barrier.set``).
 
-        Raises:
-            ValueError: Arguments are validated.
-            ValueError: If task groups are not finished within the sequence() context, and error will be raised.
+        Each ``fn_args`` entry is one of:
 
-        Yields:
-            _type_: Handles to the buffers matching the input types.
+        * an unbound **DispatchTime parameter**: replaced with its live SSA
+          scalar. Forward each parameter once, in any order; parameter identity
+          determines the host binding, not its position in ``fn_args``.
+        * a **type** (a tensor type, a generator's ``In``/``Out``/``InOut``
+          operand, or a scalar type like ``np.int32``): declares a runtime
+          input and is replaced with a live SSA value bound to a new
+          ``runtime_sequence`` block arg -- a tensor type becomes a
+          ``RuntimeData`` (``fill``/``drain`` target), a scalar type becomes the
+          bare SSA value (``scf`` survives to the dynamic EmitC path).
+        * a concrete **int or NumPy integer value**: also declares a runtime input,
+          but is folded into a constant instead of a block arg (constant-bound
+          ``range_``/``if_`` unrolls to the static binary path). One body thus
+          serves both lowerings depending on whether the caller passes a type or
+          an integer here. NumPy integers retain their scalar dtype; plain Python
+          integers use i32 for compatibility with the common ``np.int32`` path.
+        * any other object (ObjectFifoHandle, Buffer, Kernel, ScratchpadParameter,
+          WorkerRuntimeBarrier, ...): passed through to the body unchanged, as
+          with ``Worker.fn_args``.
+
+        Args:
+            seq_fn (Callable): The sequence body; params bound to ``fn_args`` in order.
+            fn_args (Sequence | None): Types/ints (runtime inputs) and shared objects,
+                in the order ``seq_fn`` expects them. Defaults to None (empty list).
+            name (str | None): The runtime-sequence symbol name. Program assigns
+                a unique name when this value is None.
+            strict_task_groups (bool): Disallow mixing the default and explicit task groups. Defaults to True.
+            implicit_configure (bool): Configure the full-ELF entry sequence's
+                device when the body contains no ``aiex.configure`` or
+                ``aiex.npu.load_pdi`` operation. Defaults to True.
         """
-        try:
-            self._rt_data = list(map(RuntimeData, input_types))
-            if len(self._rt_data) == 1:
-                yield self._rt_data[0]
-            else:
-                yield tuple(self._rt_data.copy())
-        finally:
-            if len(self._open_task_groups) != 0:
-                tgs_str = ", ".join([str(t) for t in self._open_task_groups])
-                raise ValueError(f"Failed to close task groups: {tgs_str}")
-            for of_handle in self._fifos:
-                # It's very easy to accidentally generate multiple (identical)
-                # consumers in the runtime. This bit of code prunes out duplicates.
-                if not of_handle._is_prod:
-                    fifo_obj = of_handle._object_fifo
-                    runtime_cons = None
-                    to_remove = []
-                    for c in fifo_obj._cons:
-                        if isinstance(c.endpoint, RuntimeEndpoint):
-                            if not runtime_cons:
-                                runtime_cons = c
-                            else:
-                                if (
-                                    c.depth == runtime_cons.depth
-                                    and c.dims_from_stream
-                                    == runtime_cons.dims_from_stream
-                                ):
-                                    to_remove.append(c)
-                                else:
-                                    raise ValueError(
-                                        f"Found two different RuntimeEndpoints for consumers of the same ObjectFifo: {fifo_obj}"
-                                    )
-                    for r in to_remove:
-                        fifo_obj._cons.remove(r)
+        super().__init__()
+        if name == "":
+            raise ValueError("Runtime name must not be empty.")
+        self._site = SourceSite.capture()
+        self._name = name
+        self._configuration: DeviceConfiguration | None = None
+        self._seq_fn: Callable = seq_fn
+        self._fn_args = [np_ndarray_type_of(arg) for arg in fn_args or ()]
+        self._dispatch_binding = object()
+        dispatch_args = [
+            arg for arg in self._fn_args if isinstance(arg, _DispatchParameter)
+        ]
+        if len({id(arg) for arg in dispatch_args}) != len(dispatch_args):
+            raise TypeError(
+                "Forward each DispatchTime parameter exactly once to Runtime."
+            )
+        if len({id(arg.owner) for arg in dispatch_args}) > 1:
+            raise TypeError(
+                "Runtime cannot mix DispatchTime parameters from different designs."
+            )
+        for container in self._fn_args:
+            if isinstance(container, (list, tuple)):
+                for arg in flatten_fn_args(container):
+                    if isinstance(arg, _DispatchParameter):
+                        raise TypeError(
+                            f"DispatchTime parameter {arg.name!r} must be a direct Runtime fn_args entry."
+                        )
+        # A concrete int entry is a folded constant; a type/generic-alias entry
+        # is a runtime input; anything else passes through as an object fn_arg.
+        self._const_inputs: list[int | np.integer | None] = [
+            v if isinstance(v, (int, np.integer)) and not isinstance(v, bool) else None
+            for v in self._fn_args
+        ]
+        self._rt_data: list["RuntimeData | None"] = [
+            (
+                RuntimeData(
+                    arg.scalar_type if isinstance(arg, _DispatchParameter) else arg
+                )
+                if c is None
+                and (
+                    isinstance(arg, (type, _DispatchParameter))
+                    or get_origin(arg) is np.ndarray
+                )
+                else None
+            )
+            for c, arg in zip(self._const_inputs, self._fn_args)
+        ]
+        # Keep the host scalar ABI in signature order, while the callback and
+        # tensor arguments retain fn_args order. Only dispatch slots move.
+        dispatch_data = iter(
+            data
+            for _, data in sorted(
+                (
+                    (arg.position, data)
+                    for arg, data in zip(self._fn_args, self._rt_data)
+                    if isinstance(arg, _DispatchParameter)
+                ),
+                key=lambda item: item[0],
+            )
+        )
+        self._block_data = []
+        for arg, data in zip(self._fn_args, self._rt_data):
+            if isinstance(arg, _DispatchParameter):
+                self._block_data.append(next(dispatch_data))
+            elif data is not None:
+                if dispatch_args and data.is_scalar:
+                    raise TypeError(
+                        "Runtime cannot mix bare scalar types with DispatchTime parameters."
+                    )
+                self._block_data.append(data)
+        self._fifos: dict[ObjectFifoHandle, None] = {}
+        self._register_fn_args()
+        # Lower-level explicit-routing primitives (peers of ObjectFifo for
+        # designs that hand-wire flows + DMA programs instead of letting
+        # ObjectFifo manage them).
+        self._scratchpad_parameters: list[ScratchpadParameter] = []
+        self._strict_task_groups = strict_task_groups
+        self._implicit_configure = implicit_configure
+        self._task_group_index = itertools.count()
 
-    def task_group(self) -> RuntimeTaskGroup:
-        """Generate a handle to a RuntimeTaskGroup.
-        This should be called within a Runtime.sequence() context.
+    @classmethod
+    def merge(
+        cls,
+        runtimes: Sequence[Runtime],
+        name: str | None = None,
+        run: Callable[[Sequence[tuple[Runtime, tuple]]], None] | None = None,
+    ) -> Runtime:
+        """Return one Runtime whose sequence runs the bodies of ``runtimes`` in order.
+
+        For steps that run back to back on one configuration: they issue one
+        instruction stream with no ``aiex.configure`` or ``aiex.run`` between
+        them, which an xclbin can carry. Its ``fn_args`` are theirs, in order,
+        with a DispatchTime parameter several steps forward kept once, and it
+        registers their flows, locks, tile DMAs and scratchpad parameters.
+
+        Each step's task groups close before the next step issues, which frees
+        its transfers it did not await. That suits steps that each await what
+        they need; steps joined on-chip, where a step's input completes only
+        once a later step drains, give ``run`` to issue them together.
+
+        Args:
+            runtimes: The steps, in the order their bodies run.
+            name: The merged Runtime's name, or None to have one given.
+            run: Called inside the merged sequence with each step and the
+                arguments it takes, in order, in place of running the bodies
+                one after another; None runs them so.
 
         Returns:
-            RuntimeTaskGroup: The new RuntimeTaskGroup
-        """
-        tg = RuntimeTaskGroup(self.__task_group_index)
-        self._open_task_groups.append(tg)
-        self.__task_group_index += 1
-        return tg
-
-    def finish_task_group(self, task_group: RuntimeTaskGroup):
-        """Close out a RuntimeTaskGroup.
-        This should be called within a Runtime.sequence() context.
-
-        Args:
-            task_group (RuntimeTaskGroup): _description_
-        """
-        self._open_task_groups.remove(task_group)
-        self._tasks.append(FinishTaskGroupTask(task_group))
-
-    def fill(
-        self,
-        in_fifo: ObjectFifoHandle,
-        source: RuntimeData,
-        tap: TensorAccessPattern | None = None,
-        task_group: RuntimeTaskGroup | None = None,
-        wait: bool = False,
-        placement: PlacementTile = AnyShimTile,
-    ) -> None:
-        """Conceptually fill an ObjectFifoHandle (of type producer) with data from a runtime buffer.
-        This should be called within a Runtime.sequence() context.
-
-        Args:
-            in_fifo (ObjectFifoHandle): The producer ObjectFifoHandle.
-            source (RuntimeData): The input Runtime data buffer.
-            tap (TensorAccessPattern | None, optional): A way of specifying how data in the buffer is accessed when sending it to the in_fifo.
-                If None is given, this will default to a linear transfer containing all data in the source buffer. Defaults to None.
-            task_group (RuntimeTaskGroup | None, optional): A TaskGroup to associate this task with. Defaults to None.
-            wait (bool, optional): Whether this Task should be awaited on or not. If not, it will be freed when the task group is finished. Defaults to False.
-            placement (PlacementTile, optional): The Shim tile to associate the data transfer with. Defaults to AnyShimTile.
+            The merged Runtime.
 
         Raises:
-            ValueError: Arguments are validated.
+            ValueError: One of ``runtimes`` already belongs to a configuration;
+                or, once the sequence is emitted, two steps that sync parameters
+                drive one Worker that waits for them each pass.
+            TypeError: The steps forward DispatchTime parameters of different
+                designs.
         """
-        if source not in self._rt_data:
-            raise ValueError(
-                f"Source {source} is not a RuntimeData object generated by sequence()"
-            )
-        rt_endpoint = RuntimeEndpoint(placement)
+        runtimes = list(runtimes)
+        for runtime in runtimes:
+            if runtime.configuration is not None:
+                raise ValueError(
+                    f"Runtime {runtime.name!r} belongs to configuration "
+                    f"{runtime.configuration.name!r}; merge it before configuring."
+                )
+        fn_args: list = []
+        slots: list[list[int]] = []
+        for runtime in runtimes:
+            slots.append([])
+            for arg in runtime._fn_args:
+                shared = [
+                    i
+                    for i, kept in enumerate(fn_args)
+                    if isinstance(arg, _DispatchParameter) and kept is arg
+                ]
+                slots[-1].append(shared[0] if shared else len(fn_args))
+                if not shared:
+                    fn_args.append(arg)
 
-        if tap is None:
-            tap = source.default_tap()
+        def body(*args):
+            calls = [
+                (runtime, tuple(args[i] for i in slot))
+                for runtime, slot in zip(runtimes, slots)
+            ]
+            seq = active_sequence()
+            if run is not None:
+                run(calls)
+                # run issues the steps together, so once the sequence asks for
+                # a second sync any step may be one that asked.
+                synced = [seq.sync_requests > 1] * len(calls)
+            else:
+                synced = []
+                for runtime, step_args in calls:
+                    requests = seq.sync_requests
+                    seq.step = runtime
+                    runtime._seq_fn(*step_args)
+                    seq.step = None
+                    synced.append(seq.sync_requests > requests)
+                    # Closing the step's task groups awaits its wait=True
+                    # transfers before the next step issues; the rest are freed.
+                    seq.finalize(runtime._strict_task_groups)
+            _refuse_a_worker_synced_twice(runtimes, synced, seq)
 
-        in_fifo.endpoint = rt_endpoint
-        self._fifos.add(in_fifo)
-        self._tasks.append(DMATask(in_fifo, source, tap, task_group, wait))
-
-    def drain(
-        self,
-        out_fifo: ObjectFifoHandle,
-        dest: RuntimeData,
-        tap: TensorAccessPattern | None = None,
-        task_group: RuntimeTaskGroup | None = None,
-        wait: bool = False,
-        placement: PlacementTile = AnyShimTile,
-    ) -> None:
-        """Conceptually fill an ObjectFifoHandle (of type consumer) of data and write that data to a runtime buffer.
-        This should be called within a Runtime.sequence() context.
-
-        Args:
-            out_fifo (ObjectFifoHandle): The consumer ObjectFifoHandle.
-            dest (RuntimeData): The output Runtime data buffer.
-            tap (TensorAccessPattern | None, optional): A way of specifying how data in the buffer is accessed when sending it to the in_fifo.
-                If None is given, this will default to a linear transfer containing all data in the source buffer. Defaults to None.
-            task_group (RuntimeTaskGroup | None, optional):  A TaskGroup to associate this task with. Defaults to None. Defaults to None.
-            wait (bool, optional): Whether this Task should be awaited on or not. If not, it will be freed when the task group is finished. Defaults to False.
-            placement (PlacementTile, optional): The Shim tile to associate the data transfer with. Defaults to AnyShimTile.
-
-        Raises:
-            ValueError: Arguments are validated.
-        """
-        if dest not in self._rt_data:
-            raise ValueError(
-                f"Destination {dest} is not a RuntimeData object generated by sequence()"
-            )
-        rt_endpoint = RuntimeEndpoint(placement)
-        if tap is None:
-            tap = dest.default_tap()
-
-        out_fifo.endpoint = rt_endpoint
-        self._fifos.add(out_fifo)
-        self._tasks.append(DMATask(out_fifo, dest, tap, task_group, wait))
-
-    def start(self, *args: Worker):
-        """A placeholder operation to indicate that one or more Worker should be started on the device.
-        This should be called within a Runtime.sequence() context.
-
-        Args:
-            *args: One or more Workers. If more than one is given, they will be started in order.
-
-        Raises:
-            ValueError: Arguments are validated.
-        """
-        for worker in args:
-            if not isinstance(worker, Worker):
-                raise ValueError("Runtime can only start Worker objects")
-            self._workers.append(worker)
-            self._tasks.append(RuntimeStartTask(worker))
-
-    def inline_ops(self, inline_func: Callable, inline_args: list):
-        """Insert an InlineOpRuntimeTask into the runtime.
-         This should be called within a Runtime.sequence() context.
-
-        Args:
-            inline_func (Callable): The function to execute within an MLIR context.
-            inline_args (list): The state the function needs to execute.
-        """
-        # TODO: should filter args based on some criteria??
-        self._tasks.append(InlineOpRuntimeTask(inline_func, inline_args))
-
-    def enable_trace(
-        self,
-        trace_size: int = None,
-        trace_offset: int = None,
-        workers: [] = None,
-        ddr_id: int = None,
-        coretile_events: [] = None,
-        memtile_events: [] = None,
-        shimtile_events: [] = None,
-    ):
-        """Enable trace."""
-        self._trace_size = trace_size
-        self._trace_offset = trace_offset
-        self._trace_workers = workers
-        self._ddr_id = ddr_id
-        self._coretile_events = coretile_events
-        self._memtile_events = memtile_events
-        self._shimtile_events = shimtile_events
-
-    def set_barrier(self, barrier: WorkerRuntimeBarrier, value: int):
-        """Set the value of a worker barrier.
-        This should be called within a Runtime.sequence() context.
-
-        Args:
-            barrier (WorkerRuntimeBarrier): The WorkerRuntimeBarrier to set.
-            value (int): The value to set the barrier to.
-        """
-        self._tasks.append(_BarrierSetOp(barrier, value))
+        merged = cls(
+            body,
+            fn_args,
+            name=name,
+            implicit_configure=all(rt._implicit_configure for rt in runtimes),
+        )
+        for runtime in runtimes:
+            for flow in runtime.flows:
+                merged.add_flow(flow)
+            for lock in runtime.locks:
+                merged.add_lock(lock)
+            for tile_dma in runtime.tile_dmas:
+                merged.add_tile_dma(tile_dma)
+            for parameter in runtime.scratchpad_parameters:
+                merged.register_parameter(parameter)
+        return merged
 
     @property
-    def workers(self) -> list[Worker]:
-        """The workers associated with the Runtime by calls to start()"""
-        return self._workers.copy()
+    def name(self) -> str | None:
+        return self._name
+
+    def _assign_name(self, name: str) -> None:
+        if self._name is None:
+            self._name = name
+
+    @property
+    def arg_types(self) -> list[type]:
+        """The sequence's argument types, in the order it takes them."""
+        return [data.arr_type for data in self._block_data]
+
+    @property
+    def configuration(self) -> DeviceConfiguration | None:
+        return self._configuration
+
+    def _bind_configuration(self, configuration: DeviceConfiguration) -> None:
+        if self._configuration is not None:
+            raise ValueError(
+                f"Runtime {self._name!r} already belongs to configuration "
+                f"{self._configuration.name!r}."
+            )
+        self._configuration = configuration
+        for flow in self._flows:
+            configuration.add_flow(flow)
+        for lock in self._locks:
+            configuration.add_lock(lock)
+        for tile_dma in self._tile_dmas:
+            configuration.add_tile_dma(tile_dma)
+
+    def call(self, *args) -> None:
+        configuration = active_configuration()
+        if configuration is None:
+            raise RuntimeError(
+                f"Runtime {self._name!r} must be called inside a configuration scope."
+            )
+        if configuration is not self._configuration:
+            owner = (
+                self._configuration.name if self._configuration is not None else None
+            )
+            raise ValueError(
+                f"Runtime {self._name!r} belongs to configuration {owner!r}, "
+                f"not {configuration.name!r}."
+            )
+        values = [arg.op if isinstance(arg, RuntimeData) else arg for arg in args]
+        run(self._name, values)
+
+    def _register_fn_args(self) -> None:
+        """Bind shared objects before DeviceConfiguration resolves them.
+
+        Mirrors Worker.__init__: an ObjectFifoHandle gets its shim endpoint bound
+        (from the handle's prod()/cons() tile) and is recorded, so the fifo has
+        both ends known when DeviceConfiguration resolves it, letting the sequence body
+        emit last (after workers), which the body's worker-reading verbs need.
+
+        A fn_args entry may be a nested list/tuple of handles (e.g. one per
+        column); the flattened leaves are registered while the body still
+        receives the structured argument.
+
+        Consumer handles of one ObjectFifo bound to the same shim end, as when
+        several Runtimes drain it through their own ``cons()``, share the
+        first one's consumer, so the fifo does not broadcast to a shim
+        channel per handle.
+
+        Raises:
+            ValueError: Two such handles differ in depth, ``from_stream`` or
+                pinned DMA channel.
+        """
+        for arg in flatten_fn_args(self._fn_args):
+            if isinstance(arg, ObjectFifoHandle):
+                if arg.endpoint is None:
+                    arg.endpoint = RuntimeEndpoint(arg._shim_tile)
+                fifo_obj = arg._object_fifo
+                if not arg._is_prod:
+                    for first in fifo_obj._cons:
+                        shared = first.endpoint
+                        if (
+                            first is arg
+                            or not isinstance(shared, RuntimeEndpoint)
+                            or shared != arg.endpoint
+                        ):
+                            continue
+                        if (
+                            first.depth,
+                            first.from_stream,
+                            first.port or Port.dma(),
+                        ) != (arg.depth, arg.from_stream, arg.port or Port.dma()):
+                            raise ValueError(
+                                f"ObjectFifo {fifo_obj.name!r} is drained to one "
+                                "shim end through consumer handles with different "
+                                "depths, from_stream patterns or pinned DMA channels"
+                            )
+                        if arg in fifo_obj._cons:
+                            fifo_obj._cons.remove(arg)
+                        arg.endpoint = shared
+                        break
+                self._fifos[arg] = None
+
+    def add_flow(self, flow) -> None:
+        """Register a flow for resolution alongside the ObjectFifos.
+
+        Accepts a [`Flow`][aie.iron.Flow] or [`PacketFlow`][aie.iron.PacketFlow].
+        """
+        super().add_flow(flow)
+        if self._configuration is not None:
+            self._configuration.add_flow(flow)
+
+    def add_lock(self, lock) -> None:
+        """Register an explicit [`Lock`][aie.iron.Lock] no TileDma, task or Worker reaches.
+
+        Locks a [`TileDma`][aie.iron.TileDma]'s or a task's Bds use are found
+        from them, and a Worker's from its ``fn_args``.
+        """
+        super().add_lock(lock)
+        if self._configuration is not None:
+            self._configuration.add_lock(lock)
+
+    def add_tile_dma(self, tile_dma) -> None:
+        """Register a TileDma; channels sharing a Tile are combined at resolution."""
+        if self._configuration is not None:
+            self._configuration.add_tile_dma(tile_dma)
+        super().add_tile_dma(tile_dma)
+
+    def resolve_tile_dmas(self) -> None:
+        """Validate and emit one DMA region per Tile without changing registrations."""
+        if self._configuration is not None:
+            self._configuration.resolve_tile_dmas()
+            return
+        super().resolve_tile_dmas()
 
     @property
     def fifos(self) -> list[ObjectFifoHandle]:
-        """The ObjectFifoHandles associated with the Runtime by calls to fill() and drain()"""
-        return self._fifos.copy()
+        """The ObjectFifoHandles driven from the runtime by fill()/drain()."""
+        return list(self._fifos)
 
-    def get_first_cons_shimtile(self):
-        """Find the first consumer side of an objfifo that is in the 0th row
-        and uses it as the trace shim tile
+    def register_parameter(self, param: ScratchpadParameter | str | None) -> str | None:
+        """Record a ScratchpadParameter a transfer uses, for the Program to declare.
+
+        Args:
+            param: The parameter, the name of one the Program declares anyway
+                (e.g. from a Worker's `fn_args`), or None.
+
+        Returns:
+            The parameter's name, or None for None.
+        """
+        if isinstance(param, ScratchpadParameter):
+            if param not in self._scratchpad_parameters:
+                self._scratchpad_parameters.append(param)
+            return param.name
+        return param
+
+    @property
+    def scratchpad_parameters(self) -> list[ScratchpadParameter]:
+        """The ScratchpadParameters the sequence's transfers registered."""
+        return list(self._scratchpad_parameters)
+
+    def resolve(
+        self,
+        loc: ir.Location | None = None,
+        ip: ir.InsertionPoint | None = None,
+        *,
+        trace_size: int | None = None,
+        reuse_output_buffer: bool = False,
+        egress_shim_col: int = 0,
+        implicit_configure_device_ref: str | None = None,
+        device: Device | None = None,
+    ) -> None:
+        """Build the ``runtime_sequence`` op and run the sequence body inside it.
+
+        The body runs exactly once. Each ``fill``/``drain`` verb binds its
+        ObjectFifo's shim endpoint and emits the shim DMA (referencing the fifo
+        by symbol name, a forward reference). The Program calls this before it
+        resolves ObjectFifos and cores, so by the time a fifo is resolved every
+        runtime endpoint -- including those on link siblings -- is already bound.
+
+        Args:
+            loc: Optional MLIR source location for the generated ops.
+            ip: Optional MLIR insertion point for the generated ops.
+            trace_size: Forwarded from
+                [`Program.enable_trace`][aie.iron.program.Program.enable_trace]; see
+                there. ``None``/``0`` disables tracing.
+            reuse_output_buffer: Forwarded from
+                [`Program.enable_trace`][aie.iron.program.Program.enable_trace]; see
+                there.
+            egress_shim_col: Forwarded from
+                [`Program.enable_trace`][aie.iron.program.Program.enable_trace]; see
+                there.
+            implicit_configure_device_ref: The enclosing device symbol for an
+                implicit full-ELF ``aiex.npu.load_pdi``. ``None`` on the xclbin path.
+            device: The [`Device`][aie.iron.Device] that places tiles the body
+                reaches first, such as a buffer only a runtime task names.
+        """
+        # A runtime_sequence block arg per runtime (type) input; folded-constant
+        # inputs contribute no block arg.
+        rt_dtypes = [
+            try_convert_np_type_to_mlir_type(rt_data.arr_type)
+            for rt_data in self._block_data
+            if rt_data is not None
+        ]
+        loc = loc or self._site.location()
+        seq_op = RuntimeSequenceOp(sym_name=self._name, loc=loc, ip=ip)
+        active = ActiveSequence(self, seq_op, device)
+        entry_block = seq_op.body.blocks.append(
+            *rt_dtypes, arg_locs=[loc] * len(rt_dtypes)
+        )
+        with ir.InsertionPoint(entry_block), seq_op.location:
+            block_args = iter(entry_block.arguments)
+            for rt_data in self._block_data:
+                if rt_data is not None:
+                    rt_data.op = next(block_args)
+            for arg, rt_data in zip(self._fn_args, self._rt_data):
+                if isinstance(arg, _DispatchParameter):
+                    assert rt_data is not None
+                    arg._bind(self._dispatch_binding, rt_data.op)
+
+            if trace_size is not None and trace_size > 0:
+                trace_utils.start_trace(
+                    trace_size=trace_size,
+                    reuse_output_buffer=reuse_output_buffer,
+                    routing="single",
+                    egress_shim_col=egress_shim_col,
+                )
+
+            # Build the body's positional args, one per fn_args entry, in order:
+            #   * folded-constant entry -> an arith.constant of that value;
+            #   * scalar type entry     -> its live SSA value (used in arithmetic
+            #                              and range_/if_ bounds);
+            #   * tensor type entry     -> its RuntimeData handle (fill/drain);
+            #   * anything else         -> passed through unchanged (fifos, etc).
+            body_args = []
+            for arg, const_val, rt_data in zip(
+                self._fn_args, self._const_inputs, self._rt_data
+            ):
+                if const_val is not None:
+                    dtype = (
+                        type(const_val)
+                        if isinstance(const_val, np.integer)
+                        else np.int32
+                    )
+                    scalar_type = np_dtype_to_mlir_type(dtype)
+                    value = int(const_val)
+                    # IntegerAttr's C API accepts int64_t, including the bit
+                    # pattern of a uint64/index value above INT64_MAX.
+                    if value > np.iinfo(np.int64).max:
+                        value -= 1 << 64
+                    if (
+                        isinstance(scalar_type, ir.IntegerType)
+                        and ir.IntegerType(scalar_type).is_unsigned
+                    ):
+                        # arith.constant requires signless integers. EmitC's
+                        # ConstantLike op preserves unsigned types and folds.
+                        from ...dialects.emitc import (  # pyright: ignore[reportMissingImports]
+                            ConstantOp,
+                        )
+
+                        body_args.append(
+                            ConstantOp(
+                                scalar_type, ir.IntegerAttr.get(scalar_type, value)
+                            ).result
+                        )
+                    else:
+                        body_args.append(constant(value, scalar_type))
+                elif rt_data is not None:
+                    body_args.append(rt_data.op if rt_data.is_scalar else rt_data)
+                else:
+                    body_args.append(arg)
+
+            # Each buffer is named after the sequence parameter it arrives as,
+            # which names the transfers that move it.
+            for name, rt_data in zip(_parameter_names(self._seq_fn), self._rt_data):
+                if rt_data is not None:
+                    rt_data.name = name
+
+            with active_sequence_scope(active):
+                with traced_body(self._seq_fn):
+                    self._seq_fn(*body_args)
+                active.finalize()
+
+        if implicit_configure_device_ref is not None:
+            self.load_pdi_first(entry_block, implicit_configure_device_ref)
+
+        self._dedup_runtime_consumers()
+
+    def load_pdi_first(self, entry_block: ir.Block, device_ref: str) -> None:
+        """Load ``device_ref``'s PDI at the start of ``entry_block``, the full-ELF entry's body.
+
+        Nothing is added when this Runtime was made with
+        ``implicit_configure=False`` or the body already configures a device.
+
+        Args:
+            entry_block: The entry runtime sequence's body.
+            device_ref: The symbol of the device whose PDI it loads.
+        """
+        if not self._implicit_configure:
+            return
+
+        def contains_configuration(block: ir.Block) -> bool:
+            for operation in block.operations:
+                if operation.name in ("aiex.configure", "aiex.npu.load_pdi"):
+                    return True
+                for region in operation.regions:
+                    if any(
+                        contains_configuration(nested_block)
+                        for nested_block in region.blocks
+                    ):
+                        return True
+            return False
+
+        if not contains_configuration(entry_block):
+            operations = list(entry_block.operations)
+            with ir.InsertionPoint(entry_block):
+                load_pdi = npu_load_pdi(device_ref=device_ref)
+            if operations:
+                load_pdi.operation.move_before(operations[0])
+
+    def _dedup_runtime_consumers(self) -> None:
+        """Prune duplicate runtime consumer handles on shared ObjectFifos.
+
+        A loop that drains one ObjectFifo obtains a fresh consumer handle per
+        ``cons()`` call, so identical runtime consumers accumulate. Collapse
+        them, matching the flat-list runtime's ``__exit__`` cleanup.
         """
         for of_handle in self._fifos:
-            if not of_handle._is_prod:
-                endpoint_tile = of_handle._object_fifo._cons[0]._endpoint._tile
-                if endpoint_tile.row == 0:
-                    return endpoint_tile.op
+            if of_handle._is_prod:
+                continue
+            fifo_obj = of_handle._object_fifo
+            runtime_cons = None
+            to_remove = []
+            for c in fifo_obj._cons:
+                if isinstance(c.endpoint, RuntimeEndpoint):
+                    if not runtime_cons:
+                        runtime_cons = c
+                    elif (
+                        c.depth == runtime_cons.depth
+                        and c.from_stream == runtime_cons.from_stream
+                    ):
+                        to_remove.append(c)
+                    else:
+                        raise ValueError(
+                            f"Found two different RuntimeEndpoints for consumers "
+                            f"of the same ObjectFifo: {fifo_obj}"
+                        )
+            for r in to_remove:
+                fifo_obj._cons.remove(r)
+
+
+def _parameter_names(fn) -> list[str]:
+    """Return `fn`'s positional parameter names, or none if it has no fixed ones."""
+    try:
+        parameters = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return []
+    names = []
+    for parameter in parameters:
+        if parameter.kind not in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            break
+        names.append(parameter.name)
+    return names
+
+
+class _SyncParametersTask(Resolvable):
+    """Emits `aiex.sync_scratchpad_parameters_from_host` during runtime sequence resolution."""
 
     def resolve(
         self,
         loc: ir.Location | None = None,
         ip: ir.InsertionPoint | None = None,
     ) -> None:
-        rt_dtypes = [rt_data.arr_type for rt_data in self._rt_data]
+        sync_scratchpad_parameters_from_host(loc=loc, ip=ip)
 
-        task_group_actions = defaultdict(list)
 
-        @runtime_sequence(*rt_dtypes)
-        def sequence(*args):
+def sync_parameters() -> None:
+    """Emit ``aiex.sync_scratchpad_parameters_from_host`` in the sequence body.
 
-            if self._trace_size is not None:
-                tiles_to_trace = []
-                if self._trace_workers is not None:
-                    for w in self._trace_workers:
-                        tiles_to_trace.append(w.tile.op)
-                else:
-                    for w in self._workers:
-                        if w.trace is not None:
-                            tiles_to_trace.append(w.tile.op)
+    Call after all scratchpad parameters have been written on the host side and
+    before starting workers that read them, at the top level of the sequence
+    body: the sync op must sit directly in its ``aie.runtime_sequence``, so it
+    cannot go under ``range_`` or ``if_``. A sequence syncs once: the sync
+    stages every parameter of the device and releases every core waiting on
+    one, so a later call in the same sequence (a merged step's) emits nothing,
+    the earlier sync having already run ahead of it. A Worker that waits for
+    parameters each pass therefore makes one pass per sequence, and
+    ``Runtime.merge`` refuses two syncing steps that both drive one.
 
-                trace_shim_tile = self.get_first_cons_shimtile()
+    Raises:
+        ValueError: The call is inside a ``range_`` or ``if_`` of the body.
+    """
+    seq = active_sequence()
+    if ir.InsertionPoint.current.block != seq.body:
+        raise ValueError(
+            "sync_parameters() must be called at the top level of a runtime "
+            "sequence body, not under range_ or if_: "
+            "aiex.sync_scratchpad_parameters_from_host sits directly in its "
+            "aie.runtime_sequence"
+        )
+    seq.sync_requests += 1
+    if seq.sync_requests == 1:
+        _SyncParametersTask().resolve()
 
-                # print("config_trace")
-                trace_utils.configure_packet_tracing_aie2(
-                    # tiles_to_trace=[ tiles_to_trace[0] ],
-                    tiles_to_trace=tiles_to_trace,
-                    shim=trace_shim_tile,
-                    trace_size=self._trace_size,
-                    trace_offset=(
-                        self._trace_offset if self._trace_offset is not None else 0
-                    ),
-                    ddr_id=self._ddr_id if self._ddr_id is not None else 4,
-                    coretile_events=self._coretile_events,
-                    memtile_events=self._memtile_events,
-                    shimtile_events=self._shimtile_events,
-                )
 
-            for rt_data, rt_data_val in zip(self._rt_data, args):
-                rt_data.op = rt_data_val
+def _refuse_a_worker_synced_twice(
+    steps: list[Runtime], synced: list[bool], seq: ActiveSequence
+) -> None:
+    """Refuse two syncing merged steps that drive one Worker waiting each pass.
 
-            no_waits = []
-            for task in self._tasks:
-                task.resolve()
-                if isinstance(task, DMATask):
-                    if task.will_wait():
-                        if task.task_group:
-                            task_group_actions[task.task_group].append(
-                                (dma_await_task, [task.task])
-                            )
-                        else:
-                            dma_await_task(task.task)
-                            for t in no_waits:
-                                dma_free_task(t.task)
-                            no_waits = []
-                    else:
-                        if task.task_group:
-                            task_group_actions[task.task_group].append(
-                                (dma_free_task, [task.task])
-                            )
-                        else:
-                            no_waits.append(task)
-                if isinstance(task, FinishTaskGroupTask):
-                    actions = task_group_actions[task.task_group]
-                    for fn, args in actions:
-                        if fn == dma_await_task:
-                            fn(*args)
-                    for fn, args in actions:
-                        if fn != dma_await_task:
-                            fn(*args)
-                    task_group_actions[task.task_group] = None
+    The merged sequence syncs once, and a ``while_true`` Worker with
+    ``wait_for_parameters`` makes one pass per sync, so the second step's
+    pass would never start. A step drives the Workers its fifos reach,
+    through any chain of links; a fifo the sequence moves that no step
+    declares may be any step's. A pool handle states one end only, so a
+    Worker holding one counts as driven by every syncing step.
 
-            if self._trace_size is not None:
-                trace_utils.gen_trace_done_aie2(trace_shim_tile)
+    Args:
+        steps: The merged steps, in order.
+        synced: Whether each step asked for a sync.
+        seq: The merged sequence.
+
+    Raises:
+        ValueError: Two syncing steps drive one such Worker.
+    """
+    configuration = seq.runtime.configuration
+    waiting = [
+        worker
+        for worker in (configuration.workers if configuration is not None else [])
+        if worker.while_true and worker.wait_for_parameters
+    ]
+    if sum(synced) < 2 or not waiting:
+        return
+    declared = {handle for step in steps for handle in step.fifos}
+    stray = [handle for handle in seq.runtime.fifos if handle not in declared]
+    reached: list[list] = []
+    for step in steps:
+        endpoints = []
+        seen = set()
+        fifos = [handle._object_fifo for handle in [*step.fifos, *stray]]
+        while fifos:
+            fifo = fifos.pop()
+            if id(fifo) in seen:
+                continue
+            seen.add(id(fifo))
+            for handle in [fifo._prod, *fifo._cons]:
+                endpoint = handle.endpoint if handle is not None else None
+                endpoints.append(endpoint)
+                if isinstance(endpoint, ObjectFifoLink):
+                    fifos.extend(
+                        linked._object_fifo
+                        for linked in [*endpoint._srcs, *endpoint._dsts]
+                    )
+        reached.append(endpoints)
+    for worker in waiting:
+        untraced = any(isinstance(h, ObjectFifoPoolHandle) for h in worker.fifos)
+        driving = [
+            i
+            for i, endpoints in enumerate(reached)
+            if synced[i]
+            and (untraced or any(endpoint is worker for endpoint in endpoints))
+        ]
+        if len(driving) > 1:
+            first, second = (steps[i] for i in driving[:2])
+            raise ValueError(
+                f"Runtime.merge: steps {driving[0]} ({first.name}) and "
+                f"{driving[1]} ({second.name}) both sync parameters and drive "
+                f"the Worker running {worker.core_fn!r} on {worker.tile}, which "
+                "waits for parameters each pass of its loop. A sequence syncs "
+                "once, so that Worker would make one pass where the steps need "
+                "two; run them as separate dispatches."
+            )

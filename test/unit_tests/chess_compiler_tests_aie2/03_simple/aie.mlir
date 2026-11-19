@@ -1,16 +1,14 @@
 //===- aie.mlir ------------------------------------------------*- MLIR -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2021-2022 Xilinx, Inc.
+// Copyright (C) 2022-2024 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2021 Xilinx Inc.
 //
 //===----------------------------------------------------------------------===//
 
-// REQUIRES: aiesimulator, valid_xchess_license, !hsa
-// RUN: %PYTHON aiecc.py --aiesim --xchesscc --xbridge --no-compile-host %s %test_lib_flags %S/test.cpp
-// RUN: sh -c 'aie.mlir.prj/aiesim.sh; exit 0' | FileCheck %s
+// REQUIRES: aiesimulator, valid_xchess_license
+// RUN: %aiecc --get-aiesim --xchesscc --xbridge %s %test_lib_flags -- %S/test.cpp
+// RUN: sh -c './aie.mlir.prj/aiesim.sh; exit 0' | FileCheck %s
 
 // CHECK: AIE2 ISS
 // CHECK: test start.
@@ -29,7 +27,8 @@ module @test04_shared_memory {
     %lock13_5 = aie.lock(%tile13, 5) { sym_name = "output_lock" } // output buffer lock
 
     %core13 = aie.core(%tile13) {
-      aie.use_lock(%lock13_3, AcquireGreaterEqual, 1)
+      %c1_ul0 = arith.constant 1 : i32
+      aie.use_lock(%lock13_3, AcquireGreaterEqual, %c1_ul0)
       %idx1 = arith.constant 3 : index
       %val1 = memref.load %buf13_0[%idx1] : memref<256xi32>
       %2    = arith.addi %val1, %val1 : i32
@@ -38,7 +37,8 @@ module @test04_shared_memory {
       %5 = arith.addi %4, %val1 : i32
       %idx2 = arith.constant 5 : index
       memref.store %5, %buf13_1[%idx2] : memref<256xi32>
-      aie.use_lock(%lock13_5, Release, 1)
+      %c1_ul1 = arith.constant 1 : i32
+      aie.use_lock(%lock13_5, Release, %c1_ul1)
       aie.end
     }
   }

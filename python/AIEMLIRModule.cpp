@@ -1,6 +1,6 @@
 //===- AIEMLIRModule.cpp ----------------------------------------*- C++ -*-===//
 //
-// Copyright (C) 2022, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2022 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
@@ -57,16 +57,6 @@ NB_MODULE(_aie, m) {
           "Get an instance of ObjectFifoType with given element type.",
           "self"_a, "type"_a = nb::none());
 
-  nanobind_adaptors::mlir_type_subclass(m, "ObjectFifoSubviewType",
-                                        aieTypeIsObjectFifoSubviewType)
-      .def_classmethod(
-          "get",
-          [](const nb::object &cls, const MlirType type) {
-            return cls(aieObjectFifoSubviewTypeGet(type));
-          },
-          "Get an instance of ObjectFifoSubviewType with given element type.",
-          "self"_a, "type"_a = nb::none());
-
   nanobind_adaptors::mlir_type_subclass(m, "blockFloatType",
                                         aieTypeIsBlockFloatType)
       .def_classmethod(
@@ -77,6 +67,14 @@ NB_MODULE(_aie, m) {
           },
           "Get an instance of BlockFloat type with the specified subtype.",
           "self"_a, "subtype"_a, "ctx"_a = nb::none());
+
+  m.def(
+      "type_size_in_bits",
+      [](MlirType type) { return aieTypeGetSizeInBits(type); },
+      "Size of a type in bits under the default data layout, or 0 when the "
+      "type does not describe one. A block floating-point type reports the "
+      "bits one block occupies, not the bits of one value.",
+      "type"_a);
 
   auto stealCStr = [](MlirStringRef mlirString) {
     if (!mlirString.data || mlirString.length == 0)
@@ -90,13 +88,6 @@ NB_MODULE(_aie, m) {
   };
 
   m.def(
-      "translate_aie_vec_to_cpp",
-      [&stealCStr](MlirOperation op, bool aie2) {
-        return stealCStr(aieTranslateAIEVecToCpp(op, aie2));
-      },
-      "module"_a, "aie2"_a = false);
-
-  m.def(
       "translate_mlir_to_llvmir",
       [&stealCStr](MlirOperation op) {
         return stealCStr(aieTranslateModuleToLLVMIR(op));
@@ -105,23 +96,24 @@ NB_MODULE(_aie, m) {
 
   m.def(
       "generate_cdo",
-      [](MlirOperation op, const std::string &workDirPath, bool bigendian,
-         bool emitUnified, bool cdoDebug, bool aieSim, bool xaieDebug,
-         bool enableCores) {
+      [](MlirOperation op, const std::string &workDirPath,
+         const std::string &deviceName, bool bigendian, bool emitUnified,
+         bool cdoDebug, bool aieSim, bool xaieDebug, bool enableCores) {
         mlir::python::CollectDiagnosticsToStringScope scope(
             mlirOperationGetContext(op));
         if (mlirLogicalResultIsFailure(aieTranslateToCDODirect(
-                op, {workDirPath.data(), workDirPath.size()}, bigendian,
-                emitUnified, cdoDebug, aieSim, xaieDebug, enableCores)))
+                op, {workDirPath.data(), workDirPath.size()},
+                {deviceName.data(), deviceName.size()}, bigendian, emitUnified,
+                cdoDebug, aieSim, xaieDebug, enableCores)))
           throw nb::value_error(
               (llvm::Twine("Failed to generate cdo because: ") +
                llvm::Twine(scope.takeMessage()))
                   .str()
                   .c_str());
       },
-      "module"_a, "work_dir_path"_a, "bigendian"_a = false,
-      "emit_unified"_a = false, "cdo_debug"_a = false, "aiesim"_a = false,
-      "xaie_debug"_a = false, "enable_cores"_a = true);
+      "module"_a, "work_dir_path"_a, "device_name"_a = "",
+      "bigendian"_a = false, "emit_unified"_a = false, "cdo_debug"_a = false,
+      "aiesim"_a = false, "xaie_debug"_a = false, "enable_cores"_a = true);
 
   m.def(
       "transaction_binary_to_mlir",
@@ -134,9 +126,11 @@ NB_MODULE(_aie, m) {
 
   m.def(
       "translate_npu_to_binary",
-      [](MlirOperation op, const std::string &sequence_name) {
+      [](MlirOperation op, const std::string &device_name,
+         const std::string &sequence_name) {
         MlirStringRef instStr = aieTranslateNpuToBinary(
-            op, {sequence_name.data(), sequence_name.size()});
+            op, {device_name.data(), device_name.size()},
+            {sequence_name.data(), sequence_name.size()});
         size_t num_insts = instStr.length / sizeof(uint32_t);
         std::vector<uint32_t> vec(
             reinterpret_cast<const uint32_t *>(instStr.data),
@@ -144,12 +138,13 @@ NB_MODULE(_aie, m) {
         free((void *)instStr.data);
         return vec;
       },
-      "module"_a, "sequence_name"_a = "");
+      "module"_a, "device_name"_a = "", "sequence_name"_a = "");
 
   m.def(
       "generate_control_packets",
-      [](MlirOperation op) {
-        MlirStringRef instStr = aieTranslateControlPacketsToUI32Vec(op);
+      [](MlirOperation op, const std::string &deviceName) {
+        MlirStringRef instStr = aieTranslateControlPacketsToUI32Vec(
+            op, {deviceName.data(), deviceName.size()});
         size_t num_insts = instStr.length / sizeof(uint32_t);
         std::vector<uint32_t> vec(
             reinterpret_cast<const uint32_t *>(instStr.data),
@@ -157,21 +152,24 @@ NB_MODULE(_aie, m) {
         free((void *)instStr.data);
         return vec;
       },
-      "module"_a);
+      "module"_a, "device_name"_a = "");
 
   m.def(
       "generate_xaie",
-      [&stealCStr](MlirOperation op) {
-        return stealCStr(aieTranslateToXAIEV2(op));
+      [&stealCStr](MlirOperation op, const std::string &deviceName) {
+        return stealCStr(
+            aieTranslateToXAIEV2(op, {deviceName.data(), deviceName.size()}));
       },
-      "module"_a);
+      "module"_a, "device_name"_a = "");
 
   m.def(
       "generate_bcf",
-      [&stealCStr](MlirOperation op, int col, int row) {
-        return stealCStr(aieTranslateToBCF(op, col, row));
+      [&stealCStr](MlirOperation op, int col, int row,
+                   const std::string &deviceName) {
+        return stealCStr(aieTranslateToBCF(
+            op, col, row, {deviceName.data(), deviceName.size()}));
       },
-      "module"_a, "col"_a, "row"_a);
+      "module"_a, "col"_a, "row"_a, "device_name"_a = "");
 
   m.def(
       "aie_llvm_link",
@@ -188,6 +186,21 @@ NB_MODULE(_aie, m) {
   m.def("get_target_model",
         [](uint32_t d) -> PyAieTargetModel { return aieGetTargetModel(d); });
 
+  m.def(
+      "dma_bd_fits",
+      [](uint32_t device, int col, int row, MlirType elementType,
+         int64_t offset, const std::vector<int64_t> &sizes,
+         const std::vector<int64_t> &strides, int64_t len) {
+        if (sizes.size() != 4 || strides.size() != 4)
+          throw nb::value_error("dma_bd_fits takes four sizes and strides");
+        return aieDmaBdFits(device, col, row, elementType, offset, sizes.data(),
+                            strides.data(), len);
+      },
+      "device"_a, "col"_a, "row"_a, "element_type"_a, "offset"_a, "sizes"_a,
+      "strides"_a, "len"_a,
+      "Whether one DMA buffer descriptor of a tile holds an access pattern: "
+      "four sizes and strides, outermost first, and the descriptor's length.");
+
   nb::class_<PyAieTargetModel>(m, "AIETargetModel")
       .def(
           "columns",
@@ -199,6 +212,10 @@ NB_MODULE(_aie, m) {
           "rows",
           [](PyAieTargetModel &self) { return aieTargetModelRows(self.get()); },
           "Get the number of rows in the device.")
+      .def("get_tile_type",
+           [](PyAieTargetModel &self, int col, int row) {
+             return aieTargetModelGetTileType(self.get(), col, row);
+           })
       .def("is_core_tile",
            [](PyAieTargetModel &self, int col, int row) {
              return aieTargetModelIsCoreTile(self.get(), col, row);
@@ -306,6 +323,10 @@ NB_MODULE(_aie, m) {
            [](PyAieTargetModel &self) {
              return aieTargetModelGetLocalMemorySize(self.get());
            })
+      .def("get_default_core_stack_size",
+           [](PyAieTargetModel &self) {
+             return aieTargetModelGetDefaultCoreStackSize(self.get());
+           })
       .def("get_num_locks",
            [](PyAieTargetModel &self, int col, int row) {
              return aieTargetModelGetNumLocks(self.get(), col, row);
@@ -314,6 +335,34 @@ NB_MODULE(_aie, m) {
            [](PyAieTargetModel &self, int col, int row) {
              return aieTargetModelGetNumBDs(self.get(), col, row);
            })
+      .def("get_max_lock_value",
+           [](PyAieTargetModel &self) {
+             return aieTargetModelGetMaxLockValue(self.get());
+           })
+      .def("get_max_repeat_count",
+           [](PyAieTargetModel &self) {
+             return aieTargetModelGetMaxRepeatCount(self.get());
+           })
+      .def("get_dma_task_queue_depth",
+           [](PyAieTargetModel &self) {
+             return aieTargetModelGetDmaTaskQueueDepth(self.get());
+           })
+      .def("get_dma_bd_wrap_bits",
+           [](PyAieTargetModel &self, int col, int row) {
+             return aieTargetModelGetDmaBdWrapBits(self.get(), col, row);
+           })
+      .def("get_dma_bd_step_bits",
+           [](PyAieTargetModel &self, int col, int row) {
+             return aieTargetModelGetDmaBdStepBits(self.get(), col, row);
+           })
+      .def("get_dma_bd_iter_bits",
+           [](PyAieTargetModel &self, int col, int row) {
+             return aieTargetModelGetDmaBdIterBits(self.get(), col, row);
+           })
+      .def("get_address_gen_granularity",
+           [](PyAieTargetModel &self) {
+             return aieGetTargetModelAddressGenGranularity(self.get());
+           })
       .def("get_num_mem_tile_rows",
            [](PyAieTargetModel &self) {
              return aieTargetModelGetNumMemTileRows(self.get());
@@ -321,6 +370,10 @@ NB_MODULE(_aie, m) {
       .def("get_mem_tile_size",
            [](PyAieTargetModel &self) {
              return aieTargetModelGetMemTileSize(self.get());
+           })
+      .def("get_num_banks",
+           [](PyAieTargetModel &self, int col, int row) {
+             return aieTargetModelGetNumBanks(self.get(), col, row);
            })
       .def("get_num_dest_switchbox_connections",
            [](PyAieTargetModel &self, int col, int row, uint32_t bundle) {
@@ -347,6 +400,10 @@ NB_MODULE(_aie, m) {
            [](PyAieTargetModel &self) {
              return aieTargetModelIsNPU(self.get());
            })
+      .def("get_target_arch",
+           [](PyAieTargetModel &self) {
+             return aieTargetModelGetTargetArch(self.get());
+           })
       .def("get_column_shift",
            [](PyAieTargetModel &self) {
              return aieTargetModelGetColumnShift(self.get());
@@ -354,4 +411,53 @@ NB_MODULE(_aie, m) {
       .def("get_row_shift", [](PyAieTargetModel &self) {
         return aieTargetModelGetRowShift(self.get());
       });
+
+  // TileLike interface bindings
+  m.def(
+      "tile_like_is_core_tile",
+      [](MlirOperation op) { return aieTileLikeIsCoreTile(op); },
+      "Returns true if the tile operation is a core tile.");
+  m.def(
+      "tile_like_is_mem_tile",
+      [](MlirOperation op) { return aieTileLikeIsMemTile(op); },
+      "Returns true if the tile operation is a mem tile.");
+  m.def(
+      "tile_like_is_shim_noc_tile",
+      [](MlirOperation op) { return aieTileLikeIsShimNOCTile(op); },
+      "Returns true if the tile operation is a shim NOC tile.");
+  m.def(
+      "tile_like_is_shim_pl_tile",
+      [](MlirOperation op) { return aieTileLikeIsShimPLTile(op); },
+      "Returns true if the tile operation is a shim PL tile.");
+  m.def(
+      "tile_like_is_shim_tile",
+      [](MlirOperation op) { return aieTileLikeIsShimNOCorPLTile(op); },
+      "Returns true if the tile operation is a shim tile (NOC or PL).");
+
+  // #aie.trace_buffer and #aie.trace_slice field access
+  m.def(
+      "trace_buffer_fields",
+      [](MlirAttribute attr) {
+        if (!aieAttrIsTraceBuffer(attr)) {
+          throw nb::value_error("not a #aie.trace_buffer attribute");
+        }
+        return nb::make_tuple(
+            aieTraceBufferGetArgIndex(attr), aieTraceBufferGetOffset(attr),
+            aieTraceBufferGetSize(attr), aieTraceBufferGetDedicated(attr));
+      },
+      "Returns (arg_index, offset, size, dedicated) of a #aie.trace_buffer.");
+  m.def(
+      "trace_slice_fields",
+      [](MlirAttribute attr) {
+        if (!aieAttrIsTraceSlice(attr)) {
+          throw nb::value_error("not a #aie.trace_slice attribute");
+        }
+        MlirStringRef device = aieTraceSliceGetDevice(attr);
+        MlirStringRef sequence = aieTraceSliceGetSequence(attr);
+        return nb::make_tuple(std::string(device.data, device.length),
+                              std::string(sequence.data, sequence.length),
+                              aieTraceSliceGetOffset(attr),
+                              aieTraceSliceGetSize(attr));
+      },
+      "Returns (device, sequence, offset, size) of a #aie.trace_slice.");
 }

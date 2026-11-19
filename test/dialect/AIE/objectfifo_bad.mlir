@@ -1,11 +1,8 @@
 //===- objectfifo_bad.mlir --------------------------------------*- MLIR -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2025 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Copyright (C) 2025, Advanced Micro Devices, Inc.
-// 
 //===----------------------------------------------------------------------===//
 
 // RUN: not aie-opt -split-input-file %s 2>&1 | FileCheck %s
@@ -50,29 +47,193 @@ aie.device(xcve2302) {
    %tile12 = aie.tile(1, 2)
    %tile23 = aie.tile(2, 3)
 
-   aie.objectfifo @of0 (%tile12, {%tile23}, 2 : i32) : !aie.objectfifo<memref<2x2xi32>> = [dense<[[4, 5], [6, 7]]> : memref<2x2xi32>, 
+   aie.objectfifo @of0 (%tile12, {%tile23}, 2 : i32) : !aie.objectfifo<memref<2x2xi32>> = [dense<[[4, 5], [6, 7]]> : memref<2x2xi32>,
                                                                                           dense<[[0, 1, 2], [3, 4, 5]]> : memref<2x2xi32>]
 }
 
 // -----
 
-// CHECK: `via_shared_mem` can only be used in 1-to-1 object FIFOs
+// CHECK: producer element size (35) must be an integer multiple of consumer element size (10)
 
-aie.device(xcve2302) {
-   %tile20 = aie.tile(2, 0)
-   %tile13 = aie.tile(1, 3)
-   %tile23 = aie.tile(2, 3)
+aie.device(npu2) {
+   %tile01 = aie.tile(0, 1)
+   %tile02 = aie.tile(0, 2)
 
-   aie.objectfifo @of_0 (%tile20, {%tile13, %tile23}, 2 : i32) {via_shared_mem = 1 : i32} : !aie.objectfifo<memref<16xi32>>
+   aie.objectfifo @of0 (%tile01, {%tile02}, 1 : i32) : !aie.objectfifo<memref<35xi32>> -> !aie.objectfifo<memref<10xi32>>
 }
 
 // -----
 
-// CHECK: `via_shared_mem` and `via_DMA` cannot occur together
+// CHECK: producer and consumer must have the same scalar element type
 
-aie.device(xcve2302) {
-   %tile12 = aie.tile(1, 2)
-   %tile13 = aie.tile(1, 3)
+aie.device(npu2) {
+   %tile01 = aie.tile(0, 1)
+   %tile02 = aie.tile(0, 2)
 
-   aie.objectfifo @of_0 (%tile12, {%tile13}, 2 : i32) {via_shared_mem = 1 : i32, via_DMA = true} : !aie.objectfifo<memref<16xi32>>
+   aie.objectfifo @of0 (%tile01, {%tile02}, 1 : i32) : !aie.objectfifo<memref<40xi32>> -> !aie.objectfifo<memref<10xf32>>
+}
+
+// -----
+
+// CHECK: consumer element count must be positive
+
+aie.device(npu2) {
+   %tile01 = aie.tile(0, 1)
+   %tile02 = aie.tile(0, 2)
+
+   aie.objectfifo @of0 (%tile01, {%tile02}, 1 : i32) : !aie.objectfifo<memref<40xi32>> -> !aie.objectfifo<memref<0xi32>>
+}
+
+// -----
+
+// The direction of a route endpoint is read off the routes that name it, so
+// they must all name it on the same side.
+
+// CHECK: 'aie.route_endpoint' op is named as both a source and a destination, so its direction is ambiguous
+
+aie.device(npu1) {
+  %tile02 = aie.tile(0, 2)
+  %shim0 = aie.tile(0, 0)
+  %shim1 = aie.tile(1, 0)
+
+  aie.objectfifo.pool @p(%tile02) {depth = 2 : i32} : memref<16xi32> {
+    aie.objectfifo.segment @s0 {offset = 0 : i32, size = 16 : i32}
+  }
+  aie.objectfifo.core_endpoint @fill(%tile02) fills @p
+  aie.objectfifo.dma_endpoint @drain(%tile02) drains @p
+
+  aie.route_endpoint @mid(%shim1) DMA
+  aie.route_endpoint @sink(%shim0) DMA
+
+  aie.route from @drain to [@mid]
+  aie.route from @mid to [@sink]
+}
+
+// -----
+
+// Both ends of one flow is the same ambiguity.
+
+// CHECK: 'aie.route_endpoint' op is named as both a source and a destination, so its direction is ambiguous
+
+aie.device(npu1) {
+  %shim0 = aie.tile(0, 0)
+
+  aie.route_endpoint @loop(%shim0) DMA
+
+  aie.route from @loop to [@loop]
+}
+
+// -----
+
+// Initial contents may fill only the first objects of a pool, never more than
+// it holds.
+
+// CHECK: 'aie.objectfifo.pool' op has more 'init_values' than 'depth' objects
+
+aie.device(npu1) {
+  %tile02 = aie.tile(0, 2)
+
+  aie.objectfifo.pool @p(%tile02) {depth = 1 : i32, initValues = [dense<0> : memref<16xi32>, dense<1> : memref<16xi32>]} : memref<16xi32> {
+    aie.objectfifo.segment @s0 {offset = 0 : i32, size = 16 : i32}
+  }
+}
+
+// -----
+
+// A circuit owns its channel, so no second flow may name its endpoint.
+
+// CHECK: 'aie.route_endpoint' op drives one channel, which a circuit flow owns, but it is named 2 times
+
+aie.device(npu1) {
+  %shim0 = aie.tile(0, 0)
+  %shim1 = aie.tile(1, 0)
+
+  aie.route_endpoint @a(%shim0) DMA
+  aie.route_endpoint @b(%shim0) DMA
+  aie.route_endpoint @sink(%shim1) DMA
+
+  aie.route from @a to [@sink] {packet = #aie.packet_info<>}
+  aie.route from @b to [@sink]
+}
+
+// -----
+
+// A shared source's BDs state each header, so they must know each id.
+
+// CHECK: 'aie.route_endpoint' op sends several packet flows, so each must pin its pkt_id for the BDs to state it
+
+aie.device(npu1) {
+  %shim0 = aie.tile(0, 0)
+  %shim1 = aie.tile(1, 0)
+
+  aie.route_endpoint @src(%shim0) DMA
+  aie.route_endpoint @a(%shim1) DMA
+  aie.route_endpoint @b(%shim1) DMA
+
+  aie.route from @src to [@a] {packet = #aie.packet_info<pkt_id = 1>}
+  aie.route from @src to [@b] {packet = #aie.packet_info<>}
+}
+
+// -----
+
+// CHECK: 'aie.route' op keep_pkt_header is only meaningful on a packet flow
+
+aie.device(npu1) {
+  %shim0 = aie.tile(0, 0)
+  %shim1 = aie.tile(1, 0)
+
+  aie.route_endpoint @src(%shim0) DMA
+  aie.route_endpoint @dst(%shim1) DMA
+
+  aie.route from @src to [@dst] {keep_pkt_header}
+}
+
+// -----
+
+// A shared source's BDs tell its flows apart by id.
+
+// CHECK: 'aie.route_endpoint' op sends several packet flows, two of which pin the same pkt_id 1; each needs its own
+
+aie.device(npu1) {
+  %shim0 = aie.tile(0, 0)
+  %shim1 = aie.tile(1, 0)
+
+  aie.route_endpoint @src(%shim0) DMA
+  aie.route_endpoint @a(%shim1) DMA
+  aie.route_endpoint @b(%shim1) DMA
+
+  aie.route from @src to [@a] {packet = #aie.packet_info<pkt_id = 1>}
+  aie.route from @src to [@b] {packet = #aie.packet_info<pkt_id = 1>}
+}
+
+// -----
+
+// One port keeps or drops every header it receives.
+
+// CHECK: 'aie.route_endpoint' op receives several packet flows, so they must agree on keep_pkt_header
+
+aie.device(npu1) {
+  %shim0 = aie.tile(0, 0)
+  %shim1 = aie.tile(1, 0)
+
+  aie.route_endpoint @a(%shim0) DMA
+  aie.route_endpoint @b(%shim0) DMA
+  aie.route_endpoint @sink(%shim1) DMA
+
+  aie.route from @a to [@sink] {keep_pkt_header, packet = #aie.packet_info<>}
+  aie.route from @b to [@sink] {packet = #aie.packet_info<>}
+}
+
+// -----
+
+// CHECK: 'aie.route' op names '@sink' more than once
+
+aie.device(npu1) {
+  %shim0 = aie.tile(0, 0)
+  %shim1 = aie.tile(1, 0)
+
+  aie.route_endpoint @a(%shim0) DMA
+  aie.route_endpoint @sink(%shim1) DMA
+
+  aie.route from @a to [@sink, @sink] {packet = #aie.packet_info<>}
 }

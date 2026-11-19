@@ -1,23 +1,25 @@
 //===- AIEVecOptimizations.cpp - Patterns to optimize AIEVec ----*- C++ -*-===//
 //
-// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2023 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2023, Advanced Micro Devices, Inc.
 //
 //===----------------------------------------------------------------------===//
 // This file contains conversions and rewrite that replace common AIEVec ops
 // with more complex, and performant AIEVec ops.
 //===----------------------------------------------------------------------===//
 
+#include "BFP16MatMulOperands.h"
 #include "FoldMulAddChainToConvOp.h"
+#include "mlir/IR/Dominance.h"
+#include "mlir/Transforms/CSE.h"
 
 #include "aie/Dialect/AIEVec/AIE1/IR/AIEVecAIE1Ops.h"
 #include "aie/Dialect/AIEVec/AIEVecUtils.h"
 #include "aie/Dialect/AIEVec/Analysis/Passes.h"
+#include "aie/Dialect/AIEVec/IR/AIEVecMatMul.h"
 #include "aie/Dialect/AIEVec/IR/AIEVecOps.h"
 #include "aie/Dialect/AIEVec/Pipelines/Passes.h"
+#include "aie/Dialect/AIEVec/Utils/TargetInfo.h"
 
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -68,11 +70,7 @@ static bool canFoldAIEShiftAndBroadcast(aievec::BroadcastOp op,
   int32_t shiftBytes = cast<IntegerAttr>(constOp.getValue()).getInt();
   idx = shiftBytes * 8 / elemSize + op.getIdx();
 
-  if (idx <= 0 || idx >= (int32_t)getVectorLaneSize(vType)) {
-    return false;
-  }
-
-  return true;
+  return idx > 0 && idx < (int32_t)getVectorLaneSize(vType);
 }
 
 template <typename AIEv1MACLikeOp,
@@ -113,7 +111,7 @@ static bool isSingleColumnInt16VectorTimesScalarMac(AIEv1MACLikeOp fmaOp) {
 }
 
 static bool singleColumnFMAOpCanFold(aievec::aie1::FMAOp fmaOp) {
-  auto accProdOp = fmaOp.getAcc().getDefiningOp();
+  auto *accProdOp = fmaOp.getAcc().getDefiningOp();
   if (!accProdOp)
     return false;
   auto accFmaOp = dyn_cast<aievec::aie1::FMAOp>(accProdOp);
@@ -137,7 +135,7 @@ struct MergeSingleColumnI16FMAOpPattern
                   ConversionPatternRewriter &rewriter) const override {
     if (!isSingleColumnInt16VectorTimesScalarMac(adaptor))
       return failure();
-    auto accProdOp = adaptor.getAcc().getDefiningOp();
+    auto *accProdOp = adaptor.getAcc().getDefiningOp();
     if (!accProdOp)
       return failure();
     auto accFmaOp = dyn_cast<aievec::aie1::FMAOp>(accProdOp);
@@ -160,14 +158,19 @@ struct MergeSingleColumnI16FMAOpPattern
     auto hiV = fmaConcatOp.getSources()[0];
     if (accFmaZstart > fmaZstart)
       std::swap(lowV, hiV);
-    auto newConcatOp = rewriter.create<aievec::ConcatOp>(
-        fmaOp.getLoc(), adaptor.getLhs().getType(),
+    auto newConcatOp = aievec::ConcatOp::create(
+        rewriter, fmaOp.getLoc(), adaptor.getLhs().getType(),
         SmallVector<Value, 2>({lowV, hiV}));
     auto newFmaOpAttr = buildFMAOpSplatAttrForElemTy(fmaOp, start, step);
+    aievec::aie1::FMAOp::Properties fmaProps;
+    if (failed(aievec::aie1::FMAOp::setPropertiesFromAttr(
+            fmaProps, rewriter.getDictionaryAttr(newFmaOpAttr),
+            [&]() { return fmaOp.emitError(); })))
+      return failure();
     rewriter.replaceOpWithNewOp<aievec::aie1::FMAOp>(
         fmaOp, TypeRange({fmaOp.getResult().getType()}),
         ValueRange({newConcatOp, adaptor.getRhs(), accFmaOp.getAcc()}),
-        newFmaOpAttr);
+        fmaProps);
     return success();
   }
 };
@@ -198,14 +201,38 @@ struct FoldAIEShiftAndBroadcast
 //===----------------------------------------------------------------------===//
 // Pattern collection
 //===----------------------------------------------------------------------===//
-static void populateAIEVecV1TransformationPatterns(RewritePatternSet &patterns,
-                                                   TargetBackend backend) {
+static void
+populateAIEVecV1TransformationPatterns(RewritePatternSet &patterns) {
   patterns.add<MergeSingleColumnI16FMAOpPattern>(patterns.getContext());
 }
 
-static void populateAIEVecV2TransformationPatterns(RewritePatternSet &patterns,
-                                                   TargetBackend backend) {
+static void
+populateAIEVecV2TransformationPatterns(RewritePatternSet &patterns) {
   patterns.add<FoldAIEShiftAndBroadcast>(patterns.getContext());
+}
+
+// Expands bf16 matmuls with a bfp16 recipe so that later patterns can
+// rewrite the conversions.
+struct ExpandBFP16MatMulPattern
+    : public OpConversionPattern<aievec::MatMulOp_AIE2P> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(aievec::MatMulOp_AIE2P op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    return aievec::expandBFP16MatMul(rewriter, op);
+  }
+};
+
+static bool isBFP16MatMul(aievec::MatMulOp_AIE2P op) {
+  std::optional<aievec::MatMulRecipe> recipe = aievec::checkMatMulTile(
+      /*aie2p=*/true, cast<VectorType>(op.getLhs().getType()),
+      cast<VectorType>(op.getRhs().getType()),
+      cast<VectorType>(op.getAcc().getType()), op.getLhsTransposed(),
+      op.getRhsTransposed());
+  return recipe &&
+         (recipe->kind == aievec::MatMulRecipeKind::AIE2P_BFP16_8x8x8 ||
+          recipe->kind == aievec::MatMulRecipeKind::AIE2P_BFP16_4x8x8);
 }
 
 //===----------------------------------------------------------------------===//
@@ -213,8 +240,7 @@ static void populateAIEVecV2TransformationPatterns(RewritePatternSet &patterns,
 //===----------------------------------------------------------------------===//
 
 static void
-configureAIEVecV1TransformationLegalizations(ConversionTarget &target,
-                                             TargetBackend backend) {
+configureAIEVecV1TransformationLegalizations(ConversionTarget &target) {
   target.addLegalDialect<aievec::AIEVecDialect,
                          aievec::aie1::AIEVecAIE1Dialect>();
   target.addDynamicallyLegalOp<aievec::aie1::FMAOp>(
@@ -226,8 +252,7 @@ configureAIEVecV1TransformationLegalizations(ConversionTarget &target,
 }
 
 static void
-configureAIEVecV2TransformationLegalizations(ConversionTarget &target,
-                                             TargetBackend backend) {
+configureAIEVecV2TransformationLegalizations(ConversionTarget &target) {
   target.addDynamicallyLegalOp<xilinx::aievec::BroadcastOp>(
       [](xilinx::aievec::BroadcastOp op) {
         aievec::ShiftOp shiftOp = nullptr;
@@ -250,7 +275,6 @@ struct AIEVecTransformationPass
   AIEVecTransformationPass(const OptimizeAIEVecOptions &options)
       : AIEVecTransformationPass() {
     aieTarget = options.aieTarget;
-    targetBackend = options.targetBackend;
   }
 
   // In case we want to register this pass as a standalone pass for test
@@ -269,61 +293,66 @@ struct AIEVecTransformationPass
 
   Option<std::string> aieTarget{
       *this, "aie-target",
-      llvm::cl::desc("Select AIE version: \"aie\" or \"aie2\". This will "
-                     "determine the vector size and available operations."),
+      llvm::cl::desc(
+          "Select AIE version: \"aie\", \"aie2\", or \"aie2p\". This will "
+          "determine the vector size and available operations."),
       llvm::cl::init("aie")};
 
-  Option<std::string> targetBackend{
-      *this, "target-backend",
-      llvm::cl::desc("Select translation backend: \"cpp\" or \"llvmir\". This "
-                     "will determine the aievec operations used to convert "
-                     "from vector dialect."),
-      llvm::cl::init("cpp")};
-
   void runOnOperation() override {
-    auto op = getOperation();
+    auto *op = getOperation();
     MLIRContext *context = &getContext();
     RewritePatternSet patterns(context);
     ConversionTarget target(*context);
-    AIEArch aieVersion = AIEArch::AIE;
-    if (!aieTarget.empty()) {
-      std::string target = aieTarget;
-      if (target == "aieml" || target == "aie2") {
-        aieVersion = AIEArch::AIE2;
-      } else if (target != "aie") {
-        op->emitError() << "unknown AIE target '" << aieTarget << "'";
-        signalPassFailure();
-        return;
-      }
+    std::optional<AIEVecTargetInfo> targetInfo =
+        parseAIEVecLoweringTarget(aieTarget, op);
+    if (!targetInfo) {
+      signalPassFailure();
+      return;
     }
 
-    TargetBackend backend = TargetBackend::CPP;
-    if (!targetBackend.empty()) {
-      std::string backendStr = targetBackend;
-      if (backendStr == "llvmir") {
-        backend = TargetBackend::LLVMIR;
-        if (aieVersion == AIEArch::AIE) {
-          op->emitError() << "targetting LLVM IR is not supported for AIEv1";
-          signalPassFailure();
-          return;
-        }
-      } else if (backendStr != "cpp") {
-        op->emitError() << "unknown target backend'" << targetBackend << "'";
-        signalPassFailure();
-        return;
-      }
-    }
-
-    if (aieVersion == AIEArch::AIE) {
-      populateAIEVecV1TransformationPatterns(patterns, backend);
-      configureAIEVecV1TransformationLegalizations(target, backend);
+    // AIE2P uses the AIE2 transformations.
+    if (targetInfo->isAIE1()) {
+      populateAIEVecV1TransformationPatterns(patterns);
+      configureAIEVecV1TransformationLegalizations(target);
     } else {
-      populateAIEVecV2TransformationPatterns(patterns, backend);
-      configureAIEVecV2TransformationLegalizations(target, backend);
+      populateAIEVecV2TransformationPatterns(patterns);
+      configureAIEVecV2TransformationLegalizations(target);
+    }
+    if (targetInfo->isAIE2P()) {
+      patterns.add<ExpandBFP16MatMulPattern>(context);
+      target.addLegalOp<aievec::ToBFP16Op, aievec::MatMulBFP16Op_AIE2P>();
+      target.addDynamicallyLegalOp<aievec::MatMulOp_AIE2P>(
+          [](aievec::MatMulOp_AIE2P op) { return !isBFP16MatMul(op); });
     }
 
     if (failed(applyPartialConversion(op, target, std::move(patterns)))) {
       signalPassFailure();
+      return;
+    }
+
+    if (targetInfo->isAIE2P()) {
+      // A tile that feeds several matmuls is converted once.
+      IRRewriter rewriter(context);
+      DominanceInfo domInfo(op);
+      eliminateCommonSubExpressions(rewriter, domInfo, op);
+      // Replace decoded tiles by their blocks before hoisting conversions,
+      // so that the hoisting pattern does not pick up those tiles.
+      RewritePatternSet decoded(context);
+      populateReadDecodedBFP16Patterns(decoded);
+      if (failed(applyPatternsGreedily(op, std::move(decoded)))) {
+        signalPassFailure();
+        return;
+      }
+      RewritePatternSet hoist(context);
+      populateHoistBFP16ConversionPatterns(hoist);
+      if (failed(applyPatternsGreedily(op, std::move(hoist)))) {
+        signalPassFailure();
+        return;
+      }
+      RewritePatternSet streams(context);
+      populateBFP16LoadStreamPatterns(streams);
+      if (failed(applyPatternsGreedily(op, std::move(streams))))
+        signalPassFailure();
     }
   }
 };
@@ -344,7 +373,6 @@ struct AIEVecConvOpTransformationPass
   AIEVecConvOpTransformationPass(const OptimizeAIEVecOptions &options)
       : AIEVecConvOpTransformationPass() {
     aieTarget = options.aieTarget;
-    targetBackend = options.targetBackend;
     shiftParam = options.shiftParam;
   }
 
@@ -366,16 +394,10 @@ struct AIEVecConvOpTransformationPass
 
   Option<std::string> aieTarget{
       *this, "aie-target",
-      llvm::cl::desc("Select AIE version: \"aie\" or \"aie2\". This will "
-                     "determine the vector size and available operations."),
+      llvm::cl::desc(
+          "Select AIE version: \"aie\", \"aie2\", or \"aie2p\". This will "
+          "determine the vector size and available operations."),
       llvm::cl::init("aie")};
-
-  Option<std::string> targetBackend{
-      *this, "target-backend",
-      llvm::cl::desc("Select translation backend: \"cpp\" or \"llvmir\". This "
-                     "will determine the aievec operations used to convert "
-                     "from vector dialect."),
-      llvm::cl::init("cpp")};
 
   Option<unsigned> shiftParam{
       *this, "shift",
@@ -383,44 +405,21 @@ struct AIEVecConvOpTransformationPass
       llvm::cl::init(0)};
 
   void runOnOperation() override {
-    auto op = getOperation();
+    auto *op = getOperation();
     MLIRContext *context = &getContext();
     RewritePatternSet patterns(context);
     ConversionTarget target(*context);
-    AIEArch aieVersion = AIEArch::AIE;
-    if (!aieTarget.empty()) {
-      std::string target = aieTarget;
-      if (target == "aieml" || target == "aie2") {
-        aieVersion = AIEArch::AIE2;
-      } else if (target != "aie") {
-        op->emitError() << "unknown AIE target '" << aieTarget << "'";
-        signalPassFailure();
-        return;
-      }
-    }
-
-    TargetBackend backend = TargetBackend::CPP;
-    if (!targetBackend.empty()) {
-      std::string backendStr = targetBackend;
-      if (backendStr == "llvmir") {
-        backend = TargetBackend::LLVMIR;
-        if (aieVersion == AIEArch::AIE) {
-          op->emitError() << "targetting LLVM IR is not supported for AIEv1";
-          signalPassFailure();
-          return;
-        }
-      } else if (backendStr != "cpp") {
-        op->emitError() << "unknown target backend'" << targetBackend << "'";
-        signalPassFailure();
-        return;
-      }
+    std::optional<AIEVecTargetInfo> targetInfo =
+        parseAIEVecLoweringTarget(aieTarget, op);
+    if (!targetInfo) {
+      signalPassFailure();
+      return;
     }
 
     AnalysisManager am = getAnalysisManager();
-    if (aieVersion == AIEArch::AIE2) {
-      populateAIEVecConvOpTransformationPatterns(patterns, am, shiftParam,
-                                                 backend);
-      configureAIEVecConvOpTransformationLegalizations(target, am, backend);
+    if (targetInfo->isAIE2() || targetInfo->isAIE2P()) {
+      populateAIEVecConvOpTransformationPatterns(patterns, am, shiftParam);
+      configureAIEVecConvOpTransformationLegalizations(target, am);
     }
 
     if (failed(applyPartialConversion(op, target, std::move(patterns)))) {
@@ -447,7 +446,9 @@ void xilinx::aievec::buildOptimizeAIEVec(OpPassManager &pm,
   pm.addPass(createCanonicalizerPass());
 
   // Add generating aievec convolution ops pass
-  if (options.aieTarget == "aieml" || options.aieTarget == "aie2") {
+  std::optional<AIEVecTargetInfo> targetInfo =
+      parseAIEVecTarget(options.aieTarget);
+  if (targetInfo && (targetInfo->isAIE2() || targetInfo->isAIE2P())) {
     pm.addPass(createAIEVecConvolutionAnalysisPass());
     pm.addPass(createAIEVecConvOpTransformationPass(options));
   }

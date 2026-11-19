@@ -1,25 +1,33 @@
 # resolvable.py -*- Python -*-
 #
-# This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-# See https://llvm.org/LICENSE.txt for license information.
+# Copyright (C) 2024 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #
-# (c) Copyright 2024 Advanced Micro Devices, Inc.
+"""Structural protocol for objects that lower to MLIR operations."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
+
+from .. import ir  # pyright: ignore[reportMissingImports, reportAttributeAccessIssue]
+
+if TYPE_CHECKING:
+    from .configuration import DeviceConfiguration
 
 
-from abc import ABC, abstractmethod
-
-from .. import ir  # type: ignore
-
-
-class Resolvable(ABC):
-    @abstractmethod
+# Structural typing via @runtime_checkable Protocol: any class with both
+# .resolve() and .tiles() passes isinstance(x, Resolvable).  The two-method
+# requirement is the safeguard against false positives from classes that
+# happen to define an unrelated .resolve() (e.g. pathlib.Path).
+@runtime_checkable
+class Resolvable(Protocol):
     def resolve(
-        cls,
+        self,
         loc: ir.Location | None = None,
         ip: ir.InsertionPoint | None = None,
     ) -> None:
         """Resolve the current object into one or more MLIR operations.
+
         Should only be called within an MLIR context.
 
         Args:
@@ -28,14 +36,118 @@ class Resolvable(ABC):
         """
         ...
 
+    def tiles(self) -> list:
+        """Tiles this Resolvable depends on for code generation.
+
+        Override this in user-side Resolvable subclasses that reference tiles
+        which aren't already discoverable via Workers or ObjectFifos. The
+        DeviceConfiguration resolves these tiles before calling `resolve`, so
+        `tile.op` is valid by then. Default: empty list.
+        """
+        return []
+
+
+class PerDeviceConfiguration:
+    """An object that belongs to one ``aie.device`` image."""
+
+    _device_configuration: DeviceConfiguration | None = None
+
+    def _bind_device_configuration(self, configuration: DeviceConfiguration) -> None:
+        owner = self._device_configuration
+        if owner is not None and owner is not configuration:
+            raise ValueError(
+                f"{type(self).__name__} already belongs to device configuration "
+                f"{owner.name!r}; it cannot also belong to {configuration.name!r}."
+            )
+        self._device_configuration = configuration
+
+
+class PerDeviceConfigurationResolvable(PerDeviceConfiguration, Resolvable):
+    """A resolvable whose emitted operations belong to one ``aie.device``.
+
+    User-defined worker arguments that emit device-local operations should
+    inherit this class. Structural ``Resolvable`` implementations remain
+    supported, but this base reports cross-configuration reuse at the object.
+    """
+
+
+class DeviceResources:
+    """Flows, locks, and tile DMA programs owned by one device image."""
+
+    def __init__(self) -> None:
+        self._flows = []
+        self._locks = []
+        self._tile_dmas = []
+        self._resolved_tile_dmas = None
+
+    def add_flow(self, flow) -> None:
+        if flow not in self._flows:
+            self._flows.append(flow)
+
+    def add_lock(self, lock) -> None:
+        if lock not in self._locks:
+            self._locks.append(lock)
+
+    def add_tile_dma(self, tile_dma) -> None:
+        from .runtime.runtime import IronRuntimeError
+
+        if self._resolved_tile_dmas is not None:
+            raise IronRuntimeError("Cannot register TileDma after DMA resolution.")
+        self._tile_dmas.append(tile_dma)
+
+    def resolve_tile_dmas(self) -> None:
+        from .dataflow.tile_dma import TileDma
+        from .runtime.runtime import IronRuntimeError
+
+        if self._resolved_tile_dmas is None:
+            programs = {}
+            coordinates = {}
+            for tile_dma in self._tile_dmas:
+                tile = tile_dma.tile
+                if tile.col is not None and tile.row is not None:
+                    key = (tile.col, tile.row)
+                    if key in coordinates and coordinates[key] is not tile:
+                        raise IronRuntimeError(
+                            f"Two TileDma programs name {tile}, via different "
+                            "Tile objects. Share one Tile object for their channels."
+                        )
+                    coordinates[key] = tile
+                if tile in programs:
+                    programs[tile] = TileDma(
+                        tile, [*programs[tile].channels, *tile_dma.channels]
+                    )
+                else:
+                    programs[tile] = tile_dma
+            self._resolved_tile_dmas = list(programs.values())
+            # A control-packet route rewrites its tile's DMA at dispatch; that
+            # would leave a static program broken for every later dispatch.
+            for flow in self._flows:
+                for tile in flow.control_tiles():
+                    if tile in programs or (tile.col, tile.row) in coordinates:
+                        raise ValueError(
+                            f"{type(flow).__name__} {flow.name!r} writes the "
+                            f"TileControl of {tile}, which runs a TileDma program: "
+                            "a dispatch would rewrite the DMA that program "
+                            "keeps running."
+                        )
+        for program in self._resolved_tile_dmas:
+            program.resolve()
+
+    @property
+    def flows(self) -> list:
+        return list(self._flows)
+
+    @property
+    def locks(self) -> list:
+        return list(self._locks)
+
+    @property
+    def tile_dmas(self) -> list:
+        return list(self._tile_dmas)
+
 
 class NotResolvedError(Exception):
-    """If the current object is Resolvable but the resolve() method has not been called,
-    before resolution information is accessed, they should raise this error.
-
-    Args:
-        Exception (_type_): _description_
-    """
+    """Raised when a property or operation is accessed on a `Resolvable` object before `resolve` has been called."""
 
     def __init__(self, message="Cannot get operation; class not resolved."):
         self.message = message

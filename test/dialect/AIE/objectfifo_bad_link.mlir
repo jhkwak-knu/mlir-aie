@@ -1,11 +1,8 @@
 //===- objectfifo_bad_link.mlir ---------------------------------*- MLIR -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2025 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Copyright (C) 2025, Advanced Micro Devices, Inc.
-// 
 //===----------------------------------------------------------------------===//
 
 // RUN: not aie-opt -split-input-file %s 2>&1 | FileCheck %s
@@ -85,7 +82,7 @@ aie.device(xcve2302) {
 
 // -----
 
-// CHECK: ObjectFifoLinkOp join and distribute are unavailable on compute or shim tiles
+// CHECK: ObjectFifoLinkOp join and distribute are unavailable on shim tiles
 
 aie.device(xcve2302) {
     %tile20 = aie.tile(2, 0)
@@ -103,25 +100,7 @@ aie.device(xcve2302) {
 
 // -----
 
-// CHECK: ObjectFifoLinkOp join and distribute are unavailable on compute or shim tiles
-
-aie.device(xcve2302) {
-    %tile32 = aie.tile(3, 2)
-    %tile22 = aie.tile(2, 2)
-    %tile23 = aie.tile(2, 3)
-    %tile33 = aie.tile(3, 3)
-
-    aie.objectfifo @link1 (%tile22, {%tile32}, 2 : i32) : !aie.objectfifo<memref<4x4xi32>>
-    aie.objectfifo @link2 (%tile23, {%tile32}, 2 : i32) : !aie.objectfifo<memref<20xi32>>
-    aie.objectfifo @link3 (%tile33, {%tile32}, 2 : i32) : !aie.objectfifo<memref<12xi32>>
-    aie.objectfifo @link4 (%tile32, {%tile33}, 2 : i32) : !aie.objectfifo<memref<48xi32>>
-
-    aie.objectfifo.link [@link1, @link2, @link3] -> [@link4] ([0, 16, 36][])
-}
-
-// -----
-
-// CHECK: ObjectFifoLinkOp join and distribute are unavailable on compute or shim tiles
+// CHECK: ObjectFifoLinkOp join and distribute are unavailable on shim tiles
 
 aie.device(xcve2302) {
     %tile20 = aie.tile(2, 0)
@@ -133,24 +112,6 @@ aie.device(xcve2302) {
     aie.objectfifo @link2 (%tile20, {%tile22}, 2 : i32) : !aie.objectfifo<memref<4x4xi32>>
     aie.objectfifo @link3 (%tile20, {%tile23}, 2 : i32) : !aie.objectfifo<memref<20xi32>>
     aie.objectfifo @link4 (%tile20, {%tile33}, 2 : i32) : !aie.objectfifo<memref<12xi32>>
-
-    aie.objectfifo.link [@link1] -> [@link2, @link3, @link4] ([][0, 16, 36])
-}
-
-// -----
-
-// CHECK: ObjectFifoLinkOp join and distribute are unavailable on compute or shim tiles
-
-aie.device(xcve2302) {
-    %tile32 = aie.tile(3, 2)
-    %tile22 = aie.tile(2, 2)
-    %tile23 = aie.tile(2, 3)
-    %tile33 = aie.tile(3, 3)
-
-    aie.objectfifo @link1 (%tile33, {%tile32}, 2 : i32) : !aie.objectfifo<memref<48xi32>>
-    aie.objectfifo @link2 (%tile32, {%tile22}, 2 : i32) : !aie.objectfifo<memref<4x4xi32>>
-    aie.objectfifo @link3 (%tile32, {%tile23}, 2 : i32) : !aie.objectfifo<memref<20xi32>>
-    aie.objectfifo @link4 (%tile32, {%tile33}, 2 : i32) : !aie.objectfifo<memref<12xi32>>
 
     aie.objectfifo.link [@link1] -> [@link2, @link3, @link4] ([][0, 16, 36])
 }
@@ -229,51 +190,109 @@ aie.device(xcve2302) {
 
 // -----
 
-// CHECK: currently does not support objectFifos with dimensionsToStream.
+// CHECK: specified output stride(s) and size(s) result in out of bounds access in join input, for index 23 in transfer of length 12.
 
 aie.device(xcve2302) {
+   %tile10 = aie.tile(1, 0)
+   %tile11 = aie.tile(1, 1)
+   %tile22 = aie.tile(2, 2)
    %tile23 = aie.tile(2, 3)
-   %tile21 = aie.tile(2, 1)
-   %tile13 = aie.tile(1, 3)
-   %tile33 = aie.tile(3, 3)
 
-   aie.objectfifo @of_in (%tile23 dimensionsToStream [<size = 1, stride = 1>, <size = 1, stride = 1>], {%tile21}, 2 : i32) : !aie.objectfifo<memref<16xi32>>
-   aie.objectfifo @of_out1 (%tile21, {%tile13}, 2 : i32) : !aie.objectfifo<memref<8xi32>>
-   aie.objectfifo @of_out2 (%tile21, {%tile33}, 2 : i32) : !aie.objectfifo<memref<8xi32>>
-
-   aie.objectfifo.link [@of_in] -> [@of_out1, @of_out2] ([][0, 8])
+   aie.objectfifo @of_in1 (%tile22, {%tile11}, 2 : i32) : !aie.objectfifo<memref<12xi32>>
+   aie.objectfifo @of_in2 (%tile23, {%tile11}, 2 : i32) : !aie.objectfifo<memref<12xi32>>
+   aie.objectfifo @of_out (%tile11 dimensionsToStream [<size = 8, stride = 1>,
+                                           <size = 3, stride = 8>],
+                        {%tile10}, 2 : i32) : !aie.objectfifo<memref<24xi32>>
+   aie.objectfifo.link [ @of_in1, @of_in2 ] -> [ @of_out ] ([0, 12] [])
 }
 
 // -----
 
-// CHECK: currently does not support objectFifos with dimensionsFromStreamPerConsumer.
+// CHECK: specified input stride(s) and size(s) result in out of bounds access in distribute output, for index 503 in transfer of length 56.
 
 aie.device(xcve2302) {
+   %tile10 = aie.tile(1, 0)
+   %tile11 = aie.tile(1, 1)
+   %tile22 = aie.tile(2, 2)
    %tile23 = aie.tile(2, 3)
-   %tile21 = aie.tile(2, 1)
-   %tile13 = aie.tile(1, 3)
-   %tile33 = aie.tile(3, 3)
 
-   aie.objectfifo @of_in (%tile23, {%tile21 dimensionsFromStream [<size = 1, stride = 1>, <size = 1, stride = 1>]}, 2 : i32) : !aie.objectfifo<memref<16xi32>>
-   aie.objectfifo @of_out1 (%tile21, {%tile13}, 2 : i32) : !aie.objectfifo<memref<8xi32>>
-   aie.objectfifo @of_out2 (%tile21, {%tile33}, 2 : i32) : !aie.objectfifo<memref<8xi32>>
-
-   aie.objectfifo.link [@of_in] -> [@of_out1, @of_out2] ([][0, 8])
+   aie.objectfifo @of_in (%tile10, {%tile11 dimensionsFromStream [<size = 32, stride = 16>,
+                                                       <size = 8, stride = 1>]},
+                         2 : i32) : !aie.objectfifo<memref<256xi32>>
+   aie.objectfifo @of_out1 (%tile11, {%tile22}, 2 : i32) : !aie.objectfifo<memref<200xi32>>
+   aie.objectfifo @of_out2 (%tile11, {%tile23}, 2 : i32) : !aie.objectfifo<memref<56xi32>>
+   aie.objectfifo.link [ @of_in ] -> [ @of_out1, @of_out2 ] ([] [0, 200])
 }
 
 // -----
 
-// CHECK: currently does not support objectFifos with dimensionsFromStreamPerConsumer.
+// CHECK: src offsets must increase: input objectFifo 0 would transfer -12 elements
 
 aie.device(xcve2302) {
+   %tile10 = aie.tile(1, 0)
+   %tile11 = aie.tile(1, 1)
+   %tile22 = aie.tile(2, 2)
    %tile23 = aie.tile(2, 3)
-   %tile21 = aie.tile(2, 1)
-   %tile13 = aie.tile(1, 3)
-   %tile33 = aie.tile(3, 3)
 
-   aie.objectfifo @of_in (%tile23, {%tile21}, 2 : i32) : !aie.objectfifo<memref<16xi32>>
-   aie.objectfifo @of_out1 (%tile21, {%tile13}, 2 : i32) : !aie.objectfifo<memref<8xi32>>
-   aie.objectfifo @of_out2 (%tile21, {%tile33 dimensionsFromStream [<size = 1, stride = 1>, <size = 1, stride = 1>]}, 2 : i32) : !aie.objectfifo<memref<8xi32>>
+   aie.objectfifo @of_in1 (%tile22, {%tile11}, 2 : i32) : !aie.objectfifo<memref<12xi32>>
+   aie.objectfifo @of_in2 (%tile23, {%tile11}, 2 : i32) : !aie.objectfifo<memref<12xi32>>
+   aie.objectfifo @of_out (%tile11, {%tile10}, 2 : i32) : !aie.objectfifo<memref<24xi32>>
+   aie.objectfifo.link [ @of_in1, @of_in2 ] -> [ @of_out ] ([12, 0] [])
+}
 
-   aie.objectfifo.link [@of_in] -> [@of_out1, @of_out2] ([][0, 8])
+// -----
+
+// CHECK: dst offsets must increase: output objectFifo 0 would transfer -12 elements
+
+aie.device(xcve2302) {
+   %tile10 = aie.tile(1, 0)
+   %tile11 = aie.tile(1, 1)
+   %tile22 = aie.tile(2, 2)
+   %tile23 = aie.tile(2, 3)
+
+   aie.objectfifo @of_in (%tile10, {%tile11}, 2 : i32) : !aie.objectfifo<memref<24xi32>>
+   aie.objectfifo @of_out1 (%tile11, {%tile22}, 2 : i32) : !aie.objectfifo<memref<12xi32>>
+   aie.objectfifo @of_out2 (%tile11, {%tile23}, 2 : i32) : !aie.objectfifo<memref<12xi32>>
+   aie.objectfifo.link [ @of_in ] -> [ @of_out1, @of_out2 ] ([] [12, 0])
+}
+
+// -----
+
+// CHECK: 'aie.objectfifo.link' op input @of_in1 has empty objects
+
+aie.device(npu2) {
+   %tile00 = aie.tile(0, 0)
+   %tile01 = aie.tile(0, 1)
+   %tile02 = aie.tile(0, 2)
+   %tile03 = aie.tile(0, 3)
+
+   aie.objectfifo @of_in1 (%tile02, {%tile01}, 2 : i32) : !aie.objectfifo<memref<0xi32>>
+   aie.objectfifo @of_in2 (%tile03, {%tile01}, 2 : i32) : !aie.objectfifo<memref<16xi32>>
+   aie.objectfifo @of_out (%tile01, {%tile00}, 2 : i32) : !aie.objectfifo<memref<32xi32>>
+   aie.objectfifo.link [ @of_in1, @of_in2 ] -> [ @of_out ] ([0, 16] [])
+}
+
+// -----
+
+// Two distributes on one mem tile read the fifo's two ends there in order;
+// the second link reads the second end, whose dims run past its transfer.
+
+// CHECK: specified input stride(s) and size(s) result in out of bounds access in distribute output, for index 31 in transfer of length 16.
+
+module @two_distributes_one_tile {
+  aie.device(npu2) {
+    %s = aie.tile(0, 0)
+    %m0 = aie.tile(0, 1)
+    %t0 = aie.tile(0, 2)
+    %t1 = aie.tile(0, 3)
+    %t2 = aie.tile(1, 2)
+    %t3 = aie.tile(1, 3)
+    aie.objectfifo @in(%s, {%m0 dimensionsFromStream [], %m0 dimensionsFromStream [<size = 1, stride = 0>, <size = 32, stride = 1>]}, 2 : i32) : !aie.objectfifo<memref<32xi32>>
+    aie.objectfifo @a0(%m0, {%t0}, 2 : i32) : !aie.objectfifo<memref<16xi32>>
+    aie.objectfifo @a1(%m0, {%t1}, 2 : i32) : !aie.objectfifo<memref<16xi32>>
+    aie.objectfifo.link [@in] -> [@a0, @a1] ([] [0, 16])
+    aie.objectfifo @b0(%m0, {%t2}, 2 : i32) : !aie.objectfifo<memref<16xi32>>
+    aie.objectfifo @b1(%m0, {%t3}, 2 : i32) : !aie.objectfifo<memref<16xi32>>
+    aie.objectfifo.link [@in] -> [@b0, @b1] ([] [0, 16])
+  }
 }

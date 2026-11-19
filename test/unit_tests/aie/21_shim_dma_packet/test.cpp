@@ -1,3 +1,5 @@
+// Copyright (C) 2022-2023 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 //===------------------------------------------------------------*- C++ -*-===//
 //
@@ -8,6 +10,7 @@
 #include "memory_allocator.h"
 #include "test_library.h"
 
+#include <aie_codegen.h>
 #include <cassert>
 #include <cmath>
 #include <cstdio>
@@ -17,7 +20,6 @@
 #include <sys/mman.h>
 #include <thread>
 #include <unistd.h>
-#include <xaiengine.h>
 
 #include "aie_inc.cpp"
 

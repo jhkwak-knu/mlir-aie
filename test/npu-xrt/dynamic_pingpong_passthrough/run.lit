@@ -1,0 +1,34 @@
+// Copyright (C) 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+// REQUIRES: ryzen_ai, peano
+//
+// Dynamic (runtime tile-count) ping-pong passthrough on real hardware. The
+// runtime sequence keeps its scf.for rolled over a RUNTIME trip count `%n`,
+// which the dynamic BD free-list pool path supports (the static allocator would
+// reject it). One compiled xclbin serves any n: the instruction stream is built
+// at runtime by the generated C++ TXN builder called with n.
+//
+// aiecc builds both the xclbin and the parameterized instruction builder.
+// The host #includes the generated header and calls it per n.
+//
+// RUN: mkdir -p %t.prj
+// RUN: cp %S/aie.mlir aie_arch.mlir
+// RUN: %run_on_npu1% sed 's/NPUDEVICE/npu1_1col/g' -i aie_arch.mlir
+// RUN: %run_on_npu2% sed 's/NPUDEVICE/npu2_1col/g' -i aie_arch.mlir
+// RUN: %aiecc --get-xclbin --get-npu-cpp --npu-cpp-name=%t.gen.h \
+// RUN:   --output-dir=%t.prj \
+// RUN:   --xclbin-name=%t.xclbin --tmpdir=%t.prj aie_arch.mlir
+//
+// RUN: %host_clang %S/test.cpp -o %t.exe -std=c++17 -Wall \
+// RUN:   -DGEN_HDR='"%t.gen.h"' -DXCLBIN='std::string("%/t.xclbin")' \
+// RUN:   -I%S/../../../include %xrt_flags %host_link_flags %test_utils_flags
+//
+// The runtime tile count is the last host argument: exercise several values
+// (loop body skipped at n=1, ping-pong at n=2, and a larger n).
+// RUN: %run_on_npu1% %t.exe 1
+// RUN: %run_on_npu2% %t.exe 1
+// RUN: %run_on_npu1% %t.exe 2
+// RUN: %run_on_npu2% %t.exe 2
+// RUN: %run_on_npu1% %t.exe 8
+// RUN: %run_on_npu2% %t.exe 8

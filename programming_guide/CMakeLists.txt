@@ -1,12 +1,9 @@
 #
-# This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-# See https://llvm.org/LICENSE.txt for license information.
+# Copyright (C) 2022-2026 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #
-# Copyright (C) 2022, Advanced Micro Devices, Inc.
 
-cmake_minimum_required(VERSION 3.10)
-
+cmake_minimum_required(VERSION 3.30)
 if(POLICY CMP0074)
   cmake_policy(SET CMP0074 NEW)
 endif()
@@ -49,13 +46,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED YES)
 option(LLVM_INCLUDE_TOOLS "Generate build targets for the LLVM tools." ON)
 option(LLVM_BUILD_TOOLS "Build the LLVM tools. If OFF, just generate build targets." ON)
 
-if(Vitis_FOUND)
-  set(DEFAULT_ENABLE_CHESS_TESTS ON)
-else()
-  set(DEFAULT_ENABLE_CHESS_TESTS OFF)
-endif()
-option(ENABLE_CHESS_TESTS "Enable backend tests using xchesscc" ${DEFAULT_ENABLE_CHESS_TESTS})
-
 if(${CMAKE_HOST_SYSTEM_PROCESSOR} STREQUAL aarch64)
   set(DEFAULT_ENABLE_BOARD_TESTS ON)
 endif()
@@ -71,15 +61,20 @@ set(LLVM_LIBRARY_OUTPUT_INTDIR ${CMAKE_BINARY_DIR}/lib)
 set(MLIR_BINARY_DIR ${CMAKE_BINARY_DIR})
 
 find_package(Vitis 2023.2 COMPONENTS ${AIE_VITIS_COMPONENTS})
+if(Vitis_FOUND)
+  set(DEFAULT_ENABLE_CHESS_TESTS ON)
+else()
+  set(DEFAULT_ENABLE_CHESS_TESTS OFF)
+endif()
+option(ENABLE_CHESS_TESTS "Enable backend tests using xchesscc" ${DEFAULT_ENABLE_CHESS_TESTS})
 find_package(Python3 COMPONENTS Interpreter)
 find_package(XRT)
 find_package(OpenCV)
-find_package(hsa-runtime64)
 
 # Look for LibXAIE
 if (DEFINED LibXAIE_${AIE_RUNTIME_TEST_TARGET}_DIR)
     message("Ref designs using xaiengine from LibXAIE_${AIE_RUNTIME_TEST_TARGET}_DIR=${LibXAIE_${AIE_RUNTIME_TEST_TARGET}_DIR}")
-    set(LibXAIE_ROOT ${LibXAIE_${target}_DIR})
+    set(LibXAIE_ROOT ${LibXAIE_${AIE_RUNTIME_TEST_TARGET}_DIR})
     find_package(LibXAIE)
 else()
   if(DEFINED VITIS_ROOT)
@@ -107,7 +102,6 @@ include_directories(${LLVM_INCLUDE_DIRS})
 include_directories(${MLIR_INCLUDE_DIRS})
 include_directories(${PROJECT_SOURCE_DIR}/include)
 include_directories(${PROJECT_BINARY_DIR}/include)
-add_definitions(${LLVM_DEFINITIONS})
 
 if(ENABLE_CHESS_TESTS)
 set(CONFIG_ENABLE_CHESS_TESTS 1)
@@ -129,6 +123,7 @@ configure_lit_site_cfg(
 set(TEST_DEPENDS
   FileCheck count not
   AIEPythonModules
+  aiecc
   aie-opt
   aie-translate
 )
@@ -136,6 +131,6 @@ set(TEST_DEPENDS
 add_lit_testsuite(check-programming-guide "Running the programming guide code samples"
   ${CMAKE_CURRENT_BINARY_DIR}
   DEPENDS ${TEST_DEPENDS}
-  ARGS "-sv --timeout 600"
+  ARGS "-sv --timeout 600 --max-failures 1"
 )
-set_target_properties(check-reference-designs PROPERTIES FOLDER "Programming Guide")
+set_target_properties(check-programming-guide PROPERTIES FOLDER "Programming Guide")

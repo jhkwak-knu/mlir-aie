@@ -1,0 +1,202 @@
+# Copyright (C) 2025-2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+#
+"""Single-core matmul, optionally AOT-compiled at known shapes.
+
+The design is decorated with the usual ``@iron.jit`` so callers can use
+it the JIT way (compile-on-first-call).  ``main()`` demonstrates the
+opt-in AOT path: each desired shape is pre-compiled by building a
+``CompilableDesign`` from the JIT generator and calling ``.compile()``
+eagerly.  This produces distinct xclbin/insts artifacts on disk before
+any kernel runs, so subsequent ``matrix_multiplication_single_core(...)``
+calls with matching compile-time kwargs hit the on-disk cache instead
+of paying ``aiecc`` time on first call.
+
+Use this pattern when you know your problem sizes in advance and want
+to ship pre-compiled binaries — without having to change how the design
+is decorated.
+"""
+
+import aie.iron as iron
+import numpy as np
+from aie.helpers.taplib import TensorAccessPattern
+from aie.iron import (
+    CompileTime,
+    In,
+    ObjectFifo,
+    Out,
+    Program,
+    Runtime,
+    TaskGroup,
+    Worker,
+    kernels,
+)
+from aie.iron.controlflow import range_
+from aie.utils.verify import assert_pass
+
+# Tile size moved to/from the compute cores via mem tiles.
+_TILE_M = _TILE_K = _TILE_N = 64
+# AIE kernel intrinsic (r, s, t) used to drive the DMA layout transforms
+# below (r*s / s*t / r*t sub-tiles) is read from `matmul_kernel.mac_dims`
+# inside the design — see aie_kernels/linalg/mm_aie2{,p}.h for the per-arch
+# values (e.g. int16/int16 is 4x4x4 on AIE2 but 4x4x8 on AIE2P, so a
+# hardcoded `_R, _S, _T` would break on whichever arch you didn't pin to).
+
+
+@iron.jit
+def matrix_multiplication_single_core(
+    input0: In,
+    input1: In,
+    output: Out,
+    *,
+    M: CompileTime[int],
+    K: CompileTime[int],
+    N: CompileTime[int],
+    element_type: CompileTime[type],
+):
+    m, k, n = _TILE_M, _TILE_K, _TILE_N
+
+    matmul_kernel = kernels.mm(
+        dim_m=m,
+        dim_k=k,
+        dim_n=n,
+        input_dtype=element_type,
+        output_dtype=element_type,
+        vectorized=True,
+    )
+    # Pull the MMUL geometry from the kernel itself so the DMA layout
+    # transforms below match whatever the freshly-compiled binary expects
+    # (4x4x4 on AIE2, 4x4x8 on AIE2P for i16/i16 — see _MM_MAC_DIMS in
+    # python/iron/kernels/linalg.py).
+    r, s, t = matmul_kernel.mac_dims
+
+    A_ty = np.ndarray[(M, K), np.dtype[element_type]]
+    B_ty = np.ndarray[(K, N), np.dtype[element_type]]
+    C_ty = np.ndarray[(M, N), np.dtype[element_type]]
+    # Tile types are flat to match the kernels.mm() ExternalFunction signature.
+    a_ty = np.ndarray[(m * k,), np.dtype[element_type]]
+    b_ty = np.ndarray[(k * n,), np.dtype[element_type]]
+    c_ty = np.ndarray[(m * n,), np.dtype[element_type]]
+
+    # The DMA-level layout transformations rearrange m*k / k*n / m*n tiles
+    # into r*s / s*t / r*t sub-tiles for the MMUL intrinsic.  See
+    # programming_guide/section-2/section-2c/ for n-D layout transformations.
+    fifo_A_L3L2 = ObjectFifo(a_ty, name="A_L3L2")
+    tap_A_L2L1 = TensorAccessPattern.full((m, k)).tile((r, s))
+    fifo_A_L2L1 = fifo_A_L3L2.cons().forward(to_stream=tap_A_L2L1, name="A_L2L1")
+
+    fifo_B_L3L2 = ObjectFifo(b_ty, name="B_L3L2")
+    tap_B_L2L1 = TensorAccessPattern.full((k, n)).tile((s, t))
+    fifo_B_L2L1 = fifo_B_L3L2.cons().forward(to_stream=tap_B_L2L1, name="B_L2L1")
+
+    fifo_C_L1L2 = ObjectFifo(c_ty, name="C_L1L2")
+    # The kernel leaves C as (r, t) sub-tiles; reading them back row-major is
+    # the inverse of that tiling.
+    tap_C_L1L2 = TensorAccessPattern.full((m, n)).tile((r, t)).inverse()
+    fifo_C_L2L3 = fifo_C_L1L2.cons().forward(to_stream=tap_C_L1L2, name="C_L2L3")
+
+    def core_fn(of_a, of_b, of_c, matmul):
+        for _ in range_(M // m * N // n):
+            elem_out = of_c.acquire(1)
+            for i in range_(m * n):
+                elem_out[i] = 0
+            for _ in range_(K // k):
+                elem_in_a = of_a.acquire(1)
+                elem_in_b = of_b.acquire(1)
+                matmul(elem_in_a, elem_in_b, elem_out)
+                of_a.release(1)
+                of_b.release(1)
+            of_c.release(1)
+
+    worker = Worker(
+        core_fn,
+        [fifo_A_L2L1.cons(), fifo_B_L2L1.cons(), fifo_C_L1L2.prod(), matmul_kernel],
+    )
+
+    # Each task group encompasses all data movement for one row of output
+    # tiles. See programming_guide/section-2/section-2f/ for multi-level
+    # (L3→L2→L1) data-movement patterns.
+    a_tiles = TensorAccessPattern.full((M, K)).tile((m, k))
+    # All of B, walked one column of k*n tiles at a time.
+    b_tap = TensorAccessPattern.full((K, N)).tile((k, n)).permute((1, 0, 2, 3))
+    c_tiles = TensorAccessPattern.full((M, N)).tile((m, n))
+
+    def sequence(A, B, C, a_prod, b_prod, c_cons):
+        for tile_row in range(M // m):
+            task_group = TaskGroup()
+            a_prod.fill(A, tap=a_tiles[tile_row].repeat(N // n), group=task_group)
+            b_prod.fill(B, tap=b_tap, group=task_group)
+            c_cons.drain(
+                C,
+                tap=c_tiles[tile_row],
+                group=task_group,
+                wait=True,
+            )
+            task_group.finish()
+
+    rt = Runtime(
+        sequence,
+        [A_ty, B_ty, C_ty, fifo_A_L3L2.prod(), fifo_B_L3L2.prod(), fifo_C_L2L3.cons()],
+    )
+
+    return Program(iron.get_current_device(), rt, workers=[worker]).resolve_program()
+
+
+def aot_compile(M: int, K: int, N: int, element_type) -> None:
+    """Pre-compile the JIT design for one shape and print the artifact paths."""
+    xclbin, insts = matrix_multiplication_single_core.specialize(
+        M=M, K=K, N=N, element_type=element_type
+    ).compile()
+    print(f"  AOT compiled matmul {M}x{K}x{N} {np.dtype(element_type).name}")
+    print(f"    xclbin: {xclbin}")
+    print(f"    insts:  {insts}")
+
+
+def run_and_verify(M: int, K: int, N: int, element_type) -> None:
+    print(f"\n=== Running matmul {M}x{K}x{N} {np.dtype(element_type).name} ===")
+    input0 = iron.randint(0, 256, (M, K), dtype=element_type, device="npu")
+    input1 = iron.randint(0, 256, (K, N), dtype=element_type, device="npu")
+    output = iron.zeros(M * N, dtype=element_type, device="npu")
+    ref = np.matmul(input0.numpy(), input1.numpy())
+
+    # Same JIT-decorated function — because the AOT step above already
+    # populated the on-disk cache for these compile_kwargs, this call hits
+    # the cache instead of paying aiecc time.
+    matrix_multiplication_single_core(
+        input0, input1, output, M=M, K=K, N=N, element_type=element_type
+    )
+
+    assert_pass(
+        output.numpy(),
+        ref.flatten(),
+        fail_msg=f"matmul {M}x{K}x{N} output does not match np.matmul",
+        print_pass=False,
+    )
+    print("  PASS")
+
+
+def main():
+    shapes: list[tuple[int, int, int]] = [
+        (256, 256, 256),
+        (512, 512, 512),
+    ]
+    element_type = np.int16
+
+    # AOT phase: pre-compile both shapes upfront so the artifacts exist on
+    # disk before any kernel runs.  This is purely opt-in — the @iron.jit
+    # decorator above means callers who skip this step would simply pay the
+    # compile cost on first invocation instead.
+    print("=== AOT pre-compile phase ===")
+    for M, K, N in shapes:
+        aot_compile(M, K, N, element_type)
+
+    # Runtime dispatch.  Each call uses the same JIT-decorated function and
+    # finds its compiled artifact already in the on-disk cache.
+    for M, K, N in shapes:
+        run_and_verify(M, K, N, element_type)
+
+    print("\nAll variants PASS!")
+
+
+if __name__ == "__main__":
+    main()

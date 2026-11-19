@@ -1,10 +1,8 @@
 //===-- Passes.td - Conversion pass definition file --------*- tablegen -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2022 Xilinx, Inc.
+// Copyright (C) 2022-2025 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2022 Xilinx Inc.
 //
 //===----------------------------------------------------------------------===//
 
@@ -17,12 +15,11 @@ include "mlir/Pass/PassBase.td"
 //===----------------------------------------------------------------------===//
 // AIEVecToLLVM
 //===----------------------------------------------------------------------===//
-def Aie2Fp32EmulationType : I32EnumAttr<"Aie2Fp32Emulation", "AIE2 FP32 Emulation",
-    [
-      I32EnumAttrCase<"AccuracySafe", 0, "accuracy-safe">,
-      I32EnumAttrCase<"AccuracyFast", 1, "accuracy-fast">,
-      I32EnumAttrCase<"AccuracyLow", 2, "accuracy-low">
-    ]>{
+def Aie2Fp32EmulationType
+    : I32EnumAttr<"Aie2Fp32Emulation", "AIE2 FP32 Emulation",
+                  [I32EnumAttrCase<"AccuracySafe", 0, "accuracy-safe">,
+                   I32EnumAttrCase<"AccuracyFast", 1, "accuracy-fast">,
+                   I32EnumAttrCase<"AccuracyLow", 2, "accuracy-low">]> {
   let cppNamespace = "xilinx::aievec";
 }
 
@@ -32,31 +29,51 @@ def ConvertAIEVecToLLVM : Pass<"convert-aievec-to-llvm", "mlir::ModuleOp"> {
     This pass converts AIEVec dialect ops to LLVM dialect calls to builtins.
   }];
   let constructor = "xilinx::aievec::createConvertAIEVecToLLVMPass()";
-  let dependentDialects = ["LLVM::LLVMDialect",
-                           "mlir::arith::ArithDialect",
+  let dependentDialects = ["LLVM::LLVMDialect", "mlir::arith::ArithDialect",
+                           "mlir::memref::MemRefDialect",
                            "mlir::vector::VectorDialect",
                            "xilinx::xllvm::XLLVMDialect"];
-  let options = [
-      Option<"aie2Fp32Emulation", "aie2-fp32-emulation-strategy", "xilinx::aievec::Aie2Fp32Emulation",
-             /*default=*/"xilinx::aievec::Aie2Fp32Emulation::AccuracySafe",
-             "Set the AIE2 FP32 emulation strategy. Elementwise multiplication and matrix multiplication intrinsics for FP32 input type are emulated using bfloat16 data-path.",
-             [{::llvm::cl::values(
+  let options =
+      [Option<"aieTarget", "aie-target", "std::string",
+              /*default=*/"\"aie2\"",
+              "Select AIE version: \\\"aie\\\", \\\"aie2\\\", \\\"aie2p\\\", "
+              "or \\\"aie2ps\\\". This will determine which XLLVM intrinsics "
+              "to use. \\\"aie2ps\\\" has no AIEVec lowering: the pass rejects "
+              "any AIEVec op.">,
+       Option<"aie2Fp32Emulation", "aie2-fp32-emulation-strategy",
+              "xilinx::aievec::Aie2Fp32Emulation",
+              /*default=*/"xilinx::aievec::Aie2Fp32Emulation::AccuracySafe",
+              "Set the AIE2 FP32 emulation strategy. Elementwise "
+              "multiplication and matrix multiplication intrinsics for FP32 "
+              "input type are emulated using bfloat16 data-path.",
+              [{::llvm::cl::values(
                clEnumValN(xilinx::aievec::Aie2Fp32Emulation::AccuracySafe, "accuracy-safe",
                 "Most accurate option since input fp32 number is split into 3 bfloat16 numbers. float a*b would require 9 mac operations due to 3 bfloat16 splits each."),
                clEnumValN(xilinx::aievec::Aie2Fp32Emulation::AccuracyFast, "accuracy-fast",
                 "Fast and Accurate option. Input fp32 number is split in to 3 bfloat16 numbers. In the 9 mac operations to emulate fp32 mul, mac operations with LSBs are ignored. (3 last terms)."),
                clEnumValN(xilinx::aievec::Aie2Fp32Emulation::AccuracyLow, "accuracy-low",
                 "Fast and least accurate option. Input fp32 number is split in to 2 bfloat16 numbers. In the 4 mac operations to emulate fp32 mul, mac operations with LSBs are ignored. (1 last term).")
-              )}]>
-   ];
+              )}]>];
 }
 
 //===----------------------------------------------------------------------===//
 // AIEToTransaction
 //===----------------------------------------------------------------------===//
 
-def ConvertAIEToTransaction : Pass<"convert-aie-to-transaction",
-                                   "xilinx::AIE::DeviceOp"> {
+def AIEAnnotateCoreLockAcquires
+    : Pass<"aie-annotate-core-lock-acquires", "mlir::ModuleOp"> {
+  let summary = "Record core lock acquires before ELF substitution";
+  let description = [{
+    Records each source core's acquire conditions in its typed `lock_acquires`
+    summary after physical lock assignment. Precompiled cores retain their
+    supplied summaries.
+  }];
+  let constructor = "xilinx::AIE::createAIEAnnotateCoreLockAcquiresPass()";
+  let dependentDialects = ["xilinx::AIE::AIEDialect"];
+}
+
+def ConvertAIEToTransaction
+    : Pass<"convert-aie-to-transaction", "xilinx::AIE::DeviceOp"> {
   let summary = "Convert AIE dialect to npu transaction operations";
   let description = [{
     This pass converts aie.device operations to a sequence of transaction binary
@@ -69,18 +86,65 @@ def ConvertAIEToTransaction : Pass<"convert-aie-to-transaction",
   let constructor = "xilinx::AIE::createConvertAIEToTransactionPass()";
   let dependentDialects = ["xilinx::AIE::AIEDialect",
                            "xilinx::AIEX::AIEXDialect"];
-  let options = [
-      Option<"clElfDir", "elf-dir", "std::string", /*default=*/"",
-             "Where to find ELF files">,
+  let options = [Option<"clElfDir", "elf-dir", "std::string", /*default=*/"",
+                        "Where to find ELF files">,
+                 Option<"clDeviceName", "device-name", "std::string",
+                        /*default=*/"",
+                        "Which device to generate code for; if none specified, "
+                        "process all devices">,
   ];
+}
+
+//===----------------------------------------------------------------------===//
+// AIEXToEmitC
+//===----------------------------------------------------------------------===//
+
+def ConvertAIEXToEmitC : Pass<"convert-aiex-to-emitc", "mlir::ModuleOp"> {
+  let summary =
+      "Convert AIEX runtime sequence ops to EmitC for C++ TXN generation";
+  let description = [{
+    This pass converts the straight-line npu transaction ops in an
+    `aie.runtime_sequence` (`npu.write32`, `npu.maskwrite32`, `npu.sync`,
+    `npu.address_patch`, `npu.blockwrite`) into EmitC dialect calls naming the
+    functions in `aie/Runtime/TxnEncoding.h`. Running MLIR's `translateToCpp()`
+    on the result produces a standalone `generate_txn_<seq>(...)` C++ function
+    that assembles the TXN binary at run time -- the same words the compile-time
+    binary emitter (`AIETargetNPU.cpp`) produces, but from a C++ function so
+    runtime-valued operands can flow through to a single compiled xclbin.
+
+    Control flow (`scf.for`/`scf.if`) inside a runtime sequence is rejected with
+    a diagnostic; it is handled by later passes in the dynamic-sequences work.
+  }];
+  let constructor = "xilinx::createConvertAIEXToEmitCPass()";
+  let dependentDialects = ["mlir::arith::ArithDialect",
+                           "mlir::emitc::EmitCDialect",
+                           "mlir::memref::MemRefDialect",
+                           "xilinx::AIE::AIEDialect",
+                           "xilinx::AIEX::AIEXDialect"];
+  let options =
+      [Option<"foldDDRAddrOffset", "fold-ddr-addr-offset", "bool",
+              /*default=*/"true",
+              "Fold the AIE DDR-aperture offset into the arg_plus of DDR "
+              "address patches for host arguments beyond the firmware-"
+              "translated set (mirrors -aie-npu-fold-ddr-addr-offset on the "
+              "static aie-npu-to-binary path). Required for the xclbin + "
+              "instruction-buffer runtime; must be false for the full-ELF "
+              "(xrt.ext.kernel) runtime and for HRX, which translate every "
+              "host buffer address themselves.">,
+       Option<"emitDispatchShim", "emit-dispatch-shim", "bool",
+              /*default=*/"false",
+              "Also emit the extern \"C\" dispatch_abi() / dispatch_generate() "
+              "entry points the JIT dispatch bridge loads via ctypes. Requires "
+              "exactly one aie.runtime_sequence. Off by default: these are "
+              "definitions, so a header including them twice would not link.">];
 }
 
 //===----------------------------------------------------------------------===//
 // AIEToControlPackets
 //===----------------------------------------------------------------------===//
 
-def ConvertAIEToControlPackets : Pass<"convert-aie-to-control-packets",
-                                   "xilinx::AIE::DeviceOp"> {
+def ConvertAIEToControlPackets
+    : Pass<"convert-aie-to-control-packets", "xilinx::AIE::DeviceOp"> {
   let summary = "Convert AIE dialect to npu control packet operations";
   let description = [{
     This pass converts aie.device operations to a sequence of control packet
@@ -91,9 +155,12 @@ def ConvertAIEToControlPackets : Pass<"convert-aie-to-control-packets",
   let constructor = "xilinx::AIE::createConvertAIEToControlPacketsPass()";
   let dependentDialects = ["xilinx::AIE::AIEDialect",
                            "xilinx::AIEX::AIEXDialect"];
-  let options = [
-      Option<"clElfDir", "elf-dir", "std::string", /*default=*/"",
-             "Where to find ELF files">,
+  let options = [Option<"clElfDir", "elf-dir", "std::string", /*default=*/"",
+                        "Where to find ELF files">,
+                 Option<"clDeviceName", "device-name", "std::string",
+                        /*default=*/"",
+                        "Which device to generate code for; if none specified, "
+                        "process all devices">,
   ];
 }
 

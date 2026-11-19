@@ -1,10 +1,8 @@
 //===- aie-opt.cpp ----------------------------------------------*- C++ -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2019-2022 Xilinx, Inc.
+// Copyright (C) 2022-2024 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2019 Xilinx Inc.
 //
 //===----------------------------------------------------------------------===//
 
@@ -28,8 +26,9 @@
 using namespace llvm;
 using namespace mlir;
 
-void version_printer(raw_ostream &os) {
+static void version_printer(raw_ostream &os) {
   os << "aie-opt " << AIE_GIT_COMMIT << "\n";
+  os << "  peano: " << AIE_PEANO_VERSION << "\n";
 }
 
 int main(int argc, char **argv) {
@@ -37,7 +36,9 @@ int main(int argc, char **argv) {
   registerAllPasses();
   xilinx::registerConversionPasses();
   xilinx::AIE::registerAIEPasses();
+  xilinx::AIE::registerAIEObjectFifoPipeline();
   xilinx::AIEX::registerAIEXPasses();
+  xilinx::AIEX::registerAIEResourceStagesPipeline();
   xilinx::aievec::registerAIEVecAnalysisPasses();
   xilinx::aievec::registerAIEVecPasses();
   xilinx::aievec::registerAIEVecPipelines();

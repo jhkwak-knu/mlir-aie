@@ -1,10 +1,7 @@
 //===- AIETransformBfpTypes.cpp --------------------------------*- C++ -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2025 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// Copyright (C) 2025, Advanced Micro Devices, Inc.
 //
 //===----------------------------------------------------------------------===//
 
@@ -23,6 +20,11 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Type.h"
 #include "llvm/Support/raw_ostream.h"
+
+namespace xilinx::AIEX {
+#define GEN_PASS_DEF_AIETRANSFORMBFPTYPES
+#include "aie/Dialect/AIEX/Transforms/AIEXPasses.h.inc"
+} // namespace xilinx::AIEX
 
 #define DEBUG_TYPE "transform-bfp-types"
 
@@ -63,7 +65,8 @@ public:
         return nullptr;
       }
 
-      return mlir::IntegerType::get(blockType.getContext(), blockType.getTotalSizeInBits());
+      return mlir::IntegerType::get(blockType.getContext(),
+                                    blockType.getTotalSizeInBits());
     });
 
     // Add a conversion for MemRefType
@@ -92,25 +95,6 @@ public:
 
       llvm::errs()
           << "ObjectFifoType converted element type is not a MemRefType\n";
-      return nullptr;
-    });
-
-    // Add a conversion for ObjectFifoSubviewType
-    addConversion([&](AIEObjectFifoSubviewType objectFifoSubviewType)
-                      -> std::optional<AIEObjectFifoSubviewType> {
-      auto newElementType = convertType(objectFifoSubviewType.getElementType());
-      if (!newElementType) {
-        llvm::errs()
-            << "Failed to convert ObjectFifoSubviewType element type\n";
-        return nullptr;
-      }
-
-      if (auto newMemRef = dyn_cast<MemRefType>(newElementType))
-        return AIEObjectFifoSubviewType::get(objectFifoSubviewType.getContext(),
-                                             newMemRef);
-
-      llvm::errs()
-          << "ObjectFifoSubviewType element type is not a MemRefType\n";
       return nullptr;
     });
 
@@ -205,7 +189,8 @@ private:
 };
 
 class AIETransformBfpTypesPass
-    : public AIETransformBfpTypesBase<AIETransformBfpTypesPass> {
+    : public xilinx::AIEX::impl::AIETransformBfpTypesBase<
+          AIETransformBfpTypesPass> {
 public:
   void runOnOperation() override {
     DeviceOp device = getOperation();

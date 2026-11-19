@@ -1,4 +1,4 @@
-# Copyright (C) 2024, Advanced Micro Devices, Inc.
+# Copyright (C) 2024 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 # RUN: %python %s | FileCheck %s
@@ -24,7 +24,6 @@ from aie.ir import InsertionPoint, Block
 
 from util import construct_and_print_module
 
-
 # CHECK:  module {
 #  aie.device(xcve2302) {
 #   %tile_0_0 = aie.tile(0, 0)
@@ -37,7 +36,7 @@ from util import construct_and_print_module
 #    %memtile_dma_0_1 = aie.memtile_dma(%tile_0_1) {
 #      %0 = aie.dma(MM2S, 0) [{
 #        aie.use_lock(%lock_0_1_0, AcquireGreaterEqual)
-#        aie.dma_bd(%mem_A : memref<2x1xi16>, 0, 2, [<size = 1, stride = 1>, <size = 1, stride = 1>, <size = 1, stride = 1>, <size = 1, stride = 1>])
+#        aie.dma_bd(%mem_A : memref<2x1xi16> len = 2 sizes = [1, 1, 1, 1] strides = [1, 1, 1, 1])
 #        aie.use_lock(%lock_0_1, Release)
 #      }]
 #      aie.end
@@ -61,7 +60,7 @@ def objFifo_example():
 
         flow(mem_tile, WireBundle.DMA, 0, shim_tile, WireBundle.DMA, 0)
 
-        shim_dma_allocation("mem_A", DMAChannelDir.MM2S, 0, 0)
+        shim_dma_allocation("mem_A_shim_alloc", shim_tile, DMAChannelDir.MM2S, 0)
 
         @memtile_dma(mem_tile)
         def memtile_dma_0_1():
@@ -70,13 +69,9 @@ def objFifo_example():
                 use_lock(cons_lock_mem_A, LockAction.AcquireGreaterEqual)
                 dma_bd(
                     buff_mem_A,
-                    len=2,
-                    dimensions=[
-                        (1, 1),
-                        (1, 1),
-                        (1, 1),
-                        (1, 1),
-                    ],
+                    transfer_len=2,
+                    sizes=[1, 1, 1, 1],
+                    strides=[1, 1, 1, 1],
                 )
                 use_lock(prod_lock_mem_A, LockAction.Release)
 

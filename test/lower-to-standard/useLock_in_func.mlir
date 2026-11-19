@@ -1,9 +1,12 @@
+// Copyright (C) 2022-2023 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
 // RUN: aie-opt --aie-localize-locks --aie-standard-lowering="tilecol=1 tilerow=3" %s | FileCheck --check-prefix=CHECK %s
 
 // CHECK: module @test attributes {llvm.target_triple = "aie"} {
 // CHECK:   func.func private @kernel(%arg0: index) {
-// CHECK-NEXT:     %0 = arith.index_cast %arg0 : index to i32
 // CHECK-NEXT:     %c0_i32 = arith.constant 0 : i32
+// CHECK-NEXT:     %0 = arith.index_cast %arg0 : index to i32
 // CHECK-NEXT:     call @llvm.aie.lock.acquire.reg(%0, %c0_i32) : (i32, i32) -> ()
 // CHECK-NEXT:     return
 // CHECK:   }
@@ -20,7 +23,8 @@ module @test {
   %lock13_3 = aie.lock(%tile13, 0)
 
   func.func private @kernel(%lock : index) {
-    aie.use_lock(%lock, "Acquire", 0)
+    %c0_ul0 = arith.constant 0 : i32
+    aie.use_lock(%lock, "Acquire", %c0_ul0)
     return
   }
 

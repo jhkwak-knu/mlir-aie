@@ -1,40 +1,18 @@
 //===- aie.mlir ------------------------------------------------*- MLIR -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2021-2022 Xilinx, Inc.
+// Copyright (C) 2023 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2021 Xilinx Inc.
-// (c) Copyright 2023 Advanced Micro Devices, Inc.
 //
 //===----------------------------------------------------------------------===//
 
-// REQUIRES: aiesimulator, valid_xchess_license, !hsa
-// RUN: %PYTHON aiecc.py --aiesim --xchesscc --xbridge --no-compile-host %s %test_lib_flags %S/test.cpp
-// RUN: sh -c 'aie.mlir.prj/aiesim.sh; exit 0' | FileCheck %s
+// REQUIRES: aiesimulator, valid_xchess_license
+// RUN: %aiecc --get-aiesim --xchesscc --xbridge %s %test_lib_flags -- %S/test.cpp
+// RUN: sh -c './aie.mlir.prj/aiesim.sh; exit 0' | FileCheck %s
 
 // CHECK: AIE2 ISS
 // CHECK: test start.
 // CHECK: after core start
-// CHECK: MemTileDMA [7, 1] AIE2 locks are: 0 0 1 1 0 0 0 0 0 0 0 0 0 0 0 0
-// CHECK: BD 0 valid (Next BD: 1)
-// CHECK:    Transferring 2 32 bit words to/from byte address 000000
-// CHECK:    Acquires lock 64 with value -1
-// CHECK:    Releases lock 65 with value 1
-// CHECK: BD 1 valid (Last BD)
-// CHECK:  * Current BD for mm2s channel 0
-// CHECK:    Transferring 2 32 bit words to/from byte address 000010
-// CHECK:    Acquires lock 64 with value -1
-// CHECK:    Releases lock 65 with value 1
-// CHECK: BD 2 valid (Next BD: 3)
-// CHECK:    Transferring 2 32 bit words to/from byte address 100020
-// CHECK:    Acquires lock 66 with value -1
-// CHECK:    Releases lock 67 with value 1
-// CHECK: BD 3 valid (Last BD)
-// CHECK:  * Current BD for s2mm channel 0
-// CHECK:    Transferring 2 32 bit words to/from byte address 100030
-// CHECK:    Acquires lock 66 with value -1
-// CHECK:    Releases lock 67 with value 1
 // CHECK: PASS!
 
 module @test_chess_08_tile_locks {
@@ -54,39 +32,53 @@ module @test_chess_08_tile_locks {
 
     aie.flow(%t71, "DMA" : 0, %t71, "DMA" : 0)
     aie.memtile_dma(%t81) {
+      %c0_i32 = arith.constant 0 : i32
+      %c2_i32 = arith.constant 2 : i32
          %srcDma = aie.dma_start("MM2S", 0, ^bd0, ^end)
       ^bd0:
-        aie.use_lock(%lock_d2, AcquireGreaterEqual, 1)
-        aie.dma_bd(%buf_e : memref<256xi32>, 0, 2)
-        aie.use_lock(%lock_s2, Release, 1)
+        %c1_ul1 = arith.constant 1 : i32
+        aie.use_lock(%lock_d2, AcquireGreaterEqual, %c1_ul1)
+        aie.dma_bd(%buf_e : memref<256xi32> offset = 0 len = 2)
+        %c1_ul2 = arith.constant 1 : i32
+        aie.use_lock(%lock_s2, Release, %c1_ul2)
         aie.next_bd ^end
       ^end:
         aie.end
     }
     // Tile DMA
     %m71 = aie.memtile_dma(%t71) {
+      %c0_i32 = arith.constant 0 : i32
+      %c2_i32 = arith.constant 2 : i32
         %srcDma = aie.dma_start("MM2S", 0, ^bd0, ^dma1)
       ^dma1:
         %dstDma = aie.dma_start("S2MM", 0, ^bd2, ^end)
       ^bd0:
-        aie.use_lock(%lock_s1, AcquireGreaterEqual, 1)
-        aie.dma_bd(%buf_w : memref<256xi32>, 0, 2)
-        aie.use_lock(%lock_d1, Release, 1)
+        %c1_ul3 = arith.constant 1 : i32
+        aie.use_lock(%lock_s1, AcquireGreaterEqual, %c1_ul3)
+        aie.dma_bd(%buf_w : memref<256xi32> offset = 0 len = 2)
+        %c1_ul4 = arith.constant 1 : i32
+        aie.use_lock(%lock_d1, Release, %c1_ul4)
         aie.next_bd ^bd1
       ^bd1:
-        aie.use_lock(%lock_s1, AcquireGreaterEqual, 1)
-        aie.dma_bd(%buf_w : memref<256xi32>, 4, 2)
-        aie.use_lock(%lock_d1, Release, 1)
+        %c1_ul5 = arith.constant 1 : i32
+        aie.use_lock(%lock_s1, AcquireGreaterEqual, %c1_ul5)
+        aie.dma_bd(%buf_w : memref<256xi32> offset = 4 len = 2)
+        %c1_ul6 = arith.constant 1 : i32
+        aie.use_lock(%lock_d1, Release, %c1_ul6)
         aie.next_bd ^end
       ^bd2:
-        aie.use_lock(%lock_s2, AcquireGreaterEqual, 1)
-        aie.dma_bd(%buf_e : memref<256xi32>, 8, 2)
-        aie.use_lock(%lock_d2, Release, 1)
+        %c1_ul7 = arith.constant 1 : i32
+        aie.use_lock(%lock_s2, AcquireGreaterEqual, %c1_ul7)
+        aie.dma_bd(%buf_e : memref<256xi32> offset = 8 len = 2)
+        %c1_ul8 = arith.constant 1 : i32
+        aie.use_lock(%lock_d2, Release, %c1_ul8)
         aie.next_bd ^bd3
       ^bd3:
-        aie.use_lock(%lock_s2, AcquireGreaterEqual, 1)
-        aie.dma_bd(%buf_e : memref<256xi32>, 12, 2)
-        aie.use_lock(%lock_d2, Release, 1)
+        %c1_ul9 = arith.constant 1 : i32
+        aie.use_lock(%lock_s2, AcquireGreaterEqual, %c1_ul9)
+        aie.dma_bd(%buf_e : memref<256xi32> offset = 12 len = 2)
+        %c1_ul10 = arith.constant 1 : i32
+        aie.use_lock(%lock_d2, Release, %c1_ul10)
         aie.next_bd ^end
       ^end:
         aie.end

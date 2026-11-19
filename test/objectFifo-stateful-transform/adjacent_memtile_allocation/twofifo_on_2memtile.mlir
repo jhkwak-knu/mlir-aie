@@ -1,0 +1,90 @@
+//===- twofifo_on_2memtile.mlir ---------------------------------*- MLIR -*-===//
+//
+// Copyright (C) 2025 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+// RUN: aie-opt --aie-objectFifo-stateful-transform="skip-verify=true" --aie-objectFifo-unroll %s | FileCheck %s
+
+// CHECK-DAG:     %[[SHIM_NOC_TILE_0_0:.*]] = aie.tile(0, 0)
+// CHECK-DAG:     %[[MEM_TILE_0_1:.*]] = aie.tile(0, 1)
+// CHECK-DAG:     %[[MEM_TILE_1_1:.*]] = aie.tile(1, 1)
+// CHECK-DAG:     %[[TILE_0_2:.*]] = aie.tile(0, 2)
+// CHECK-DAG:     %[[OUT1_BUFF_0:.*]] = aie.buffer(%[[TILE_0_2]]) {sym_name = "out1__buf0"} : memref<8xi32>
+// CHECK-DAG:     %[[OUT1_BUFF_1:.*]] = aie.buffer(%[[TILE_0_2]]) {sym_name = "out1__buf1"} : memref<8xi32>
+// CHECK-DAG:     %[[OUT1_PROD_LOCK:.*]] = aie.lock(%[[TILE_0_2]]) {init = 2 : i32, sym_name = "out1__prodlock0"}
+// CHECK-DAG:     %[[OUT1_CONS_LOCK:.*]] = aie.lock(%[[TILE_0_2]]) {init = 0 : i32, sym_name = "out1__conslock0"}
+// CHECK-DAG:     %[[OUT0_BUFF_0:.*]] = aie.buffer(%[[MEM_TILE_0_1]]) {sym_name = "out0__buf0"} : memref<64000xi32>
+// CHECK-DAG:     %[[OUT0_BUFF_1:.*]] = aie.buffer(%[[MEM_TILE_0_1]]) {sym_name = "out0__buf1"} : memref<64000xi32>
+// CHECK-DAG:     %[[OUT0_PROD_LOCK:.*]] = aie.lock(%[[MEM_TILE_0_1]]) {init = 2 : i32, sym_name = "out0__prodlock0"}
+// CHECK-DAG:     %[[OUT0_CONS_LOCK:.*]] = aie.lock(%[[MEM_TILE_0_1]]) {init = 0 : i32, sym_name = "out0__conslock0"}
+// CHECK-DAG:     %[[IN1_CONS_BUFF_0:.*]] = aie.buffer(%[[TILE_0_2]]) {sym_name = "in1__cons__buf0"} : memref<8xi32>
+// CHECK-DAG:     %[[IN1_CONS_BUFF_1:.*]] = aie.buffer(%[[TILE_0_2]]) {sym_name = "in1__cons__buf1"} : memref<8xi32>
+// CHECK-DAG:     %[[IN1_CONS_PROD_LOCK:.*]] = aie.lock(%[[TILE_0_2]]) {init = 2 : i32, sym_name = "in1__cons__prodlock0"}
+// CHECK-DAG:     %[[IN1_CONS_CONS_LOCK:.*]] = aie.lock(%[[TILE_0_2]]) {init = 0 : i32, sym_name = "in1__cons__conslock0"}
+// CHECK-DAG:     %[[IN0_CONS_BUFF_0:.*]] = aie.buffer(%[[MEM_TILE_1_1]]) {sym_name = "in0__cons__buf0"} : memref<64000xi32>
+// CHECK-DAG:     %[[IN0_CONS_BUFF_1:.*]] = aie.buffer(%[[MEM_TILE_1_1]]) {sym_name = "in0__cons__buf1"} : memref<64000xi32>
+// CHECK-DAG:     %[[IN0_CONS_PROD_LOCK:.*]] = aie.lock(%[[MEM_TILE_0_1]]) {init = 2 : i32, sym_name = "in0__cons__prodlock0"}
+// CHECK-DAG:     %[[IN0_CONS_CONS_LOCK:.*]] = aie.lock(%[[MEM_TILE_0_1]]) {init = 0 : i32, sym_name = "in0__cons__conslock0"}
+// CHECK-DAG:     aie.flow(%[[SHIM_NOC_TILE_0_0]], DMA : 0, %[[MEM_TILE_0_1]], DMA : 0)
+// CHECK-DAG:     aie.flow(%[[MEM_TILE_0_1]], DMA : 0, %[[TILE_0_2]], DMA : 0)
+// CHECK-DAG:     aie.flow(%[[MEM_TILE_0_1]], DMA : 1, %[[SHIM_NOC_TILE_0_0]], DMA : 0)
+// CHECK-DAG:     aie.flow(%[[TILE_0_2]], DMA : 0, %[[MEM_TILE_0_1]], DMA : 1)
+// CHECK-DAG:     aie.shim_dma_allocation @in0__shim_alloc(%[[SHIM_NOC_TILE_0_0]], MM2S, 0)
+// CHECK-DAG:     aie.shim_dma_allocation @out0__shim_alloc(%[[SHIM_NOC_TILE_0_0]], S2MM, 0)
+// CHECK:     %{{.*}} = aie.memtile_dma(%[[MEM_TILE_0_1]]) {
+// CHECK:       aie.dma_start(S2MM, 0, ^bb1, ^bb3)
+// CHECK:     ^bb1:
+// CHECK:       aie.use_lock(%[[IN0_CONS_PROD_LOCK]], AcquireGreaterEqual, %{{.*}})
+// CHECK:       aie.dma_bd(%[[IN0_CONS_BUFF_0]] : memref<64000xi32> offset = {{.*}} len = {{.*}})
+// CHECK:       aie.use_lock(%[[IN0_CONS_CONS_LOCK]], Release, %{{.*}})
+// CHECK:     ^bb3:
+// CHECK:       aie.dma_start(S2MM, 1, ^bb4, ^bb6)
+// CHECK:     ^bb4:
+// CHECK:       aie.use_lock(%[[OUT0_PROD_LOCK]], AcquireGreaterEqual, %{{.*}})
+// CHECK:       aie.dma_bd(%[[OUT0_BUFF_0]] : memref<64000xi32> offset = {{.*}} len = {{.*}})
+// CHECK:       aie.use_lock(%[[OUT0_CONS_LOCK]], Release, %{{.*}})
+// CHECK:     ^bb6:
+// CHECK:       aie.dma_start(MM2S, 0, ^bb7, ^bb9)
+// CHECK:     ^bb7:
+// CHECK:       aie.use_lock(%[[IN0_CONS_CONS_LOCK]], AcquireGreaterEqual, %{{.*}})
+// CHECK:       aie.dma_bd(%[[IN0_CONS_BUFF_0]] : memref<64000xi32> offset = {{.*}} len = {{.*}})
+// CHECK:       aie.use_lock(%[[IN0_CONS_PROD_LOCK]], Release, %{{.*}})
+// CHECK:     ^bb9:
+// CHECK:       aie.dma_start(MM2S, 1, ^bb10, ^bb12)
+// CHECK:     ^bb10:
+// CHECK:       aie.use_lock(%[[OUT0_CONS_LOCK]], AcquireGreaterEqual, %{{.*}})
+// CHECK:       aie.dma_bd(%[[OUT0_BUFF_0]] : memref<64000xi32> offset = {{.*}} len = {{.*}})
+// CHECK:       aie.use_lock(%[[OUT0_PROD_LOCK]], Release, %{{.*}})
+// CHECK:     }
+// CHECK:     %{{.*}} = aie.mem(%[[TILE_0_2]]) {
+// CHECK:       aie.dma_start(S2MM, 0, ^bb1, ^bb3)
+// CHECK:     ^bb1:
+// CHECK:       aie.use_lock(%[[IN1_CONS_PROD_LOCK]], AcquireGreaterEqual, %{{.*}})
+// CHECK:       aie.dma_bd(%[[IN1_CONS_BUFF_0]] : memref<8xi32> offset = {{.*}} len = {{.*}})
+// CHECK:       aie.use_lock(%[[IN1_CONS_CONS_LOCK]], Release, %{{.*}})
+// CHECK:     ^bb3:
+// CHECK:       aie.dma_start(MM2S, 0, ^bb4, ^bb6)
+// CHECK:     ^bb4:
+// CHECK:       aie.use_lock(%[[OUT1_CONS_LOCK]], AcquireGreaterEqual, %{{.*}})
+// CHECK:       aie.dma_bd(%[[OUT1_BUFF_0]] : memref<8xi32> offset = {{.*}} len = {{.*}})
+// CHECK:       aie.use_lock(%[[OUT1_PROD_LOCK]], Release, %{{.*}})
+// CHECK:     }
+// CHECK:   }
+// CHECK: }
+
+
+module {
+  aie.device(npu1) {
+    %shim_noc_tile_0_0 = aie.tile(0, 0)
+    %mem_tile_0_1 = aie.tile(0, 1)
+    %tile_0_2 = aie.tile(0, 2)
+    aie.objectfifo @in0(%shim_noc_tile_0_0, {%mem_tile_0_1}, 2 : i32) : !aie.objectfifo<memref<64000xi32>>
+    aie.objectfifo @in1(%mem_tile_0_1, {%tile_0_2}, 2 : i32) : !aie.objectfifo<memref<8xi32>>
+    aie.objectfifo.link [@in0] -> [@in1]([] [])
+    aie.objectfifo @out0(%mem_tile_0_1, {%shim_noc_tile_0_0}, 2 : i32) : !aie.objectfifo<memref<64000xi32>>
+    aie.objectfifo @out1(%tile_0_2, {%mem_tile_0_1}, 2 : i32) : !aie.objectfifo<memref<8xi32>>
+    aie.objectfifo.link [@out1] -> [@out0]([] [])
+  }
+}

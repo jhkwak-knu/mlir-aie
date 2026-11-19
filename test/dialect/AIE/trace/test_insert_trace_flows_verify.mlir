@@ -1,0 +1,279 @@
+//===- test_insert_trace_flows_verify.mlir --------------------*- MLIR -*-===//
+//
+// Copyright (C) 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+// RUN: aie-opt %s -split-input-file -verify-diagnostics -aie-insert-trace-flows
+
+// Test: Missing host_config in runtime_sequence with traces
+module @missing_host_config {
+  aie.device(npu1_1col) {
+    %tile02 = aie.tile(0, 2)
+    aie.trace @core_trace(%tile02) {
+      aie.trace.packet id=1 type=core
+      aie.trace.event<"INSTR_EVENT_0">
+      aie.trace.start broadcast=15
+      aie.trace.stop broadcast=14
+    }
+    // expected-error@+1 {{runtime_sequence with traces requires aie.trace.host_config}}
+    aie.runtime_sequence(%arg0: memref<16xi32>) {
+      aie.trace.start_config @core_trace
+    }
+  }
+}
+
+// -----
+
+// Test: Trace missing aie.trace.start
+module @missing_start {
+  aie.device(npu1_1col) {
+    %tile02 = aie.tile(0, 2)
+    // expected-error@+1 {{trace is missing 'aie.trace.start'}}
+    aie.trace @core_trace(%tile02) {
+      aie.trace.packet id=1 type=core
+      aie.trace.event<"INSTR_EVENT_0">
+      aie.trace.stop broadcast=14
+    }
+    aie.runtime_sequence(%arg0: memref<16xi32>) {
+      aie.trace.host_config {buffer_size = 65536 : i32}
+      aie.trace.start_config @core_trace
+    }
+  }
+}
+
+// -----
+
+// Test: Trace missing aie.trace.stop
+module @missing_stop {
+  aie.device(npu1_1col) {
+    %tile02 = aie.tile(0, 2)
+    // expected-error@+1 {{trace is missing 'aie.trace.stop'}}
+    aie.trace @core_trace(%tile02) {
+      aie.trace.packet id=1 type=core
+      aie.trace.event<"INSTR_EVENT_0">
+      aie.trace.start broadcast=15
+    }
+    aie.runtime_sequence(%arg0: memref<16xi32>) {
+      aie.trace.host_config {buffer_size = 65536 : i32}
+      aie.trace.start_config @core_trace
+    }
+  }
+}
+
+// -----
+
+// Test: LogicalTileOp must be resolved before insert-trace-flows
+module @unresolved_logical_tile {
+  aie.device(npu1_1col) {
+    // expected-error@+1 {{LogicalTileOp must be resolved to TileOp before running -aie-insert-trace-flows (run -aie-place-tiles first)}}
+    %tile = aie.logical_tile<CoreTile>(?, ?)
+    aie.trace @core_trace(%tile) {
+      aie.trace.packet id=1 type=core
+      aie.trace.event<"INSTR_EVENT_0">
+      aie.trace.start broadcast=15
+      aie.trace.stop broadcast=14
+    }
+    aie.runtime_sequence(%arg0: memref<16xi32>) {
+      aie.trace.host_config {buffer_size = 65536 : i32}
+      aie.trace.start_config @core_trace
+    }
+  }
+}
+
+// -----
+
+// Test: Trace ops without runtime_sequence
+module @no_runtime_seq {
+  // expected-error@+1 {{aie.trace ops found but no runtime_sequence defined}}
+  aie.device(npu1_1col) {
+    %tile02 = aie.tile(0, 2)
+    aie.trace @core_trace(%tile02) {
+      aie.trace.packet id=1 type=core
+      aie.trace.event<"INSTR_EVENT_0">
+      aie.trace.start broadcast=15
+      aie.trace.stop broadcast=14
+    }
+  }
+}
+
+// -----
+
+// Test: Two traces pinning the same explicit packet id -- error
+module @explicit_packet_id_collision {
+  aie.device(npu1_1col) {
+    %tile02 = aie.tile(0, 2)
+    %tile03 = aie.tile(0, 3)
+    aie.trace @trace1(%tile02) {
+      // expected-note@+1 {{previous use of packet id 5}}
+      aie.trace.packet id=5 type=core
+      aie.trace.event<"INSTR_EVENT_0">
+      aie.trace.start broadcast=15
+      aie.trace.stop broadcast=14
+    }
+    aie.trace @trace2(%tile03) {
+      // expected-error@+1 {{trace packet id 5 is already used by another trace}}
+      aie.trace.packet id=5 type=core
+      aie.trace.event<"INSTR_EVENT_0">
+      aie.trace.start broadcast=15
+      aie.trace.stop broadcast=14
+    }
+    aie.runtime_sequence(%arg0: memref<16xi32>) {
+      aie.trace.host_config {buffer_size = 65536 : i32}
+      aie.trace.start_config @trace1
+      aie.trace.start_config @trace2
+    }
+  }
+}
+
+// -----
+
+// Test: Both S2MM channels used, no lateral routing -- error
+module @shim_full_no_lateral {
+  // expected-error@+1 {{no S2MM channels available on shim tile at column 0}}
+  aie.device(npu1_1col) {
+    %tile02 = aie.tile(0, 2)
+    %tile00 = aie.tile(0, 0)
+
+    aie.flow(%tile02, DMA : 0, %tile00, DMA : 0)
+    aie.flow(%tile02, DMA : 1, %tile00, DMA : 1)
+
+    aie.trace @trace(%tile02) {
+      aie.trace.packet id=1 type=core
+      aie.trace.event<"INSTR_EVENT_0">
+      aie.trace.start broadcast=15
+      aie.trace.stop broadcast=14
+    }
+
+    aie.runtime_sequence(%arg0: memref<16xi32>) {
+      aie.trace.host_config {buffer_size = 8192 : i32}
+      aie.trace.start_config @trace
+    }
+  }
+}
+
+// -----
+
+// Test: Two objectFifos end at the shim; their lowering, which runs after
+// this pass, takes both S2MM channels, so the trace has none -- error rather
+// than a route that collides with theirs.
+module @shim_full_objectfifos {
+  // expected-error@+1 {{no S2MM channels available on shim tile at column 0}}
+  aie.device(npu1_1col) {
+    %tile02 = aie.tile(0, 2)
+    %tile00 = aie.tile(0, 0)
+
+    aie.objectfifo @out0(%tile02, {%tile00}, 2 : i32) : !aie.objectfifo<memref<16xi32>>
+    aie.objectfifo @out1(%tile02, {%tile00}, 2 : i32) : !aie.objectfifo<memref<16xi32>>
+
+    aie.trace @trace(%tile02) {
+      aie.trace.packet id=1 type=core
+      aie.trace.event<"INSTR_EVENT_0">
+      aie.trace.start broadcast=15
+      aie.trace.stop broadcast=14
+    }
+
+    aie.runtime_sequence(%arg0: memref<16xi32>) {
+      aie.trace.host_config {buffer_size = 8192 : i32}
+      aie.trace.start_config @trace
+    }
+  }
+}
+
+// -----
+
+// Test: Pins are reserved before first-free assignment, as in the lowering:
+// @out1 pins channel 0, so @out0, declared first, takes channel 1 and the
+// shim is full.
+module @shim_full_pinned_objectfifo {
+  // expected-error@+1 {{no S2MM channels available on shim tile at column 0}}
+  aie.device(npu1_1col) {
+    %tile02 = aie.tile(0, 2)
+    %tile00 = aie.tile(0, 0)
+
+    aie.objectfifo @out0(%tile02, {%tile00}, 2 : i32) : !aie.objectfifo<memref<16xi32>>
+    aie.objectfifo @out1(%tile02, {%tile00}, 2 : i32) {cons_ports = [#aie.end_port<DMA : 0>]} : !aie.objectfifo<memref<16xi32>>
+
+    aie.trace @trace(%tile02) {
+      aie.trace.packet id=1 type=core
+      aie.trace.event<"INSTR_EVENT_0">
+      aie.trace.start broadcast=15
+      aie.trace.stop broadcast=14
+    }
+
+    aie.runtime_sequence(%arg0: memref<16xi32>) {
+      aie.trace.host_config {buffer_size = 8192 : i32}
+      aie.trace.start_config @trace
+    }
+  }
+}
+
+// -----
+
+// Test: egress_shim_col past device width is rejected by the lowering pass.
+module @invalid_egress_col_oob {
+  // expected-error@+1 {{egress_shim_col 5 is not a valid shim NOC tile (device has 1 columns)}}
+  aie.device(npu1_1col) {
+    %tile02 = aie.tile(0, 2)
+    aie.trace @trace0(%tile02) {
+      aie.trace.packet id=1 type=core
+      aie.trace.event<"INSTR_EVENT_0">
+      aie.trace.start broadcast=15
+      aie.trace.stop broadcast=14
+    }
+    aie.runtime_sequence(%arg0: memref<16xi32>) {
+      aie.trace.host_config {buffer_size = 8192 : i32, egress_shim_col = 5 : i32}
+      aie.trace.start_config @trace0
+    }
+  }
+}
+
+// -----
+
+// Test: reuse_output_buffer with a dynamic (runtime-sized) runtime_sequence is
+// rejected -- the trace offset can't be a compile-time constant when the last
+// tensor's real size is a runtime value (%n). Use a separate trace buffer.
+module @reuse_output_buffer_dynamic {
+  aie.device(npu2) {
+    %tile02 = aie.tile(0, 2)
+    aie.trace @core_trace(%tile02) {
+      aie.trace.packet id=1 type=core
+      aie.trace.event<"INSTR_EVENT_0">
+      aie.trace.start broadcast=15
+      aie.trace.stop broadcast=14
+    }
+    // expected-error@+1 {{reuse_output_buffer=true cannot be used with a dynamic}}
+    aie.runtime_sequence(%arg0: memref<4096xi32>, %n: i64) {
+      aie.trace.host_config {buffer_size = 8192 : i32, reuse_output_buffer = true}
+      aie.trace.start_config @core_trace
+    }
+  }
+}
+
+// -----
+
+// Test: the trace routes live in the device's stream switches, which every
+// sequence of the device drives, so the sequences must name one egress column.
+// Buffer size and reuse mode are per sequence.
+module @disagreeing_host_configs {
+  aie.device(npu2) {
+    %tile02 = aie.tile(0, 2)
+    aie.trace @core_trace(%tile02) {
+      aie.trace.packet id=1 type=core
+      aie.trace.event<"INSTR_EVENT_0">
+      aie.trace.start broadcast=15
+      aie.trace.stop broadcast=14
+    }
+    aie.runtime_sequence @first(%arg0: memref<64xi32>) {
+      // expected-note@+1 {{first aie.trace.host_config here}}
+      aie.trace.host_config {buffer_size = 4096 : i32, egress_shim_col = 0 : i32}
+      aie.trace.start_config @core_trace
+    }
+    aie.runtime_sequence @second(%arg0: memref<64xi32>) {
+      // expected-error@+1 {{routes trace data differently}}
+      aie.trace.host_config {buffer_size = 8192 : i32, egress_shim_col = 1 : i32}
+      aie.trace.start_config @core_trace
+    }
+  }
+}

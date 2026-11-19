@@ -1,25 +1,26 @@
 # answer_1.py -*- Python -*-
 #
-# This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-# See https://llvm.org/LICENSE.txt for license information.
+# Copyright (C) 2025 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #
-# (c) Copyright 2025 Advanced Micro Devices, Inc. or its affiliates
 
 import sys
 import numpy as np
 
-from aie.iron import Program, Runtime, Worker, ObjectFifo
-from aie.iron.placers import SequentialPlacer
+from aie.iron import Out, In, CompileTime, Program, Runtime, Worker, ObjectFifo
 from aie.iron.controlflow import range_
 
 import aie.iron as iron
 
 
-@iron.jit(is_placed=False)
-def exercise_2(input0, output):
-    data_size = output.numel()
-    element_type = output.dtype
+@iron.jit
+def exercise_2(
+    input0: In,
+    output: Out,
+    *,
+    data_size: CompileTime[int],
+    element_type: CompileTime[type],
+):
     data_ty = np.ndarray[(data_size,), np.dtype[element_type]]
 
     n_workers = 3
@@ -67,17 +68,17 @@ def exercise_2(input0, output):
         )
 
     # To/from AIE-array runtime data movement
-    rt = Runtime()
-    with rt.sequence(data_ty, data_ty) as (a_in, c_out):
-        rt.start(*workers)
-        rt.fill(of_in.prod(), a_in)
-        rt.drain(of_out.cons(), c_out, wait=True)
+    def sequence(a_in, c_out, in_h, out_h):
+        in_h.fill(a_in)
+        out_h.drain(c_out, wait=True)
+
+    rt = Runtime(sequence, [data_ty, data_ty, of_in.prod(), of_out.cons()])
 
     # Create the program from the device type and runtime
-    my_program = Program(iron.get_current_device(), rt)
+    my_program = Program(iron.get_current_device(), rt, workers=workers)
 
     # Place components (assign them resources on the device) and generate an MLIR module
-    return my_program.resolve_program(SequentialPlacer())
+    return my_program.resolve_program()
 
 
 def main():
@@ -92,7 +93,7 @@ def main():
 
     # JIT-compile the kernel then launches the kernel with the given arguments. Future calls
     # to the kernel will use the same compiled kernel and loaded code objects
-    exercise_2(input0, output)
+    exercise_2(input0, output, data_size=output.numel(), element_type=output.dtype)
 
     # Check the correctness of the result
     e = np.equal(input0.numpy(), output.numpy())

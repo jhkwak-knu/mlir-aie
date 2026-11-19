@@ -1,0 +1,52 @@
+<!---//===- README.md -----------------------------------------*- Markdown -*-===//
+//
+// Copyright (C) 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//-->
+
+# Custom DMA
+
+This IRON design demonstrates how to program custom DMA patterns with a
+`PerDeviceConfigurationResolvable` subclass. `ScatterReadDMA` is discovered in
+the Worker's `fn_args` by `DeviceConfiguration`, which calls `resolve()` to emit
+the DMA configuration. One instance belongs to one `aie.device` image.
+
+A `Resolvable` is the tool for packaging a pattern as a reusable class. To spell out a one-off DMA program, IRON's `Buffer`, `Lock`, `Flow` and `TileDma` / `Bd` classes express the same kind of BD chain directly; see [section 2g of the programming guide](../../../programming_guide/section-2/section-2g/README.md).
+
+## Source Files Overview
+
+1. `custom_dma.py`: A Python script that defines the IRON design. It contains a `ScatterReadDMA` class that emits custom locks, DMA buffer descriptors, and flows alongside standard IRON components.
+
+2. `test.py`: Host program to run the design on the NPU and verify the output against expected values.
+
+## Design Overview
+
+A 4×16 matrix of `int32` values is pre-loaded on a MemTile via `initial_value`. A custom three-BD DMA chain reads rows 0, 1, and 3 (skipping row 2) using per-BD offsets with non-uniform spacing. Each BD transfers 16 elements to a compute tile, which copies them to an output ObjectFifo that drains to the host.
+
+```
+MemTile buffer (64 x i32):
+  row 0 [0..15]  = [100, 101, ..., 115]  ← BD1 reads here
+  row 1 [16..31] = [200, 201, ..., 215]  ← BD2 reads here
+  row 2 [32..47] = [300, 301, ..., 315]  (skipped)
+  row 3 [48..63] = [400, 401, ..., 415]  ← BD3 reads here
+```
+The MemTile DMA is triggered from the runtime sequence via `set_lock_value`, which ensures the shim drain is configured before data starts flowing.
+
+## Usage
+
+### Compilation
+
+To compile the design:
+
+```shell
+make
+```
+
+### Python Testbench
+
+To run the design:
+
+```shell
+make run_py
+```

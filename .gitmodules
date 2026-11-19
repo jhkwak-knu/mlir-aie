@@ -1,16 +1,21 @@
+# Copyright (C) 2021 Xilinx, Inc.
+# Copyright (C) 2022-2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
 [submodule "platforms/boards"]
 	path = platforms/boards
 	url = https://github.com/Xilinx/XilinxBoardStore.git
 [submodule "cmake/modulesXilinx"]
 	path = cmake/modulesXilinx
 	url = https://github.com/Xilinx/cmakeModules.git
-[submodule "runtime_lib/xaiengine/aie-rt"]
-	path = third_party/aie-rt
-	url = https://github.com/stephenneuendorffer/aie-rt.git
-	branch = strix_2024.2
 [submodule "third_party/bootgen"]
 	path = third_party/bootgen
 	url = https://github.com/Xilinx/bootgen.git
+	ignore = dirty
 [submodule "third_party/aie_api"]
 	path = third_party/aie_api
-	url = https://github.com/jgmelber/aie_api
+	url = https://github.com/Xilinx/aie_api
+[submodule "third_party/aie-codegen"]
+	path = third_party/aie-codegen
+	url = https://github.com/Xilinx/aie-codegen.git
+	branch = main

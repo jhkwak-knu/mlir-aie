@@ -1,17 +1,15 @@
 ///===- test.cpp -------------------------------------------000---*- C++
 ///-*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2023 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// Copyright (C) 2023, Advanced Micro Devices, Inc.
 //
 //===----------------------------------------------------------------------===//
 
 #include "cxxopts.hpp"
-#include <bits/stdc++.h>
+#include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -59,8 +57,6 @@ int main(int argc, const char *argv[]) {
   // TODO Remove trace for now?
   size_t OUT_SIZE = INOUT1_SIZE + trace_size;
 
-  srand(time(NULL));
-
   // Load instruction sequence
   std::vector<uint32_t> instr_v =
       test_utils::load_instr_binary(vm["instr"].as<std::string>());
@@ -97,8 +93,10 @@ int main(int argc, const char *argv[]) {
   // Initialize Inout buffer 0
   INOUT0_DATATYPE *bufInOut0 = bo_inout0.map<INOUT0_DATATYPE *>();
   std::int32_t reducedSum = (std::int32_t)0;
+  const int input_shift = INOUT0_VOLUME / 3;
   for (int i = 0; i < INOUT0_VOLUME; i++) {
-    std::int32_t next = test_utils::random_int32_t(100000);
+    std::int32_t next =
+        (i + INOUT0_VOLUME - input_shift) % INOUT0_VOLUME - INOUT0_VOLUME / 2;
     reducedSum += next;
     bufInOut0[i] = next;
   }

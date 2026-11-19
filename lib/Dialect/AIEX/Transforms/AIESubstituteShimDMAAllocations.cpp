@@ -1,11 +1,8 @@
 //===- AIESubstituteShimDMAAllocations.cpp -----------------------*- C++
 //-*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2024 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2024 Advanced Micro Devices, Inc.
 //
 //===----------------------------------------------------------------------===//
 
@@ -16,10 +13,14 @@
 #include "aie/Dialect/AIEX/IR/AIEXDialect.h"
 #include "aie/Dialect/AIEX/Transforms/AIEXPasses.h"
 
+#include "mlir/IR/PatternMatch.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
-#include "mlir/Transforms/DialectConversion.h"
-#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
-#include "llvm/ADT/TypeSwitch.h"
+
+namespace xilinx::AIEX {
+#define GEN_PASS_DEF_AIESUBSTITUTESHIMDMAALLOCATIONS
+#include "aie/Dialect/AIEX/Transforms/AIEXPasses.h.inc"
+} // namespace xilinx::AIEX
 
 using namespace mlir;
 using namespace xilinx;
@@ -27,47 +28,47 @@ using namespace xilinx::AIEX;
 
 namespace {
 
-struct DMAConfigureTaskForOpPattern
-    : public mlir::OpRewritePattern<DMAConfigureTaskForOp> {
-
-  using OpRewritePattern::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(DMAConfigureTaskForOp op,
-                                PatternRewriter &rewriter) const override {
-    AIE::DeviceOp device = op->getParentOfType<AIE::DeviceOp>();
-
-    AIE::ShimDMAAllocationOp alloc_op =
-        AIE::ShimDMAAllocationOp::getForSymbol(device, op.getAlloc());
-    if (!alloc_op) {
-      return op.emitOpError("no shim DMA allocation found for symbol");
-    }
-
-    const int col = alloc_op.getCol();
-    AIE::TileOp tile = AIE::TileOp::getOrCreate(rewriter, device, col, 0);
-    DMAConfigureTaskOp new_op = rewriter.create<DMAConfigureTaskOp>(
-        op.getLoc(), rewriter.getIndexType(), tile.getResult(),
-        alloc_op.getChannelDir(), (int32_t)alloc_op.getChannelIndex(),
-        op.getIssueToken(), op.getRepeatCount());
-    rewriter.replaceAllUsesWith(op.getResult(), new_op.getResult());
-    rewriter.inlineRegionBefore(op.getBody(), new_op.getBody(),
-                                new_op.getBody().begin());
-    rewriter.eraseOp(op);
-    return success();
-  }
-};
-
 struct AIESubstituteShimDMAAllocationsPass
-    : AIESubstituteShimDMAAllocationsBase<AIESubstituteShimDMAAllocationsPass> {
+    : xilinx::AIEX::impl::AIESubstituteShimDMAAllocationsBase<
+          AIESubstituteShimDMAAllocationsPass> {
 
   void runOnOperation() override {
     AIE::DeviceOp device = getOperation();
+    mlir::SymbolTable symbolTable(device);
 
-    // Convert DMAConfigureTaskForOps that reference shim DMA allocations
-    // to regular DMAConfigureTaskOps
-    RewritePatternSet patterns(&getContext());
-    patterns.insert<DMAConfigureTaskForOpPattern>(&getContext());
+    SmallVector<DMAConfigureTaskForOp> tasks;
+    device.walk([&](DMAConfigureTaskForOp op) { tasks.push_back(op); });
 
-    (void)applyPatternsGreedily(device, std::move(patterns));
+    IRRewriter rewriter(&getContext());
+    for (DMAConfigureTaskForOp op : tasks) {
+      AIE::ShimDMAAllocationOp alloc_op =
+          symbolTable.lookup<AIE::ShimDMAAllocationOp>(
+              op.getAlloc().getRootReference());
+      if (!alloc_op) {
+        op.emitOpError("no shim DMA allocation found for symbol");
+        return signalPassFailure();
+      }
+
+      AIE::TileOp tile = alloc_op.getTileOp();
+      if (!tile) {
+        op.emitOpError("shim DMA allocation must reference a valid TileOp");
+        return signalPassFailure();
+      }
+
+      rewriter.setInsertionPoint(op);
+      DMAConfigureTaskOp new_op = DMAConfigureTaskOp::create(
+          rewriter, op.getLoc(), rewriter.getIndexType(), tile.getResult(),
+          alloc_op.getChannelDirAttr(),
+          rewriter.getI32IntegerAttr((int32_t)alloc_op.getChannelIndex()),
+          rewriter.getBoolAttr(op.getIssueToken()),
+          rewriter.getI32IntegerAttr(op.getRepeatCount()),
+          /*repeat_count_val=*/op.getRepeatCountVal(),
+          alloc_op.getPacket().value_or(nullptr));
+      rewriter.replaceAllUsesWith(op.getResult(), new_op.getResult());
+      rewriter.inlineRegionBefore(op.getBody(), new_op.getBody(),
+                                  new_op.getBody().begin());
+      rewriter.eraseOp(op);
+    }
   }
 };
 

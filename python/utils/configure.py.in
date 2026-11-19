@@ -1,0 +1,59 @@
+#
+# Copyright (C) 2021 Xilinx, Inc.
+# Copyright (C) 2022-2025 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+#
+
+import numbers
+import os
+import sysconfig
+
+
+def pythonize_bool(value):
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, numbers.Number):
+        return value != 0
+    if isinstance(value, str):
+        if value.lower() in ("1", "true", "on", "yes"):
+            return True
+        if value.lower() in ("", "0", "false", "off", "no"):
+            return False
+    raise ValueError(f"Cannot convert {value!r} to bool")
+
+
+git_commit = "@AIE_GIT_COMMIT@"
+
+aie_link_with_xchesscc = pythonize_bool("@AIECC_LINK_WITH_XCHESSCC@")
+aie_compile_with_xchesscc = pythonize_bool("@AIECC_COMPILE_WITH_XCHESSCC@")
+aie_disable_link = not pythonize_bool("@AIECC_LINK@")
+aie_disable_compile = not pythonize_bool("@AIECC_COMPILE@")
+aie_unified_compile = True
+host_disable_compile = not pythonize_bool("@AIECC_HOST_COMPILE@")
+host_architecture = os.getenv("LLVM_HOST_TRIPLE", "@LLVM_HOST_TRIPLE@")
+
+peano_install_dir = os.getenv("PEANO_INSTALL_DIR", r"""@PEANO_INSTALL_DIR@""")
+aie_dir = os.path.realpath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+if not os.path.exists(peano_install_dir):
+    # The expected location in an install area
+    peano_install_dir = os.path.join(aie_dir, "peano")
+if not os.path.exists(peano_install_dir):
+    # The expected location in a build area
+    peano_install_dir = os.path.realpath(os.path.join(aie_dir, "..", "peano"))
+if not os.path.exists(peano_install_dir):
+    # The expected location in platform-specific installed modules
+    peano_install_dir = os.path.join(sysconfig.get_path("platlib"), "llvm-aie")
+if not os.path.exists(peano_install_dir):
+    peano_install_dir = "peano_not_found"
+
+# The bin directory of the LLVM this tree was configured against. Only an
+# installed tree bundles its llvm-objcopy; a build tree finds it here.
+llvm_tools_binary_dir = r"""@LLVM_TOOLS_BINARY_DIR@"""
+
+
+def install_path():
+    path = os.path.dirname(os.path.realpath(__file__))
+    path = os.path.join(path, "..", "..", "..")
+    return os.path.realpath(path)

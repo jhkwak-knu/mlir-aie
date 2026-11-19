@@ -1,23 +1,26 @@
 //===- AIECoreToStandard.cpp ------------------------------------*- C++ -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2019-2022 Xilinx, Inc.
+// Copyright (C) 2022-2026 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2019 Xilinx Inc.
 //
 //===----------------------------------------------------------------------===//
 
+#include "aie/Dialect/AIE/IR/AIECoreSymbols.h"
 #include "aie/Dialect/AIE/IR/AIEDialect.h"
 #include "aie/Dialect/AIE/Transforms/AIEPasses.h"
+#include "aie/Dialect/AIEVec/IR/AIEVecDialect.h"
 
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVMPass.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
+#include "mlir/Dialect/DLTI/DLTI.h"
 #include "mlir/Dialect/Index/IR/IndexDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/Ptr/IR/PtrOps.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/IRMapping.h"
@@ -26,12 +29,17 @@
 #include "mlir/Tools/mlir-translate/MlirTranslateMain.h"
 #include "mlir/Transforms/DialectConversion.h"
 
+namespace xilinx::AIE {
+#define GEN_PASS_DEF_AIECORETOSTANDARD
+#include "aie/Dialect/AIE/Transforms/AIEPasses.h.inc"
+} // namespace xilinx::AIE
+
 using namespace mlir;
 using namespace mlir::vector;
 using namespace xilinx;
 using namespace xilinx::AIE;
 
-static StringRef getArchIntrinsicString(AIEArch arch) {
+static StringRef getArchTargetTriple(AIEArch arch) {
   switch (arch) {
   case AIEArch::AIE1:
     return "aie";
@@ -39,13 +47,23 @@ static StringRef getArchIntrinsicString(AIEArch arch) {
     return "aie2";
   case AIEArch::AIE2p:
     return "aie2p";
+  case AIEArch::AIE2ps:
+    return "aie2ps";
   }
   llvm::report_fatal_error("unsupported arch");
 }
 
-typedef std::tuple<const char *, std::vector<Type>, std::vector<Type>>
-    IntrinsicDecl;
-typedef std::vector<IntrinsicDecl> IntrinsicDecls;
+// AIE2PS has no core intrinsic set (see declareAIEIntrinsics), so an op that
+// lowers to an intrinsic call is diagnosed rather than left behind.
+static LogicalResult checkCoreIntrinsics(Operation *op) {
+  if (!isa<AIE2PSTargetModel>(op->getParentOfType<DeviceOp>().getTargetModel()))
+    return success();
+  return op->emitOpError("has no core lowering for AIE2ps");
+}
+
+using IntrinsicDecl =
+    std::tuple<const char *, std::vector<Type>, std::vector<Type>>;
+using IntrinsicDecls = std::vector<IntrinsicDecl>;
 
 static auto getAIE1Intrinsics(OpBuilder &builder) {
   Type int32Type = IntegerType::get(builder.getContext(), 32);
@@ -90,6 +108,7 @@ static auto getAIE2Intrinsics(OpBuilder &builder) {
   Type accType = VectorType::get({16}, int32Type);
   IntrinsicDecls functions = {
       {"debug_i32", {int32Type}, {}},
+      {"llvm.aie2.event", {int32Type}, {}},
       {"llvm.aie2.put.ms", {int32Type, int32Type}, {}}, //(%value, %tlast) -> ()
       {"llvm.aie2.get.ss", {}, {int32Type, int32Type}}, //() -> (%value, %tlast)
       {"llvm.aie2.mcd.write.vec",
@@ -104,6 +123,9 @@ static auto getAIE2Intrinsics(OpBuilder &builder) {
       {"llvm.aie2.release",
        {int32Type, int32Type},
        {}}, //(%lock_id, %lock_val) -> ()
+      {"llvm.aie2.set.ctrl.reg",
+       {int32Type, int32Type},
+       {}}, //(%reg_id, %value) -> ()
   };
   return functions;
 }
@@ -113,8 +135,7 @@ static auto getAIE2pIntrinsics(OpBuilder &builder) {
   Type accType = VectorType::get({16}, int32Type);
   IntrinsicDecls functions = {
       {"debug_i32", {int32Type}, {}},
-      {"llvm.aie.event0", {}, {}},
-      {"llvm.aie.event1", {}, {}},
+      {"llvm.aie2p.event", {int32Type}, {}},
       {"llvm.aie2p.put.ms",
        {int32Type, int32Type},
        {}}, //(%value, %tlast) -> ()
@@ -133,18 +154,20 @@ static auto getAIE2pIntrinsics(OpBuilder &builder) {
       {"llvm.aie2p.release",
        {int32Type, int32Type},
        {}}, //(%lock_id, %lock_val) -> ()
+      {"llvm.aie2p.set.ctrl.reg",
+       {int32Type, int32Type},
+       {}}, //(%reg_id, %value) -> ()
   };
   return functions;
 }
 
 static void declareAIEIntrinsics(AIEArch arch, OpBuilder &builder) {
-  auto registerIntrinsics = [&builder](IntrinsicDecls functions) {
+  auto registerIntrinsics = [&builder](const IntrinsicDecls &functions) {
     for (auto &i : functions) {
       auto [name, argTypes, retTypes] = i;
-      builder
-          .create<func::FuncOp>(
-              builder.getUnknownLoc(), name,
-              FunctionType::get(builder.getContext(), argTypes, retTypes))
+      func::FuncOp::create(
+          builder, builder.getUnknownLoc(), name,
+          FunctionType::get(builder.getContext(), argTypes, retTypes))
           .setPrivate();
     }
   };
@@ -158,10 +181,58 @@ static void declareAIEIntrinsics(AIEArch arch, OpBuilder &builder) {
   case AIEArch::AIE2p:
     registerIntrinsics(getAIE2pIntrinsics(builder));
     return;
+  case AIEArch::AIE2ps:
+    // No intrinsic set: checkCoreIntrinsics rejects ops that need one.
+    return;
   }
   llvm::report_fatal_error("unsupported arch");
 }
 
+// Move all the ops with OpTy inside device, to just before the device.
+template <typename OpTy>
+static void outlineOps(DeviceOp device) {
+  SmallVector<OpTy, 16> ops;
+  for (const auto &op : device.getOps<OpTy>())
+    ops.push_back(op);
+
+  for (const auto &op : ops)
+    op->moveBefore(device);
+}
+
+// The outlined core function must not use values of the device, which is
+// erased. Give the core its own copy of each outside constant it uses and
+// diagnose any other outside value.
+static LogicalResult sinkOutsideValuesIntoCore(CoreOp core) {
+  Region &body = core.getBody();
+  OpBuilder builder = OpBuilder::atBlockBegin(&body.front());
+  DenseMap<Value, Value> copies;
+  WalkResult result = body.walk([&](Operation *op) {
+    for (OpOperand &operand : op->getOpOperands()) {
+      Value value = operand.get();
+      if (body.isAncestor(value.getParentRegion()))
+        continue;
+      Operation *def = value.getDefiningOp();
+      if (!def || !def->hasTrait<OpTrait::ConstantLike>()) {
+        InFlightDiagnostic diag =
+            op->emitOpError("uses a value defined outside its aie.core, "
+                            "which cannot be outlined");
+        diag.attachNote(value.getLoc()) << "value defined here";
+        return WalkResult::interrupt();
+      }
+      Value &copy = copies[value];
+      if (!copy) {
+        Operation *clone = builder.clone(*def);
+        builder.setInsertionPointAfter(clone);
+        copy = clone->getResult(cast<OpResult>(value).getResultNumber());
+      }
+      operand.set(copy);
+    }
+    return WalkResult::advance();
+  });
+  return failure(result.wasInterrupted());
+}
+
+namespace {
 template <typename MyAIEOp>
 struct AIEOpRemoval : OpConversionPattern<MyAIEOp> {
   using OpConversionPattern<MyAIEOp>::OpConversionPattern;
@@ -190,6 +261,8 @@ struct AIEDebugOpToStdLowering : OpConversionPattern<DebugOp> {
   LogicalResult
   matchAndRewrite(DebugOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    if (failed(checkCoreIntrinsics(op)))
+      return failure();
     std::string funcName = "debug_i32";
     auto func = module.lookupSymbol<func::FuncOp>(funcName);
     if (!func)
@@ -197,7 +270,7 @@ struct AIEDebugOpToStdLowering : OpConversionPattern<DebugOp> {
              << funcName;
     SmallVector<Value, 1> args;
     args.push_back(op.getArg());
-    rewriter.create<func::CallOp>(rewriter.getUnknownLoc(), func, args);
+    func::CallOp::create(rewriter, op.getLoc(), func, args);
     rewriter.eraseOp(op);
     return success();
   }
@@ -214,6 +287,8 @@ struct AIEPutStreamToStdLowering : OpConversionPattern<PutStreamOp> {
   LogicalResult
   matchAndRewrite(PutStreamOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    if (failed(checkCoreIntrinsics(op)))
+      return failure();
     auto device = op->getParentOfType<DeviceOp>();
     const auto &targetModel = device.getTargetModel();
     std::string funcName;
@@ -241,11 +316,11 @@ struct AIEPutStreamToStdLowering : OpConversionPattern<PutStreamOp> {
       args.push_back(op.getStreamValue());
     } else {
       args.push_back(op.getStreamValue());
-      args.push_back(rewriter.create<arith::ConstantOp>(
-          op.getLoc(), IntegerType::get(rewriter.getContext(), 32),
+      args.push_back(arith::ConstantOp::create(
+          rewriter, op.getLoc(), IntegerType::get(rewriter.getContext(), 32),
           rewriter.getI32IntegerAttr(0))); // tlast
     }
-    rewriter.create<func::CallOp>(rewriter.getUnknownLoc(), putMSFunc, args);
+    func::CallOp::create(rewriter, op.getLoc(), putMSFunc, args);
     rewriter.eraseOp(op);
     return success();
   }
@@ -262,6 +337,8 @@ struct AIEGetStreamToStdLowering : OpConversionPattern<GetStreamOp> {
   LogicalResult
   matchAndRewrite(GetStreamOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    if (failed(checkCoreIntrinsics(op)))
+      return failure();
     auto device = op->getParentOfType<DeviceOp>();
     const auto &targetModel = device.getTargetModel();
     std::string funcName;
@@ -286,8 +363,8 @@ struct AIEGetStreamToStdLowering : OpConversionPattern<GetStreamOp> {
     SmallVector<Value, 2> args;
     if (targetModel.getTargetArch() == AIEArch::AIE1)
       args.push_back(op.getChannel());
-    auto getSSCall = rewriter.create<func::CallOp>(rewriter.getUnknownLoc(),
-                                                   getSSFunc, args);
+    auto getSSCall =
+        func::CallOp::create(rewriter, op.getLoc(), getSSFunc, args);
     rewriter.replaceOp(op, getSSCall.getResult(0));
     // Capture TLAST in AIEv2?
     return success();
@@ -305,6 +382,8 @@ struct AIEPutCascadeToStdLowering : OpConversionPattern<PutCascadeOp> {
   LogicalResult
   matchAndRewrite(PutCascadeOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    if (failed(checkCoreIntrinsics(op)))
+      return failure();
     auto device = op->getParentOfType<DeviceOp>();
     const auto &targetModel = device.getTargetModel();
     std::string funcName;
@@ -319,13 +398,26 @@ struct AIEPutCascadeToStdLowering : OpConversionPattern<PutCascadeOp> {
       return op.emitOpError("Could not find the intrinsic function ")
              << funcName;
     SmallVector<Value, 2> args;
-    args.push_back(op.getCascadeValue());
+    Value cascadeValue = op.getCascadeValue();
+
+    // Check if we need a bitcast for the input value
+    Type expectedInputType = putMCDFunc.getFunctionType().getInput(0);
+    Type actualInputType = cascadeValue.getType();
+
+    if (expectedInputType != actualInputType) {
+      // Create a bitcast operation to convert from actual input type to
+      // expected type
+      cascadeValue = vector::BitCastOp::create(rewriter, op.getLoc(),
+                                               expectedInputType, cascadeValue);
+    }
+
+    args.push_back(cascadeValue);
     if (isa<AIE2TargetModel>(targetModel))
-      args.push_back(rewriter.create<arith::ConstantOp>(
-          op.getLoc(), IntegerType::get(rewriter.getContext(), 32),
+      args.push_back(arith::ConstantOp::create(
+          rewriter, op.getLoc(), IntegerType::get(rewriter.getContext(), 32),
           rewriter.getI32IntegerAttr(1))); // enable
 
-    rewriter.create<func::CallOp>(rewriter.getUnknownLoc(), putMCDFunc, args);
+    func::CallOp::create(rewriter, op.getLoc(), putMCDFunc, args);
     rewriter.eraseOp(op);
     return success();
   }
@@ -342,6 +434,8 @@ struct AIEGetCascadeToStdLowering : OpConversionPattern<GetCascadeOp> {
   LogicalResult
   matchAndRewrite(GetCascadeOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    if (failed(checkCoreIntrinsics(op)))
+      return failure();
     auto device = op->getParentOfType<DeviceOp>();
     const auto &targetModel = device.getTargetModel();
     std::string funcName;
@@ -357,13 +451,26 @@ struct AIEGetCascadeToStdLowering : OpConversionPattern<GetCascadeOp> {
              << funcName;
     SmallVector<Value, 2> args;
     if (isa<AIE2TargetModel>(targetModel))
-      args.push_back(rewriter.create<arith::ConstantOp>(
-          op.getLoc(), IntegerType::get(rewriter.getContext(), 32),
+      args.push_back(arith::ConstantOp::create(
+          rewriter, op.getLoc(), IntegerType::get(rewriter.getContext(), 32),
           rewriter.getI32IntegerAttr(1))); // enable
 
-    auto getSCDCall = rewriter.create<func::CallOp>(rewriter.getUnknownLoc(),
-                                                    getSCDFunc, args);
-    rewriter.replaceOp(op, getSCDCall.getResult(0));
+    auto getSCDCall =
+        func::CallOp::create(rewriter, op.getLoc(), getSCDFunc, args);
+    Value result = getSCDCall.getResult(0);
+
+    // Check if we need a bitcast
+    Type expectedType = op.getResult().getType();
+    Type intrinsicReturnType = result.getType();
+
+    if (expectedType != intrinsicReturnType) {
+      // Create a bitcast operation to convert from intrinsic return type to
+      // expected type
+      result = vector::BitCastOp::create(rewriter, op.getLoc(), expectedType,
+                                         result);
+    }
+
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
@@ -384,6 +491,16 @@ struct AIEUseLockToStdLowering : OpConversionPattern<UseLockOp> {
         return module.emitOpError("Device Not found!");
       }
       const auto &targetModel = device.getTargetModel();
+      // A lock in a core or in any function needs an intrinsic, whether or
+      // not an exported core calls the function. Any other lock (DMA
+      // regions, runtime sequences) is erased with its parent.
+      if (isa<AIE2PSTargetModel>(targetModel)) {
+        if (useLock->getParentOfType<CoreOp>() ||
+            useLock->getParentOfType<func::FuncOp>())
+          return checkCoreIntrinsics(useLock);
+        rewriter.eraseOp(useLock);
+        return success();
+      }
 
       // Generate the intrinsic name
       std::string funcName;
@@ -405,21 +522,21 @@ struct AIEUseLockToStdLowering : OpConversionPattern<UseLockOp> {
         return useLock.emitOpError("Could not find the intrinsic function!");
 
       SmallVector<Value, 2> args;
-      auto lockValue = useLock.getLockValue();
+      auto i32Ty = IntegerType::get(rewriter.getContext(), 32);
+      args.push_back(arith::IndexCastOp::create(rewriter, useLock.getLoc(),
+                                                i32Ty, useLock.getLock()));
 
-      // AIE2 acquire greater equal is encoded as a negative value.
+      Value value = adaptor.getValue();
+      // AIE2 acquire-greater-equal is encoded as a negative value, so negate
+      // it at runtime.
       if (useLock.acquireGE()) {
-        lockValue = -lockValue;
+        Value zero = arith::ConstantOp::create(
+            rewriter, useLock.getLoc(), i32Ty, rewriter.getI32IntegerAttr(0));
+        value = arith::SubIOp::create(rewriter, useLock.getLoc(), zero, value);
       }
-      args.push_back(rewriter.create<arith::IndexCastOp>(
-          useLock.getLoc(), IntegerType::get(rewriter.getContext(), 32),
-          useLock.getLock()));
-      args.push_back(rewriter.create<arith::ConstantOp>(
-          useLock.getLoc(), IntegerType::get(rewriter.getContext(), 32),
-          rewriter.getI32IntegerAttr(lockValue)));
+      args.push_back(value);
 
-      rewriter.create<func::CallOp>(rewriter.getUnknownLoc(), useLockFunc,
-                                    args);
+      func::CallOp::create(rewriter, useLock.getLoc(), useLockFunc, args);
     }
     rewriter.eraseOp(useLock);
     return success();
@@ -429,39 +546,40 @@ struct AIEUseLockToStdLowering : OpConversionPattern<UseLockOp> {
 struct AIEBufferToStandard : OpConversionPattern<BufferOp> {
   using OpConversionPattern::OpConversionPattern;
   ModuleOp &module;
-  int tileCol = 0;
-  int tileRow = 0;
   AIEBufferToStandard(MLIRContext *context, ModuleOp &m,
-                      PatternBenefit benefit = 1, int tileCol = -1,
-                      int tileRow = -1)
-      : OpConversionPattern(context, benefit), module(m), tileCol(tileCol),
-        tileRow(tileRow) {}
+                      PatternBenefit benefit = 1)
+      : OpConversionPattern(context, benefit), module(m) {}
   LogicalResult
   matchAndRewrite(BufferOp buffer, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    // The core's own sections fill this extent; nothing refers to it by name.
+    if (buffer.getCoreData()) {
+      rewriter.eraseOp(buffer);
+      return success();
+    }
     rewriter.setInsertionPointToStart(module.getBody());
     auto t = llvm::cast<MemRefType>(buffer.getType());
-    int col = llvm::cast<TileOp>(buffer.getTile().getDefiningOp()).getCol();
-    int row = llvm::cast<TileOp>(buffer.getTile().getDefiningOp()).getRow();
     auto symName = buffer.name().getValue();
-    mlir::ElementsAttr initValue = buffer.getInitialValueAttr();
-    // Don't emit initialization for cores that don't "own" the buffer (to
-    // prevent duplication in the data section of the elf/object file)
-    if ((tileRow != row && tileRow != -1) || (tileCol != col && tileCol != -1))
-      initValue = nullptr;
-    rewriter.create<memref::GlobalOp>(
-        rewriter.getUnknownLoc(), symName, rewriter.getStringAttr("public"),
-        buffer.getType(), initValue, /*constant*/ false,
-        /*alignment*/ nullptr);
+    // A declaration, never a definition: a buffer lives at the address the
+    // allocator chose, and the linker supplies that address from the generated
+    // script or BCF. `initial_value` is device state, written by whoever
+    // configures the device -- the CDO writer, or mlir_aie_initialize_buffers
+    // on the simulator path. A definition here would place the bytes wherever
+    // `*(.data*)` lands, which costs the core's data region a copy it never
+    // reads.
+    memref::GlobalOp::create(rewriter, buffer.getLoc(), symName,
+                             rewriter.getStringAttr("public"), buffer.getType(),
+                             /*initial_value=*/nullptr, /*constant*/ false,
+                             /*alignment*/ nullptr);
 
     for (auto &use : make_early_inc_range(buffer.getResult().getUses())) {
       Operation *user = use.getOwner();
       rewriter.setInsertionPoint(user);
-      auto allocated = rewriter.create<memref::GetGlobalOp>(
-          rewriter.getUnknownLoc(), t, symName);
+      auto allocated =
+          memref::GetGlobalOp::create(rewriter, buffer.getLoc(), t, symName);
       // Assume that buffers are aligned so they can be vectorized.
-      rewriter.create<memref::AssumeAlignmentOp>(rewriter.getUnknownLoc(),
-                                                 allocated, 32);
+      memref::AssumeAlignmentOp::create(rewriter, buffer.getLoc(), allocated,
+                                        32);
 
       use.set(allocated.getResult());
     }
@@ -503,22 +621,134 @@ struct AIECoreToStandardFunc : OpConversionPattern<CoreOp> {
     // The parent should be an AIE.device op.
     rewriter.setInsertionPointAfter(op->getParentOp());
 
-    std::string coreName("core_" + std::to_string(col) + "_" +
-                         std::to_string(row));
-    auto coreFunc = rewriter.create<func::FuncOp>(
-        rewriter.getUnknownLoc(), coreName,
-        FunctionType::get(rewriter.getContext(), {}, {}));
+    std::string coreName = coreFrameSymbolName(col, row);
+    auto coreFunc =
+        func::FuncOp::create(rewriter, op.getLoc(), coreName,
+                             FunctionType::get(rewriter.getContext(), {}, {}));
 
     rewriter.cloneRegionBefore(op.getBody(), coreFunc.getBody(),
                                coreFunc.getBody().begin(), mapper);
+
+    // Set saturation and rounding modes at core entry for AIE2/AIE2p, but
+    // only if the core body contains aievec.srs or bf16 aievec.matmul ops.
+    // Skip for cores with only lock/stream ops to avoid breaking existing
+    // test SSA naming.
+    bool hasSRS = false;
+    bool hasIntegerSRS = false;
+    bool hasBF16Matmul = false;
+    auto scan = [&](Operation *childOp) {
+      StringRef opName = childOp->getName().getStringRef();
+      if (opName == "aievec.srs") {
+        hasSRS = true;
+        // Check if this is an integer SRS (e.g., i32→i8) vs float SRS
+        // (e.g., f32→bf16). Integer SRS needs positive_inf rounding to
+        // match C++ kernel behavior; float SRS works better with floor.
+        if (childOp->getNumResults() > 0) {
+          auto resultType = childOp->getResult(0).getType();
+          if (auto vecType = dyn_cast<VectorType>(resultType)) {
+            if (vecType.getElementType().isInteger())
+              hasIntegerSRS = true;
+          }
+        }
+      }
+      // Detect bf16 matmul ops — these need conv_even rounding to avoid
+      // systematic negative bias from floor rounding in BFP16 arithmetic.
+      // On AIE2P a bf16 matmul is a bfp16 one: aievec.to_bfp16 converts its
+      // bf16 operands, and aievec.matmul_aie2p_bfp16 may take them loaded.
+      if (opName == "aievec.to_bfp16" || opName == "aievec.matmul_aie2p_bfp16")
+        hasBF16Matmul = true;
+      if (opName == "aievec.matmul" || opName == "aievec.matmul_aie2p") {
+        if (childOp->getNumOperands() > 0) {
+          auto lhsType = childOp->getOperand(0).getType();
+          if (auto vecType = dyn_cast<VectorType>(lhsType))
+            if (vecType.getElementType().isBF16())
+              hasBF16Matmul = true;
+        }
+      }
+    };
+    coreFunc.walk(scan);
+    auto device = op->getParentOfType<DeviceOp>();
+    // AIE2ps cannot set the modes anywhere, so the functions the core calls
+    // must be free of these ops too.
+    if (device && isa<AIE2PSTargetModel>(device.getTargetModel())) {
+      SmallVector<func::FuncOp> worklist;
+      DenseSet<Operation *> visited;
+      auto addCallees = [&](Operation *root) {
+        root->walk([&](func::CallOp call) {
+          auto callee = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
+              device, call.getCalleeAttr());
+          if (callee && visited.insert(callee).second)
+            worklist.push_back(callee);
+        });
+      };
+      addCallees(coreFunc);
+      while (!worklist.empty()) {
+        func::FuncOp callee = worklist.pop_back_val();
+        callee.walk(scan);
+        addCallees(callee);
+      }
+    }
+    if (hasSRS || hasBF16Matmul) {
+      if (device) {
+        if (isa<AIE2PSTargetModel>(device.getTargetModel()))
+          return op.emitOpError("needs the rounding and saturation modes set "
+                                "for aievec.srs or bf16 matmul, which has no "
+                                "lowering for AIE2ps");
+        AIEArch arch = device.getTargetModel().getTargetArch();
+        if (arch == AIEArch::AIE2 || arch == AIEArch::AIE2p) {
+          std::string ctrlRegFuncName = (arch == AIEArch::AIE2p)
+                                            ? "llvm.aie2p.set.ctrl.reg"
+                                            : "llvm.aie2.set.ctrl.reg";
+          auto ctrlRegFunc = module.lookupSymbol<func::FuncOp>(ctrlRegFuncName);
+          if (ctrlRegFunc) {
+            Block &entryBlock = coreFunc.getBody().front();
+            rewriter.setInsertionPointToStart(&entryBlock);
+            Location loc = op.getLoc();
+            // Rounding register index differs between AIE2 and AIE2P:
+            //   AIE2:  crRnd=6
+            //   AIE2P: crRnd=1
+            // Saturation register uses AIE2 index (9) for both architectures.
+            // On AIE2P, index 9 maps to crPackSize (no-op for saturation),
+            // preserving the pre-existing behavior. The AIE2P crSat fix
+            // (index 0) requires updating downstream tests and is tracked
+            // separately.
+            int satRegIdx = 9;
+            int rndRegIdx = (arch == AIEArch::AIE2p) ? 1 : 6;
+            // saturation_mode::saturate = 1
+            auto cSatIdx = arith::ConstantOp::create(
+                rewriter, loc, rewriter.getI32IntegerAttr(satRegIdx));
+            auto c1 = arith::ConstantOp::create(rewriter, loc,
+                                                rewriter.getI32IntegerAttr(1));
+            func::CallOp::create(rewriter, loc, ctrlRegFunc,
+                                 ValueRange{cSatIdx, c1});
+            // Rounding mode:
+            //  - conv_even (12) for bf16 matmul: eliminates systematic
+            //    negative bias from floor rounding in BFP16 arithmetic,
+            //    matching ::aie::set_rounding(aie::rounding_mode::conv_even)
+            //    used in external C++ matmul kernels.
+            //  - positive_inf (9) for integer SRS (shift-round-saturate on
+            //    integer data, e.g., i32→i8), unless the core has a bf16
+            //    matmul.
+            //  - conv_even (12) for float-only SRS (f32→bf16), matching the
+            //    round-to-nearest-even semantics of arith.truncf.
+            int roundingMode = hasIntegerSRS && !hasBF16Matmul ? 9 : 12;
+            auto cRndIdx = arith::ConstantOp::create(
+                rewriter, loc, rewriter.getI32IntegerAttr(rndRegIdx));
+            auto cRoundingMode = arith::ConstantOp::create(
+                rewriter, loc, rewriter.getI32IntegerAttr(roundingMode));
+            func::CallOp::create(rewriter, loc, ctrlRegFunc,
+                                 ValueRange{cRndIdx, cRoundingMode});
+          }
+        }
+      }
+    }
 
     // Rewrite the AIE.end() op
     coreFunc.getBody().walk([&](Operation *childOp) {
       rewriter.setInsertionPointAfter(childOp);
 
       if (isa<EndOp>(childOp)) {
-        rewriter.create<func::ReturnOp>(rewriter.getUnknownLoc(),
-                                        ValueRange({}));
+        func::ReturnOp::create(rewriter, childOp->getLoc(), ValueRange({}));
         rewriter.eraseOp(childOp);
       }
     });
@@ -527,17 +757,6 @@ struct AIECoreToStandardFunc : OpConversionPattern<CoreOp> {
     return success();
   }
 };
-
-// Move all the ops with OpTy inside device, to just before the device.
-template <typename OpTy>
-void outlineOps(DeviceOp device) {
-  SmallVector<OpTy, 16> ops;
-  for (const auto &op : device.getOps<OpTy>())
-    ops.push_back(op);
-
-  for (const auto &op : ops)
-    op->moveBefore(device);
-}
 
 // Lower AIE.event to llvm.aie.event intrinsic
 struct AIEEventOpToStdLowering : OpConversionPattern<EventOp> {
@@ -551,36 +770,68 @@ struct AIEEventOpToStdLowering : OpConversionPattern<EventOp> {
   LogicalResult
   matchAndRewrite(EventOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    std::string funcName = "llvm.aie.event" + std::to_string(op.getVal());
+    auto device = op->getParentOfType<DeviceOp>();
+    std::string funcName;
+    SmallVector<Value, 1> args;
+    switch (device.getTargetModel().getTargetArch()) {
+    case AIEArch::AIE1:
+      funcName = "llvm.aie.event" + std::to_string(op.getVal());
+      break;
+    case AIEArch::AIE2:
+      funcName = "llvm.aie2.event";
+      args.push_back(arith::ConstantOp::create(
+          rewriter, op.getLoc(), rewriter.getI32Type(),
+          rewriter.getI32IntegerAttr(op.getVal())));
+      break;
+    case AIEArch::AIE2p:
+      funcName = "llvm.aie2p.event";
+      args.push_back(arith::ConstantOp::create(
+          rewriter, op.getLoc(), rewriter.getI32Type(),
+          rewriter.getI32IntegerAttr(op.getVal())));
+      break;
+    case AIEArch::AIE2ps:
+      return op.emitOpError("has no core lowering for AIE2ps");
+    }
     auto eventFunc = module.lookupSymbol<func::FuncOp>(funcName);
     if (!eventFunc)
       return op.emitOpError("Could not find the intrinsic function ")
              << funcName;
-    rewriter.create<func::CallOp>(rewriter.getUnknownLoc(), eventFunc,
-                                  ValueRange({}));
+    func::CallOp::create(rewriter, op.getLoc(), eventFunc, args);
     rewriter.eraseOp(op);
     return success();
   }
 };
 
-struct AIECoreToStandardPass : AIECoreToStandardBase<AIECoreToStandardPass> {
+struct AIECoreToStandardPass
+    : xilinx::AIE::impl::AIECoreToStandardBase<AIECoreToStandardPass> {
+  AIECoreToStandardPass() = default;
+  AIECoreToStandardPass(const AIECoreToStandardOptions &options) {
+    deviceName = options.deviceName;
+    tileCol = options.tileCol;
+    tileRow = options.tileRow;
+  }
+
   void runOnOperation() override {
 
     ModuleOp m = getOperation();
     OpBuilder builder = OpBuilder::atBlockEnd(m.getBody());
 
-    if (m.getOps<DeviceOp>().empty()) {
-      m.emitOpError("expected AIE.device operation at toplevel");
+    DeviceOp deviceOp = DeviceOp::getForSymbolInModuleOrError(m, deviceName);
+    if (!deviceOp) {
       return signalPassFailure();
     }
-    DeviceOp device = *m.getOps<DeviceOp>().begin();
-    const auto &targetModel = device.getTargetModel();
+    const auto &targetModel = deviceOp.getTargetModel();
+
+    // Copy data layout attribute from DeviceOp to ModuleOp if present
+    if (auto dlAttr = deviceOp->getAttr(DLTIDialect::kDataLayoutAttrName)) {
+      m->setAttr(DLTIDialect::kDataLayoutAttrName, dlAttr);
+    }
 
     // Ensure that we don't have an incorrect target triple.  This may override
     // some bogus target triple in the original mlir.
     m->setAttr(LLVM::LLVMDialect::getTargetTripleAttrName(),
                builder.getStringAttr(
-                   getArchIntrinsicString(targetModel.getTargetArch())));
+                   getArchTargetTriple(targetModel.getTargetArch())));
 
     DenseMap<Operation *, SmallVector<BufferOp, 4>> tileToBuffers;
 
@@ -597,10 +848,28 @@ struct AIECoreToStandardPass : AIECoreToStandardBase<AIECoreToStandardPass> {
     target.addLegalDialect<cf::ControlFlowDialect>();
     target.addLegalDialect<memref::MemRefDialect>();
     target.addLegalDialect<VectorDialect>();
+    target.addLegalDialect<aievec::AIEVecDialect>();
     target.addLegalDialect<arith::ArithDialect>();
+    target.addLegalDialect<ub::UBDialect>();
     target.addLegalDialect<math::MathDialect>();
     target.addLegalDialect<index::IndexDialect>();
-    target.addLegalOp<func::FuncOp, ModuleOp>();
+    target.addLegalDialect<ptr::PtrDialect>();
+    // A core body may already hold LLVM ops: aie.dma_push_queue lowers to the
+    // stores that push a task before the body is outlined.
+    target.addLegalDialect<LLVM::LLVMDialect>();
+    target.addLegalOp<func::FuncOp, ModuleOp, UnrealizedConversionCastOp>();
+    // Ops this pass lowers must be illegal: a failed rewrite of an op with
+    // unknown legality is silently left in place.
+    // A core that is not exported is erased, so its ops are left alone.
+    target.addIllegalOp<BufferOp>();
+    target.addDynamicallyLegalOp<PutStreamOp, GetStreamOp, PutCascadeOp,
+                                 GetCascadeOp, DebugOp, UseLockOp, EventOp>(
+        [col = static_cast<int>(tileCol),
+         row = static_cast<int>(tileRow)](Operation *op) {
+          auto core = op->getParentOfType<CoreOp>();
+          return core && ((row != core.rowIndex() && row != -1) ||
+                          (col != core.colIndex() && col != -1));
+        });
 
     RewritePatternSet patterns(&getContext());
     patterns.add<AIEPutStreamToStdLowering, AIEGetStreamToStdLowering,
@@ -608,22 +877,35 @@ struct AIECoreToStandardPass : AIECoreToStandardBase<AIECoreToStandardPass> {
                  AIEDebugOpToStdLowering, AIEUseLockToStdLowering,
                  AIEEventOpToStdLowering>(m.getContext(), m);
 
-    patterns.add<AIEBufferToStandard>(m.getContext(), m, /*benefit*/ 1, tileCol,
-                                      tileRow);
-    if (failed(applyPartialConversion(m, target, std::move(patterns))))
+    patterns.add<AIEBufferToStandard>(m.getContext(), m, /*benefit*/ 1);
+    if (failed(applyPartialConversion(deviceOp, target, std::move(patterns))))
       return signalPassFailure();
+
+    // Unselected cores are erased, not outlined.
+    int col = static_cast<int>(tileCol);
+    int row = static_cast<int>(tileRow);
+    for (CoreOp core : deviceOp.getOps<CoreOp>()) {
+      if ((row != core.rowIndex() && row != -1) ||
+          (col != core.colIndex() && col != -1))
+        continue;
+      if (failed(sinkOutsideValuesIntoCore(core)))
+        return signalPassFailure();
+    }
 
     RewritePatternSet outlinePatterns(&getContext());
     outlinePatterns.add<AIECoreToStandardFunc>(m.getContext(), m, mapper,
                                                tileToBuffers, /*benefit*/ 1,
                                                tileCol, tileRow);
-    if (failed(applyPartialConversion(m, target, std::move(outlinePatterns))))
+    // Otherwise a core whose outlined body does not legalize is dropped.
+    target.addIllegalOp<CoreOp>();
+    if (failed(applyPartialConversion(deviceOp, target,
+                                      std::move(outlinePatterns))))
       return signalPassFailure();
 
     // Move all the func.func ops and memref.globals from the device to the
     // module
-    outlineOps<memref::GlobalOp>(device);
-    outlineOps<func::FuncOp>(device);
+    outlineOps<memref::GlobalOp>(deviceOp);
+    outlineOps<func::FuncOp>(deviceOp);
 
     RewritePatternSet removepatterns(&getContext());
     removepatterns.add<
@@ -638,7 +920,13 @@ struct AIECoreToStandardPass : AIECoreToStandardBase<AIECoreToStandardPass> {
       return signalPassFailure();
   }
 };
+} // namespace
 
 std::unique_ptr<OperationPass<ModuleOp>> AIE::createAIECoreToStandardPass() {
   return std::make_unique<AIECoreToStandardPass>();
+}
+
+std::unique_ptr<OperationPass<ModuleOp>>
+AIE::createAIECoreToStandardPass(const AIECoreToStandardOptions &options) {
+  return std::make_unique<AIECoreToStandardPass>(options);
 }

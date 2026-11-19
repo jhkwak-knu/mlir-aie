@@ -1,10 +1,7 @@
 //===- AIECanonicalizeDevice.cpp --------------------------------*- C++ -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2023 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2023 Advanced Micro Devices, Inc.
 //
 //===----------------------------------------------------------------------===//
 
@@ -15,6 +12,11 @@
 #include "mlir/IR/Location.h"
 #include "mlir/Pass/Pass.h"
 
+namespace xilinx::AIE {
+#define GEN_PASS_DEF_AIECANONICALIZEDEVICE
+#include "aie/Dialect/AIE/Transforms/AIEPasses.h.inc"
+} // namespace xilinx::AIE
+
 #define DEBUG_TYPE "aie-canonicalize-device"
 
 using namespace mlir;
@@ -22,7 +24,7 @@ using namespace xilinx;
 using namespace xilinx::AIE;
 
 struct AIECanonicalizeDevicePass
-    : AIECanonicalizeDeviceBase<AIECanonicalizeDevicePass> {
+    : xilinx::AIE::impl::AIECanonicalizeDeviceBase<AIECanonicalizeDevicePass> {
   void runOnOperation() override {
 
     ModuleOp moduleOp = getOperation();
@@ -37,10 +39,12 @@ struct AIECanonicalizeDevicePass
     // the new op quite yet.
     OpBuilder builder(moduleOp->getContext());
 
-    Location location = builder.getUnknownLoc();
-    auto deviceOp = builder.create<DeviceOp>(
-        location,
-        AIEDeviceAttr::get(builder.getContext(), AIEDevice::xcvc1902));
+    Location location = moduleOp.getLoc();
+    auto deviceOp = DeviceOp::create(
+        builder, location,
+        AIEDeviceAttr::get(builder.getContext(), AIEDevice::xcvc1902),
+        StringAttr::get(builder.getContext(), DeviceOp::getDefaultDeviceName()),
+        nullptr);
 
     deviceOp.getRegion().takeBody(moduleOp.getBodyRegion());
     new (&moduleOp->getRegion(0)) Region(moduleOp);

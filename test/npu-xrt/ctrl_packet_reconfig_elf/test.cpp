@@ -1,10 +1,7 @@
 //===- test.cpp -------------------------------------------000---*- C++ -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2024 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// Copyright (C) 2024, Advanced Micro Devices, Inc.
 //
 //===----------------------------------------------------------------------===//
 
@@ -38,9 +35,8 @@ int main(int argc, const char *argv[]) {
 
   // Load the xclbin
   // Skeleton xclbin containing only the control packet network
-  auto xclbin = xrt::xclbin(std::string("aie1.xclbin"));
+  auto xclbin = xrt::xclbin(std::string("aie.xclbin"));
 
-  
   // Get the kernel from the xclbin
   auto xkernels = xclbin.get_kernels();
   auto xkernel = *std::find_if(xkernels.begin(), xkernels.end(),
@@ -52,18 +48,14 @@ int main(int argc, const char *argv[]) {
 
   device.register_xclbin(xclbin);
 
-  xrt::elf elf0("ctrlpkt_dma_seq.elf");
+  xrt::elf elf0("aie.elf");
   xrt::module mod0{elf0};
-
-  xrt::elf elf1("aie2.elf");
-  xrt::module mod1{elf1};
 
   // get a hardware context
   xrt::hw_context context(device, xclbin.get_uuid());
 
   // get a kernel handle
   auto kernel0 = xrt::ext::kernel(context, mod0, kernelName);
-  auto kernel1 = xrt::ext::kernel(context, mod1, kernelName);
 
   xrt::bo bo_in = xrt::ext::bo(device, DATA_SIZE * sizeof(DATATYPE));
   xrt::bo bo_out = xrt::ext::bo(device, DATA_SIZE * sizeof(DATATYPE));
@@ -79,8 +71,7 @@ int main(int argc, const char *argv[]) {
 
   unsigned int opcode = 3;
 
-  kernel0(opcode).wait2();
-  kernel1(opcode, 0, 0, 0, bo_in, bo_out).wait2();
+  kernel0(opcode, 0, 0, bo_in, bo_out).wait2();
 
   bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
 

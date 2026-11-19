@@ -1,27 +1,181 @@
-from .globalbuffer import GlobalBuffer
-from .kernel import Kernel
-from .localbuffer import LocalBuffer
+# Copyright (C) 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+"""IRON: High-level Python API for programming AMD Ryzen™ AI NPUs.
+
+Provides the primary abstractions for describing NPU designs:
+
+- [`Buffer`][aie.iron.Buffer] — named memory region shared between Workers and the Runtime
+- [`ObjectFifo`][aie.iron.ObjectFifo] — synchronized dataflow channel between program components
+- [`CascadeFlow`][aie.iron.CascadeFlow] — directed cascade stream connection between two Workers
+- [`Worker`][aie.iron.Worker] — a task running on an AIE compute core
+- [`Runtime`][aie.iron.Runtime] — host-side orchestration of data movement and worker execution
+- [`DeviceConfiguration`][aie.iron.DeviceConfiguration] — one ``aie.device`` image
+- [`Program`][aie.iron.Program] — module-level composition and compilation unit
+- [`Kernel`][aie.iron.Kernel] / [`ExternalFunction`][aie.iron.ExternalFunction] — pre-compiled or C++ kernel functions
+- [`KernelObject`][aie.iron.KernelObject] — shared link artifact and compilation ownership
+- [`ObjectFile`][aie.iron.ObjectFile] — prebuilt object-file bindings with a symbol namespace
+- [`WorkerRuntimeBarrier`][aie.iron.WorkerRuntimeBarrier] — synchronization primitive between workers and runtime
+- Tensor utilities ([`arange`][aie.iron.arange], [`zeros`][aie.iron.zeros], [`ones`][aie.iron.ones], etc.) for NPU-accessible buffers
+- dtype helpers ([`str_to_dtype`][aie.iron.str_to_dtype], [`dtype_to_str`][aie.iron.dtype_to_str])
+- [`CompilableDesign`][aie.iron.CompilableDesign] / [`compileconfig`][aie.iron.compileconfig] — bundle a generator with compile-time config
+- [`CallableDesign`][aie.iron.CallableDesign] / [`jit`][aie.iron.jit] — JIT-compile and run on the NPU (Triton-style)
+- [`CompileTime`][aie.iron.CompileTime] / [`In`][aie.iron.In] / [`Out`][aie.iron.Out] / [`InOut`][aie.iron.InOut] — type-annotation markers
+- [`DispatchTime`][aie.iron.DispatchTime] — runtime-scalar type-annotation marker
+- [`get_compile_arg`][aie.iron.get_compile_arg] — dynamic compile-time injection (advanced)
+
+!!! note "Implicit MLIR context"
+    IRON designs decorated with `@iron.jit` execute inside an implicit
+    MLIR context (thread-local `Location` / `InsertionPoint`). See the
+    [Implicit MLIR Context](../../programming_guide/implicit_mlir_context.md)
+    guide for the mental model and how to read "no active location" errors.
+
+!!! note "Automatic shape collapse"
+    `Kernel.__call__` / `ExternalFunction.__call__` silently insert a
+    `memref.collapse_shape` when an N-D contiguous memref arg is fed
+    into a 1-D kernel signature with the same element count and dtype
+    (typical case: IRON L1 ObjectFifo elements are 2-D, `kernels.X`
+    helpers declare flat 1-D args). Real shape / dtype mismatches still
+    surface at MLIR verification time.
+"""
+
+from aie.helpers.taplib._symbolic import require
+from aie.utils import (
+    arange,
+    ceildiv,
+    ensure_current_device,
+    full,
+    get_current_device,
+    ones,
+    rand,
+    randint,
+    set_current_device,
+    set_tensor_class,
+    tensor,
+    zeros,
+    zeros_like,
+)
+from aie.utils.callabledesign import CallableDesign
+from aie.utils.compile.jit import (
+    CompilableDesign,
+    CompileTime,
+    DispatchTime,
+    In,
+    InOut,
+    Out,
+    compile_context,
+    compileconfig,
+    get_compile_arg,
+)
+from aie.utils.jit import jit
+
+from . import algorithms, kernels
+from .buffer import Buffer
+from .configuration import DeviceConfiguration
+from .dataflow import (
+    Acquire,
+    Bd,
+    BdIteration,
+    CascadeFlow,
+    DmaChannel,
+    DmaEndpoint,
+    Flow,
+    FlowEndpoint,
+    ObjectFifo,
+    ObjectFifoPool,
+    ObjectFifoPoolHandle,
+    Packet,
+    PacketDest,
+    PacketFlow,
+    PoolSegment,
+    Port,
+    Release,
+    TileDma,
+    TileDmaTask,
+    Transport,
+)
+from .device import Device
+from .dtype import dtype_to_str, str_to_dtype
+from .kernel import ExternalFunction, Kernel, KernelObject, ObjectFile
+from .lock import Lock
 from .program import Program
+from .resolvable import PerDeviceConfigurationResolvable, Resolvable
+from .runtime import Runtime, RuntimeData, Task, TaskGroup, sync_parameters
+from .scratchpad_parameter import ScratchpadParameter
 from .worker import Worker, WorkerRuntimeBarrier
-from .runtime import Runtime
-from .dataflow import ObjectFifo
 
-try:
-    # The .jit module requires pyxrt which may not exist.
-    # The try-except block tests if the module exists and
-    # imports the .jit module.
-    import pyxrt
-    from .jit import jit
-    from .config import set_current_device, get_current_device, detect_npu_device
-
-    from .tensor import (
-        tensor,
-        ones,
-        zeros,
-        randint,
-        rand,
-        arange,
-        zeros_like,
-    )
-except ImportError:
-    pass  # silently ignore if pyxrt or .jit can't be imported
+__all__ = [
+    "ObjectFifoPool",
+    "ObjectFifoPoolHandle",
+    "PoolSegment",
+    # Core design abstractions
+    "Buffer",
+    "DeviceConfiguration",
+    "ExternalFunction",
+    "Kernel",
+    "KernelObject",
+    "ObjectFile",
+    "Program",
+    "Resolvable",
+    "PerDeviceConfigurationResolvable",
+    "Device",
+    "Worker",
+    "WorkerRuntimeBarrier",
+    "Runtime",
+    "TaskGroup",
+    "RuntimeData",
+    "Task",
+    "sync_parameters",
+    "ObjectFifo",
+    "Packet",
+    "Port",
+    "Transport",
+    # Lower-level explicit-routing primitives
+    "Acquire",
+    "Bd",
+    "BdIteration",
+    "CascadeFlow",
+    "DmaChannel",
+    "DmaEndpoint",
+    "Flow",
+    "FlowEndpoint",
+    "Lock",
+    "ScratchpadParameter",
+    "PacketDest",
+    "PacketFlow",
+    "Release",
+    "TileDma",
+    "TileDmaTask",
+    # Compile-time / JIT API
+    "CompileTime",
+    "DispatchTime",
+    "In",
+    "Out",
+    "InOut",
+    "CompilableDesign",
+    "CallableDesign",
+    "compileconfig",
+    "jit",
+    "compile_context",
+    "get_compile_arg",
+    "require",
+    # Tensor factories
+    "tensor",
+    "ones",
+    "zeros",
+    "full",
+    "randint",
+    "rand",
+    "arange",
+    "zeros_like",
+    "ceildiv",
+    "set_tensor_class",
+    "set_current_device",
+    "get_current_device",
+    "ensure_current_device",
+    # dtype helpers
+    "str_to_dtype",
+    "dtype_to_str",
+    # Submodules
+    "kernels",
+    "algorithms",
+]

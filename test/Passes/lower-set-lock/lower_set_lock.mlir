@@ -1,10 +1,7 @@
 //===- lower_set_lock.mlir -------------------------------------*- MLIR -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2025 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// Copyright (C) 2025, Advanced Micro Devices, Inc.
 //
 //===----------------------------------------------------------------------===//
 
@@ -24,33 +21,60 @@ module @test_simple_lock_set {
     %lock00_5 = aie.lock(%shimtile00, 5)  {init = 1 : i32}
 
     %core22 = aie.core(%tile22) {
-        aie.use_lock(%lock22_0, "Acquire", 0)
-        aie.use_lock(%lock22_15, "Acquire", 1)
+        %c0_ul0 = arith.constant 0 : i32
+        aie.use_lock(%lock22_0, "Acquire", %c0_ul0)
+        %c1_ul1 = arith.constant 1 : i32
+        aie.use_lock(%lock22_15, "Acquire", %c1_ul1)
         // Do operations
         aie.end
     }
 
-    aie.shim_dma_allocation @in0(S2MM, 0, 0)
-    aie.shim_dma_allocation @out0(MM2S, 0, 0)
+    %tile_0_0 = aie.tile(0, 0)
+    aie.shim_dma_allocation @in0 (%tile_0_0, S2MM, 0)
+    aie.shim_dma_allocation @out0 (%tile_0_0, MM2S, 0)
 
-    aiex.runtime_sequence(%arg0: memref<1024xi32>, %arg1: memref<1024xi32>) {
+    aie.runtime_sequence(%arg0: memref<1024xi32>, %arg1: memref<1024xi32>) {
         // Set some runtime parameters before starting execution
 
         // 126976 = 0x0001F000 (lock 0 address in a compute tile's local address space)
-        // CHECK: aiex.npu.write32 {address = 126976 : ui32, column = 2 : i32, row = 2 : i32, value = 0 : ui32}
-        aiex.set_lock(%lock22_0, 0)
+        // CHECK-DAG: %[[V0:.*]] = arith.constant 0 : i32
+        // CHECK-DAG: %[[A0:.*]] = arith.constant 126976 : i32
+        // CHECK: aiex.npu.write32(%[[A0]], %[[V0]]) {column = 2 : i32, row = 2 : i32} : i32, i32
+        %lock22_0_v0 = arith.constant 0 : i32
+        aiex.set_lock(%lock22_0, %lock22_0_v0)
         // 127216 = 0X0001F0F0
-        // CHECK: aiex.npu.write32 {address = 127216 : ui32, column = 2 : i32, row = 2 : i32, value = 1 : ui32}
-        aiex.set_lock(%lock22_15, 1)
+        // CHECK-DAG: %[[V1:.*]] = arith.constant 1 : i32
+        // CHECK-DAG: %[[A1:.*]] = arith.constant 127216 : i32
+        // CHECK: aiex.npu.write32(%[[A1]], %[[V1]]) {column = 2 : i32, row = 2 : i32} : i32, i32
+        %lock22_15_v1 = arith.constant 1 : i32
+        aiex.set_lock(%lock22_15, %lock22_15_v1)
         // 786480 = 0x000C0030
-        // CHECK: aiex.npu.write32 {address = 786480 : ui32, column = 1 : i32, row = 1 : i32, value = 0 : ui32}
-        aiex.set_lock(%lock11_3, 0)
+        // CHECK-DAG: %[[V2:.*]] = arith.constant 0 : i32
+        // CHECK-DAG: %[[A2:.*]] = arith.constant 786480 : i32
+        // CHECK: aiex.npu.write32(%[[A2]], %[[V2]]) {column = 1 : i32, row = 1 : i32} : i32, i32
+        %lock11_3_v0 = arith.constant 0 : i32
+        aiex.set_lock(%lock11_3, %lock11_3_v0)
         // 787328 = 0x000C0380
-        // CHECK: aiex.npu.write32 {address = 787328 : ui32, column = 1 : i32, row = 1 : i32, value = 0 : ui32}
-        aiex.set_lock(%lock11_56, 0)
+        // CHECK-DAG: %[[V3:.*]] = arith.constant 0 : i32
+        // CHECK-DAG: %[[A3:.*]] = arith.constant 787328 : i32
+        // CHECK: aiex.npu.write32(%[[A3]], %[[V3]]) {column = 1 : i32, row = 1 : i32} : i32, i32
+        %lock11_56_v0 = arith.constant 0 : i32
+        aiex.set_lock(%lock11_56, %lock11_56_v0)
         // 82000 = 0x00014050
-        // CHECK: aiex.npu.write32 {address = 82000 : ui32, column = 0 : i32, row = 0 : i32, value = 0 : ui32}
-        aiex.set_lock(%lock00_5, 0)
+        // CHECK-DAG: %[[V4:.*]] = arith.constant 0 : i32
+        // CHECK-DAG: %[[A4:.*]] = arith.constant 82000 : i32
+        // CHECK: aiex.npu.write32(%[[A4]], %[[V4]]) {column = 0 : i32, row = 0 : i32} : i32, i32
+        %lock00_5_v0 = arith.constant 0 : i32
+        aiex.set_lock(%lock00_5, %lock00_5_v0)
+    }
+
+    // A runtime value is written as is, guarded to [0, max lock value].
+    // CHECK-LABEL: @runtime_value
+    // CHECK: %[[OK:.*]] = arith.cmpi ule, %arg0, %{{.*}} : i32
+    // CHECK: cf.assert %[[OK]], "a runtime lock value must be in [0:63]"
+    // CHECK: aiex.npu.write32(%{{.*}}, %arg0) {column = 1 : i32, row = 1 : i32} : i32, i32
+    aie.runtime_sequence @runtime_value(%uses: i32) {
+        aiex.set_lock(%lock11_3, %uses)
     }
   }
 }

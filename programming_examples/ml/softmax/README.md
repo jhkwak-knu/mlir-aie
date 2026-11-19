@@ -1,11 +1,8 @@
 <!---//===- README.md --------------------------*- Markdown -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2022-2026 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Copyright (C) 2024, Advanced Micro Devices, Inc.
-// 
 //===----------------------------------------------------------------------===//-->
 
 # Softmax
@@ -18,13 +15,13 @@ The softmax function is a mathematical function commonly used in machine learnin
 * Formula: For a vector,
 
     ```math
-    \mathbf{z} = \begin{bmatrix} z_1 & z_2 & \cdots & z_n \end{bmatrix} 
+    \mathbf{z} = \begin{bmatrix} z_1 & z_2 & \cdots & z_n \end{bmatrix}
     ```
 
     the softmax function for each element is,
 
     ```math
-    \sigma(\mathbf{z})_i = \frac{e^{z_i}}{\sum_{j=1}^n e^{z_j}} 
+    \sigma(\mathbf{z})_i = \frac{e^{z_i}}{\sum_{j=1}^n e^{z_j}}
     ```
 
     where e is the base of the natural logarithm.
@@ -32,53 +29,51 @@ The softmax function is a mathematical function commonly used in machine learnin
 * Output as Probabilities: The output of the softmax function is a vector where each component is between 0 and 1, and the sum of all components is 1. This makes it useful for interpreting the outputs as probabilities.
 
 
-## Compilation details
+## Design Overview
 
-The softmax function employs the exponential function $e^x$, similar to the example found [here](../../basic/vector_exp/). Again to efficiently implement softmax, a lookup table approximation is utilized.
+Softmax is computed independently per 1024-element tile (no cross-tile reduction), so the design scales like `ml/eltwise_unary` — the body delegates to `iron.algorithms.transform_parallel` with `num_channels=2`. The per-tile kernel comes from `aie.iron.kernels.softmax`, which uses a lookup-table approximation of `e^x` (similar to [`basic/vector_exp`](../../basic/vector_exp/)).
 
-In addition, and unlike any of the other current design examples, this example uses MLIR dialects as direct input, including the `vector`,`affine`,`arith` and `math` dialects.  This is shown in the [source](./bf16_softmax.mlir).  This is intended to be generated from a higher-level description but is shown here as an example of how you can use other MLIR dialects as input.
 
-The compilation process is different from the other design examples, and is shown in the [Makefile](./Makefile).
+## Source Files Overview
 
-1. The input MLIR is first vectorized into chunks of size 16, and a C++ file is produced which has mapped the various MLIR dialects into AIE intrinsics, including vector loads and stores, vectorized arithmetic on those registers, and the $e^x$ approximation using look up tables
-1. This generated C++ is compiled into a first object file
-1. A file called `lut_based_ops.cpp` from the AIE2 runtime library is compiled into a second object file.  This file contains the look up table contents to approximate the $e^x$ function.
-1. A wrapper file is also compiled into an object file, which prevents C++ name mangling, and allows the wrapped C function to be called from the strucural Python
-1. These 3 object files are combined into a single .a file, which is then referenced inside the `softmax.py` structural Python.
+1. `softmax.py`: IRON design driven by `@iron.jit`; one `transform_parallel` call over `kernels.softmax(tile_size=1024)`.
 
-This is a slightly more complex process than the rest of the examples, which typically only use a single object file containing the wrapped C++ function call, but is provided to show how a library-based flow can also be used.
+1. `test.cpp`: C++ testbench that loads the compiled XCLBIN + `insts.bin`, runs the kernel, and verifies the output against a CPU reference.
 
-1. `softmax.py`: A Python script that defines the AIE array structural design using MLIR-AIE operations. This generates MLIR that is then compiled using aiecc.py to produce design binaries (ie. XCLBIN and inst.bin for the NPU in Ryzen™ AI).
-
-2. `softmax_placed.py`: An alternative version of the design in softmax.py, that is expressed in a lower-level version of IRON.
-
-3. `softmax_whole_array_placed.py`: This Python script extends the design to utilize the entire AIE array, scaling up from the use of two cores in `softmax_placed.py`. The number of cores of the AIE array (`n_cores`) is configurable via the `n_col` and `n_cores_per_col` variables.
 
 ## Usage
 
-### C++ Testbench
+### Standalone JIT verification
 
-To compile the design and C++ testbench:
 ```shell
-make
+python3 softmax.py
+python3 softmax.py --dev npu2
+python3 softmax.py --dev npu2 --channels 1
 ```
 
-To compile the placed design:
-```shell
-env use_placed=1 make
-```
+### Native C++ build and run
 
-To compile the design on whole array:
-```shell
-env use_whole_array=1 make
-```
-
-To run the design:
+Build and run with default settings (npu1):
 ```shell
 make run
 ```
 
-To generate a [trace file](../../../programming_guide/section-4/section-4b/README.md):
+Target Strix (npu2):
 ```shell
-env use_placed=1 make trace
+make run devicename=npu2
 ```
+
+Build and run with custom runtime parameters:
+```shell
+make run size=524288 n_iterations=100 n_warmup=20
+```
+
+### Configuration Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `size` | 262144 | Input data size (number of elements) |
+| `chans` | 2 | Shim DMA channels per column (1 or 2) |
+| `n_iterations` | 20 | Number of benchmark iterations |
+| `n_warmup` | 10 | Number of warmup iterations |
+| `devicename` | npu | Target device (`npu` or `npu2`) |

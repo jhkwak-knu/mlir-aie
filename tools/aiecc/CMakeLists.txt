@@ -1,0 +1,128 @@
+# Copyright (C) 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+llvm_map_components_to_libnames(llvm_libs support core irreader object objcopy)
+
+# Build aiecc compiler driver
+# AiebuConfigElf.cpp belongs to the optional aiecc-aiebu library below.
+set(LLVM_OPTIONAL_SOURCES AiebuConfigElf.cpp)
+add_llvm_executable(aiecc aiecc.cpp StackSizeAnalysis.cpp Provenance.cpp)
+llvm_update_compile_flags(aiecc)
+
+# Refresh AIECCVersion.h each build so --version reflects the current SHA.
+# GenVersion.cmake only rewrites the file when the SHA changes, so aiecc.cpp
+# is not pointlessly rebuilt.
+set(AIECC_VERSION_HEADER ${CMAKE_CURRENT_BINARY_DIR}/AIECCVersion.h)
+add_custom_target(aiecc_version ALL
+  BYPRODUCTS ${AIECC_VERSION_HEADER}
+  COMMAND ${CMAKE_COMMAND}
+    -DSOURCE_DIR=${CMAKE_SOURCE_DIR}
+    -DOUTPUT_FILE=${AIECC_VERSION_HEADER}
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/GenVersion.cmake
+  COMMENT "Updating aiecc git SHA"
+  VERBATIM)
+add_dependencies(aiecc aiecc_version)
+target_include_directories(aiecc PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+# aiecc.cpp uses __DATE__ / __TIME__ for the --version banner; that's
+# intentional (we want the compile timestamp) so silence -Wdate-time.
+# The flag is GCC/Clang-only; MSVC rejects it as an invalid argument.
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+  set_source_files_properties(aiecc.cpp PROPERTIES
+    COMPILE_OPTIONS "-Wno-date-time")
+endif()
+install(TARGETS aiecc
+  EXPORT AIETargets
+  RUNTIME DESTINATION ${LLVM_TOOLS_INSTALL_DIR}
+  COMPONENT aiecc)
+
+get_property(dialect_libs GLOBAL PROPERTY MLIR_DIALECT_LIBS)
+get_property(conversion_libs GLOBAL PROPERTY MLIR_CONVERSION_LIBS)
+get_property(extension_libs GLOBAL PROPERTY MLIR_EXTENSION_LIBS)
+
+set(LIBS
+  ${dialect_libs}
+  ${conversion_libs}
+  ${extension_libs}
+  MLIROptLib
+  MLIRParser
+  MLIRPass
+  MLIRSupport
+  MLIRIR
+  MLIRRegisterAllDialects
+  MLIRRegisterAllExtensions
+  MLIRRegisterAllPasses
+  MLIRTransformDialect
+  MLIRTargetLLVMIRExport
+  MLIRLLVMToLLVMIRTranslation
+  MLIRBuiltinToLLVMIRTranslation
+  AIE
+  AIETargets
+  AIETransforms
+  AIEX
+  AIEXTransforms
+  AIEXUtils
+  MLIRAIEToConfiguration
+  MLIRAIEVecDialect
+  MLIRAIEVecAIE1Dialect
+  MLIRAIEVecTransformOps
+  MLIRAIEVecTransforms
+  MLIRAIEVecToLLVM
+  MLIRXLLVMDialect
+  MLIRXLLVMToLLVMIRTranslation
+  ${llvm_libs}
+  )
+
+target_link_libraries(aiecc PUBLIC ${LIBS})
+
+# Optional: AIEBU library for direct ELF generation (avoids subprocess to aiebu-asm)
+if(aiebu_FOUND)
+  target_link_libraries(aiecc PRIVATE AIEBU::aiebu_static)
+  target_include_directories(aiecc PRIVATE ${AIEBU_INCLUDE_DIRS})
+  target_compile_definitions(aiecc PRIVATE AIECC_HAS_AIEBU_LIBRARY)
+  message(STATUS "aiecc: Enabled AIEBU library integration")
+
+  # The full ELF needs aiebu's in-memory config API (aiebu::file_artifact),
+  # which older XRTs lack; without it the full ELF falls back to `aiebu-asm`.
+  # aiebu reports errors by throwing, and aiecc is built without exceptions,
+  # so the call is wrapped in its own library compiled with them.
+  include(CheckCXXSourceCompiles)
+  include(CMakePushCheckState)
+  cmake_push_check_state(RESET)
+  set(CMAKE_REQUIRED_INCLUDES ${AIEBU_INCLUDE_DIRS})
+  # Only the declarations are being checked; linking would need aiebu's deps.
+  set(_aiecc_saved_try_compile_type ${CMAKE_TRY_COMPILE_TARGET_TYPE})
+  set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+  check_cxx_source_compiles([[
+    #include <aiebu/aiebu_assembler.h>
+    std::vector<char> f(const std::vector<char> &config,
+                        const aiebu::file_artifact &artifact) {
+      return aiebu::aiebu_assembler(
+          aiebu::aiebu_assembler::buffer_type::aie2_config, config, artifact,
+          {}).get_elf();
+    }
+    int main() { return 0; }
+  ]] AIECC_AIEBU_HAS_IN_MEMORY_CONFIG_ELF)
+  set(CMAKE_TRY_COMPILE_TARGET_TYPE ${_aiecc_saved_try_compile_type})
+  cmake_pop_check_state()
+  if(AIECC_AIEBU_HAS_IN_MEMORY_CONFIG_ELF)
+    add_library(aiecc-aiebu STATIC AiebuConfigElf.cpp)
+    set_target_properties(aiecc-aiebu PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(aiecc-aiebu PRIVATE ${AIEBU_INCLUDE_DIRS})
+    target_link_libraries(aiecc-aiebu PRIVATE AIEBU::aiebu_static)
+    if(MSVC)
+      target_compile_options(aiecc-aiebu PRIVATE /EHsc)
+    endif()
+    target_link_libraries(aiecc PRIVATE aiecc-aiebu)
+    target_compile_definitions(aiecc PRIVATE AIECC_HAS_AIEBU_CONFIG_ELF)
+    message(STATUS "aiecc: Enabled in-memory AIEBU full-ELF assembly")
+  endif()
+endif()
+
+# bootgen library for direct PDI generation (avoids subprocess to bootgen)
+# Uses C API wrapper that handles exceptions internally
+if(TARGET bootgen-lib)
+  find_package(OpenSSL REQUIRED)
+  target_link_libraries(aiecc PRIVATE bootgen-lib OpenSSL::SSL OpenSSL::Crypto)
+  target_compile_definitions(aiecc PRIVATE AIECC_HAS_BOOTGEN_LIBRARY)
+  message(STATUS "aiecc: Enabled bootgen library integration")
+endif()

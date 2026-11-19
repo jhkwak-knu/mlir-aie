@@ -1,12 +1,12 @@
 #
-# This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-# See https://llvm.org/LICENSE.txt for license information.
+# Copyright (C) 2022 Xilinx, Inc.
+# Copyright (C) 2022-2026 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #
-# (c) Copyright 2022 Xilinx Inc.
 
 add_mlir_dialect_library(AIEX
   AIEXDialect.cpp
+  DmaDecomposition.cpp
   ADDITIONAL_HEADER_DIRS
   ${AIE_BINARY_DIR}/include
 
@@ -14,6 +14,7 @@ add_mlir_dialect_library(AIEX
   MLIRAIEAttrDefsIncGen
   MLIRAIEEnumsIncGen
   MLIRAIEXIncGen
+  MLIRAIEXEnumsIncGen
 
   LINK_LIBS PUBLIC
   AIE

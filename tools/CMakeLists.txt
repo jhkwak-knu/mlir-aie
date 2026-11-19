@@ -1,16 +1,28 @@
 #
-# This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-# See https://llvm.org/LICENSE.txt for license information.
+# Copyright (C) 2021-2022 Xilinx, Inc.
+# Copyright (C) 2022-2026 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #
-# (c) Copyright 2021 Xilinx Inc.
 
 add_subdirectory(aie-opt)
 if(NOT CMAKE_SYSTEM_NAME MATCHES "Windows")
   add_subdirectory(aie-reset)
 endif()
-add_subdirectory(aie-lsp-server)
+if(AIE_BUILD_LSP_SERVER)
+  add_subdirectory(aie-lsp-server)
+endif()
 add_subdirectory(aie-translate)
-add_subdirectory(aie-visualize)
+if(AIE_BUILD_VISUALIZE)
+  add_subdirectory(aie-visualize)
+endif()
+# bootgen must be configured before aiecc so the `bootgen-lib` target exists
+# when aiecc's CMakeLists checks `if(TARGET bootgen-lib)` to enable in-process
+# PDI generation via the bootgen C API.
 add_subdirectory(bootgen)
-add_subdirectory(chess-clang)
+add_subdirectory(aiecc)
+if(AIE_BUILD_CHESS_CLANG)
+  add_subdirectory(chess-clang)
+endif()
+if(AIE_BUILD_HRXXCLBINUTIL)
+  add_subdirectory(hrx-xclbinutil)
+endif()

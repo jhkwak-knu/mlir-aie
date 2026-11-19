@@ -1,0 +1,209 @@
+# _dma_size_parser.py -*- Python -*-
+#
+# Copyright (C) 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+#
+"""Extract per-host-tensor bit counts from aiecc's lowered MLIR.
+
+aiecc writes ``input_with_addresses.mlir`` into the kernel directory as part
+of compilation.  The host-facing ``aie.runtime_sequence`` carries fully
+typed memref arguments — e.g.:
+
+```mlir
+aie.runtime_sequence @sequence(%arg0: memref<65536xbf16>,
+                               %arg1: memref<65536xbf16>) {
+  ...
+}
+```
+
+The argument types ARE the kernel's host-side contract, so we read each
+tensor's memref shape and compute its footprint in bits. Dispatch scalars
+are skipped. No need to walk
+``aie.dma_bd`` ops, distinguish host-facing transfers from tile-internal
+DMAs, or fold multi-DMA patterns (fan-out / repeated load / InOut fill+drain)
+back together — the runtime_sequence signature already represents what the
+caller must supply.
+
+Modules can declare more than one ``aie.runtime_sequence`` (helper
+sub-sequences invoked via ``aiex.run @<name>(...)``, or per-device main
+sequences in a multi-device program).  We pick the unique **call-graph
+root** — the runtime_sequence that no other sequence calls — as the
+host-facing entry point.  If there is no unique root (cyclic, or multi-
+device with several roots), we return ``None`` and the caller skips
+validation rather than risk validating against the wrong signature.
+
+The lowered IR may reference unregistered ops or fail strict verification
+(e.g. ``memref.alloca`` outside an ``AutomaticAllocationScope``), so the
+parsing context allows unregistered dialects.
+"""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+
+def parse_dma_sizes(kernel_dir: Path, entry: str | None = None) -> list[int] | None:
+    """Return per-host-arg footprints, in bits, from ``input_with_addresses.mlir``.
+
+    The returned list follows ``aie.runtime_sequence`` tensor argument
+    order, skipping scalars. Each entry is the product of the static dims and
+    the element type's size under the data layout. Bits rather than elements because a
+    host buffer need not divide its bits into elements the way the memref
+    does, and bits rather than bytes so a sub-byte element type stays exact.
+
+    Args:
+        kernel_dir: Directory aiecc wrote its lowered MLIR into.
+        entry: The ``"device:sequence"`` host entry to inspect. If omitted,
+            the parser infers a unique call-graph root.
+
+    Returns:
+        A list of per-tensor bit counts (scalar arguments are skipped),
+        or ``None`` when validation can't be
+        performed safely:
+
+        * file is absent or unparseable
+        * no runtime_sequence found, or no unique call-graph root (e.g.
+          multi-device modules with multiple top-level sequences)
+        * any arg has an unsupported type, a dynamic-shape dim, or an element
+          type the data layout does not describe
+    """
+    mlir_path = kernel_dir / "input_with_addresses.mlir"
+    if not mlir_path.exists():
+        return None
+    try:
+        # Trigger AIE/aiex dialect registration before constructing the context.
+        from aie import (  # pyright: ignore[reportMissingImports]
+            ir,  # pyright: ignore[reportAttributeAccessIssue]
+        )
+        from aie._mlir_libs import (  # pyright: ignore[reportMissingImports]
+            get_dialect_registry,  # pyright: ignore[reportAttributeAccessIssue]
+        )
+        from aie._mlir_libs._aie import (  # pyright: ignore[reportMissingImports]
+            type_size_in_bits,
+        )
+        from aie.dialects import aie as _aie  # noqa: F401
+        from aie.dialects import aiex as _aiex  # noqa: F401
+
+        device_op_type = _aie.DeviceOp  # pyright: ignore[reportAttributeAccessIssue]
+        run_op_type = _aiex.RunOp  # pyright: ignore[reportAttributeAccessIssue]
+        runtime_sequence_op_type = (
+            _aie.RuntimeSequenceOp  # pyright: ignore[reportAttributeAccessIssue]
+        )
+
+        ir_context = ir.Context  # pyright: ignore[reportAttributeAccessIssue]
+        ir_location = ir.Location  # pyright: ignore[reportAttributeAccessIssue]
+        ir_module = ir.Module  # pyright: ignore[reportAttributeAccessIssue]
+
+        ctx = ir_context()
+        ctx.append_dialect_registry(get_dialect_registry())
+        ctx.load_all_available_dialects()
+        ctx.allow_unregistered_dialects = True
+        mlir_text = mlir_path.read_text()
+        with ctx, ir_location.unknown():
+            module = ir_module.parse(mlir_text)
+
+        # Pass 1: collect every runtime_sequence + record aiex.run call edges.
+        all_sequences: list = []
+        named_sequences: dict = {}  # sym_name -> op  (anonymous ones omitted)
+        qualified_sequences: dict = {}
+        called: set = set()
+        for op in _walk(module.operation):
+            op_view = op.opview
+            if isinstance(op_view, runtime_sequence_op_type):
+                all_sequences.append(op_view)
+                try:
+                    sym = op_view.sym_name.value
+                except KeyError:
+                    continue
+                named_sequences[sym] = op_view
+                parent = op.parent
+                while parent is not None and not isinstance(
+                    parent.opview, device_op_type
+                ):
+                    parent = parent.parent
+                if parent is not None:
+                    device_op = parent.opview
+                    device = (
+                        device_op.sym_name.value
+                        if device_op.sym_name is not None
+                        else "main"
+                    )
+                    qualified_sequences[f"{device}:{sym}"] = op_view
+            elif isinstance(op_view, run_op_type):
+                called.add(op_view.runtime_sequence_symbol.value)
+
+        if not all_sequences:
+            return None
+
+        # Pass 2: pick the entry point.
+        if entry is not None:
+            if entry not in qualified_sequences:
+                return None
+            selected_sequence = qualified_sequences[entry]
+        elif len(all_sequences) == 1:
+            # Only one sequence in the module — trivially the root.  Works
+            # whether or not it carries a sym_name.
+            selected_sequence = all_sequences[0]
+        else:
+            # Multiple sequences: each must be named so we can reason about
+            # the call graph.  Entry point = the unique root (not called by
+            # any other sequence).  Anything else → bail and skip validation.
+            if len(named_sequences) != len(all_sequences):
+                return None
+            roots = [op for sym, op in named_sequences.items() if sym not in called]
+            if len(roots) != 1:
+                # 0 roots => cyclic; >1 roots => multi-device or multiple
+                # top-level entries — can't unambiguously map host tensors.
+                return None
+            selected_sequence = roots[0]
+
+        # Pass 3: read each arg's memref footprint, in bits.
+        seq_block = selected_sequence.operation.regions[0].blocks[0]
+        sizes: list[int] = []
+        memref_type = ir.MemRefType  # pyright: ignore[reportAttributeAccessIssue]
+        scalar_types = (
+            ir.IntegerType,  # pyright: ignore[reportAttributeAccessIssue]
+            ir.IndexType,  # pyright: ignore[reportAttributeAccessIssue]
+        )
+        for arg in seq_block.arguments:
+            t = arg.type
+            if isinstance(t, scalar_types):
+                continue
+            if not isinstance(t, memref_type):
+                return None
+            if not t.has_static_shape:
+                return None
+            # Bits, from the element type's own data layout: a host buffer and
+            # the memref agree on how many bits they cover but need not agree on
+            # how those bits are divided into elements. A v8bfp16ebs8 memref
+            # counts one element per 72-bit block where the host counts bytes.
+            bits = type_size_in_bits(t.element_type)
+            if not bits:
+                return None
+            elems = 1
+            for d in t.shape:
+                elems *= d
+            sizes.append(elems * bits)
+        return sizes if sizes else None
+    except Exception:
+        # Any binding / parsing failure means validation is unavailable
+        # rather than a hard error — a binding regression must not crash
+        # the JIT path.  Logged so the regression is still visible.
+        logger.debug(
+            "parse_dma_sizes: failed to parse %s; tensor validation disabled",
+            mlir_path,
+            exc_info=True,
+        )
+        return None
+
+
+def _walk(op):
+    """Yield *op* and every descendant op (pre-order)."""
+    yield op
+    for region in op.regions:
+        for block in region.blocks:
+            for sub in block.operations:
+                yield from _walk(sub.operation)

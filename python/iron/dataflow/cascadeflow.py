@@ -1,0 +1,73 @@
+# cascadeflow.py -*- Python -*-
+#
+# Copyright (C) 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+#
+"""CascadeFlow: a directed cascade stream connection between two Workers."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from ...dialects.aie import (
+    cascade_flow as _cascade_flow_op,  # pyright: ignore[reportAttributeAccessIssue]
+)
+from ...helpers.sourceloc import Declared, SourceSite
+from ..resolvable import PerDeviceConfigurationResolvable
+
+if TYPE_CHECKING:
+    # Import guarded: worker.py imports from dataflow/, so a module-level
+    # import here would be circular. The annotation is a lazy string via
+    # `from __future__ import annotations`, so this is type-check only.
+    from ..worker import Worker
+
+
+class CascadeFlow(Declared, PerDeviceConfigurationResolvable):
+    """A directed cascade stream connection from one Worker to another.
+
+    Construct one of these for each cascade edge in your design:
+
+    ```python
+    CascadeFlow(producer_worker, consumer_worker)
+    ```
+
+    Lowers to ``aie.cascade_flow(producer.tile, consumer.tile)`` after both
+    Workers are placed. The kernel functions are responsible for using the
+    ``put_mcd`` / ``get_scd`` intrinsics to actually drive/read the cascade
+    stream — this object only declares the directed topology edge.
+
+    Hardware constraints (enforced by the underlying op verifier):
+
+    * Source and destination tiles must be cardinal-adjacent.
+    * Each compute tile has at most one cascade input (from N or W) and one
+      cascade output (to S or E). Multiple cascade outputs from the same
+      tile will fail at lowering, not at construction.
+    * ShimTiles and MemTiles do not have cascade interfaces.
+
+    Discovery: each newly-constructed CascadeFlow registers itself on its
+    *source* Worker's ``_outgoing_cascades`` list. ``DeviceConfiguration.resolve()``
+    walks its workers and resolves each worker's outgoing
+    cascades after placement — no global registry, no drain step.
+    """
+
+    def __init__(self, src: "Worker", dst: "Worker"):
+        """Construct a CascadeFlow.
+
+        Args:
+            src: Source `Worker` whose tile drives the cascade stream.
+            dst: Destination `Worker` whose tile reads the cascade stream.
+        """
+        self._site = SourceSite.capture()
+        self._src = src
+        self._dst = dst
+        # The source registration makes the edge part of its configuration's graph.
+        src._outgoing_cascades.append(self)
+
+    def resolve(self, loc=None, ip=None) -> None:
+        """Emit ``aie.cascade_flow(src.tile, dst.tile)``."""
+        _cascade_flow_op(
+            self._src.tile.op,
+            self._dst.tile.op,
+            loc=loc or self._site.location(),
+            ip=ip,
+        )

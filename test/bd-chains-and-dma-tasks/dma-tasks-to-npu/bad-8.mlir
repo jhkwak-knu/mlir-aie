@@ -1,9 +1,7 @@
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2022-2025 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// (c) Copyright 2024 AMD Inc.
 
 // RUN: aie-opt --verify-diagnostics --aie-dma-tasks-to-npu %s 
 
@@ -15,11 +13,11 @@ module {
     %tile_0_0 = aie.tile(0, 0)
     %tile_0_2 = aie.tile(0, 2)
 
-    aiex.runtime_sequence(%arg0: memref<32xi8>) {
+    aie.runtime_sequence(%arg0: memref<32xi8>) {
       %t1 = aiex.dma_configure_task(%tile_0_0, MM2S, 0) {
-          aie.dma_bd(%arg0 : memref<32xi8>, 3, 4)
+          aie.dma_bd(%arg0 : memref<32xi8> offset = 3 len = 4)
           // expected-note@+1 {{Extra}}
-          aie.dma_bd(%arg0 : memref<32xi8>, 3, 4)
+          aie.dma_bd(%arg0 : memref<32xi8> offset = 3 len = 4)
           // expected-error@+1 {{This block contains multiple}}
           aie.end
       }

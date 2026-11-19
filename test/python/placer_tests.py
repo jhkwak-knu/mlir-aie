@@ -1,20 +1,52 @@
-# Copyright (C) 2025, Advanced Micro Devices, Inc.
+# Copyright (C) 2025 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 import numpy as np
 from aie.iron import ObjectFifo, Program, Runtime, Worker
-from aie.iron.placers import SequentialPlacer
-from aie.iron.device import NPU2, AnyComputeTile, Tile
-from aie.helpers.util import np_ndarray_type_get_shape
+from aie.iron.device import NPU2, AnyMemTile, Tile
+from aie.helpers.npdtypes import np_ndarray_type_get_shape
 from util import construct_and_print_module
 
 # RUN: %python %s | FileCheck %s
 
 
+# CHECK-LABEL: TEST: objectfifo_order
+# CHECK: aie.objectfifo @in_A
+# CHECK: aie.objectfifo @in_B
+# CHECK: aie.objectfifo @out_C
+@construct_and_print_module
+def objectfifo_order(module):
+    N = 4096
+    n = 1024
+
+    n_ty = np.ndarray[(n,), np.dtype[np.int32]]
+
+    of_in_A = ObjectFifo(n_ty, name="in_A")
+    of_in_B = ObjectFifo(n_ty, name="in_B")
+    of_out_C = ObjectFifo(n_ty, name="out_C")
+
+    def core_fn(in_A, in_B, out_C):
+        pass
+
+    my_worker = Worker(core_fn, [of_in_A.cons(), of_in_B.cons(), of_out_C.prod()])
+
+    def sequence(A, B, C, in_A, in_B, out_C):
+        in_A.fill(A)
+        in_B.fill(B)
+        out_C.drain(C, wait=True)
+
+    rt = Runtime(
+        sequence,
+        [n_ty, n_ty, n_ty, of_in_A.prod(), of_in_B.prod(), of_out_C.cons()],
+    )
+    module = Program(NPU2(), rt, workers=[my_worker]).resolve_program()
+    return module
+
+
 # CHECK-LABEL: TEST: shim_three_in
-# CHECK: %[[shim_noc_tile_0_0:.+]] = aie.tile
-# CHECK: %[[shim_noc_tile_1_0:.+]] = aie.tile
-# CHECK-NOT: %[[shim_noc_tile_2_0:.+]] = aie.tile(2, 0)
+# CHECK: aie.logical_tile<ShimNOCTile>
+# CHECK: aie.logical_tile<ShimNOCTile>
+# CHECK: aie.logical_tile<ShimNOCTile>
 @construct_and_print_module
 def shim_three_in(module):
     N = 4096
@@ -34,20 +66,23 @@ def shim_three_in(module):
     for i in range(n_inputs):
         workers.append(Worker(core_fn, [of_ins[i].cons()]))
 
-    rt = Runtime()
-    with rt.sequence(n_ty, n_ty, n_ty) as (A, B, C):
-        rt.start(*workers)
-        rt.fill(of_ins[0].prod(), A)
-        rt.fill(of_ins[1].prod(), B)
-        rt.fill(of_ins[2].prod(), C)
+    def sequence(A, B, C, in_0, in_1, in_2):
+        in_0.fill(A)
+        in_1.fill(B)
+        in_2.fill(C)
 
-    module = Program(NPU2(), rt).resolve_program(SequentialPlacer())
+    rt = Runtime(
+        sequence,
+        [n_ty, n_ty, n_ty, of_ins[0].prod(), of_ins[1].prod(), of_ins[2].prod()],
+    )
+    module = Program(NPU2(), rt, workers=workers).resolve_program()
     return module
 
 
 # CHECK-LABEL: TEST: shim_two_in_one_out
-# CHECK: %[[shim_noc_tile_0_0:.+]] = aie.tile(0, 0)
-# CHECK-NOT: %[[shim_noc_tile_1_0:.+]] = aie.tile(1, 0)
+# CHECK: aie.logical_tile<ShimNOCTile>
+# CHECK: aie.logical_tile<ShimNOCTile>
+# CHECK: aie.logical_tile<ShimNOCTile>
 @construct_and_print_module
 def shim_two_in_one_out(module):
     N = 4096
@@ -64,20 +99,22 @@ def shim_two_in_one_out(module):
 
     my_worker = Worker(core_fn, [of_in_A.cons(), of_in_B.cons(), of_out_C.prod()])
 
-    rt = Runtime()
-    with rt.sequence(n_ty, n_ty, n_ty) as (A, B, C):
-        rt.start(my_worker)
-        rt.fill(of_in_A.prod(), A)
-        rt.fill(of_in_B.prod(), B)
-        rt.drain(of_out_C.cons(), C, wait=True)
+    def sequence(A, B, C, in_A, in_B, out_C):
+        in_A.fill(A)
+        in_B.fill(B)
+        out_C.drain(C, wait=True)
 
-    module = Program(NPU2(), rt).resolve_program(SequentialPlacer())
+    rt = Runtime(
+        sequence,
+        [n_ty, n_ty, n_ty, of_in_A.prod(), of_in_B.prod(), of_out_C.cons()],
+    )
+    module = Program(NPU2(), rt, workers=[my_worker]).resolve_program()
     return module
 
 
 # CHECK-LABEL: TEST: compute_three_in
-# CHECK: %[[tile_0_2:.+]] = aie.tile(0, 2)
-# CHECK-NOT: %[[tile_0_3:.+]] = aie.tile(0, 3)
+# CHECK: aie.logical_tile<CoreTile>
+# CHECK-NOT: aie.logical_tile<CoreTile>
 @construct_and_print_module
 def compute_three_in(module):
     n = 1024
@@ -93,20 +130,23 @@ def compute_three_in(module):
 
     worker = Worker(core_fn, [of_0.cons(), of_1.cons(), of_2.cons()])
 
-    rt = Runtime()
-    with rt.sequence(n_ty, n_ty, n_ty) as (A, B, C):
-        rt.start(worker)
-        rt.fill(of_0.prod(), A)
-        rt.fill(of_1.prod(), B)
-        rt.fill(of_2.prod(), C)
+    def sequence(A, B, C, in_0, in_1, in_2):
+        in_0.fill(A)
+        in_1.fill(B)
+        in_2.fill(C)
 
-    module = Program(NPU2(), rt).resolve_program(SequentialPlacer())
+    rt = Runtime(
+        sequence,
+        [n_ty, n_ty, n_ty, of_0.prod(), of_1.prod(), of_2.prod()],
+    )
+    module = Program(NPU2(), rt, workers=[worker]).resolve_program()
     return module
 
 
 # CHECK-LABEL: TEST: compute_one_in_two_links
-# CHECK: %[[tile_0_2:.+]] = aie.tile
-# CHECK: %[[tile_0_3:.+]] = aie.tile
+# CHECK: aie.logical_tile<CoreTile>
+# CHECK: aie.logical_tile<MemTile>
+# CHECK: aie.logical_tile<MemTile>
 @construct_and_print_module
 def compute_one_in_two_links(module):
     n = 1024
@@ -116,34 +156,44 @@ def compute_one_in_two_links(module):
     of_0 = ObjectFifo(n_ty, name="of0")
     of_in1 = ObjectFifo(n_ty, name="in1")
     of_in2 = ObjectFifo(n_ty, name="in2")
-    of_out1 = of_in1.cons().forward(
-        obj_type=n_ty, name="out1", placement=AnyComputeTile
-    )
-    of_out2 = of_in2.cons().forward(
-        obj_type=n_ty, name="out_2", placement=AnyComputeTile
-    )
+    of_out1 = of_in1.cons().forward(obj_type=n_ty, name="out1", tile=AnyMemTile)
+    of_out2 = of_in2.cons().forward(obj_type=n_ty, name="out_2", tile=AnyMemTile)
 
     def core_fn(of_in0):
         pass
 
     worker = Worker(core_fn, [of_0.cons()])
 
-    rt = Runtime()
-    with rt.sequence(n_ty, n_ty, n_ty, n_ty, n_ty) as (A, B, C, D, E):
-        rt.start(worker)
-        rt.fill(of_0.prod(), A)
-        rt.fill(of_in1.prod(), B)
-        rt.fill(of_in2.prod(), C)
-        rt.drain(of_out1.cons(), D, wait=True)
-        rt.drain(of_out2.cons(), E, wait=True)
+    def sequence(A, B, C, D, E, in_0, in1, in2, out1, out2):
+        in_0.fill(A)
+        in1.fill(B)
+        in2.fill(C)
+        out1.drain(D, wait=True)
+        out2.drain(E, wait=True)
 
-    module = Program(NPU2(), rt).resolve_program(SequentialPlacer())
+    rt = Runtime(
+        sequence,
+        [
+            n_ty,
+            n_ty,
+            n_ty,
+            n_ty,
+            n_ty,
+            of_0.prod(),
+            of_in1.prod(),
+            of_in2.prod(),
+            of_out1.cons(),
+            of_out2.cons(),
+        ],
+    )
+    module = Program(NPU2(), rt, workers=[worker]).resolve_program()
     return module
 
 
 # CHECK-LABEL: TEST: compute_partial_placement
-# CHECK: %[[tile_0_2:.+]] = aie.tile
-# CHECK: %[[tile_0_4:.+]] = aie.tile
+# CHECK: aie.logical_tile<CoreTile>(0, 4)
+# CHECK: aie.logical_tile<MemTile>
+# CHECK: aie.logical_tile<MemTile>
 @construct_and_print_module
 def compute_partial_placement(module):
     n = 1024
@@ -153,36 +203,44 @@ def compute_partial_placement(module):
     of_0 = ObjectFifo(n_ty, name="of0")
     of_in1 = ObjectFifo(n_ty, name="in1")
     of_in2 = ObjectFifo(n_ty, name="in2")
-    of_out1 = of_in1.cons().forward(
-        obj_type=n_ty, name="out1", placement=AnyComputeTile
-    )
-    of_out2 = of_in2.cons().forward(
-        obj_type=n_ty, name="out_2", placement=AnyComputeTile
-    )
+    of_out1 = of_in1.cons().forward(obj_type=n_ty, name="out1", tile=AnyMemTile)
+    of_out2 = of_in2.cons().forward(obj_type=n_ty, name="out_2", tile=AnyMemTile)
 
     def core_fn(of_in0):
         pass
 
-    worker = Worker(core_fn, [of_0.cons()], placement=Tile(0, 4))
+    worker = Worker(core_fn, [of_0.cons()], tile=Tile(0, 4))
 
-    rt = Runtime()
-    with rt.sequence(n_ty, n_ty, n_ty, n_ty, n_ty) as (A, B, C, D, E):
-        rt.start(worker)
-        rt.fill(of_0.prod(), A)
-        rt.fill(of_in1.prod(), B)
-        rt.fill(of_in2.prod(), C)
-        rt.drain(of_out1.cons(), D, wait=True)
-        rt.drain(of_out2.cons(), E, wait=True)
+    def sequence(A, B, C, D, E, in_0, in1, in2, out1, out2):
+        in_0.fill(A)
+        in1.fill(B)
+        in2.fill(C)
+        out1.drain(D, wait=True)
+        out2.drain(E, wait=True)
 
-    module = Program(NPU2(), rt).resolve_program(SequentialPlacer())
+    rt = Runtime(
+        sequence,
+        [
+            n_ty,
+            n_ty,
+            n_ty,
+            n_ty,
+            n_ty,
+            of_0.prod(),
+            of_in1.prod(),
+            of_in2.prod(),
+            of_out1.cons(),
+            of_out2.cons(),
+        ],
+    )
+    module = Program(NPU2(), rt, workers=[worker]).resolve_program()
     return module
 
 
 # CHECK-LABEL: TEST: mem_eight_in_three_out
-# CHECK: %[[mem_tile_0_1:.+]] = aie.tile
-# CHECK: %[[shim_noc_tile_0_0:.+]] = aie.tile
-# CHECK: %[[mem_tile_1_1:.+]] = aie.tile
-# CHECK: %[[shim_noc_tile_1_0:.+]] = aie.tile
+# CHECK: aie.logical_tile<MemTile>
+# CHECK: aie.logical_tile<MemTile>
+# CHECK: aie.logical_tile<MemTile>
 @construct_and_print_module
 def mem_eight_in_three_out(module):
     N = 6000
@@ -216,12 +274,74 @@ def mem_eight_in_three_out(module):
     workers.append(Worker(core_fn, [of_mem_in_6.prod()]))
     workers.append(Worker(core_fn, [of_mem_in_7.prod()]))
 
-    rt = Runtime()
-    with rt.sequence(N_ty, n_ty, n_ty) as (A, B, C):
-        rt.start(*workers)
-        rt.drain(of_out_A.cons(), A, wait=True)
-        rt.drain(of_out_B.cons(), B, wait=True)
-        rt.drain(of_out_C.cons(), C, wait=True)
+    def sequence(A, B, C, out_A, out_B, out_C):
+        out_A.drain(A, wait=True)
+        out_B.drain(B, wait=True)
+        out_C.drain(C, wait=True)
 
-    module = Program(NPU2(), rt).resolve_program(SequentialPlacer())
+    rt = Runtime(
+        sequence,
+        [N_ty, n_ty, n_ty, of_out_A.cons(), of_out_B.cons(), of_out_C.cons()],
+    )
+    module = Program(NPU2(), rt, workers=workers).resolve_program()
+    return module
+
+
+# CHECK-LABEL: TEST: compute_three_in_col_lim
+# CHECK: aie.logical_tile<CoreTile>
+# CHECK: aie.logical_tile<CoreTile>
+# CHECK: aie.logical_tile<CoreTile>
+@construct_and_print_module
+def compute_three_in_col_lim(module):
+    n = 1024
+    cores_per_col = 2
+
+    n_ty = np.ndarray[(n,), np.dtype[np.int32]]
+
+    of_0 = ObjectFifo(n_ty, name="of0")
+    of_1 = ObjectFifo(n_ty, name="of1")
+    of_2 = ObjectFifo(n_ty, name="iof2")
+
+    def core_fn(of):
+        pass
+
+    workers = [
+        Worker(core_fn, [of_0.cons()]),
+        Worker(core_fn, [of_1.cons()]),
+        Worker(core_fn, [of_2.cons()]),
+    ]
+
+    def sequence(A, B, C, in_0, in_1, in_2):
+        in_0.fill(A)
+        in_1.fill(B)
+        in_2.fill(C)
+
+    rt = Runtime(
+        sequence,
+        [n_ty, n_ty, n_ty, of_0.prod(), of_1.prod(), of_2.prod()],
+    )
+    module = Program(NPU2(), rt, workers=workers).resolve_program()
+    return module
+
+
+# CHECK-LABEL: TEST: worker_tile_control_packet
+# CHECK: aie.logical_tile<CoreTile>({{.*}}) {controller_id = #aie.packet_info<pkt_type = 2, pkt_id = 3>}
+@construct_and_print_module
+def worker_tile_control_packet(module):
+    n = 1024
+    n_ty = np.ndarray[(n,), np.dtype[np.int32]]
+
+    of_in = ObjectFifo(n_ty, name="in")
+
+    def core_fn(of):
+        pass
+
+    my_tile = Tile(packet_type=2, packet_id=3)
+    my_worker = Worker(core_fn, [of_in.cons()], tile=my_tile)
+
+    def sequence(A, in_):
+        in_.fill(A)
+
+    rt = Runtime(sequence, [n_ty, of_in.prod()])
+    module = Program(NPU2(), rt, workers=[my_worker]).resolve_program()
     return module

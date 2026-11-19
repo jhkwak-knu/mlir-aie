@@ -1,10 +1,7 @@
 //===- test.cpp -------------------------------------------000---*- C++ -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2023 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// Copyright (C) 2023, Advanced Micro Devices, Inc.
 //
 //===----------------------------------------------------------------------===//
 
@@ -28,7 +25,7 @@ int main(int argc, const char *argv[]) {
   test_utils::add_default_options(options);
   options.add_options()("m", "m, number of rows in the small tile",
                         cxxopts::value<int>()->default_value("32"))(
-      "k", "k, number of columns in the small tile",
+      "tile-k", "tile-k, number of columns in the small tile",
       cxxopts::value<int>()->default_value("64"))(
       "K", "K, number of columns in the large tile",
       cxxopts::value<int>()->default_value("256"))(
@@ -49,7 +46,7 @@ int main(int argc, const char *argv[]) {
 
   // input arguments m, k, K, r, s
   int m = vm["m"].as<int>();
-  int k = vm["k"].as<int>();
+  int k = vm["tile-k"].as<int>();
   int K = vm["K"].as<int>();
   int r = vm["r"].as<int>();
   int s = vm["s"].as<int>();

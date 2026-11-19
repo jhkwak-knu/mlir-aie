@@ -1,10 +1,7 @@
 //===-- AIEVecAIE1Ops.cpp - MLIR AIE Vector Dialect Operations --*- C++ -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2024 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2024 Advanced Micro Devices, Inc. or its affiliates
 //
 //===----------------------------------------------------------------------===//
 // This file implements AIE1 vector op printing, pasing, and verification.
@@ -44,7 +41,7 @@ void AIEVecAIE1Dialect::initialize() {
 
 // Print out Add and Sub op.
 template <typename T>
-void printAddSubOp(OpAsmPrinter &p, T op) {
+static void printAddSubOp(OpAsmPrinter &p, T op) {
   // Print the lhs operand
   p << " " << op.getLhs();
   // Print the rhs operand
@@ -75,7 +72,7 @@ void SubOp::print(OpAsmPrinter &p) { printAddSubOp<SubOp>(p, *this); }
 
 // Verify Add and Sub op.
 template <typename T>
-LogicalResult verifyAddSubOp(T op) {
+static LogicalResult verifyAddSubOp(T op) {
   // Verify the types
   auto resultType = llvm::dyn_cast<VectorType>(op.getResult().getType());
   auto lhsType = llvm::dyn_cast<VectorType>(op.getLhs().getType());
@@ -96,7 +93,7 @@ LogicalResult AddOp::verify() { return verifyAddSubOp<AddOp>(*this); }
 LogicalResult SubOp::verify() { return verifyAddSubOp<SubOp>(*this); }
 
 // Parse Add and Sub op.
-ParseResult parseAddSubOp(OpAsmParser &parser, OperationState &result) {
+static ParseResult parseAddSubOp(OpAsmParser &parser, OperationState &result) {
   llvm::SMLoc typesLoc;
   SmallVector<Type, 3> types;
   OpAsmParser::UnresolvedOperand lhs, rhs;
@@ -209,7 +206,7 @@ void FMAOp::print(OpAsmPrinter &p) { printMulFMAOp<FMAOp>(p, *this); }
 
 // Verify Mul and FMA op.
 template <typename T>
-LogicalResult verifyMulFMAOp(T op) {
+static LogicalResult verifyMulFMAOp(T op) {
   // Verify the types
   auto lhsType = llvm::dyn_cast<VectorType>(op.getLhs().getType());
   auto rhsType = llvm::dyn_cast<VectorType>(op.getRhs().getType());
@@ -278,8 +275,8 @@ LogicalResult MulOp::verify() { return verifyMulFMAOp<MulOp>(*this); }
 LogicalResult FMAOp::verify() { return verifyMulFMAOp<FMAOp>(*this); }
 
 // Parse Mul and FMA op.
-ParseResult parseMulFMAOp(OpAsmParser &parser, OperationState &result,
-                          bool isFMAOp = true) {
+static ParseResult parseMulFMAOp(OpAsmParser &parser, OperationState &result,
+                                 bool isFMAOp = true) {
   llvm::SMLoc typesLoc;
   SmallVector<Type, 3> types;
   OpAsmParser::UnresolvedOperand lhs, rhs, acc;

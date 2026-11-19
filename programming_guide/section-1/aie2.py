@@ -1,45 +1,73 @@
 # section-1/aie2.py -*- Python -*-
 #
-# This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-# See https://llvm.org/LICENSE.txt for license information.
+# Copyright (C) 2025-2026 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #
-# (c) Copyright 2025 Advanced Micro Devices, Inc. or its affiliates
+"""Section-1 minimal IRON design — ``@iron.jit`` entry point.
+
+A single ``Worker`` placed on tile (0, 2) writes zeros into a local
+``Buffer``.  The runtime sequence has one tensor argument (the host-
+facing output) and starts the worker.
+
+The whole design is just a function decorated with ``@iron.jit``: the
+first call JIT-compiles + runs on the attached NPU; ``--dev npu
+--emit-mlir`` prints the lowered MLIR without touching the hardware.
+"""
+
+import argparse
 
 import numpy as np
 
-from aie.iron import Program, Runtime, Worker, LocalBuffer
-from aie.iron.placers import SequentialPlacer
-from aie.iron.device import NPU1Col1, Tile
+import aie.iron as iron
+from aie.iron import Buffer, Out, Program, Runtime, Worker
 from aie.iron.controlflow import range_
+from aie.iron.device import Tile
+from aie.utils.hostruntime.argparse import (
+    device_from_args,
+    add_compile_args,
+)
+from aie.utils.hostruntime.cli import run_design_cli
 
 data_size = 48
 data_ty = np.ndarray[(data_size,), np.dtype[np.int32]]
 
-# Dataflow configuration
-# described in a future section of the guide...
+
+@iron.jit
+def section_one(b_out: Out):
+    buf = Buffer(data_ty, name="buff")
+
+    def core_fn(buff):
+        for i in range_(data_size):
+            buff[i] = 0
+
+    my_worker = Worker(core_fn, [buf], tile=Tile(0, 2), while_true=False)
+
+    def sequence(_):
+        pass
+
+    rt = Runtime(sequence, [data_ty])
+
+    return Program(iron.get_current_device(), rt, workers=[my_worker]).resolve_program()
 
 
-# Task for the worker to perform
-def core_fn():
-    local = LocalBuffer(data_ty, name="local")
-    for i in range_(data_size):
-        local[i] = 0
+def _run_and_verify(opts):
+    out = iron.zeros(data_size, dtype=np.int32, device="npu")
+    section_one(out)
+    print("PASS!")
 
 
-# Create a worker to perform the task
-my_worker = Worker(core_fn, [], placement=Tile(0, 2), while_true=False)
+def main():
+    p = argparse.ArgumentParser(prog="Section 1 minimal IRON design")
+    add_compile_args(p, with_emit_mlir=True)
+    opts = p.parse_args()
+    run_design_cli(
+        section_one,
+        opts,
+        compile_kwargs={},
+        run_and_verify=_run_and_verify,
+        device=lambda o: device_from_args(o, n_cols=1),
+    )
 
-# Runtime operations to move data to/from the AIE-array
-rt = Runtime()
-with rt.sequence(data_ty, data_ty, data_ty) as (_, _, _):
-    rt.start(my_worker)
 
-# Create the program from the device type and runtime
-my_program = Program(NPU1Col1(), rt)
-
-# Place components (assign them resources on the device) and generate an MLIR module
-module = my_program.resolve_program(SequentialPlacer())
-
-# Print the generated MLIR
-print(module)
+if __name__ == "__main__":
+    main()

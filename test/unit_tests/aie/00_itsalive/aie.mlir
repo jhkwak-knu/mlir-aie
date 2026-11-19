@@ -1,17 +1,17 @@
 //===- aie.mlir ------------------------------------------------*- MLIR -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2021-2022 Xilinx, Inc.
+// Copyright (C) 2022-2025 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2021 Xilinx Inc.
 //
 //===----------------------------------------------------------------------===//
 
-// RUN: %PYTHON aiecc.py --unified %s
-// RUN: %PYTHON aiecc.py --no-unified %s
+// RUN: %aiecc --xchesscc --xbridge --unified %s
+// RUN: %aiecc --xchesscc --xbridge --no-unified %s
 
 module @test00_itsalive {
+aie.device(xcvc1902) {
+
   %tile12 = aie.tile(1, 2)
 
   %buf12_0 = aie.buffer(%tile12) { sym_name = "a" } : memref<256xi32>
@@ -22,4 +22,6 @@ module @test00_itsalive {
     %2 = arith.addi %val1, %val1 : i32
     aie.end
   }
+
+}
 }

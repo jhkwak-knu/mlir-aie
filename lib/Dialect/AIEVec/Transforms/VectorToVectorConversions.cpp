@@ -1,10 +1,7 @@
 //===-VectorToVectorConversions.cpp - Conversions within Vector -*- C++ -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2023-2024 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2023-2024 Advanced Micro Devices, Inc.
 //
 //===----------------------------------------------------------------------===//
 // This file contains conversions and rewrites to the Vector dialect to make
@@ -13,19 +10,26 @@
 
 #include "aie/Dialect/AIEVec/AIEVecUtils.h"
 #include "aie/Dialect/AIEVec/Pipelines/Passes.h"
+#include "aie/Dialect/AIEVec/Utils/TargetInfo.h"
 #include "aie/Dialect/AIEVec/Utils/Utils.h"
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
 #include "mlir/Dialect/Affine/Analysis/LoopAnalysis.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/Dialect/Utils/ReshapeOpsUtils.h"
 #include "mlir/Dialect/Vector/Transforms/LoweringPatterns.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "llvm/ADT/STLExtras.h"
 #include <algorithm>
+#include <utility>
 
 #define DEBUG_TYPE "aievec-canonicalization"
 
@@ -38,79 +42,6 @@ using namespace xilinx::aievec;
 //============================================================================//
 //================== Common AIE canonicalization analysis ====================//
 //============================================================================//
-
-static TargetBackend decodeTargetBackend(const std::string &backend) {
-  if (!backend.empty()) {
-    if (backend == "llvmir")
-      return TargetBackend::LLVMIR;
-    if (backend != "cpp")
-      return TargetBackend::UNKNOWN;
-  }
-  return TargetBackend::CPP;
-}
-
-static AIEArch decodeAIETarget(const std::string &target) {
-  if (!target.empty()) {
-    if (target == "aieml" || target == "aie2")
-      return AIEArch::AIE2;
-    if (target != "aie")
-      return AIEArch::UNKNOWN;
-  }
-  return AIEArch::AIE;
-}
-
-//============================================================================//
-//================== Common AIE canonicalization analysis ====================//
-//============================================================================//
-
-static bool isGemmBTransposedContractionOp(vector::ContractionOp op) {
-  if (op.getKind() != vector::CombiningKind::ADD)
-    return false;
-
-  // Get and check shape of operands
-  auto lhsShape = op.getLhsType().getShape();
-  auto rhsShape = op.getRhsType().getShape();
-  auto accShape = cast<ShapedType>(op.getAccType()).getShape();
-  if (lhsShape.size() < 2 || rhsShape.size() < 2 || accShape.size() < 2)
-    return false;
-
-  // Check that the innermost iterators match gemm-like iterators
-  SmallVector<vector::IteratorType> iterators = op.getIteratorTypesArray();
-  if (iterators.size() < 3)
-    return false;
-  auto innerMostIterators =
-      SmallVector<vector::IteratorType>(iterators.end() - 3, iterators.end());
-  if (vector::IteratorType::parallel != innerMostIterators[0] ||
-      vector::IteratorType::parallel != innerMostIterators[1] ||
-      vector::IteratorType::reduction != innerMostIterators[2])
-    return false;
-
-  // Get indexing maps of iterators for operands
-  SmallVector<AffineMap, 4> indexingMaps(op.getIndexingMapsArray());
-  SmallVector<int64_t> outerMostResults;
-  for (int64_t i = 0; i < indexingMaps[0].getNumResults() - 2; i++)
-    outerMostResults.push_back(i);
-
-  auto innerLhsMap = indexingMaps[0].dropResults(outerMostResults);
-  auto innerRhsMap = indexingMaps[1].dropResults(outerMostResults);
-  auto innerAccMap = indexingMaps[2].dropResults(outerMostResults);
-
-  // Check whether they conform to a "transposed B" gemm
-  auto *ctx = op.getContext();
-  auto mmAidxMap =
-      AffineMap::getPermutationMap(ArrayRef<unsigned>{1, 0, 2}, ctx)
-          .dropResults(0);
-  auto mmBidxMap =
-      AffineMap::getPermutationMap(ArrayRef<unsigned>{0, 1, 2}, ctx)
-          .dropResults(0);
-  auto mmCidxMap =
-      AffineMap::getPermutationMap(ArrayRef<unsigned>{2, 0, 1}, ctx)
-          .dropResults(0);
-  int64_t numOuterMostDims = indexingMaps[0].getNumDims() - 3;
-  return innerLhsMap == mmAidxMap.shiftDims(numOuterMostDims) &&
-         innerRhsMap == mmBidxMap.shiftDims(numOuterMostDims) &&
-         innerAccMap == mmCidxMap.shiftDims(numOuterMostDims);
-}
 
 //============================================================================//
 //============ Common AIE canonicalization conversion patterns ===============//
@@ -158,10 +89,9 @@ struct SplitUnalignedTransferReadPattern
     Value oldInnerMostIdx = adaptor.getIndices().back();
     auto offsetCorrectionMap =
         AffineMap::get(1, 0, getAffineDimExpr(0, readOp.getContext()) - offset);
-    Value newInnerMostIdx = rewriter
-                                .create<affine::AffineApplyOp>(
-                                    readOp.getLoc(), offsetCorrectionMap,
-                                    SmallVector<Value, 1>({oldInnerMostIdx}))
+    Value newInnerMostIdx = affine::AffineApplyOp::create(
+                                rewriter, readOp.getLoc(), offsetCorrectionMap,
+                                SmallVector<Value, 1>({oldInnerMostIdx}))
                                 .getResult();
     SmallVector<Value, 8> alignedIdx;
     alignedIdx.append(adaptor.getIndices().begin(), adaptor.getIndices().end());
@@ -169,8 +99,9 @@ struct SplitUnalignedTransferReadPattern
 
     // Create the aligned transfer read for a vector 2x as long that covers the
     // elements of the unaligned vector.
-    auto newReadOp = rewriter.create<vector::TransferReadOp>(
-        loc, longVecTy, adaptor.getBase(), alignedIdx, adaptor.getPadding());
+    auto newReadOp = vector::TransferReadOp::create(
+        rewriter, loc, longVecTy, adaptor.getBase(), alignedIdx,
+        adaptor.getPadding());
 
     // Create a `vector.extract_strided_slice` to extract the unaligned vector.
     rewriter.replaceOpWithNewOp<vector::ExtractStridedSliceOp>(
@@ -207,13 +138,12 @@ struct ConvertSplatTransferReadToBroadcastPattern
     int64_t offset = 0;
     // If it's a zero-rank memory access
     if (cast<MemRefType>(srcMemRef.getType()).getRank() == 0) {
-      srcMemRef = rewriter
-                      .create<memref::ExpandShapeOp>(
-                          readOp.getLoc(), SmallVector<int64_t, 1>({1}),
-                          srcMemRef, SmallVector<ReassociationIndices, 1>({}))
+      srcMemRef = memref::ExpandShapeOp::create(
+                      rewriter, readOp.getLoc(), SmallVector<int64_t, 1>({1}),
+                      srcMemRef, SmallVector<ReassociationIndices, 1>({}))
                       .getResult();
-      newIdx = rewriter.create<arith::ConstantOp>(readOp.getLoc(),
-                                                  rewriter.getIndexAttr(0L));
+      newIdx = arith::ConstantOp::create(rewriter, readOp.getLoc(),
+                                         rewriter.getIndexAttr(0L));
       indices.push_back(newIdx);
     } else {
       indices.append(adaptor.getIndices().begin(), adaptor.getIndices().end());
@@ -237,91 +167,19 @@ struct ConvertSplatTransferReadToBroadcastPattern
       auto newAddrMap = AffineMap::get(
           1, 0, getAffineDimExpr(0, readOp.getContext()) + numElemsToSkip);
       newIdx =
-          rewriter
-              .create<affine::AffineApplyOp>(readOp.getLoc(), newAddrMap,
-                                             SmallVector<Value, 1>({newIdx}))
+          affine::AffineApplyOp::create(rewriter, readOp.getLoc(), newAddrMap,
+                                        SmallVector<Value, 1>({newIdx}))
               .getResult();
     }
     indices[indices.size() - 1] = newIdx;
-    auto newReadOp = rewriter.create<vector::TransferReadOp>(
-        readOp.getLoc(), readOp.getVector().getType(), srcMemRef, indices,
-        adaptor.getPadding());
-    auto extractOp = rewriter.create<vector::ExtractOp>(
-        readOp.getLoc(), newReadOp.getResult(), ArrayRef<int64_t>{offset});
-    rewriter.replaceOpWithNewOp<vector::SplatOp>(
+    auto newReadOp = vector::TransferReadOp::create(
+        rewriter, readOp.getLoc(), readOp.getVector().getType(), srcMemRef,
+        indices, adaptor.getPadding());
+    auto extractOp = vector::ExtractOp::create(rewriter, readOp.getLoc(),
+                                               newReadOp.getResult(),
+                                               ArrayRef<int64_t>{offset});
+    rewriter.replaceOpWithNewOp<vector::BroadcastOp>(
         readOp, newReadOp.getVector().getType(), extractOp.getResult());
-    return success();
-  }
-};
-
-// This pattern moves cast operations as close as possible to the source of
-// the data. This helps to simplify dealing with patterns that may vary only
-// by these sorts of casts between data manipulation operations and arithmetic
-// ops.
-// TODO: Generalize this op and instantiate for different types of cast ops.
-struct HoistCastOpToDataSourcePattern : public RewritePattern {
-  HoistCastOpToDataSourcePattern(MLIRContext *context)
-      : RewritePattern(arith::ExtSIOp::getOperationName(), /*benefit=*/1,
-                       context) {}
-
-  LogicalResult matchAndRewrite(Operation *op,
-                                PatternRewriter &rewriter) const override {
-    arith::ExtSIOp extOp = cast<arith::ExtSIOp>(op);
-    Operation *defOp = extOp.getIn().getDefiningOp();
-    // If it's a data source op, we're done.
-    if (!defOp || isa<vector::TransferReadOp, memref::LoadOp,
-                      affine::AffineLoadOp, func::CallOp>(defOp))
-      return failure();
-
-    // At the moment, we only accept ops we know we can swap with cast.
-    if (!isa<vector::BroadcastOp, vector::ExtractOp, vector::SplatOp,
-             vector::ExtractStridedSliceOp>(defOp))
-      return failure();
-
-    Type extOpInTy = extOp.getIn().getType();
-    SmallVector<Value, 4> inputs;
-    for (Value operand : defOp->getOperands()) {
-      Type operandTy = operand.getType();
-      VectorType extOpInVecTy = dyn_cast<VectorType>(extOpInTy);
-      VectorType operandVecTy = dyn_cast<VectorType>(operandTy);
-      if (operandTy == extOpInTy) {
-        Type outTy = extOp.getOut().getType();
-        inputs.push_back(
-            rewriter.create<arith::ExtSIOp>(extOp.getLoc(), outTy, operand)
-                .getOut());
-      } else if (extOpInVecTy && extOpInVecTy.getElementType() == operandTy) {
-        // Promote from vector to scalar -> scalar conversion for this operand
-        Type outTy =
-            cast<VectorType>(extOp.getOut().getType()).getElementType();
-        inputs.push_back(
-            rewriter.create<arith::ExtSIOp>(extOp.getLoc(), outTy, operand)
-                .getOut());
-      } else if (operandVecTy && operandVecTy.getElementType() == extOpInTy) {
-        // Promote from scalar to vector -> vector conversion for this operand
-        Type outTy =
-            VectorType::get(operandVecTy.getShape(), extOp.getOut().getType());
-        inputs.push_back(
-            rewriter.create<arith::ExtSIOp>(extOp.getLoc(), outTy, operand)
-                .getOut());
-      } else if (extOpInVecTy && operandVecTy &&
-                 (extOpInVecTy.getElementType() ==
-                  operandVecTy.getElementType())) {
-        // Hoist through a vector shape change
-        Type outTy = VectorType::get(
-            operandVecTy.getShape(),
-            cast<VectorType>(extOp.getOut().getType()).getElementType());
-        inputs.push_back(
-            rewriter.create<arith::ExtSIOp>(extOp.getLoc(), outTy, operand)
-                .getOut());
-      } else {
-        inputs.push_back(operand);
-      }
-    }
-
-    auto *newOp =
-        rewriter.create(extOp->getLoc(), defOp->getName().getIdentifier(),
-                        inputs, {extOp.getOut().getType()}, defOp->getAttrs());
-    rewriter.replaceOp(extOp, newOp->getResult(0));
     return success();
   }
 };
@@ -338,7 +196,8 @@ struct SwapUnaryOpsPattern : public OpRewritePattern<UnaryOpB> {
   InferTypeB2AFnTy inferTypeB2A = nullptr;
 
   SwapUnaryOpsPattern(MLIRContext *context, InferTypeB2AFnTy inferType)
-      : OpRewritePattern<UnaryOpB>(context), inferTypeB2A(inferType) {}
+      : OpRewritePattern<UnaryOpB>(context),
+        inferTypeB2A(std::move(inferType)) {}
 
   LogicalResult matchAndRewrite(UnaryOpB bOp,
                                 PatternRewriter &rewriter) const override {
@@ -357,11 +216,11 @@ struct SwapUnaryOpsPattern : public OpRewritePattern<UnaryOpB> {
     Type newA2BTy = inferTypeB2A(aOp, bOp);
 
     auto newA =
-        rewriter.create<UnaryOpB>(bOp->getLoc(), SmallVector<Type>({newA2BTy}),
-                                  aOp->getOperands(), bOp->getAttrs());
-    auto newB = rewriter.create<UnaryOpA>(
-        bOp->getLoc(), SmallVector<Type>({bOp.getResult().getType()}),
-        newA->getResults(), aOp->getAttrs());
+        UnaryOpB::create(rewriter, bOp->getLoc(), SmallVector<Type>({newA2BTy}),
+                         aOp->getOperands(), bOp->getAttrs());
+    auto newB = UnaryOpA::create(rewriter, bOp->getLoc(),
+                                 SmallVector<Type>({bOp.getResult().getType()}),
+                                 newA->getResults(), aOp->getAttrs());
     rewriter.replaceOp(bOp, newB.getResult());
     return success();
   }
@@ -372,9 +231,7 @@ static SmallVector<Value> collapseInnerMostDimIndices(PatternRewriter &b,
                                                       ValueRange indices,
                                                       ArrayRef<int64_t> shape,
                                                       AffineMap layout) {
-  // TODO: Don't assume trivial layout
-  assert(layout.isMinorIdentity() &&
-         "dimension collapse in non-identity layout is not implemented");
+  (void)layout; // Layout is verified by callers; index computation uses shape.
   auto newIdxExpr = b.getAffineDimExpr(numDims - 1);
   int64_t stride = 1;
   for (int64_t dim = numDims - 2; dim >= 0; dim--) {
@@ -383,8 +240,8 @@ static SmallVector<Value> collapseInnerMostDimIndices(PatternRewriter &b,
   }
   auto newIndexMap = AffineMap::get(numDims, 0, newIdxExpr);
   Value newInnerMostIdxValue =
-      b.create<affine::AffineApplyOp>(loc, newIndexMap,
-                                      indices.take_back(numDims))
+      affine::AffineApplyOp::create(b, loc, newIndexMap,
+                                    indices.take_back(numDims))
           .getResult();
   SmallVector<Value> newIdxRange;
   for (auto idx : indices.drop_back(numDims))
@@ -401,17 +258,39 @@ static Value collapseInnerMostShapeDims(PatternRewriter &b, Location loc,
                                             1, std::multiplies<>());
   SmallVector<int64_t, 4> newShape{shape.begin(), shape.end() - numDims + 1};
   newShape[shape.size() - numDims] = newInnerMostDim;
-  auto newNumDims = newShape.size();
-  auto *ctx = b.getContext();
-  auto newMemRefTy = MemRefType::get(
-      newShape, memRefTy.getElementType(),
-      AffineMap::getMinorIdentityMap(newNumDims, newNumDims, ctx),
-      memRefTy.getMemorySpace());
-  auto reassocIndices =
-      getReassociationIndicesForCollapse(shape, newShape).value();
-  return b
-      .create<memref::CollapseShapeOp>(loc, newMemRefTy, val, reassocIndices)
+  // newShape is constructed above as exactly shape with its trailing
+  // numDims dims merged into one, so this is always a valid collapse.
+  auto reassocIndicesOpt = getReassociationIndicesForCollapse(shape, newShape);
+  assert(reassocIndicesOpt && "newShape must be a valid collapse of shape");
+  const auto &reassocIndices = *reassocIndicesOpt;
+  // Let CollapseShapeOp::inferResultType compute the correct result type,
+  // which preserves strided layout and dynamic offset from the source.
+  auto newMemRefTy =
+      memref::CollapseShapeOp::computeCollapsedType(memRefTy, reassocIndices);
+  return memref::CollapseShapeOp::create(b, loc, newMemRefTy, val,
+                                         reassocIndices)
       .getResult();
+}
+
+/// Check if a memref has contiguous row-major strides (each stride equals the
+/// product of trailing dimensions). Dynamic strides are accepted when the
+/// corresponding dimension size is 1. Memrefs with dynamic offsets are fine.
+static bool hasContiguousRowMajorStrides(MemRefType memRefTy) {
+  SmallVector<int64_t> strides;
+  int64_t offset;
+  if (failed(memRefTy.getStridesAndOffset(strides, offset)))
+    return false;
+  auto shape = memRefTy.getShape();
+  int64_t expected = 1;
+  for (int i = shape.size() - 1; i >= 0; --i) {
+    if (strides[i] != ShapedType::kDynamic && strides[i] != expected)
+      return false;
+    if (shape[i] != ShapedType::kDynamic)
+      expected *= shape[i];
+    else
+      expected = ShapedType::kDynamic;
+  }
+  return true;
 }
 
 // This pattern flatten multidimensional `vector.transfer_read` operations
@@ -442,22 +321,27 @@ struct FlattenMultDimTransferReadPattern
         VectorType::get({std::accumulate(vecShape.begin(), vecShape.end(), 1,
                                          std::multiplies<>())},
                         vectorTy.getElementType());
+    if (!hasContiguousRowMajorStrides(memRefTy))
+      return failure();
+
     AffineMap layout = memRefTy.getLayout().getAffineMap();
     auto newIndices =
         collapseInnerMostDimIndices(rewriter, readOp.getLoc(), vecShape.size(),
                                     adaptor.getIndices(), memRefShape, layout);
     auto newSource = collapseInnerMostShapeDims(
         rewriter, readOp.getLoc(), vecShape.size(), adaptor.getBase());
-    auto newVector = rewriter.create<vector::TransferReadOp>(
-        readOp.getLoc(), newVectorTy, newSource, newIndices);
+    auto newVector = vector::TransferReadOp::create(
+        rewriter, readOp.getLoc(), newVectorTy, newSource, newIndices,
+        /*padding*/
+        arith::getZeroConstant(rewriter, readOp.getLoc(),
+                               newVectorTy.getElementType()));
 
     auto inBoundsArrayAttrOpt = adaptor.getInBounds();
     if (inBoundsArrayAttrOpt) {
       SmallVector<bool> inBounds =
           llvm::to_vector(inBoundsArrayAttrOpt.getAsValueRange<BoolAttr>());
       SmallVector<bool> newInBounds({false});
-      newInBounds[0] = std::all_of(inBounds.begin(), inBounds.end(),
-                                   [](bool v) { return v; });
+      newInBounds[0] = llvm::all_of(inBounds, [](bool v) { return v; });
       newVector.getProperties().setInBounds(
           rewriter.getBoolArrayAttr(newInBounds));
     }
@@ -493,15 +377,17 @@ struct FlattenMultDimTransferWritePattern
     auto memRefShape = memRefTy.getShape();
     auto vecShape = vectorTy.getShape();
 
+    if (!hasContiguousRowMajorStrides(memRefTy))
+      return failure();
+
     auto newVectorTy =
         VectorType::get({std::accumulate(vecShape.begin(), vecShape.end(), 1,
                                          std::multiplies<>())},
                         vectorTy.getElementType());
     AffineMap layout = memRefTy.getLayout().getAffineMap();
     auto newVector =
-        rewriter
-            .create<vector::ShapeCastOp>(writeOp.getLoc(), newVectorTy,
-                                         adaptor.getValueToStore())
+        vector::ShapeCastOp::create(rewriter, writeOp.getLoc(), newVectorTy,
+                                    adaptor.getValueToStore())
             .getResult();
     auto newIndices =
         collapseInnerMostDimIndices(rewriter, writeOp.getLoc(), vecShape.size(),
@@ -517,8 +403,7 @@ struct FlattenMultDimTransferWritePattern
       SmallVector<bool> inBounds =
           llvm::to_vector(inBoundsArrayAttrOpt.getAsValueRange<BoolAttr>());
       SmallVector<bool> newInBounds({false});
-      newInBounds[0] = std::all_of(inBounds.begin(), inBounds.end(),
-                                   [](bool v) { return v; });
+      newInBounds[0] = llvm::all_of(inBounds, [](bool v) { return v; });
       newOp.getProperties().setInBounds(rewriter.getBoolArrayAttr(newInBounds));
     }
 
@@ -526,105 +411,158 @@ struct FlattenMultDimTransferWritePattern
   }
 };
 
-// This pattern extracts an implicit transposition of the 2 innermost
-// dimensions of `rhs` in a gemm-like contraction op, making it an explicit
-// `vector.transpose` op.
-// If `rhs` is coming from a widening op (`extf`/`extsi`/`extui`), the
-// transposition will be hoisted above the widening op.
-struct ExtractTransposeFromContractionOp
-    : public OpConversionPattern<vector::ContractionOp> {
-  using OpConversionPattern<vector::ContractionOp>::OpConversionPattern;
-
-  static VectorType getTransposedVectorType(VectorType vecTy) {
-    SmallVector<int64_t> shape{vecTy.getShape()};
-    auto nDim = shape.size();
-    int64_t dimNm1 = shape[nDim - 1];
-    shape[nDim - 1] = shape[nDim - 2];
-    shape[nDim - 2] = dimNm1;
-    auto elemTy = vecTy.getElementType();
-    return VectorType::get(shape, elemTy);
+/// Utility function to check if all provided indices are constant zero values.
+/// @return success() if all indices are constant zeros, failure() otherwise
+static LogicalResult isAllZeroOffsetAccess(mlir::OperandRange indices) {
+  if (!llvm::all_of(indices, [](Value val) {
+        IntegerAttr attr;
+        if (!matchPattern(val, m_Constant(&attr)))
+          return false;
+        return attr.getInt() == 0;
+      })) {
+    return failure();
   }
+  return success();
+}
 
-  LogicalResult
-  matchAndRewrite(vector::ContractionOp contractOp, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    if (!isGemmBTransposedContractionOp(contractOp))
+/// Utility function to convert OpFoldResult offsets from a SubView operation
+/// into a vector of Values.
+static SmallVector<Value> opFoldResultsToValues(PatternRewriter &rewriter,
+                                                Location loc,
+                                                memref::SubViewOp subViewOp) {
+  OpBuilder::InsertionGuard g(rewriter);
+  rewriter.setInsertionPoint(subViewOp);
+  SmallVector<Value> newIndices;
+  for (OpFoldResult offset : subViewOp.getMixedOffsets()) {
+    Value indexVal;
+    if (auto attr = dyn_cast<Attribute>(offset)) {
+      indexVal = arith::ConstantIndexOp::create(
+          rewriter, loc, cast<IntegerAttr>(attr).getInt());
+    } else {
+      indexVal = cast<Value>(offset);
+    }
+    newIndices.push_back(indexVal);
+  }
+  return newIndices;
+}
+
+/// Pattern to canonicalize trivial vector.transfer_read operations on subviews.
+///
+/// This pattern eliminates unnecessary memref.subview operations when the
+/// transfer_read accesses the subview with all-zero indices. It transforms:
+///
+/// INPUT:
+///   %subview = memref.subview %memref [offset0, offset1, ...]
+///   %result = vector.transfer_read %subview[0, 0, ...]
+///
+/// OUTPUT:
+///   %result = vector.transfer_read %memref[offset0, offset1, ...]
+///
+/// The pattern only matches when:
+/// - The base of transfer_read is defined by a memref.subview operation
+/// - All indices in the transfer_read are constant zeros
+struct CanonicalizeTrivialReadAccessSubviewOpPattern
+    : public OpRewritePattern<vector::TransferReadOp> {
+  using OpRewritePattern<vector::TransferReadOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(vector::TransferReadOp readOp,
+                                PatternRewriter &rewriter) const override {
+    // Check if the base memref comes from a subview operation
+    auto subViewOp = dyn_cast_if_present<memref::SubViewOp>(
+        readOp.getBase().getDefiningOp());
+    if (!subViewOp)
       return failure();
 
-    Location loc = contractOp.getLoc();
-    auto *ctx = rewriter.getContext();
+    // Verify that all access indices are zero
+    if (failed(isAllZeroOffsetAccess(readOp.getIndices())))
+      return failure();
 
-    Value rhsVal = adaptor.getRhs();
-    VectorType rhsVecTy = contractOp.getRhsType();
-    Type rhsElemTy = rhsVecTy.getElementType();
+    // Convert subview offsets to explicit index values
+    SmallVector<Value> newIndices =
+        opFoldResultsToValues(rewriter, readOp.getLoc(), subViewOp);
 
-    bool doExtF = false, doExtSI = false, doExtUI = false;
-    if (auto extfRhsOp = rhsVal.getDefiningOp<arith::ExtFOp>()) {
-      rhsVal = extfRhsOp.getIn();
-      rhsVecTy = cast<VectorType>(rhsVal.getType());
-      doExtF = true;
-    } else if (auto extsiRhsOp = rhsVal.getDefiningOp<arith::ExtSIOp>()) {
-      rhsVal = extsiRhsOp.getIn();
-      rhsVecTy = cast<VectorType>(rhsVal.getType());
-      doExtSI = true;
-    } else if (auto extuiRhsOp = rhsVal.getDefiningOp<arith::ExtUIOp>()) {
-      rhsVal = extuiRhsOp.getIn();
-      rhsVecTy = cast<VectorType>(rhsVal.getType());
-      doExtUI = true;
-    }
-
-    int64_t nDim = rhsVecTy.getShape().size();
-    SmallVector<int64_t> rhsPermutation;
-    for (int64_t i = 0; i < nDim - 2; i++)
-      rhsPermutation.push_back(i);
-    rhsPermutation.push_back(nDim - 1);
-    rhsPermutation.push_back(nDim - 2);
-    auto transpRhsVecTy = getTransposedVectorType(rhsVecTy);
-    rhsVal = rewriter
-                 .create<vector::TransposeOp>(loc, transpRhsVecTy, rhsVal,
-                                              rhsPermutation)
-                 .getResult();
-
-    if (doExtF)
-      rhsVal =
-          rewriter
-              .create<arith::ExtFOp>(
-                  loc, VectorType::get(transpRhsVecTy.getShape(), rhsElemTy),
-                  rhsVal)
-              .getOut();
-    if (doExtSI)
-      rhsVal =
-          rewriter
-              .create<arith::ExtSIOp>(
-                  loc, VectorType::get(transpRhsVecTy.getShape(), rhsElemTy),
-                  rhsVal)
-              .getOut();
-    if (doExtUI)
-      rhsVal =
-          rewriter
-              .create<arith::ExtUIOp>(
-                  loc, VectorType::get(transpRhsVecTy.getShape(), rhsElemTy),
-                  rhsVal)
-              .getOut();
-
-    SmallVector<AffineMap, 4> oldIdxMaps(contractOp.getIndexingMapsArray());
-
-    nDim = oldIdxMaps[1].getNumDims();
-    SmallVector<int64_t> innerDimPerm;
-    for (int64_t i = 0; i < nDim - 2; i++)
-      innerDimPerm.push_back(i);
-    innerDimPerm.push_back(nDim - 1);
-    innerDimPerm.push_back(nDim - 2);
-    auto transpPermMap = AffineMap::getPermutationMap(innerDimPerm, ctx);
-
-    auto newIdxMaps = rewriter.getAffineMapArrayAttr(
-        {oldIdxMaps[0], oldIdxMaps[1].compose(transpPermMap), oldIdxMaps[2]});
-
-    rewriter.replaceOpWithNewOp<vector::ContractionOp>(
-        contractOp, contractOp.getResult().getType(), adaptor.getLhs(), rhsVal,
-        adaptor.getAcc(), newIdxMaps, contractOp.getIteratorTypes());
-
+    // Replace with direct access to the original memref using subview offsets
+    rewriter.replaceOpWithNewOp<vector::TransferReadOp>(
+        readOp, readOp.getType(), subViewOp.getSource(), newIndices,
+        readOp.getPadding(), readOp.getInBoundsValues());
     return success();
+  }
+};
+
+/// Pattern to canonicalize trivial vector.transfer_write operations on
+/// subviews.
+///
+/// This pattern eliminates unnecessary memref.subview operations when the
+/// transfer_write accesses the subview with all-zero indices. It transforms:
+///
+/// INPUT:
+///   %subview = memref.subview %memref [offset0, offset1, ...]
+///   vector.transfer_write %value, %subview[0, 0, ...]
+///
+/// OUTPUT:
+///   vector.transfer_write %value, %memref[offset0, offset1, ...]
+///
+/// The pattern only matches when:
+/// - The base of transfer_write is defined by a memref.subview operation
+/// - All indices in the transfer_write are constant zeros
+struct CanonicalizeTrivialWriteAccessSubviewOpPattern
+    : public OpRewritePattern<vector::TransferWriteOp> {
+  using OpRewritePattern<vector::TransferWriteOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(vector::TransferWriteOp writeOp,
+                                PatternRewriter &rewriter) const override {
+    // Check if the base memref comes from a subview operation
+    auto subViewOp = dyn_cast_if_present<memref::SubViewOp>(
+        writeOp.getBase().getDefiningOp());
+    if (!subViewOp)
+      return failure();
+
+    // Verify that all access indices are zero
+    if (failed(isAllZeroOffsetAccess(writeOp.getIndices())))
+      return failure();
+
+    // Convert subview offsets to explicit index values
+    SmallVector<Value> newIndices =
+        opFoldResultsToValues(rewriter, writeOp.getLoc(), subViewOp);
+
+    // Create new transfer_write with direct access to original memref
+    vector::TransferWriteOp::create(rewriter, writeOp.getLoc(),
+                                    writeOp.getVector(), subViewOp.getSource(),
+                                    newIndices, writeOp.getInBoundsValues());
+
+    // Remove the original transfer_write operation
+    rewriter.eraseOp(writeOp);
+    return success();
+  }
+};
+
+// Carry an n-D vector through an scf.for loop as a rank-1 vector. The LLVM
+// lowering turns an n-D vector into an array of rank-1 rows, so a loop that
+// carries one splits it into rows and rebuilds it on every iteration instead
+// of keeping it in registers. AIE2P lowers n-D elementwise ops by flattening
+// them to rank 1, so the shape casts added here at the loop boundary fold
+// against the ones that flattening adds. Each match rewrites one iter_arg.
+struct FlattenVectorIterArgsPattern : OpRewritePattern<scf::ForOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(scf::ForOp forOp,
+                                PatternRewriter &rewriter) const override {
+    for (OpOperand &init : forOp.getInitArgsMutable()) {
+      auto vecType = dyn_cast<VectorType>(init.get().getType());
+      if (!vecType || vecType.getRank() < 2 || vecType.isScalable())
+        continue;
+      Value flat = vector::ShapeCastOp::create(rewriter, forOp.getLoc(),
+                                               getFlattenedVectorType(vecType),
+                                               init.get());
+      auto shapeCast = [](OpBuilder &builder, Location loc, Type type,
+                          Value source) -> Value {
+        return vector::ShapeCastOp::create(builder, loc, type, source);
+      };
+      rewriter.replaceOp(forOp, scf::replaceAndCastForOpIterArg(
+                                    rewriter, forOp, init, flat, shapeCast));
+      return success();
+    }
+    return failure();
   }
 };
 
@@ -677,15 +615,14 @@ struct ConvertLeadingUnitDimInsertToReshapePattern
 //================ Common AIE canonicalization configuration =================//
 //============================================================================//
 static void
-configureCommonAIECanonicalizeLegalizations(ConversionTarget &target,
-                                            TargetBackend backend) {
+configureCommonAIECanonicalizeLegalizations(ConversionTarget &target) {
   target.addLegalDialect<arith::ArithDialect, affine::AffineDialect,
-                         memref::MemRefDialect, vector::VectorDialect>();
+                         memref::MemRefDialect, vector::VectorDialect,
+                         ub::UBDialect>();
 }
 
 static void
-populateCommonAIECanonicalizeConversionPatterns(RewritePatternSet &patterns,
-                                                TargetBackend backend) {
+populateCommonAIECanonicalizeConversionPatterns(RewritePatternSet &patterns) {
   patterns.add<ConvertSplatTransferReadToBroadcastPattern>(
       patterns.getContext());
 }
@@ -694,8 +631,7 @@ populateCommonAIECanonicalizeConversionPatterns(RewritePatternSet &patterns,
 //============== AIEv1-specific canonicalization configuration ===============//
 //============================================================================//
 
-static void configureAIEv1CanonicalizeLegalizations(ConversionTarget &target,
-                                                    TargetBackend backend) {
+static void configureAIEv1CanonicalizeLegalizations(ConversionTarget &target) {
   target.addDynamicallyLegalOp<vector::TransferReadOp>(
       [](vector::TransferReadOp op) {
         return !op.getPermutationMap().isConstant() &&
@@ -705,8 +641,7 @@ static void configureAIEv1CanonicalizeLegalizations(ConversionTarget &target,
 }
 
 static void
-populateAIEv1CanonicalizeConversionPatterns(RewritePatternSet &patterns,
-                                            TargetBackend backend) {
+populateAIEv1CanonicalizeConversionPatterns(RewritePatternSet &patterns) {
   patterns.add<SplitUnalignedTransferReadPattern>(patterns.getContext(), 512,
                                                   128);
 }
@@ -715,8 +650,7 @@ populateAIEv1CanonicalizeConversionPatterns(RewritePatternSet &patterns,
 //============== AIE2-specific canonicalization configuration ===============//
 //============================================================================//
 
-static void configureAIE2CanonicalizeLegalizations(ConversionTarget &target,
-                                                   TargetBackend backend) {
+static void configureAIE2CanonicalizeLegalizations(ConversionTarget &target) {
   target.addDynamicallyLegalOp<vector::TransferReadOp>(
       [](vector::TransferReadOp op) {
         return !op.getPermutationMap().isConstant() &&
@@ -728,28 +662,405 @@ static void configureAIE2CanonicalizeLegalizations(ConversionTarget &target,
       [](vector::TransferWriteOp op) {
         return cast<VectorType>(op.getVector().getType()).getRank() < 2;
       });
-  target.addDynamicallyLegalOp<vector::ContractionOp>(
-      [](vector::ContractionOp op) {
-        return !isGemmBTransposedContractionOp(op);
-      });
 }
 
 static void
-populateAIE2CanonicalizeConversionPatterns(RewritePatternSet &patterns,
-                                           TargetBackend backend) {
+populateAIE2CanonicalizeConversionPatterns(RewritePatternSet &patterns) {
   patterns.add<SplitUnalignedTransferReadPattern>(patterns.getContext(), 1024,
                                                   256);
-  patterns
-      .add<ExtractTransposeFromContractionOp, FlattenMultDimTransferReadPattern,
-           FlattenMultDimTransferWritePattern>(patterns.getContext());
+  patterns.add<FlattenMultDimTransferReadPattern,
+               FlattenMultDimTransferWritePattern>(patterns.getContext());
 }
 
 //============================================================================//
 //=================== Common AIE Canonicalization Passes =====================//
 //============================================================================//
 
+//===----------------------------------------------------------------------===//
+// BF16 Emulation: Emulate f32 vector arithmetic using bf16 operations.
+//===----------------------------------------------------------------------===//
+
+// Smart truncation helper: if the value was produced by arith.extf from bf16,
+// reuse the bf16 source directly to avoid redundant extf->truncf chains.
+static Value smartTruncF32ToBF16(PatternRewriter &rewriter, Location loc,
+                                 Value val, Type bf16Type) {
+  if (auto extfOp = val.getDefiningOp<arith::ExtFOp>()) {
+    if (extfOp.getIn().getType() == bf16Type)
+      return extfOp.getIn();
+  }
+  return arith::TruncFOp::create(rewriter, loc, bf16Type, val);
+}
+
+// `v` rounded to the nearest bf16, still in its own semantics.
+static APFloat roundedToBF16(APFloat v) {
+  bool losesInfo = false;
+  const llvm::fltSemantics &sem = v.getSemantics();
+  v.convert(APFloat::BFloat(), APFloat::rmNearestTiesToEven, &losesInfo);
+  v.convert(sem, APFloat::rmNearestTiesToEven, &losesInfo);
+  return v;
+}
+
+// True if `val` is an f32 vector whose elements are all bf16 values.
+static bool holdsBF16(Value val) {
+  // a splat of a scalar widened from bf16
+  if (auto bcastOp = val.getDefiningOp<vector::BroadcastOp>())
+    val = bcastOp.getSource();
+  if (auto extfOp = val.getDefiningOp<arith::ExtFOp>())
+    return getElementTypeOrSelf(extfOp.getIn().getType()).isBF16();
+  DenseFPElementsAttr dense;
+  return matchPattern(val, m_Constant(&dense)) &&
+         llvm::all_of(dense.getValues<APFloat>(), [](const APFloat &v) {
+           return roundedToBF16(v).bitwiseIsEqual(v);
+         });
+}
+
+// `val` rounded to bf16, still as f32. Constants are rounded here.
+static Value roundToBF16(PatternRewriter &rewriter, Location loc, Value val) {
+  if (holdsBF16(val))
+    return val;
+  auto vecType = cast<VectorType>(val.getType());
+  DenseFPElementsAttr dense;
+  if (matchPattern(val, m_Constant(&dense))) {
+    SmallVector<APFloat> values;
+    for (const APFloat &v : dense.getValues<APFloat>())
+      values.push_back(roundedToBF16(v));
+    return arith::ConstantOp::create(rewriter, loc,
+                                     DenseElementsAttr::get(vecType, values));
+  }
+  auto bf16VecType =
+      VectorType::get(vecType.getShape(), rewriter.getBF16Type());
+  Value bf16 = smartTruncF32ToBF16(rewriter, loc, val, bf16VecType);
+  return arith::ExtFOp::create(rewriter, loc, vecType, bf16,
+                               /*fastmath=*/nullptr);
+}
+
+static bool isF32Vector(Type type) {
+  auto vecType = dyn_cast<VectorType>(type);
+  return vecType && vecType.getElementType().isF32();
+}
+
+/// Pattern to drop `bf16 -> f32 -> bf16` round trips.
+///
+/// Arith used to fold these but no longer does: widening a signaling NaN quiets
+/// it, so the original bit pattern cannot be recovered. This pass has always
+/// made that trade anyway -- `smartTruncF32ToBF16` collapses the same pair on
+/// sight -- so fold here to keep the pipeline's pre-existing behavior rather
+/// than leaving the round trips for the backend.
+struct FoldBF16RoundTripPattern : public OpRewritePattern<arith::TruncFOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(arith::TruncFOp op,
+                                PatternRewriter &rewriter) const override {
+    auto resultType = dyn_cast<VectorType>(op.getType());
+    auto intermediateType = dyn_cast<VectorType>(op.getIn().getType());
+    if (!resultType || !intermediateType ||
+        !resultType.getElementType().isBF16() ||
+        !intermediateType.getElementType().isF32())
+      return failure();
+
+    auto extfOp = op.getIn().getDefiningOp<arith::ExtFOp>();
+    if (!extfOp || extfOp.getIn().getType() != resultType)
+      return failure();
+
+    rewriter.replaceOp(op, extfOp.getIn());
+    return success();
+  }
+};
+
+/// Pattern to emulate f32 binary vector arithmetic ops in bf16.
+/// For an op like: %r = arith.addf %a, %b : vector<16xf32>
+/// Produces:
+///   %a_bf16 = arith.truncf %a : vector<16xf32> to vector<16xbf16>
+///   %b_bf16 = arith.truncf %b : vector<16xf32> to vector<16xbf16>
+///   %r_bf16 = arith.addf %a_bf16, %b_bf16 : vector<16xbf16>
+///   %r = arith.extf %r_bf16 : vector<16xbf16> to vector<16xf32>
+template <typename OpTy>
+struct EmulateBinaryF32InBF16Pattern : public OpRewritePattern<OpTy> {
+  using OpRewritePattern<OpTy>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(OpTy op,
+                                PatternRewriter &rewriter) const override {
+    auto resultType = dyn_cast<VectorType>(op.getType());
+    if (!resultType || !resultType.getElementType().isF32())
+      return failure();
+
+    Location loc = op.getLoc();
+    auto bf16VecType =
+        VectorType::get(resultType.getShape(), rewriter.getBF16Type());
+
+    Value lhsBF16 =
+        smartTruncF32ToBF16(rewriter, loc, op.getLhs(), bf16VecType);
+    Value rhsBF16 =
+        smartTruncF32ToBF16(rewriter, loc, op.getRhs(), bf16VecType);
+
+    Value newResult =
+        OpTy::create(rewriter, loc, bf16VecType, lhsBF16, rhsBF16);
+    auto extOp = arith::ExtFOp::create(rewriter, loc, resultType, newResult,
+                                       /*fastmath=*/nullptr);
+    rewriter.replaceOp(op, extOp);
+    return success();
+  }
+};
+
+/// Pattern to emulate f32 comparison ops in bf16.
+/// Result type stays vector<Nxi1>, only operands are truncated.
+struct EmulateCmpFF32InBF16Pattern : public OpRewritePattern<arith::CmpFOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(arith::CmpFOp op,
+                                PatternRewriter &rewriter) const override {
+    auto lhsType = dyn_cast<VectorType>(op.getLhs().getType());
+    if (!lhsType || !lhsType.getElementType().isF32())
+      return failure();
+
+    Location loc = op.getLoc();
+    auto bf16VecType =
+        VectorType::get(lhsType.getShape(), rewriter.getBF16Type());
+
+    Value lhsBF16 =
+        smartTruncF32ToBF16(rewriter, loc, op.getLhs(), bf16VecType);
+    Value rhsBF16 =
+        smartTruncF32ToBF16(rewriter, loc, op.getRhs(), bf16VecType);
+
+    rewriter.replaceOpWithNewOp<arith::CmpFOp>(op, op.getPredicate(), lhsBF16,
+                                               rhsBF16);
+    return success();
+  }
+};
+
+/// Pattern to emulate f32 select ops in bf16.
+/// Condition stays vector<Nxi1>, true/false values are truncated.
+struct EmulateSelectF32InBF16Pattern
+    : public OpRewritePattern<arith::SelectOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(arith::SelectOp op,
+                                PatternRewriter &rewriter) const override {
+    auto resultType = dyn_cast<VectorType>(op.getType());
+    if (!resultType || !resultType.getElementType().isF32())
+      return failure();
+
+    Location loc = op.getLoc();
+    auto bf16VecType =
+        VectorType::get(resultType.getShape(), rewriter.getBF16Type());
+
+    Value trueValBF16 =
+        smartTruncF32ToBF16(rewriter, loc, op.getTrueValue(), bf16VecType);
+    Value falseValBF16 =
+        smartTruncF32ToBF16(rewriter, loc, op.getFalseValue(), bf16VecType);
+
+    Value newResult = arith::SelectOp::create(rewriter, loc, op.getCondition(),
+                                              trueValBF16, falseValBF16);
+    auto extOp = arith::ExtFOp::create(rewriter, loc, resultType, newResult,
+                                       /*fastmath=*/nullptr);
+    rewriter.replaceOp(op, extOp);
+    return success();
+  }
+};
+
+/// Pattern to emulate an f32 multiply with bf16 inputs. The product of two
+/// bf16 values fits in f32 except at the ends of the exponent range, so only
+/// the inputs are rounded:
+///   %r = arith.mulf %a, %b : vector<16xf32>
+/// becomes
+///   %r = arith.mulf (extf (truncf %a)), (extf (truncf %b)) : vector<16xf32>
+struct EmulateMulFInBF16Pattern : public OpRewritePattern<arith::MulFOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(arith::MulFOp op,
+                                PatternRewriter &rewriter) const override {
+    if (!isF32Vector(op.getType()) ||
+        (holdsBF16(op.getLhs()) && holdsBF16(op.getRhs())))
+      return failure();
+    Location loc = op.getLoc();
+    Value lhs = roundToBF16(rewriter, loc, op.getLhs());
+    Value rhs = roundToBF16(rewriter, loc, op.getRhs());
+    rewriter.replaceOpWithNewOp<arith::MulFOp>(op, lhs, rhs,
+                                               op.getFastmathAttr());
+    return success();
+  }
+};
+
+static bool contracts(arith::FastMathFlagsAttr flags) {
+  return flags &&
+         bitEnumContainsAll(flags.getValue(), arith::FastMathFlags::contract);
+}
+
+/// Whether `op` may take a multiply into a vector.fma: it allows contraction
+/// and has a type the FMA lowerings take, a 1-D f32 vector of 16 or 32 lanes.
+static bool fusesIntoFMA(arith::AddFOp op) {
+  auto type = dyn_cast<VectorType>(op.getType());
+  return isF32Vector(op.getType()) && type.getRank() == 1 &&
+         (type.getNumElements() == 16 || type.getNumElements() == 32) &&
+         contracts(op.getFastmathAttr());
+}
+
+/// Pattern to fold an f32 multiply into the add that is its only user, as a
+/// vector.fma with bf16 inputs. Only when both ops allow contraction: the
+/// fused result can differ where the product underflows or overflows.
+struct FuseMulAddFInBF16Pattern : public OpRewritePattern<arith::AddFOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(arith::AddFOp op,
+                                PatternRewriter &rewriter) const override {
+    if (!fusesIntoFMA(op))
+      return failure();
+    for (auto [mulOperand, acc] : {std::pair(op.getLhs(), op.getRhs()),
+                                   std::pair(op.getRhs(), op.getLhs())}) {
+      auto mulOp = mulOperand.getDefiningOp<arith::MulFOp>();
+      if (!mulOp || !mulOp->hasOneUse() || !contracts(mulOp.getFastmathAttr()))
+        continue;
+      Location loc = op.getLoc();
+      Value lhs = roundToBF16(rewriter, loc, mulOp.getLhs());
+      Value rhs = roundToBF16(rewriter, loc, mulOp.getRhs());
+      rewriter.replaceOpWithNewOp<vector::FMAOp>(op, lhs, rhs, acc);
+      rewriter.eraseOp(mulOp);
+      return success();
+    }
+    return failure();
+  }
+};
+
+/// FuseMulAddFInBF16Pattern for a multiply whose inputs already hold bf16
+/// values, outside bf16 emulation; likewise only when both ops allow
+/// contraction.
+struct FuseExactMulAddFPattern : public OpRewritePattern<arith::AddFOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(arith::AddFOp op,
+                                PatternRewriter &rewriter) const override {
+    if (!fusesIntoFMA(op))
+      return failure();
+    for (auto [mulOperand, acc] : {std::pair(op.getLhs(), op.getRhs()),
+                                   std::pair(op.getRhs(), op.getLhs())}) {
+      auto mulOp = mulOperand.getDefiningOp<arith::MulFOp>();
+      if (!mulOp || !mulOp->hasOneUse() ||
+          !contracts(mulOp.getFastmathAttr()) || !holdsBF16(mulOp.getLhs()) ||
+          !holdsBF16(mulOp.getRhs()))
+        continue;
+      rewriter.replaceOpWithNewOp<vector::FMAOp>(op, mulOp.getLhs(),
+                                                 mulOp.getRhs(), acc);
+      rewriter.eraseOp(mulOp);
+      return success();
+    }
+    return failure();
+  }
+};
+
+/// Pattern to emulate f32 vector.fma with bf16 inputs. The accumulator stays
+/// f32.
+struct EmulateFMAF32InBF16Pattern : public OpRewritePattern<vector::FMAOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(vector::FMAOp op,
+                                PatternRewriter &rewriter) const override {
+    if (!isF32Vector(op.getType()) ||
+        (holdsBF16(op.getLhs()) && holdsBF16(op.getRhs())))
+      return failure();
+    Location loc = op.getLoc();
+    Value lhs = roundToBF16(rewriter, loc, op.getLhs());
+    Value rhs = roundToBF16(rewriter, loc, op.getRhs());
+    rewriter.replaceOpWithNewOp<vector::FMAOp>(op, lhs, rhs, op.getAcc());
+    return success();
+  }
+};
+
+/// Pattern to emulate f32 unary vector ops in bf16.
+template <typename OpTy>
+struct EmulateUnaryF32InBF16Pattern : public OpRewritePattern<OpTy> {
+  using OpRewritePattern<OpTy>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(OpTy op,
+                                PatternRewriter &rewriter) const override {
+    auto resultType = dyn_cast<VectorType>(op.getType());
+    if (!resultType || !resultType.getElementType().isF32())
+      return failure();
+
+    Location loc = op.getLoc();
+    auto bf16VecType =
+        VectorType::get(resultType.getShape(), rewriter.getBF16Type());
+
+    Value inputBF16 =
+        smartTruncF32ToBF16(rewriter, loc, op->getOperand(0), bf16VecType);
+
+    Value newResult = OpTy::create(rewriter, loc, bf16VecType, inputBF16);
+    auto extOp = arith::ExtFOp::create(rewriter, loc, resultType, newResult,
+                                       /*fastmath=*/nullptr);
+    rewriter.replaceOp(op, extOp);
+    return success();
+  }
+};
+
+struct BF16EmulationPass
+    : public PassWrapper<BF16EmulationPass, OperationPass<>> {
+
+  void runOnOperation() override {
+    auto *op = getOperation();
+    MLIRContext *context = &getContext();
+    RewritePatternSet patterns(context);
+
+    // Multiplies take bf16 inputs; sums stay f32, which the accumulator
+    // adds natively.
+    patterns.add<FuseMulAddFInBF16Pattern>(context, /*benefit=*/2);
+    patterns.add<EmulateMulFInBF16Pattern, EmulateFMAF32InBF16Pattern>(context);
+    patterns.add<EmulateBinaryF32InBF16Pattern<arith::MaximumFOp>,
+                 EmulateBinaryF32InBF16Pattern<arith::MinimumFOp>>(context);
+
+    // Note: arith.divf is NOT demoted because bf16 vector divf is unsupported
+    // on all AIE targets (Peano does not legalize G_FDIV on <16 x s16>).
+
+    // Special-case ops (excluding ReductionOp — its scalar accumulator
+    // and result lower to fp_to_bf16/bf16_to_fp which older Peano versions
+    // cannot select on AIE2P; reductions are intentionally left in f32
+    // to avoid these scalar bf16 conversions)
+    patterns.add<EmulateCmpFF32InBF16Pattern, EmulateSelectF32InBF16Pattern>(
+        context);
+
+    // Unary ops
+    patterns.add<EmulateUnaryF32InBF16Pattern<arith::NegFOp>,
+                 EmulateUnaryF32InBF16Pattern<math::TanhOp>>(context);
+
+    // Clean up the round trips the demotion itself introduces.
+    patterns.add<FoldBF16RoundTripPattern>(context);
+
+    (void)applyPatternsGreedily(op, std::move(patterns));
+  }
+};
+
+std::unique_ptr<::mlir::Pass> xilinx::aievec::createBF16EmulationPass() {
+  return std::make_unique<BF16EmulationPass>();
+}
+
+// A broadcast of a vector that only adds leading dims, as the vector repeated
+// by a 1-D shuffle (mask [i % n]). The AIE2P shuffle lowering then sees the
+// repetition, alone or together with a shuffle that reads it, as one gather.
+struct BroadcastLeadingDimsToRepeatPattern
+    : public OpRewritePattern<vector::BroadcastOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(vector::BroadcastOp op,
+                                PatternRewriter &rewriter) const override {
+    auto srcType = dyn_cast<VectorType>(op.getSourceType());
+    VectorType resType = op.getResultVectorType();
+    if (!srcType || srcType.getRank() != 1 || resType.getRank() < 2 ||
+        resType.getShape().back() != srcType.getNumElements() ||
+        !srcType.getElementType().isIntOrFloat() || resType.isScalable())
+      return failure();
+    int64_t n = srcType.getNumElements();
+    SmallVector<int64_t> mask;
+    for (int64_t i = 0; i < resType.getNumElements(); ++i)
+      mask.push_back(i % n);
+    Value src = op.getSource();
+    Value flat =
+        vector::ShuffleOp::create(rewriter, op.getLoc(), src, src, mask);
+    rewriter.replaceOpWithNewOp<vector::ShapeCastOp>(op, resType, flat);
+    return success();
+  }
+};
+
 struct VectorBroadcastLoweringPass
     : public PassWrapper<VectorBroadcastLoweringPass, OperationPass<>> {
+  VectorBroadcastLoweringPass(bool aie2p = false) : aie2p(aie2p) {}
 
   void runOnOperation() override {
     auto *op = getOperation();
@@ -758,13 +1069,21 @@ struct VectorBroadcastLoweringPass
     populateVectorBroadcastLoweringPatterns(patterns);
     patterns.add<ConvertLeadingUnitDimInsertToReshapePattern>(
         patterns.getContext());
+    // Ahead of the generic lowering, which builds the result a row at a time.
+    if (aie2p)
+      patterns.add<BroadcastLeadingDimsToRepeatPattern>(patterns.getContext(),
+                                                        /*benefit=*/2);
 
     (void)applyPatternsGreedily(op, std::move(patterns));
   }
+
+private:
+  bool aie2p;
 };
 
-static std::unique_ptr<::mlir::Pass> createVectorBroadcastLoweringPass() {
-  return std::make_unique<VectorBroadcastLoweringPass>();
+static std::unique_ptr<::mlir::Pass>
+createVectorBroadcastLoweringPass(bool aie2p = false) {
+  return std::make_unique<VectorBroadcastLoweringPass>(aie2p);
 }
 
 // This pass converts standard vector ops into a subset of `Vector` ops more
@@ -786,7 +1105,6 @@ struct CanonicalizeVectorForAIEVecPass
       const CanonicalizeVectorForAIEVecOptions &options)
       : CanonicalizeVectorForAIEVecPass() {
     aieTarget = options.aieTarget;
-    targetBackend = options.targetBackend;
   }
 
   // In case we want to register this pass as a standalone pass for test
@@ -800,22 +1118,17 @@ struct CanonicalizeVectorForAIEVecPass
   }
 
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<arith::ArithDialect, memref::MemRefDialect,
-                    vector::VectorDialect, affine::AffineDialect>();
+    registry
+        .insert<arith::ArithDialect, memref::MemRefDialect,
+                vector::VectorDialect, affine::AffineDialect, ub::UBDialect>();
   }
 
   Option<std::string> aieTarget{
       *this, "aie-target",
-      llvm::cl::desc("Select AIE version: \"aie\" or \"aie2\". This will "
-                     "determine the vector size and available operations."),
+      llvm::cl::desc(
+          "Select AIE version: \"aie\", \"aie2\", or \"aie2p\". This will "
+          "determine the vector size and available operations."),
       llvm::cl::init("aie")};
-
-  Option<std::string> targetBackend{
-      *this, "target-backend",
-      llvm::cl::desc("Select translation backend: \"cpp\" or \"llvmir\". This "
-                     "will determine the aievec operations used to convert "
-                     "from vector dialect."),
-      llvm::cl::init("cpp")};
 
   void runOnOperation() override {
     auto *op = getOperation();
@@ -823,33 +1136,31 @@ struct CanonicalizeVectorForAIEVecPass
     RewritePatternSet patterns(context);
     ConversionTarget target(*context);
 
-    AIEArch aieVersion = decodeAIETarget(aieTarget);
-    if (aieVersion == AIEArch::UNKNOWN) {
-      op->emitError() << "unknown AIE target '" << aieTarget << "'";
+    std::optional<AIEVecTargetInfo> targetInfo =
+        parseAIEVecLoweringTarget(aieTarget, op);
+    if (!targetInfo) {
       signalPassFailure();
       return;
     }
 
-    TargetBackend backend = decodeTargetBackend(targetBackend);
-    if (backend == TargetBackend::UNKNOWN) {
-      op->emitError() << "unknown target backend '" << targetBackend << "'";
-      signalPassFailure();
-      return;
-    }
-    if (backend == TargetBackend::LLVMIR && aieVersion == AIEArch::AIE) {
-      op->emitError() << "targetting LLVM IR is not supported for AIEv1";
-      signalPassFailure();
-      return;
-    }
-
-    populateCommonAIECanonicalizeConversionPatterns(patterns, backend);
-    configureCommonAIECanonicalizeLegalizations(target, backend);
-    if (aieVersion == AIEArch::AIE) {
-      populateAIEv1CanonicalizeConversionPatterns(patterns, backend);
-      configureAIEv1CanonicalizeLegalizations(target, backend);
+    populateCommonAIECanonicalizeConversionPatterns(patterns);
+    configureCommonAIECanonicalizeLegalizations(target);
+    if (targetInfo->isAIE1()) {
+      populateAIEv1CanonicalizeConversionPatterns(patterns);
+      configureAIEv1CanonicalizeLegalizations(target);
     } else {
-      populateAIE2CanonicalizeConversionPatterns(patterns, backend);
-      configureAIE2CanonicalizeLegalizations(target, backend);
+      populateAIE2CanonicalizeConversionPatterns(patterns);
+      configureAIE2CanonicalizeLegalizations(target);
+    }
+
+    {
+      RewritePatternSet patterns(context);
+      patterns.add<CanonicalizeTrivialReadAccessSubviewOpPattern,
+                   CanonicalizeTrivialWriteAccessSubviewOpPattern>(context);
+      if (targetInfo->isAIE2P())
+        patterns.add<FlattenVectorIterArgsPattern, FuseExactMulAddFPattern>(
+            context);
+      (void)applyPatternsGreedily(op, std::move(patterns));
     }
 
     if (failed(applyPartialConversion(op, target, std::move(patterns)))) {
@@ -861,24 +1172,6 @@ struct CanonicalizeVectorForAIEVecPass
 static std::unique_ptr<::mlir::Pass> createCanonicalizeVectorForAIEVecPass(
     const CanonicalizeVectorForAIEVecOptions &options) {
   return std::make_unique<CanonicalizeVectorForAIEVecPass>(options);
-}
-
-struct HoistCastOpToDataSourcePass
-    : public PassWrapper<HoistCastOpToDataSourcePass, OperationPass<>> {
-
-  void runOnOperation() override {
-    auto *op = getOperation();
-    MLIRContext *context = &getContext();
-    RewritePatternSet patterns(context);
-
-    patterns.add<HoistCastOpToDataSourcePattern>(patterns.getContext());
-
-    (void)applyPatternsGreedily(op, std::move(patterns));
-  }
-};
-
-static std::unique_ptr<::mlir::Pass> createHoistCastOpToDataSourcePass() {
-  return std::make_unique<HoistCastOpToDataSourcePass>();
 }
 
 struct ReorderOperationsPass
@@ -917,11 +1210,16 @@ void xilinx::aievec::buildCanonicalizeVectorForAIEVec(
   // Add `Vector` code canonicalization passes
   // TODO: Add passes to unroll vector with unsupported types
   // TODO: Add passes to split vectors that won't fit in registers
-  if (decodeTargetBackend(options.targetBackend) == TargetBackend::LLVMIR)
-    pm.addPass(createReorderOperationsPass());
+
+  // If bf16-emulation is enabled, demote f32 vector arithmetic to bf16 first.
+  if (options.enableBF16Emulation)
+    pm.addPass(createBF16EmulationPass());
+
+  pm.addPass(createReorderOperationsPass());
   pm.addPass(createCopyRemovalPass());
-  pm.addPass(createVectorBroadcastLoweringPass());
+  std::optional<AIEVecTargetInfo> targetInfo =
+      parseAIEVecTarget(options.aieTarget);
+  pm.addPass(
+      createVectorBroadcastLoweringPass(targetInfo && targetInfo->isAIE2P()));
   pm.addPass(createCanonicalizeVectorForAIEVecPass(options));
-  if (decodeTargetBackend(options.targetBackend) == TargetBackend::CPP)
-    pm.addPass(createHoistCastOpToDataSourcePass());
 }

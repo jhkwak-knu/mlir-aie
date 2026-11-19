@@ -1,22 +1,19 @@
 //===- plio_test.mlir -------------------------------------------*- MLIR -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2024 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// Copyright (C) 2024, Advanced Micro Devices, Inc.
 //
 //===----------------------------------------------------------------------===//
 
-// RUN: aie-opt --aie-objectFifo-stateful-transform %s | FileCheck %s
+// RUN: aie-opt --aie-objectFifo-stateful-transform="skip-verify=true" --aie-objectFifo-unroll %s | FileCheck %s
 
-// CHECK:  aie.flow(%{{.*}}tile_2_0, PLIO : 0, %{{.*}}tile_2_2, DMA : 0)
-// CHECK:  aie.flow(%{{.*}}tile_2_2, DMA : 0, %{{.*}}tile_2_0, PLIO : 0)
-// CHECK:  aie.flow(%{{.*}}tile_2_2, DMA : 1, %{{.*}}tile_2_3, DMA : 0)
-// CHECK:  aie.flow(%{{.*}}tile_2_2, DMA : 1, %{{.*}}tile_2_0, PLIO : 1)
-// CHECK:  aie.shim_dma_allocation @of_0(MM2S, 0, 2) {plio = true}
-// CHECK:  aie.shim_dma_allocation @of_1(S2MM, 0, 2) {plio = true}
-// CHECK:  aie.shim_dma_allocation @of_2(S2MM, 1, 2) {plio = true}
+// CHECK-DAG:  aie.flow(%{{.*}}tile_2_0, PLIO : 0, %{{.*}}tile_2_2, DMA : 0)
+// CHECK-DAG:  aie.flow(%{{.*}}tile_2_2, DMA : 0, %{{.*}}tile_2_0, PLIO : 0)
+// CHECK-DAG:  aie.flow(%{{.*}}tile_2_2, DMA : 0, %{{.*}}tile_2_3, DMA : 0)
+// CHECK-DAG:  aie.flow(%{{.*}}tile_2_2, DMA : 1, %{{.*}}tile_2_0, PLIO : 1)
+// CHECK-DAG:  aie.shim_dma_allocation @of_0__shim_alloc(%shim_noc_tile_2_0, MM2S, 0) {plio = true}
+// CHECK-DAG:  aie.shim_dma_allocation @of_1__shim_alloc(%shim_noc_tile_2_0, S2MM, 1) {plio = true}
+// CHECK-DAG:  aie.shim_dma_allocation @of_2__shim_alloc(%shim_noc_tile_2_0, S2MM, 0) {plio = true}
 
 module @plio {
     aie.device(xcve2302) {

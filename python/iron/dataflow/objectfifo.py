@@ -1,102 +1,256 @@
 # objectfifo.py -*- Python -*-
 #
-# This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-# See https://llvm.org/LICENSE.txt for license information.
+# Copyright (C) 2024 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #
-# (c) Copyright 2024 Advanced Micro Devices, Inc.
 from __future__ import annotations
-import numpy as np
-from typing import Sequence
 
-from ... import ir  # type: ignore
-from ...dialects._aie_enum_gen import ObjectFifoPort  # type: ignore
-from ...dialects._aie_ops_gen import ObjectFifoCreateOp  # type: ignore
-from ...dialects.aie import object_fifo, object_fifo_link
-from ...helpers.util import (
-    np_ndarray_type_to_memref_type,
+import math
+from typing import TYPE_CHECKING, Sequence
+
+import numpy as np
+
+from ... import ir  # pyright: ignore[reportMissingImports, reportAttributeAccessIssue]
+from ...dialects._aie_enum_gen import (  # pyright: ignore[reportMissingImports]
+    AIETileType,
+    ObjectFifoLinkMode,
+    ObjectFifoPort,
+)
+from ...dialects._aie_ops_gen import (  # pyright: ignore[reportMissingImports]
+    ObjectFifoCreateOp,
+)
+from ...dialects.aie import Port, Transport, object_fifo, object_fifo_link
+from ...helpers.npdtypes import (
+    NpuDType,
+    is_block_float,
     np_ndarray_type_get_dtype,
     np_ndarray_type_get_shape,
+    np_ndarray_type_of,
+    pack_pad_value,
+    single_elem_or_list_to_list,
 )
-from ...util import single_elem_or_list_to_list
-
-from ..resolvable import Resolvable, NotResolvedError
+from ...helpers.sourceloc import Declared, SourceSite, iron_name
+from ...helpers.taplib import TensorAccessPattern
+from ...helpers.taplib._symbolic import sprod
+from ...helpers.util import np_ndarray_type_to_memref_type
+from ..device import AnyComputeTile, AnyMemTile, AnyShimTile, Tile
+from ..resolvable import NotResolvedError, PerDeviceConfigurationResolvable
+from ..runtime._context import active_recording
+from ..scratchpad_parameter import ScratchpadParameter
 from .endpoint import ObjectFifoEndpoint
-from ..device import PlacementTile, AnyMemTile, Tile
+
+if TYPE_CHECKING:
+    from ...utils.compile.jit.markers import In, InOut, Out
 
 
-class ObjectFifo(Resolvable):
-    """An ObjectFifo is a method of representing synchronized, explicit dataflow between
-    IRON program components such as Workers and the Runtime.
+def _object_walk(
+    tap: TensorAccessPattern | None, what: str, can_pad: bool = False
+) -> TensorAccessPattern | None:
+    """Return `tap` after checking that it is a stream walk an ObjectFifo can take."""
+    if tap is None:
+        return None
+    if not isinstance(tap, TensorAccessPattern):
+        raise TypeError(
+            f"{what} takes a TensorAccessPattern, got {type(tap).__name__}; "
+            "TensorAccessPattern(shape, 0, sizes, strides) spells out a walk "
+            "by its numbers"
+        )
+    object_fifo.stream_dims(tap, what, can_pad)
+    return tap
 
-    Internally, it is a circular buffer with a given depth and type of buffer. The
-    users of an ObjectFifo are explicitly either a Producer or a Consumer, and each
-    user has a Placeable endpoint.
+
+def _check_walk_size(
+    tap: TensorAccessPattern | None, sizes: list[int], emits: int | None, what: str
+) -> None:
+    """Check that `tap` walks a tensor of each of `sizes` elements, padded to `emits` unless None."""
+    if tap is None:
+        return
+    numel = sprod(tap.tensor_dims)
+    for size in sizes:
+        if numel != size:
+            raise ValueError(
+                f"{what} {tap!r} walks a tensor of shape {tuple(tap.tensor_dims)}, "
+                f"but each transfer moves {size} elements"
+            )
+    padded = sprod(tap.padded_sizes)
+    if emits is not None and tap.padding is not None and padded != emits:
+        raise ValueError(
+            f"{what} {tap!r} emits {padded} elements, "
+            f"but each object it fills has {emits}"
+        )
+
+
+def _same_shim_pin(a: "Tile | None", b: "Tile | None") -> bool:
+    """Whether two shim-tile re-pin requests refer to the same placement.
+
+    Tile.__eq__ is identity-based, so compare by (col, row); two unpinned
+    (None or col/row None) tiles are considered the same.
     """
+    if a is None or b is None:
+        return a is b
+    return (a.col, a.row) == (b.col, b.row)
 
-    """This is used to generate unique ObjectFifo names."""
-    __of_index = 0
+
+class ObjectFifo(Declared, PerDeviceConfigurationResolvable):
+    """A synchronized, explicit dataflow channel between IRON program components such as [`Worker`][aie.iron.Worker]s and the [`Runtime`][aie.iron.Runtime].
+
+    Internally, an ObjectFifo is a circular buffer with a given depth and
+    element type. Its users are explicitly either a *producer* or a
+    *consumer*, and each user holds an [`ObjectFifoHandle`][aie.iron.dataflow.objectfifo.ObjectFifoHandle]
+    carrying its (possibly unplaced) tile.
+
+    Example:
+        ```python
+        of = ObjectFifo(np.ndarray[(1024,), np.dtype[np.int32]], name="in")
+        producer = of.prod()   # one producer handle
+        consumer = of.cons()   # one or more consumer handles
+        ```
+    """
 
     def __init__(
         self,
-        obj_type: type[np.ndarray],
+        obj_type: type[np.ndarray] | In | Out | InOut,
+        *,
         depth: int | None = 2,
         name: str | None = None,
-        dims_to_stream: list[Sequence[int]] | None = None,
-        default_dims_from_stream_per_cons: list[Sequence[int]] | None = None,
+        to_stream: TensorAccessPattern | None = None,
+        from_stream_per_cons: TensorAccessPattern | None = None,
         plio: bool = False,
+        pad_value: int = 0,
+        disable_synchronization: bool = False,
+        repeat_count: int | None = None,
+        delegate_tile: Tile | None = None,
+        transport: Transport | str | None = None,
+        init_values: list[np.ndarray] | None = None,
+        consumer_obj_type: type[np.ndarray] | In | Out | InOut | None = None,
+        release_strategy: str | None = None,
     ):
         """Construct an ObjectFifo.
 
         Args:
-            obj_type (type[np.ndarray]): The type of each buffer in the ObjectFifo
+            obj_type (type[np.ndarray] | In | Out | InOut): The type of each buffer in the
+                ObjectFifo, or a generator's tensor operand.
             depth (int | None, optional): The default depth of the ObjectFifo endpoints. Defaults to 2.
-            name (str | None, optional): The name of the ObjectFifo. If None is given, a unique name will be generated.. Defaults to None.
-            dims_to_stream (list[Sequence[int]] | None, optional): _description_. Defaults to None.
-            default_dims_from_stream_per_cons (list[Sequence[int]] | None, optional): _description_. Defaults to None.
-            plio (bool, optional): _description_. Defaults to False.
+            name (str | None, optional): The name of the ObjectFifo. If None is
+                given, its DeviceConfiguration names it. Defaults to None.
+            to_stream (TensorAccessPattern | None, optional): How the producer's DMA
+                walks each object onto the AXI stream: a pattern over a tensor the
+                size of one object (of each input's object, for a join's output),
+                at offset 0. A padded one (from ``.pad()``) also pads the stream,
+                on a MemTile. A forwarded fifo's pattern may instead walk the whole
+                stream of input objects (see ``forward()``). Defaults to None (a
+                linear walk).
+            from_stream_per_cons (TensorAccessPattern | None, optional): How each
+                consumer's DMA writes the stream into its object (into each
+                output's object, for a distribute's input), as for ``to_stream``
+                but unpadded. Defaults to None (a linear walk).
+            plio (bool, optional): Whether the ObjectFifo uses PLIO connections. Defaults to False.
+            pad_value (int, optional): Per-element constant value used to fill the padding
+                of a padded ``to_stream``. Packed into the raw 32-bit CONSTANT_PAD_VALUE
+                register using this fifo's element width. Defaults to 0.
+            disable_synchronization (bool, optional): When True, disables lock-based
+                synchronization on the ObjectFifo. Defaults to False.
+            repeat_count (int | None, optional): If set, the sending end replicates
+                each object this many times before moving on to the next one. The
+                receiving end covers a whole batch in one acquire, so its lock
+                initializers scale to match. Distinct from ``iter_count``
+                (BD-chain iteration count). Defaults to None.
+            delegate_tile (Tile | None, optional): Shared-memory delegate tile. When set, the
+                ObjectFifo's underlying buffer pool is allocated on this tile's memory module
+                instead of the default placement. Lowers to ``aie.objectfifo.allocate``. *Only
+                valid when both producer and consumer have shared-memory access to the
+                delegate tile* (e.g. self-loop fifos where prod == cons, or fifos between
+                adjacent tiles spilling to a neighboring MemTile). The delegate is the storage
+                location, not a producer- or consumer-side concept; the underlying op verifier
+                rejects this if either endpoint cannot share memory with the delegate.
+                Defaults to None.
+            transport (Transport | str | None, optional): Which hardware path carries the
+                objects. ``Transport.dma()`` forces the DMAs even when producer and consumer
+                share memory, and ``Transport.shared_mem()`` insists on shared memory.
+                ``Transport.dma(packet=Packet())`` routes the fifo as an
+                ``aie.packet_flow`` sharing the stream with other packet flows, and
+                ``Packet(id=7)`` pins the 5-bit header for designs that route on it.
+                ``Transport.dma(packet=Packet(), out_of_order=True)`` selects receiving
+                buffer descriptors through packet headers, allowing FIFOs to share an
+                S2MM channel. None leaves the choice to the lowering, which is the same
+                as ``Transport.auto()``.
+                What drives each end, a DMA channel or a core stream port, is the ``port``
+                of [`prod`][aie.iron.dataflow.objectfifo.ObjectFifo.prod] and
+                [`cons`][aie.iron.dataflow.objectfifo.ObjectFifo.cons].
+                Lowers to the ``transport`` attribute on the underlying ``aie.objectfifo`` op.
+                Defaults to None.
+            init_values (list[np.ndarray] | None, optional): Per-buffer static initial values
+                for the producer endpoint. One ndarray per producer-side buffer; the producer
+                tile must be able to hold static data at design startup (e.g. a MemTile).
+                Lowers to the ``initValues`` attribute on the underlying ``aie.objectfifo``
+                op. Defaults to None.
+            consumer_obj_type (type[np.ndarray] | None, optional): Consumer element type for
+                asymmetric transfer granularity. When set, the producer sends obj_type-sized
+                transfers and the consumer receives consumer_obj_type-sized transfers.
+                Producer element count must be an integer multiple of consumer element count.
+                Defaults to None.
+            release_strategy (str | None, optional): What a release on the producer
+                handle starts. ``"cycle_buffers"``, the default, leaves the sending
+                DMA to walk the pool's buffers on its own. ``"push_queue"`` has the
+                core push the descriptor of each buffer it releases, which is what
+                lets two ObjectFifos share a sending channel. Defaults to None.
 
         Raises:
-            ValueError: _description_
+            TypeError: If a stream walk is not a ``TensorAccessPattern``.
+            ValueError: If ``depth`` is provided and is less than 1, or a stream
+                walk is staged, has a nonzero offset, or pads a consumer.
         """
+        self._site = SourceSite.capture()
         self._depth = depth
-        if isinstance(self._depth, int) and self._depth < 1:
+        if self._depth is not None and self._depth < 1:
             raise ValueError(
                 f"Default ObjectFifo depth must be > 0, but got {self._depth}"
             )
-        self._obj_type = obj_type
-        self._dims_to_stream = dims_to_stream
-        self._default_dims_from_stream_per_cons = default_dims_from_stream_per_cons
+        self._obj_type = np_ndarray_type_of(obj_type)
+        self._consumer_obj_type: type[np.ndarray] | None = (
+            None if consumer_obj_type is None else np_ndarray_type_of(consumer_obj_type)
+        )
+        self._to_stream = _object_walk(to_stream, "to_stream", can_pad=True)
+        self._from_stream_per_cons = _object_walk(
+            from_stream_per_cons, "from_stream_per_cons"
+        )
         self._plio = plio
-        if name is None:
-            self.name = f"of{ObjectFifo.__get_index()}"
-        else:
-            self.name = name
+        self._pad_value = pad_value
+        self.name = name
         self._op: ObjectFifoCreateOp | None = None
         self._prod: ObjectFifoHandle | None = None
         self._cons: list[ObjectFifoHandle] = []
         self._resolving = False
-
-    @classmethod
-    def __get_index(cls) -> int:
-        idx = cls.__of_index
-        cls.__of_index += 1
-        return idx
+        self._iter_count: int | None = None
+        self._repeat_count: int | None = repeat_count
+        self._disable_synchronization: bool = disable_synchronization
+        # Delegate tile for shared-memory buffer placement (lowers to aie.objectfifo.allocate).
+        # Must be resolved before resolve() runs; DeviceConfiguration finds it via
+        # ObjectFifo._delegate_tile when collecting tiles to assign MLIR ops to.
+        self._delegate_tile: Tile | None = delegate_tile
+        self._transport: Transport | None = Transport.coerce(transport)
+        self._init_values: list[np.ndarray] | None = init_values
+        self._release_strategy: str | None = release_strategy
 
     @property
-    def depth(self) -> int:
-        """The default depth of the ObjectFifo. This may be overriden by an ObjectFifoHandle upon construction."""
+    def depth(self) -> int | None:
+        """The default depth of the ObjectFifo's endpoints; ``prod()`` and ``cons()`` may override it."""
         return self._depth
 
     @property
-    def default_dims_from_stream_per_cons(self) -> list[Sequence[int]]:
-        """The default dimensions from stream per consumer value. This may be overriden by an ObjectFifoHandle of type consumer."""
-        return self._default_dims_from_stream_per_cons
+    def from_stream_per_cons(self) -> TensorAccessPattern | None:
+        """How each consumer's DMA writes the stream into its object, unless ``cons()`` overrides it; None for a linear walk."""
+        return self._from_stream_per_cons
 
     @property
-    def dims_to_stream(self) -> list[Sequence[int]]:
-        """The dimensions to stream value. This will be shared by the ObjectFifoHandle of type producer."""
-        return self._dims_to_stream
+    def to_stream(self) -> TensorAccessPattern | None:
+        """How the producer's DMA walks each object onto the stream; None for a linear walk."""
+        return self._to_stream
+
+    @property
+    def display_name(self) -> str:
+        """The name, or before one is assigned, how an error names it."""
+        return self.name or self._site.describe(type(self).__name__)
 
     @property
     def op(self) -> ObjectFifoCreateOp:
@@ -106,18 +260,41 @@ class ObjectFifo(Resolvable):
 
     @property
     def shape(self) -> Sequence[int]:
-        """The shape of each buffer belonging to the ObjectFifo"""
+        """The shape of each buffer belonging to the ObjectFifo."""
         return np_ndarray_type_get_shape(self._obj_type)
 
     @property
-    def dtype(self) -> np.dtype:
-        """The per-element data type of each element in each buffer belonging to the ObjectFifo"""
+    def dtype(self) -> type[NpuDType]:
+        """The per-element data type of each element in each buffer belonging to the ObjectFifo."""
         return np_ndarray_type_get_dtype(self._obj_type)
 
     @property
     def obj_type(self) -> type[np.ndarray]:
-        """The tensor type of each buffer belonging to the ObjectFifo"""
+        """The tensor type of each buffer belonging to the ObjectFifo."""
         return self._obj_type
+
+    @property
+    def consumer_obj_type(self) -> type[np.ndarray]:
+        """The tensor type of each buffer at a consumer: ``obj_type`` unless the transfer is asymmetric."""
+        return self._consumer_obj_type or self._obj_type
+
+    def set_iter_count(self, iter_count: int):
+        """Set how many times each end of the ObjectFifo cycles through its buffers.
+
+        Args:
+            iter_count (int): Passes each end's BD chain makes before it stops.
+                Both ends carry ``depth * repeat_count * iter_count`` objects, so
+                a sending end replicating each object ``repeat_count`` times
+                makes that many fewer passes than the receiving end opposite it.
+                - Must be in range [1, 256]
+
+        Raises:
+            ValueError: If iter_count is outside the valid range [1, 256]
+        """
+        if not iter_count or iter_count < 1 or iter_count > 256:
+            raise ValueError("Iter count must be in [1, 256] range.")
+
+        self._iter_count = iter_count
 
     def __str__(self) -> str:
         prod_endpoint = None
@@ -125,16 +302,29 @@ class ObjectFifo(Resolvable):
             prod_endpoint = self._prod.endpoint
         return (
             f"{self.__class__.__name__}({self._obj_type}, "
-            f"depth={self.depth}, name='{self.name}', "
+            f"depth={self.depth}, name='{self.display_name}', "
             f"prod={prod_endpoint}, cons={[c.endpoint for c in self._cons]})"
         )
 
-    def prod(self, depth: int | None = None) -> ObjectFifoHandle:
-        """Returns an ObjectFifoHandle of type producer. Each ObjectFifo may have only one producer
-        handle, so if one already exists, a new reference to this handle will be returned.
+    def prod(
+        self,
+        depth: int | None = None,
+        port: Port | None = None,
+        tile: Tile | None = None,
+    ) -> ObjectFifoHandle:
+        """Return an ObjectFifoHandle of type producer.
+
+        Each ObjectFifo may have only one producer handle, so if one already
+        exists, a new reference to this handle will be returned.
 
         Args:
             depth (int | None, optional): The depth of the buffers at the endpoint corresponding to the producer handle. Defaults to None.
+            port (Port | None, optional): What drives the producer end:
+                ``Port.dma(1)`` pins DMA channel 1, and ``Port.stream(0)`` wires it to
+                the core's stream port 0. Defaults to None (a DMA channel allocation picks).
+            tile (Tile | None, optional): When this handle drives an ObjectFifo
+                from the runtime (passed in ``Runtime`` ``fn_args``), the shim tile
+                its host-side DMA binds to. Defaults to None (any available shim tile).
 
         Raises:
             ValueError: Arguments are validated
@@ -146,26 +336,47 @@ class ObjectFifo(Resolvable):
         if self._prod:
             if depth is None:
                 if self._depth is None:
-                    raise ValueError(f"If depth is None, then depth must be specified.")
+                    raise ValueError("If depth is None, then depth must be specified.")
                 else:
                     depth = self._depth
             elif depth < 1:
                 raise ValueError(f"Depth must be > 1, but got {depth}")
+            if port is not None and self._prod.port != port:
+                raise ValueError(
+                    f"Producer handle for {self.display_name} already pinned to "
+                    f"{self._prod.port}, cannot re-pin to {port}."
+                )
+            if tile is not None and not _same_shim_pin(self._prod._shim_tile, tile):
+                raise ValueError(
+                    f"Producer handle for {self.display_name} already pinned to shim tile "
+                    f"{self._prod._shim_tile}, cannot re-pin to {tile}."
+                )
         else:
-            self._prod = ObjectFifoHandle(self, True, depth)
+            self._prod = ObjectFifoHandle(self, True, depth, port=port, tile=tile)
         return self._prod
 
     def cons(
         self,
         depth: int | None = None,
-        dims_from_stream: list[Sequence[int]] | None = None,
+        from_stream: TensorAccessPattern | None = None,
+        port: Port | None = None,
+        tile: Tile | None = None,
     ) -> ObjectFifoHandle:
-        """Returns an ObjectFifoHandle of type consumer. Each ObjectFifo may have multiple consumers, so this
-        will return a new consumer handle every time is it callled.
+        """Return an ObjectFifoHandle of type consumer.
+
+        Each ObjectFifo may have multiple consumers, so this will return a new
+        consumer handle every time it is called.
 
         Args:
             depth (int | None, optional): The depth of the buffers at the endpoint corresponding to this consumer handle. Defaults to None.
-            dims_from_stream (list[Sequence[int]] | None, optional): Dimensions from stream for this consumer. Defaults to None.
+            from_stream (TensorAccessPattern | None, optional): How this consumer's DMA writes
+                the stream into its object (see ``from_stream_per_cons``). Defaults to None.
+            port (Port | None, optional): What drives this consumer end:
+                ``Port.dma(1)`` pins DMA channel 1, and ``Port.stream(0)`` wires it to
+                the core's stream port 0. Defaults to None (a DMA channel allocation picks).
+            tile (Tile | None, optional): When this handle drains an ObjectFifo to
+                the runtime (passed in ``Runtime`` ``fn_args``), the shim tile its
+                host-side DMA binds to. Defaults to None (any available shim tile).
 
         Raises:
             ValueError: Arguments are validated
@@ -175,48 +386,51 @@ class ObjectFifo(Resolvable):
         """
         if depth is None:
             if self._depth is None:
-                raise ValueError(f"If depth is None, then depth must be specified.")
+                raise ValueError("If depth is None, then depth must be specified.")
             else:
                 depth = self._depth
 
-        if dims_from_stream is None:
-            dims_from_stream = self._default_dims_from_stream_per_cons
         self._cons.append(
             ObjectFifoHandle(
-                self, is_prod=False, depth=depth, dims_from_stream=dims_from_stream
+                self,
+                is_prod=False,
+                depth=depth,
+                from_stream=from_stream,
+                port=port,
+                tile=tile,
             )
         )
         return self._cons[-1]
 
-    def tiles(self) -> list[PlacementTile]:
-        """The list of placement tiles corresponding to the endpoints of all handles of this ObjectFifo
+    def tiles(self, cons_only: bool = False) -> list[Tile]:
+        """Return the placement tiles corresponding to the endpoints of all handles of this ObjectFifo.
 
         Raises:
-            ValueError: A producer handle must be constructed.
-            ValueError: At least one consumer handle must be constructed.
+            ValueError: A producer or consumer handle is missing, or is not
+                passed to a Worker, a Runtime or a link.
 
         Returns:
-            list[PlacementTile]: A list of tiles of the endpoints of this ObjectFifo.
+            list[Tile]: A list of tiles of the endpoints of this ObjectFifo.
         """
-        if self._prod == None:
-            raise ValueError("Cannot return prod.tile.op because prod was not created.")
-        if self._cons == []:
-            raise ValueError("Cannot return cons.tile.op because prod was not created.")
-        return [self._prod.tile] + [cons.tile for cons in self._cons]
+        endpoints = [] if cons_only else self._get_endpoint(is_prod=True)
+        endpoints += self._get_endpoint(is_prod=False)
+        tiles = []
+        for endpoint in endpoints:
+            assert endpoint.tile is not None
+            tiles.append(endpoint.tile)
+        return tiles
 
     def _prod_tile_op(self) -> Tile:
-        if self._prod == None:
-            raise ValueError(
-                f"Cannot return prod.tile.op for ObjectFifo {self.name} because prod was not created."
-            )
-        return self._prod.endpoint.tile.op
+        (endpoint,) = self._get_endpoint(is_prod=True)
+        assert endpoint.tile is not None
+        return endpoint.tile.op
 
     def _cons_tiles_ops(self) -> list[Tile]:
-        if len(self._cons) < 1:
-            raise ValueError(
-                f"Cannot return cons.tile.op for ObjectFifo {self.name} because no consumers were not created."
-            )
-        return [cons.endpoint.tile.op for cons in self._cons]
+        ops = []
+        for endpoint in self._get_endpoint(is_prod=False):
+            assert endpoint.tile is not None
+            ops.append(endpoint.tile.op)
+        return ops
 
     def _get_depths(self) -> int | list[int]:
         if not self._prod:
@@ -234,14 +448,48 @@ class ObjectFifo(Resolvable):
 
     def _get_endpoint(self, is_prod: bool) -> list[ObjectFifoEndpoint]:
         if is_prod:
-            if self._prod:
-                return [self._prod.endpoint]
-            else:
-                raise ValueError(f"Prod endpoint not set for {self}")
+            end, handles = "prod", [self._prod] if self._prod else []
         else:
-            if len(self._cons) < 1:
-                raise ValueError(f"Cons endpoint not set for {self}")
-            return [con.endpoint for con in self._cons]
+            end, handles = "cons", self._cons
+        if not handles:
+            raise ValueError(
+                f"ObjectFifo {self.display_name!r} has no {end}() handle: take "
+                "one and pass it to a Worker, a Runtime or a link"
+            )
+        endpoints = []
+        for handle in handles:
+            if handle.endpoint is None:
+                raise ValueError(
+                    f"ObjectFifo {self.display_name!r} has a {end}() handle that "
+                    "is not passed to a Worker, a Runtime or a link"
+                )
+            endpoints.append(handle.endpoint)
+        return endpoints
+
+    def _check_walk_sizes(self) -> None:
+        assert self._prod is not None
+        link = self._prod.endpoint
+        sizes = [math.prod(self.shape)]
+        if isinstance(link, ObjectFifoLink):
+            sizes = link._transfer_sizes(self)
+        emits = math.prod(np_ndarray_type_get_shape(self.consumer_obj_type))
+        # A walk over the stream pads with whole objects, not within each output.
+        walks_stream = (
+            isinstance(link, ObjectFifoLink) and link._walked_objects() is not None
+        )
+        _check_walk_size(
+            self._to_stream,
+            sizes,
+            None if walks_stream else emits,
+            f"{self.display_name} to_stream",
+        )
+        for con in self._cons:
+            sizes = [emits]
+            if isinstance(con.endpoint, ObjectFifoLink):
+                sizes = con.endpoint._transfer_sizes(self)
+            _check_walk_size(
+                con.from_stream, sizes, emits, f"{self.display_name} from_stream"
+            )
 
     def resolve(
         self,
@@ -250,21 +498,63 @@ class ObjectFifo(Resolvable):
     ) -> None:
         if not self._resolving:
             self._resolving = True
-            dims_from_stream_per_cons = [
-                con.dims_from_stream if con.dims_from_stream else []
-                for con in self._cons
-            ]
-            self._op = object_fifo(
+            self._check_walk_sizes()
+            from_stream_per_cons = [con.from_stream for con in self._cons]
+
+            consumer_datatype = (
+                np_ndarray_type_to_memref_type(self._consumer_obj_type)
+                if self._consumer_obj_type is not None
+                else None
+            )
+            assert self.name is not None
+            op = object_fifo(
                 self.name,
                 self._prod_tile_op(),
                 self._cons_tiles_ops(),
                 self._get_depths(),
                 np_ndarray_type_to_memref_type(self._obj_type),
-                dimensionsToStream=self._dims_to_stream,
-                dimensionsFromStreamPerConsumer=dims_from_stream_per_cons,
+                dimensionsToStream=self._to_stream,
+                dimensionsFromStreamPerConsumer=from_stream_per_cons,
                 plio=self._plio,
+                padValue=(
+                    pack_pad_value(
+                        self._pad_value,
+                        np.dtype(np_ndarray_type_get_dtype(self._obj_type)).itemsize,
+                    )
+                    if self._pad_value
+                    else None
+                ),
+                iter_count=self._iter_count,
+                disable_synchronization=self._disable_synchronization or None,
+                transport=self._transport,
+                initValues=self._init_values,
+                consumer_datatype=consumer_datatype,
+                loc=ir.Location.name(
+                    iron_name(self.name), childLoc=loc or self._site.location()
+                ),
+                ip=ip,
             )
+            self._op = op
 
+            if self._repeat_count is not None:
+                op.set_repeat_count(self._repeat_count)
+
+            if self._prod is not None and self._prod.port is not None:
+                op.set_prod_port(self._prod.port)
+            cons_ports = [con.port for con in self._cons]
+            if any(p is not None for p in cons_ports):
+                op.set_cons_ports(cons_ports)
+
+            if self._release_strategy is not None:
+                op.set_release_strategy(self._release_strategy)
+
+            # Shared-memory delegate: redirect the fifo's buffer pool to a tile
+            # whose memory module is shared with both prod and cons. See the
+            # delegate_tile docstring on ObjectFifo for the constraint.
+            if self._delegate_tile is not None:
+                op.allocate(self._delegate_tile.op)
+
+            assert self._prod is not None
             if isinstance(self._prod.endpoint, ObjectFifoLink):
                 self._prod.endpoint.resolve()
             for con in self._cons:
@@ -278,35 +568,53 @@ class ObjectFifo(Resolvable):
     ):
         if num_elem < 1:
             raise ValueError("Must consume at least one element")
+        if (recording := active_recording()) is not None:
+            recording.acquired(self, port, num_elem)
         return self.op.acquire(port, num_elem)
 
     def _release(
         self,
         port: ObjectFifoPort,
         num_elem: int,
+        *,
+        assume_queue_space: bool = False,
     ):
         if num_elem < 1:
             raise ValueError("Must produce at least one element")
-        self.op.release(port, num_elem)
+        if (recording := active_recording()) is not None:
+            recording.released(self, port, num_elem)
+        self.op.release(port, num_elem, assume_queue_space=assume_queue_space)
 
 
-class ObjectFifoHandle(Resolvable):
-    """This class represents a handle to an ObjectFifo. A handle may be of type Producer or type Consumer."""
+class ObjectFifoHandle(PerDeviceConfigurationResolvable):
+    """A handle to an [`ObjectFifo`][aie.iron.ObjectFifo], of type *producer* or *consumer*.
+
+    Producer and consumer handles are what [`Worker`][aie.iron.Worker] core
+    functions call [`acquire`][aie.iron.dataflow.objectfifo.ObjectFifoHandle.acquire]
+    and [`release`][aie.iron.dataflow.objectfifo.ObjectFifoHandle.release] on to
+    move data through the fifo. Obtain them via
+    [`ObjectFifo.prod()`][aie.iron.dataflow.objectfifo.ObjectFifo.prod] and
+    [`ObjectFifo.cons()`][aie.iron.dataflow.objectfifo.ObjectFifo.cons].
+    """
 
     def __init__(
         self,
         of: ObjectFifo,
         is_prod: bool,
         depth: int | None = None,
-        dims_from_stream: list[Sequence[int]] | None = None,
+        from_stream: TensorAccessPattern | None = None,
+        port: Port | None = None,
+        tile: Tile | None = None,
     ):
-        """Construct an ObjectFifoHandle
+        """Construct an ObjectFifoHandle.
 
         Args:
             of (ObjectFifo): The ObjectFifo to construct the handle for.
             is_prod (bool): Whether the handle should be producer or consumer handle.
             depth (int | None, optional): The depth of the ObjectFifo at this endpoint. Defaults to None.
-            dims_from_stream (list[Sequence[int]] | None, optional): A unique dimensions from stream. This is only valid for consumer handles. Defaults to None.
+            from_stream (TensorAccessPattern | None, optional): This consumer's own walk into its object. Only valid for consumer handles. Defaults to None.
+            port (Port | None, optional): What drives this end (see prod()/cons()). Defaults to None.
+            tile (Tile | None, optional): Shim tile for a runtime-driven endpoint (see prod()/cons()). Defaults to None.
 
         Raises:
             ValueError: Arguments are validated.
@@ -320,65 +628,92 @@ class ObjectFifoHandle(Resolvable):
                 )
         if depth < 1:
             raise ValueError(f"Depth must be > 0 but is {depth}")
-        self._port: ObjectFifoPort = (
+        self._fifo_port: ObjectFifoPort = (
             ObjectFifoPort.Produce if is_prod else ObjectFifoPort.Consume
         )
-        if is_prod and dims_from_stream:
-            raise ValueError("Can only specify dims_from_stream for cons handles")
-        elif not is_prod and not dims_from_stream:
-            dims_from_stream = of.default_dims_from_stream_per_cons
+        from_stream = _object_walk(from_stream, "from_stream")
+        if is_prod and from_stream is not None:
+            raise ValueError("Can only specify from_stream for cons handles")
+        elif not is_prod and from_stream is None:
+            from_stream = of.from_stream_per_cons
 
         self._is_prod = is_prod
         self._object_fifo = of
         self._depth = depth
+        self._end_port = port
+        self._shim_tile = tile
         self._endpoint = None
-        self._dims_from_stream = dims_from_stream
+        self._from_stream = from_stream
 
     def acquire(
         self,
         num_elem: int,
     ) -> list:
-        """Acquire access to some elements of the ObjectFifo using ObjectFifo synchronization to moderate access.
+        """Acquire access to some elements of the ObjectFifo, using ObjectFifo synchronization to moderate access.
 
         Args:
-            num_elem (int): Number of elements to acquire. If some elements are already acquired, it will only require the additional elements needed
-            to acquire a total of num_elem.
+            num_elem (int): Number of elements to acquire. If some elements are already
+                acquired, only the additional elements needed to reach a total of
+                ``num_elem`` are acquired.
 
         Raises:
             ValueError: Number of elements cannot exceed ObjectFifo depth.
 
         Returns:
-            list: A indexable handle to the acquired elements.
+            An indexable handle to the acquired elements: a single element when ``num_elem == 1``, or an indexable view when ``num_elem > 1``.
         """
         if self._depth < num_elem:
             raise ValueError(
                 f"Number of elements to acquire {num_elem} must be smaller than depth {self._depth}"
             )
-        return self._object_fifo._acquire(self._port, num_elem)
+        return self._object_fifo._acquire(self._fifo_port, num_elem)
 
     def release(
         self,
         num_elem: int,
+        *,
+        assume_queue_space: bool = False,
     ) -> None:
-        """Release access to some elements of the ObjectFifo. This the other endpoint of the ObjectFifo to acquire them.
+        """Release access to some elements of the ObjectFifo, allowing the other endpoint of the ObjectFifo to acquire them.
 
         Args:
             num_elem (int): Number of elements to release.
+            assume_queue_space (bool): Assert that every DMA queue push generated
+                by this release has room, omitting its queue-space polling.
+                Applies to sending tasks and out-of-order receive replenishment.
+                Buffer synchronization and the pushes remain. The programmer
+                must guarantee room on every execution; a full queue can discard
+                a task and prevent progress. Defaults to False.
 
         Raises:
             ValueError: Number of elements cannot exceed ObjectFifo depth.
-
         """
         if self._depth < num_elem:
             raise ValueError(
                 f"Number of elements to release {num_elem} must be smaller than depth {self._depth}"
             )
-        self._object_fifo._release(self._port, num_elem)
+        self._object_fifo._release(
+            self._fifo_port, num_elem, assume_queue_space=assume_queue_space
+        )
 
     @property
-    def name(self) -> str:
-        """The name of the ObjectFifo"""
+    def object_fifo(self) -> ObjectFifo:
+        """The ``ObjectFifo`` this is an end of."""
+        return self._object_fifo
+
+    @property
+    def name(self) -> str | None:
+        """The name, or None until its DeviceConfiguration assigns one."""
         return self._object_fifo.name
+
+    def _derived_name(self, suffix: str) -> str | None:
+        name = self._object_fifo.name
+        return None if name is None else name + suffix
+
+    @property
+    def port(self) -> Port | None:
+        """What drives this handle's end, or None for a DMA channel allocation picks."""
+        return self._end_port
 
     @property
     def op(self) -> ObjectFifoCreateOp:
@@ -386,17 +721,17 @@ class ObjectFifoHandle(Resolvable):
 
     @property
     def obj_type(self) -> type[np.ndarray]:
-        """The per-buffer type of the ObjectFifo"""
+        """The per-buffer type of the ObjectFifo."""
         return self._object_fifo.obj_type
 
     @property
     def shape(self) -> Sequence[int]:
-        """The per-buffer shape of the ObjectFifo"""
+        """The per-buffer shape of the ObjectFifo."""
         return self._object_fifo.shape
 
     @property
-    def dtype(self) -> np.dtype:
-        """The per-element datatype of the ObjectFifo"""
+    def dtype(self) -> type[NpuDType]:
+        """The per-element datatype of the ObjectFifo."""
         return self._object_fifo.dtype
 
     @property
@@ -408,25 +743,25 @@ class ObjectFifoHandle(Resolvable):
 
     @property
     def depth(self) -> int:
-        """The depth of this ObjectFifoHandle"""
+        """The depth of this ObjectFifoHandle."""
         return self._depth
 
     @property
-    def dims_from_stream(self) -> list[Sequence[int]]:
-        """The dimensions from stream of a consumer ObjectFifoHandle"""
+    def from_stream(self) -> TensorAccessPattern | None:
+        """How this consumer's DMA writes the stream into its object; None for a linear walk."""
         if self._is_prod:
-            raise ValueError("prod ObjectFifoHandles cannot have dims_from_stream")
-        return self._dims_from_stream
+            raise ValueError("prod ObjectFifoHandles cannot have from_stream")
+        return self._from_stream
 
     @property
     def endpoint(self) -> ObjectFifoEndpoint | None:
-        """The endpoint of this ObjectFifoHandle"""
+        """The endpoint of this ObjectFifoHandle."""
         return self._endpoint
 
     def __str__(self) -> str:
         my_str = f"ObjectFifoHandle({self.handle_type}, {self.depth}, "
         if not self._is_prod:
-            my_str += f"{self.dims_from_stream}, "
+            my_str += f"{self.from_stream}, "
         my_str += f"{self._object_fifo})"
         return my_str
 
@@ -434,13 +769,188 @@ class ObjectFifoHandle(Resolvable):
     def endpoint(self, endpoint: ObjectFifoEndpoint) -> None:
         if self._endpoint and self._endpoint != endpoint:
             raise ValueError(
-                f"Endpoint already set for ObjectFifoHandle {self.name}.{self.handle_type}: "
+                f"Endpoint already set for ObjectFifoHandle {self._object_fifo.display_name}.{self.handle_type}: "
                 f"Set to {self._endpoint}, trying to set to {endpoint}"
             )
         self._endpoint = endpoint
 
+    def _emit_transfer(
+        self,
+        rt_data,
+        tap,
+        wait: bool,
+        packet: tuple[int, int] | None,
+        offset_parameter: ScratchpadParameter | str | None,
+        group,
+        managed=True,
+        length_parameter: ScratchpadParameter | str | None = None,
+        length_unit: int | None = None,
+        repeat_parameter: ScratchpadParameter | str | None = None,
+        out_of_order_id: int | None = None,
+    ):
+        """Shared body for fill()/drain().
+
+        Bind the shim endpoint, register the fifo with the active runtime
+        sequence, then emit the transfer on the shim allocation this fifo's name
+        declares. Returns a [`Task`][aie.iron.runtime.dmataskhandle.Task] handle to
+        the transfer (carry it as a ``range_`` iter_arg;
+        ``.free()``/``.await_()`` it). See ``emit_shim_transfer`` for the
+        arguments.
+
+        Lazy imports break the runtime<->dataflow import cycle.
+        """
+        from ..runtime._context import active_sequence
+        from ..runtime.dmatask import emit_shim_transfer
+        from ..runtime.endpoint import RuntimeEndpoint
+
+        # The endpoint is normally bound eagerly when this handle is registered in
+        # Runtime fn_args (using its prod()/cons() tile); bind it here too so a
+        # handle used only via fill/drain still gets a shim endpoint.
+        if self._endpoint is None:
+            self.endpoint = RuntimeEndpoint(self._shim_tile)
+        active_sequence().note_fifo(self)
+        if (recording := active_recording()) is not None:
+            recording.transferred(
+                self,
+                rt_data.default_tap() if tap is None else tap,
+                length_parameter is not None or repeat_parameter is not None,
+            )
+
+        assert self.name is not None
+        return emit_shim_transfer(
+            self.name,
+            rt_data,
+            tap=tap,
+            wait=wait,
+            packet=packet,
+            offset_parameter=offset_parameter,
+            group=group,
+            managed=managed,
+            length_parameter=length_parameter,
+            length_unit=length_unit,
+            repeat_parameter=repeat_parameter,
+            out_of_order_id=out_of_order_id,
+        )
+
+    def fill(
+        self,
+        source,
+        tap=None,
+        wait: bool = False,
+        packet: tuple[int, int] | None = None,
+        offset_parameter: ScratchpadParameter | str | None = None,
+        group=None,
+        managed: bool = True,
+        length_parameter: ScratchpadParameter | str | None = None,
+        length_unit: int | None = None,
+        repeat_parameter: ScratchpadParameter | str | None = None,
+        out_of_order_id: int | None = None,
+    ):
+        """Fill this producer ObjectFifo with data from the ``source`` runtime buffer.
+
+        An ``out_of_order`` fifo requires ``out_of_order_id`` to select its
+        receiving buffer. Each packet must contain exactly one receiving
+        object's bytes, with a statically known length. Task repetitions reuse
+        the same ID; use separate fills to cycle through receiving buffers.
+
+        Call from within a [`Runtime`][aie.iron.Runtime] sequence body on a producer
+        handle. See ``_emit_transfer`` for the shared arguments; returns a
+        [`Task`][aie.iron.runtime.dmataskhandle.Task] handle to the transfer.
+        """
+        if not self._is_prod:
+            raise ValueError("fill() is only valid on a producer ObjectFifoHandle")
+
+        transport = self._object_fifo._transport
+        if transport and transport.out_of_order:
+            from ...dialects.aiex import shim_dims
+            from ..runtime.data import RuntimeData
+
+            if out_of_order_id is None:
+                raise ValueError(
+                    f"ObjectFifo '{self.name}' is out_of_order, so each fill names "
+                    "the buffer it lands in: pass out_of_order_id"
+                )
+            if not isinstance(source, RuntimeData):
+                raise ValueError(f"Expected a RuntimeData source/dest, got {source}")
+            if length_parameter is not None:
+                raise ValueError("out_of_order fill does not support length_parameter")
+            if tap is None:
+                tap = source.default_tap()
+            _, sizes, _ = shim_dims(tap)
+            # Outer dimensions repeat the BD; the last three size each packet.
+            packet_sizes = sizes[-3:]
+            if not all(isinstance(s, (int, np.integer)) for s in packet_sizes):
+                raise ValueError("out_of_order fill requires a static packet length")
+
+            def element_bytes(dtype):
+                return (
+                    dtype.block_bytes
+                    if is_block_float(dtype)
+                    else np.dtype(dtype).itemsize
+                )
+
+            packet_bytes = math.prod(packet_sizes) * element_bytes(source.dtype)
+            obj_type = self._object_fifo.consumer_obj_type
+            object_bytes = math.prod(
+                np_ndarray_type_get_shape(obj_type)
+            ) * element_bytes(np_ndarray_type_get_dtype(obj_type))
+            if packet_bytes != object_bytes:
+                raise ValueError(
+                    f"out_of_order fill sends {packet_bytes} bytes per packet, but "
+                    f"one receiving object requires {object_bytes} bytes; "
+                    "use an object-sized tap and a separate fill for each destination ID"
+                )
+        return self._emit_transfer(
+            source,
+            tap,
+            wait,
+            packet,
+            offset_parameter,
+            group,
+            managed,
+            length_parameter,
+            length_unit,
+            repeat_parameter,
+            out_of_order_id,
+        )
+
+    def drain(
+        self,
+        dest,
+        tap=None,
+        wait: bool = False,
+        packet: tuple[int, int] | None = None,
+        offset_parameter: ScratchpadParameter | str | None = None,
+        group=None,
+        managed: bool = True,
+        length_parameter: ScratchpadParameter | str | None = None,
+        length_unit: int | None = None,
+        repeat_parameter: ScratchpadParameter | str | None = None,
+    ):
+        """Drain this consumer ObjectFifo, writing data to the ``dest`` runtime buffer.
+
+        Call from within a [`Runtime`][aie.iron.Runtime] sequence body on a consumer
+        handle. See ``_emit_transfer`` for the shared arguments; returns a
+        [`Task`][aie.iron.runtime.dmataskhandle.Task] handle to the transfer.
+        """
+        if self._is_prod:
+            raise ValueError("drain() is only valid on a consumer ObjectFifoHandle")
+
+        return self._emit_transfer(
+            dest,
+            tap,
+            wait,
+            packet,
+            offset_parameter,
+            group,
+            managed,
+            length_parameter,
+            length_unit,
+            repeat_parameter,
+        )
+
     def all_of_endpoints(self) -> list[ObjectFifoEndpoint]:
-        """All endpoints belonging to an ObjectFifo"""
+        """All endpoints belonging to an ObjectFifo."""
         return self._object_fifo._get_endpoint(
             is_prod=True
         ) + self._object_fifo._get_endpoint(is_prod=False)
@@ -448,26 +958,33 @@ class ObjectFifoHandle(Resolvable):
     def join(
         self,
         offsets: list[int],
-        placement: PlacementTile = AnyMemTile,
+        tile: Tile | None = AnyMemTile,
         depths: list[int] | None = None,
-        obj_types: list[type[np.ndarray]] = None,
-        names: list[str] | None = None,
-        dims_to_stream: list[list[Sequence[int] | None]] | None = None,
-        dims_from_stream: list[list[Sequence[int] | None]] | None = None,
+        obj_types: list[type[np.ndarray]] | None = None,
+        names: Sequence[str | None] | None = None,
+        to_stream: Sequence[TensorAccessPattern | None] | None = None,
+        from_stream: Sequence[TensorAccessPattern | None] | None = None,
         plio: bool = False,
+        repeat_counts: Sequence[int | None] | None = None,
     ) -> list[ObjectFifo]:
         """Construct multiple ObjectFifos which feed data into a ObjectFifoHandle.
+
         Note that this function is only valid for producer ObjectFifoHandles.
 
         Args:
             offsets (list[int]): Offsets into the current producer, each corresponding to a new consumer.
-            placement (PlacementTile, optional): The placement where the Join operation occurs. Defaults to AnyMemTile.
+            tile (Tile, optional): The tile where the Join operation occurs. Also accepts None (treated as AnyMemTile). Defaults to AnyMemTile.
             depths (list[int] | None, optional): The depth of each new ObjectFifo. Defaults to None.
             obj_types (list[type[np.ndarray]], optional): The type of the buffers corresponding to each new ObjectFifo. Defaults to None.
-            names (list[str] | None, optional): The name of each new ObjectFifo. If not given, unique names will be generated. Defaults to None.
-            dims_to_stream (list[list[Sequence[int]  |  None]] | None, optional): The dimensionsToStream to assign to each new ObjectFifo. Defaults to None.
-            dims_from_stream (list[list[Sequence[int]  |  None]] | None, optional): The dimensionsFromStream to assign to each new ObjectFifo consumer. Defaults to None.
+            names (Sequence[str | None] | None, optional): The name of each new ObjectFifo. If not given,
+                each is named after this one, or by the Program if this one is unnamed.
+                Defaults to None.
+            to_stream (Sequence[TensorAccessPattern | None] | None, optional): Each new ObjectFifo's
+                ``to_stream``. Defaults to None.
+            from_stream (Sequence[TensorAccessPattern | None] | None, optional): Each new
+                ObjectFifo consumer's ``from_stream``. Defaults to None.
             plio (bool, optional): Set plio on each new ObjectFifo. Defaults to False.
+            repeat_counts (Sequence[int | None] | None, optional): Per-sub-fifo MemTile DMA repeat count (see ObjectFifo.repeat_count). Defaults to None.
 
         Raises:
             ValueError: Arguments are validated
@@ -489,23 +1006,26 @@ class ObjectFifoHandle(Resolvable):
             raise ValueError("Number of obj_types does not match number of offsets")
 
         if names is None:
-            names = [self._object_fifo.name + f"_join{i}" for i in range(num_subfifos)]
+            names = [self._derived_name(f"_join{i}") for i in range(num_subfifos)]
         elif len(names) != num_subfifos:
             raise ValueError("Number of names does not match number of offsets")
 
-        if dims_to_stream is None:
-            dims_to_stream = [[]] * num_subfifos
-        elif len(dims_to_stream) != num_subfifos:
+        if to_stream is None:
+            to_stream = [None] * num_subfifos
+        elif len(to_stream) != num_subfifos:
             raise ValueError(
                 "Number of dims to stream does not match number of offsets"
             )
 
-        if dims_from_stream is None:
-            dims_from_stream = [[]] * num_subfifos
-        elif dims_from_stream and len(dims_from_stream) != num_subfifos:
-            raise ValueError(
-                "Number of dims_from_stream does not match number of offsets"
-            )
+        if from_stream is None:
+            from_stream = [None] * num_subfifos
+        elif len(from_stream) != num_subfifos:
+            raise ValueError("Number of from_stream does not match number of offsets")
+
+        if repeat_counts is None:
+            repeat_counts = [None for _ in range(num_subfifos)]
+        elif len(repeat_counts) != num_subfifos:
+            raise ValueError("Number of repeat_counts does not match number of offsets")
 
         # Create subfifos
         subfifos = []
@@ -515,41 +1035,180 @@ class ObjectFifoHandle(Resolvable):
                     obj_types[i],
                     name=names[i],
                     depth=depths[i],
-                    dims_to_stream=dims_to_stream[i],
+                    to_stream=to_stream[i],
                     plio=plio,
+                    repeat_count=repeat_counts[i],
                 )
             )
 
         subfifo_cons = [
-            s.cons(depth=depths[i], dims_from_stream=dims_from_stream[i])
-            for s in subfifos
+            s.cons(depth=depths[i], from_stream=from_stream[i])
+            for i, s in enumerate(subfifos)
         ]
-        _ = ObjectFifoLink(subfifo_cons, self, placement, offsets, [])
+        _ = ObjectFifoLink(subfifo_cons, self, tile, offsets, [])
         return subfifos
+
+    def merge(
+        self,
+        num_inputs: int,
+        tile: Tile | None = AnyMemTile,
+        depths: list[int] | None = None,
+        names: Sequence[str | None] | None = None,
+        transports: Sequence[Transport | str | None] | None = None,
+    ) -> list[ObjectFifo]:
+        """Construct ObjectFifos that take turns feeding whole objects into this producer.
+
+        Unlike join(), where each input fills a slice of every object, each
+        input here sends whole objects of this fifo's type, and they share one
+        channel at the link tile through one packet-switched fan-in route.
+        Objects arrive in whatever order the inputs send them. Only valid for
+        producer ObjectFifoHandles.
+
+        Args:
+            num_inputs (int): How many ObjectFifos take turns; at least two.
+            tile (Tile, optional): The tile where the merge occurs. Also accepts
+                None (treated as AnyMemTile). Defaults to AnyMemTile.
+            depths (list[int] | None, optional): The depth of each new
+                ObjectFifo. Defaults to this handle's depth.
+            names (Sequence[str | None] | None, optional): The name of each new
+                ObjectFifo. Defaults to this one's name with ``_merge{i}``.
+            transports (Sequence[Transport | str | None] | None, optional): Each
+                new ObjectFifo's transport, for example to pin the packet header
+                they share. Defaults to None.
+
+        Raises:
+            ValueError: Arguments are validated.
+
+        Returns:
+            list[ObjectFifo]: The new ObjectFifos whose consumers feed this merge.
+        """
+        if not self._is_prod:
+            raise ValueError(f"Cannot merge() a {self.handle_type} ObjectFifoHandle")
+        subfifos = self._turn_fifos("merge", num_inputs, depths, names, transports)
+        _ = ObjectFifoLink(
+            [s.cons() for s in subfifos],
+            self,
+            tile,
+            mode=ObjectFifoLinkMode.Time,
+        )
+        return subfifos
+
+    def dispatch(
+        self,
+        num_outputs: int,
+        tile: Tile | None = AnyMemTile,
+        depths: list[int] | None = None,
+        names: Sequence[str | None] | None = None,
+        transports: Sequence[Transport | str | None] | None = None,
+    ) -> list[ObjectFifo]:
+        """Construct ObjectFifos that take turns receiving this consumer's objects.
+
+        Unlike split(), where each output takes a slice of every object, object
+        k goes whole to output k mod `num_outputs`, over one channel at the
+        link tile and one packet-switched route per output. Each output has one
+        consumer. Only valid for consumer ObjectFifoHandles.
+
+        Args:
+            num_outputs (int): How many ObjectFifos take turns; at least two.
+            tile (Tile, optional): The tile where the dispatch occurs. Also
+                accepts None (treated as AnyMemTile). Defaults to AnyMemTile.
+            depths (list[int] | None, optional): The depth of each new
+                ObjectFifo. Defaults to this handle's depth.
+            names (Sequence[str | None] | None, optional): The name of each new
+                ObjectFifo. Defaults to this one's name with ``_dispatch{i}``.
+            transports (Sequence[Transport | str | None] | None, optional): Each
+                new ObjectFifo's transport, for example to pin its turn's packet
+                header. Defaults to None.
+
+        Raises:
+            ValueError: Arguments are validated.
+
+        Returns:
+            list[ObjectFifo]: The new ObjectFifos whose producers take the turns.
+        """
+        if self._is_prod:
+            raise ValueError(f"Cannot dispatch() a {self.handle_type} ObjectFifoHandle")
+        subfifos = self._turn_fifos("dispatch", num_outputs, depths, names, transports)
+        _ = ObjectFifoLink(
+            self,
+            [s.prod() for s in subfifos],
+            tile,
+            mode=ObjectFifoLinkMode.Time,
+        )
+        return subfifos
+
+    def _turn_fifos(
+        self,
+        what: str,
+        count: int,
+        depths: list[int] | None,
+        names: Sequence[str | None] | None,
+        transports: Sequence[Transport | str | None] | None,
+    ) -> list[ObjectFifo]:
+        """Build the ObjectFifos of a merge or dispatch, one per turn."""
+        if count < 2:
+            raise ValueError(f"{what}() takes turns between at least two fifos")
+        for given, label in (
+            (depths, "depths"),
+            (names, "names"),
+            (transports, "transports"),
+        ):
+            if given is not None and len(given) != count:
+                raise ValueError(f"{what}() got {len(given)} {label} for {count} fifos")
+        depths = [self.depth] * count if depths is None else list(depths)
+        names = names or [self._derived_name(f"_{what}{i}") for i in range(count)]
+        transports = transports or [None] * count
+        return [
+            ObjectFifo(
+                self._object_fifo.obj_type,
+                name=names[i],
+                depth=depths[i],
+                transport=transports[i],
+            )
+            for i in range(count)
+        ]
 
     def split(
         self,
         offsets: list[int],
-        placement: PlacementTile = AnyMemTile,
+        tile: Tile | None = AnyMemTile,
         depths: list[int] | None = None,
-        obj_types: list[type[np.ndarray]] = None,
-        names: list[str] | None = None,
-        dims_to_stream: list[list[Sequence[int]]] | None = None,
-        dims_from_stream: list[list[Sequence[int]]] | None = None,
+        obj_types: list[type[np.ndarray]] | None = None,
+        names: Sequence[str | None] | None = None,
+        to_stream: Sequence[TensorAccessPattern | None] | None = None,
+        from_stream: Sequence[TensorAccessPattern | None] | None = None,
         plio: bool = False,
+        repeat_counts: Sequence[int | None] | None = None,
+        pad_value: list[int] | None = None,
+        ports: Sequence[Port | None] | None = None,
     ) -> list[ObjectFifo]:
         """Split the data from an ObjectFifoConsumer handle by sending it to producers in N newly constructed ObjectFifos.
+
         Note this operation is only valid for ObjectFifoHandles of type consumer.
 
         Args:
             offsets (list[int]): The offset into the current consumer for each new ObjectFifo producer.
-            placement (PlacementTile, optional): The placement tile where the Split operation takes place. Defaults to AnyMemTile.
+            tile (Tile, optional): The tile where the Split operation takes place. Also accepts None (treated as AnyMemTile). Defaults to AnyMemTile.
             depths (list[int] | None, optional): The depth of each new ObjectFifo. Defaults to None.
             obj_types (list[type[np.ndarray]], optional): The buffer type of each new ObjectFifo. Defaults to None.
-            names (list[str] | None, optional): The name of each new ObjectFifo. If not given, a unique name will be generated. Defaults to None.
-            dims_to_stream (list[list[Sequence[int]]] | None, optional): The dimensions to stream for each new ObjectFifo. Defaults to None.
-            dims_from_stream (list[list[Sequence[int]]] | None, optional): The dimensions from stream for each new ObjectFifo. Defaults to None.
+            names (Sequence[str | None] | None, optional): The name of each new ObjectFifo. If not given,
+                each is named after this one, or by the Program if this one is unnamed.
+                Defaults to None.
+            to_stream (Sequence[TensorAccessPattern | None] | None, optional): Each new ObjectFifo's
+                ``to_stream``; a padded one pads that output. A split into one
+                fifo at offset 0 is a ``forward()``, whose ``to_stream`` may
+                also walk the whole stream (overlapping windows; see
+                ``forward()``). Defaults to None.
+            from_stream (Sequence[TensorAccessPattern | None] | None, optional): Each new
+                ObjectFifo's ``from_stream_per_cons``. Defaults to None.
             plio (bool, optional): Set plio on each new ObjectFifo. Defaults to False.
+            repeat_counts (Sequence[int | None] | None, optional): Per-sub-fifo MemTile DMA repeat count (see ObjectFifo.repeat_count). Defaults to None.
+            pad_value (list[int] | None, optional): Per-sub-fifo per-element pad fill value (see ObjectFifo.pad_value). Defaults to None.
+
+            ports (Sequence[Port | None] | None, optional): What drives each output
+                ObjectFifo's producer end, one per output, such as ``Port.dma(1)``.
+                split() builds those producer handles itself, so this is the
+                only place to say it. Defaults to None (all compiler-assigned).
 
         Raises:
             ValueError: Arguments are validated.
@@ -571,23 +1230,33 @@ class ObjectFifoHandle(Resolvable):
             raise ValueError("Number of obj_types does not match number of offsets")
 
         if names is None:
-            names = [self._object_fifo.name + f"_split{i}" for i in range(num_subfifos)]
+            names = [self._derived_name(f"_split{i}") for i in range(num_subfifos)]
         elif len(names) != num_subfifos:
             raise ValueError("Number of names does not match number of offsets")
 
-        if dims_to_stream is None:
-            dims_to_stream = [[]] * num_subfifos
-        elif len(dims_to_stream) != num_subfifos:
+        if to_stream is None:
+            to_stream = [None] * num_subfifos
+        elif len(to_stream) != num_subfifos:
             raise ValueError(
-                "Number of dims_to_stream arrays does not match number of offsets"
+                "Number of to_stream arrays does not match number of offsets"
             )
 
-        if dims_from_stream is None:
-            dims_from_stream = [[]] * num_subfifos
-        elif len(dims_from_stream) != num_subfifos:
+        if from_stream is None:
+            from_stream = [None] * num_subfifos
+        elif len(from_stream) != num_subfifos:
             raise ValueError(
-                "Number of dims_from_stream arrays does not match number of offsets"
+                "Number of from_stream arrays does not match number of offsets"
             )
+
+        if repeat_counts is None:
+            repeat_counts = [None for _ in range(num_subfifos)]
+        elif len(repeat_counts) != num_subfifos:
+            raise ValueError("Number of repeat_counts does not match number of offsets")
+
+        if pad_value is None:
+            pad_value = [0 for _ in range(num_subfifos)]
+        elif len(pad_value) != num_subfifos:
+            raise ValueError("Number of pad_value does not match number of offsets")
 
         # Create subfifos
         subfifos = []
@@ -597,38 +1266,74 @@ class ObjectFifoHandle(Resolvable):
                     obj_types[i],
                     name=names[i],
                     depth=depths[i],
-                    dims_to_stream=dims_to_stream[i],
-                    default_dims_from_stream_per_cons=dims_from_stream[i],
+                    to_stream=to_stream[i],
+                    from_stream_per_cons=from_stream[i],
                     plio=plio,
+                    repeat_count=repeat_counts[i],
+                    pad_value=pad_value[i],
                 )
             )
 
         # Create link and set it as endpoints
-        subfifo_prods = [s.prod() for s in subfifos]
-        _ = ObjectFifoLink(self, subfifo_prods, placement, [], offsets)
+        pinned: list[Port | None] = (
+            [None] * len(subfifos) if ports is None else list(ports)
+        )
+        if len(pinned) != len(subfifos):
+            raise ValueError(
+                f"split() got {len(pinned)} ports for {len(subfifos)} "
+                "outputs; give one per output or none at all."
+            )
+        # A subfifo's producer handle is built here, so a caller wanting its
+        # port pinned has nowhere else to say it -- prod() refuses to re-pin.
+        subfifo_prods = [s.prod(port=p) for s, p in zip(subfifos, pinned)]
+        _ = ObjectFifoLink(self, subfifo_prods, tile, [], offsets)
         return subfifos
 
     def forward(
         self,
-        placement: PlacementTile = AnyMemTile,
+        tile: Tile | None = AnyMemTile,
         obj_type: type[np.ndarray] | None = None,
         depth: int | None = None,
         name: str | None = None,
-        dims_to_stream: list[Sequence[int]] | None = None,
-        dims_from_stream: list[Sequence[int]] | None = None,
+        to_stream: TensorAccessPattern | None = None,
+        from_stream: TensorAccessPattern | None = None,
         plio: bool = False,
+        repeat_count: int | None = None,
+        pad_value: int = 0,
+        port: Port | None = None,
     ) -> ObjectFifo:
-        """This is a special case of the split() operation where an ObjectFifoHandle of type consumer
+        """Forward an ObjectFifoHandle of type consumer to a newly-constructed ObjectFifo.
+
+        This is a special case of the split() operation where the consumer handle
         is forwarded to the producer of a newly-constructed ObjectFifo.
 
         Args:
-            placement (PlacementTile, optional): The placement of the Forward operation. Defaults to AnyMemTile.
+            tile (Tile, optional): The tile for the Forward operation. Also accepts None (treated as AnyMemTile). Defaults to AnyMemTile.
             obj_type (type[np.ndarray] | None, optional): The object type of the new ObjectFifo. Defaults to None.
             depth (int | None, optional): The depth of the new ObjectFifo. Defaults to None.
-            name (str | None, optional): The name of the new ObjectFifo. If None is given, a unique name will be generated. Defaults to None.
-            dims_to_stream (list[Sequence[int]] | None, optional): The dimensions to stream for the new ObjectFifo. Defaults to None.
-            dims_from_stream (list[Sequence[int]] | None, optional): The dimensions from stream for the new ObjectFifo. Defaults to None.
+            name (str | None, optional): The name of the new ObjectFifo. If None is given, it
+                is named after this one, or by the Program if this one is unnamed. Defaults to None.
+            to_stream (TensorAccessPattern | None, optional): The new ObjectFifo's ``to_stream``;
+                a padded one pads the forwarded stream. On a MemTile it may walk
+                the whole stream of this fifo's objects, e.g. overlapping windows
+                of rows: its tensor is the stream (a whole number of objects), the
+                outer dimension enumerates the new fifo's objects and steps whole
+                input objects, and the inner dimensions are one new object, at
+                most one of them stepping by one input object. Padding only the
+                outer dimension, by ``(before, after)``, adds that many zero
+                objects ahead of and behind the stream; walk coordinates start at
+                the first of them. The MemTile then holds the whole stream.
+                Defaults to None.
+            from_stream (TensorAccessPattern | None, optional): The new ObjectFifo's
+                ``from_stream_per_cons``. Defaults to None.
             plio (bool, optional): Set plio on each new ObjectFifo. Defaults to False.
+            repeat_count (int | None, optional): MemTile DMA repeat count for the new ObjectFifo (see ObjectFifo.repeat_count). Defaults to None.
+            pad_value (int, optional): Per-element constant fill value for a padded
+                ``to_stream`` (see ObjectFifo.pad_value). Defaults to 0.
+            port (Port | None, optional): What drives the forwarded ObjectFifo's
+                producer end, such as ``Port.dma(1)``. forward() builds that
+                producer handle itself, so this is the only place to say it.
+                Defaults to None (assigned by the compiler).
 
         Raises:
             ValueError: Arguments are Validated
@@ -638,28 +1343,24 @@ class ObjectFifoHandle(Resolvable):
         """
         if self._is_prod:
             raise ValueError(f"Cannot forward a {self.handle_type} ObjectFifoHandle")
-        if obj_type:
-            obj_type = [obj_type]
-        if depth:
-            depth = [depth]
-        if name:
-            name = [name]
-        else:
-            name = [self._object_fifo.name + "_fwd"]
-        if dims_to_stream:
-            dims_to_stream = [dims_to_stream]
-        if dims_from_stream:
-            dims_from_stream = [dims_from_stream]
+        obj_types = [obj_type] if obj_type else None
+        depths = [depth] if depth else None
+        names = [name or self._derived_name("_fwd")]
+        to_stream_arg = [to_stream] if to_stream is not None else None
+        from_stream_arg = [from_stream] if from_stream is not None else None
 
         forward_fifo = self.split(
             [0],
-            placement=placement,
-            obj_types=obj_type,
-            depths=depth,
-            names=name,
-            dims_to_stream=dims_to_stream,
-            dims_from_stream=dims_from_stream,
+            tile=tile,
+            obj_types=obj_types,
+            depths=depths,
+            names=names,
+            to_stream=to_stream_arg,
+            from_stream=from_stream_arg,
             plio=plio,
+            repeat_counts=[repeat_count] if repeat_count is not None else None,
+            pad_value=[pad_value] if pad_value else None,
+            ports=[port] if port is not None else None,
         )
         return forward_fifo[0]
 
@@ -671,34 +1372,45 @@ class ObjectFifoHandle(Resolvable):
         self._object_fifo.resolve(loc=loc, ip=ip)
 
 
-class ObjectFifoLink(ObjectFifoEndpoint, Resolvable):
+class ObjectFifoLink(Declared, ObjectFifoEndpoint, PerDeviceConfigurationResolvable):
     """This is an object used internally by split(), join() and forward() operations."""
 
     def __init__(
         self,
         srcs: list[ObjectFifoHandle] | ObjectFifoHandle,
         dsts: list[ObjectFifoHandle] | ObjectFifoHandle,
-        placement: PlacementTile = AnyMemTile,
-        src_offsets: list[int] = [],
-        dst_offsets: list[int] = [],
+        tile: Tile | None = AnyMemTile,
+        src_offsets: list[int] | None = None,
+        dst_offsets: list[int] | None = None,
+        mode: ObjectFifoLinkMode = ObjectFifoLinkMode.Space,
     ):
         """Construct an ObjectFifoLink. This is either a many-to-one, one-to-many, or one-to-one operation.
 
         Args:
             srcs (list[ObjectFifoHandle] | ObjectFifoHandle): A list of consumer ObjectFifoHandles to link.
             dsts (list[ObjectFifoHandle] | ObjectFifoHandle): A list of producer ObjectFifoHandles to link.
-            placement (PlacementTile, optional): The place the link occurs. Defaults to AnyMemTile.
-            src_offsets (list[int], optional): If many sources, one offset per source is required to split the destination. Defaults to [].
-            dst_offsets (list[int], optional): If many destinations, one offset per destination is required to split the source. Defaults to [].
+            tile (Tile, optional): The tile where the link occurs. Also accepts None (treated as AnyMemTile). Defaults to AnyMemTile.
+            src_offsets (list[int] | None, optional): If many sources, one offset per source
+                is required to split the destination. Defaults to None (empty list).
+            dst_offsets (list[int] | None, optional): If many destinations, one offset per
+                destination is required to split the source. Defaults to None (empty list).
+            mode (ObjectFifoLinkMode, optional): ``Space`` splits every object
+                between the many side's fifos at the offsets; ``Time`` has them
+                take turns with whole objects (merge() and dispatch()). Defaults
+                to ``Space``.
 
         Raises:
             ValueError: Arguments are validated.
         """
+        self._site = SourceSite.capture()
+        self._mode = mode
         self._srcs = single_elem_or_list_to_list(srcs)
         self._dsts = single_elem_or_list_to_list(dsts)
-        self._src_offsets = src_offsets
-        self._dst_offsets = dst_offsets
+        self._src_offsets = src_offsets if src_offsets is not None else []
+        self._dst_offsets = dst_offsets if dst_offsets is not None else []
         self._resolving = False
+        if (recording := active_recording()) is not None:
+            recording.linked(self)
 
         if len(self._srcs) < 1:
             raise ValueError("An ObjectFifoLink must have at least one source")
@@ -710,18 +1422,132 @@ class ObjectFifoLink(ObjectFifoEndpoint, Resolvable):
             )
         if len(self._src_offsets) > 0 and len(self._src_offsets) != len(self._srcs):
             raise ValueError(
-                "Then number of source offsets does not match the number of sources"
+                "The number of source offsets does not match the number of sources"
             )
         if len(self._dst_offsets) > 0 and len(self._dst_offsets) != len(self._dsts):
             raise ValueError(
-                "Then number of destination offsets does not match the number of destinations"
+                "The number of destination offsets does not match the number of destinations"
             )
+        if mode == ObjectFifoLinkMode.Time and (self._src_offsets or self._dst_offsets):
+            raise ValueError("A time link moves whole objects and takes no offsets")
         self._op = None
         for s in self._srcs:
             s.endpoint = self
         for d in self._dsts:
             d.endpoint = self
-        ObjectFifoEndpoint.__init__(self, placement)
+        if tile is None:
+            tile = AnyMemTile
+        # Isolate singleton defaults, but retain user tiles shared with Workers
+        # or other links so they resolve to the same logical tile.
+        if any(
+            tile is default for default in (AnyMemTile, AnyComputeTile, AnyShimTile)
+        ):
+            tile = tile.copy()
+        # Respect explicit types and let the device infer fully placed tiles.
+        placed = tile.col is not None and tile.row is not None
+        if tile.tile_type is None and not placed:
+            tile.tile_type = AIETileType.MemTile
+        ObjectFifoEndpoint.__init__(self, tile)
+
+    @property
+    def srcs(self) -> tuple[ObjectFifoHandle, ...]:
+        """The fifo ends it reads."""
+        return tuple(self._srcs)
+
+    @property
+    def dsts(self) -> tuple[ObjectFifoHandle, ...]:
+        """The fifo ends it fills."""
+        return tuple(self._dsts)
+
+    @property
+    def src_offsets(self) -> tuple[int, ...]:
+        """Where each source lands in a destination object, joining."""
+        return tuple(self._src_offsets)
+
+    @property
+    def dst_offsets(self) -> tuple[int, ...]:
+        """Where each destination's part starts in a source object, splitting."""
+        return tuple(self._dst_offsets)
+
+    @property
+    def mode(self) -> ObjectFifoLinkMode:
+        """``Space`` splits or joins every object; ``Time`` has the many side take turns."""
+        return self._mode
+
+    def _walked_objects(self) -> int | None:
+        """Return how many input objects a 1:1 link's output walks, or None for a walk within one object.
+
+        A `to_stream` that reaches past one input object walks the whole
+        stream of them: its outer dimension enumerates the outputs and steps
+        whole input objects, its inner dimensions are one output's transfer,
+        and padding the outer dimension by `(before, after)` adds that many
+        zero objects ahead of and behind the stream. The tensor it walks is
+        the stream itself.
+
+        Raises:
+            ValueError: If the walk's tensor does not hold the objects it walks.
+        """
+        if len(self._srcs) != 1 or len(self._dsts) != 1:
+            return None
+        out = self._dsts[0]._object_fifo
+        tap = out.to_stream
+        if tap is None:
+            return None
+        in_size = math.prod(self._srcs[0]._object_fifo.shape)
+        dims = tap.transformation_dims
+        reach = sum((size - 1) * stride for size, stride in dims)
+        inner = math.prod(size for size, _ in dims[1:])
+        if len(dims) < 2 or dims[0][0] < 2 or reach < in_size:
+            return None
+        if inner != math.prod(out.shape) or dims[0][1] % in_size:
+            return None
+        rows = [size for size, stride in dims[1:] if size > 1 and stride == in_size]
+        before, after = (0, 0) if tap.padding is None else tap.padding[0]
+        span = rows[0] if rows else 1
+        objects = (dims[0][0] - 1) * (dims[0][1] // in_size) + span - before - after
+        if sprod(tap.tensor_dims) != objects * in_size:
+            raise ValueError(
+                f"{out.display_name} to_stream {tap!r} walks a stream of {objects} "
+                f"objects of {in_size} elements, but its tensor has shape "
+                f"{tuple(tap.tensor_dims)}"
+            )
+        return objects
+
+    def _transfer_sizes(self, of: ObjectFifo) -> list[int]:
+        """Return the elements each transfer of `of`'s end of the link moves, per segment it walks.
+
+        The link holds one shared object. A join or distribute splits it at its
+        offsets and each participant moves its own segment, while the single
+        fifo on the other side walks every segment; a 1:1 link moves the
+        larger object, or the arriving one when the departing walk pads.
+        """
+        srcs = [h._object_fifo for h in self._srcs]
+        dsts = [h._object_fifo for h in self._dsts]
+        if self._mode == ObjectFifoLinkMode.Time:
+            return [math.prod(of.shape)]
+        if len(srcs) == len(dsts) == 1:
+            in_size, out_size = math.prod(srcs[0].shape), math.prod(dsts[0].shape)
+            objects = self._walked_objects()
+            if objects is not None:
+                return [objects * in_size if of is dsts[0] else in_size]
+            padded = dsts[0].to_stream is not None and dsts[0].to_stream.padding
+            return [out_size if out_size > in_size and not padded else in_size]
+        shared, side, offsets = (
+            (dsts[0], srcs, self._src_offsets)
+            if len(srcs) > 1
+            else (srcs[0], dsts, self._dst_offsets)
+        )
+        ends = [*offsets[1:], math.prod(shared.shape)]
+        sizes = [end - start for start, end in zip(offsets, ends)]
+        for i, participant in enumerate(side):
+            if participant is of:
+                return [sizes[i]]
+        return sizes
+
+    def __str__(self) -> str:
+        srcs = [h._object_fifo.display_name for h in self._srcs]
+        dsts = [h._object_fifo.display_name for h in self._dsts]
+        return f"ObjectFifoLink({srcs} -> {dsts})"
 
     def resolve(
         self,
@@ -744,5 +1570,11 @@ class ObjectFifoLink(ObjectFifoEndpoint, Resolvable):
             src_ops = [s.op for s in self._srcs]
             dst_ops = [d.op for d in self._dsts]
             self._op = object_fifo_link(
-                src_ops, dst_ops, self._src_offsets, self._dst_offsets
+                src_ops,
+                dst_ops,
+                self._src_offsets,
+                self._dst_offsets,
+                mode=self._mode,
+                loc=loc or self._site.location(),
+                ip=ip,
             )

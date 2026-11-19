@@ -1,20 +1,84 @@
 //===- push_to_queue.mlir ---------------------------------------*- MLIR -*-===//
 //
+// Copyright (C) 2023 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2023 Advanced Micro Devices, Inc.
 //
 //===----------------------------------------------------------------------===//
 
-// RUN: aie-opt --aie-dma-to-npu %s | FileCheck %s
-// CHECK: aiex.npu.write32 {address = 119308 : ui32, value = 2147483651 : ui32}
-// CHECK: aiex.npu.write32 {address = 67228180 : ui32, value = 196610 : ui32}
+// RUN: aie-opt --split-input-file --aie-dma-to-npu %s | FileCheck %s
+// CHECK-DAG: %[[V0:.*]] = arith.constant -2147483645 : i32
+// CHECK-DAG: %[[A0:.*]] = arith.constant 119308 : i32
+// CHECK: aiex.npu.write32(%[[A0]], %[[V0]]) : i32, i32
+// CHECK-DAG: %[[V1:.*]] = arith.constant 196610 : i32
+// CHECK-DAG: %[[A1:.*]] = arith.constant 67228180 : i32
+// CHECK: aiex.npu.write32(%[[A1]], %[[V1]]) : i32, i32
 
 module {
   aie.device(npu1) {
-    aiex.runtime_sequence() {
-      aiex.npu.push_queue (0, 0, S2MM:1) {issue_token = true, repeat_count = 0 : i32, bd_id = 3 : i32 }
-      aiex.npu.push_queue (2, 0, MM2S:0) {issue_token = false, repeat_count = 3 : i32, bd_id = 2 : i32 }
+    aie.runtime_sequence() {
+      %rc0 = arith.constant 0 : i32
+      %bd0 = arith.constant 3 : i32
+      aiex.npu.push_queue (0, 0, S2MM:1) bd_id %bd0 repeat %rc0 {issue_token = true} : i32, i32
+      %rc1 = arith.constant 3 : i32
+      %bd1 = arith.constant 2 : i32
+      aiex.npu.push_queue (2, 0, MM2S:0) bd_id %bd1 repeat %rc1 {issue_token = false} : i32, i32
+    }
+  }
+}
+
+// -----
+
+// A runtime (SSA) bd_id is no longer rejected: the command word is assembled
+// with arith (bd_id & 0xF, or'd with the issue-token bit and the shifted
+// repeat_count) instead of folded to a constant; a zero repeat_count folds away.
+// CHECK-LABEL: @rt_bd_id
+// CHECK: %[[BD:.*]] = arith.andi %arg0, %{{.*}} : i32
+// CHECK: %[[CMD:.*]] = arith.ori %[[BD]], %c-2147483648_i32 : i32
+// CHECK: aiex.npu.write32(%{{.*}}, %[[CMD]])
+module {
+  aie.device(npu1) {
+    aie.runtime_sequence @rt_bd_id(%arg0: i32) {
+      %rc0 = arith.constant 0 : i32
+      aiex.npu.push_queue (0, 0, S2MM:1) bd_id %arg0 repeat %rc0 {issue_token = true} : i32, i32
+    }
+  }
+}
+
+// -----
+
+// A mem tile has a 6-bit START_BD_ID field (48 BDs), so a head bd_id >= 16 must
+// survive the push: the command word keeps bd_id 20 (0x14); a flat 4-bit mask
+// would give 20 & 0xF = 4.
+// CHECK-LABEL: @mem_tile_bd_id
+// CHECK: %[[CMD:.*]] = arith.constant 20 : i32
+// CHECK: aiex.npu.write32(%{{.*}}, %[[CMD]])
+module {
+  aie.device(npu1) {
+    aie.runtime_sequence @mem_tile_bd_id() {
+      %rc = arith.constant 0 : i32
+      %bd = arith.constant 20 : i32
+      aiex.npu.push_queue (0, 1, S2MM:0) bd_id %bd repeat %rc {issue_token = false} : i32, i32
+    }
+  }
+}
+
+// -----
+
+// A runtime repeat_count is masked to the 8-bit queue field, so it is guarded
+// first: an out-of-range (or negative) count refuses the dispatch instead of
+// wrapping to a different number of executions. A constant count carries no
+// guard (the verifier range-checks it).
+// CHECK-LABEL: @rt_repeat
+// CHECK: %[[R:.*]] = arith.extui %arg0 : i32 to i64
+// CHECK: %[[OK:.*]] = arith.cmpi ule, %[[R]], %c255_i64 : i64
+// CHECK: cf.assert %[[OK]], "a runtime DMA repeat count exceeds the task queue's [0:255] range (at most 256 executions)"
+// CHECK: arith.andi %arg0, %{{.*}} : i32
+// CHECK: aiex.npu.write32
+module {
+  aie.device(npu1) {
+    aie.runtime_sequence @rt_repeat(%arg0: i32) {
+      %bd = arith.constant 2 : i32
+      aiex.npu.push_queue (0, 0, MM2S:0) bd_id %bd repeat %arg0 {issue_token = false} : i32, i32
     }
   }
 }

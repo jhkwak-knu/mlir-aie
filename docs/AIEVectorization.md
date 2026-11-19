@@ -1,10 +1,14 @@
-﻿# AIE Automatic Vectorization
+﻿<!-- Copyright (C) 2022-2026 Advanced Micro Devices, Inc.
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception -->
+<span style="color:red;font-weight:bold;font-size:48px">WARNING: This is documentation for legacy functionality. The last version where these passes are present is [tagged as "last-legacy-vectorize"](https://github.com/Xilinx/mlir-aie/tree/last-legacy-vectorize)</span>.
+
+# AIE Automatic Vectorization
 
 Achieving high performance with the AIEngine architecture typically requires executing vector multiply-accumulate instructions.  Ideally, an algorithm would start a new pipelined vector multiple-accumulate instruction on every clock cycle, although in practice achieving this outside of high-performance inner loops is very difficult.  Explicitly coding vector operations in C++ can take significant expertise, taking into account memory layout, register pressure, and different data types. [Ref:Vyasa](https://github.com/stephenneuendorffer/vyasa)  Fortunately, by leveraging the MLIR infrastructure, it is possible to generate reasonably high-performance code in many circumstances.
 
 ## Affine Loops
 
-A typical starting point for automatic vectorization is to consider Affine looped programs. [Example](https://github.com/Xilinx/mlir-aie/tree/main/test/aievec/pointwise_mult_f32.mlir)
+A typical starting point for automatic vectorization is to consider Affine looped programs.
 ```
 func.func @pointwise_mult (%A: memref<2048xf32>, %B: memref<2048xf32>, %C: memref<2048xf32>) {
     affine.for %arg0 = 0 to 2048 {
@@ -43,7 +47,7 @@ The super-vectorizer blocks the loop by a factor of 8, replacing scalar operatio
 
 ## AIEngine-specific vector operations
 
-The ['AIE Vectorize' pass](https://xilinx.github.io/mlir-aie/AIEVecPasses.html) in this repository transforms the above vector code into AIEngine-specific vector operations, represented in the [AIEVec Dialect](https://xilinx.github.io/mlir-aie/AIEVecOps.html).  These operations use types that are directly implementable in the AIEngine architecture and represent device specific features, such as the vector permute network.
+The ['AIE Vectorize' pass](AIEVecPasses.md) in this repository transforms the above vector code into AIEngine-specific vector operations, represented in the [AIEVec Dialect](AIEVecDialect.md).  These operations use types that are directly implementable in the AIEngine architecture and represent device specific features, such as the vector permute network.
 
 ```
 aie-opt -affine-super-vectorize="virtual-vector-size=8 vectorize-reductions" --aie-vectorize < pointwise_mult_f32.mlir
@@ -67,7 +71,7 @@ aie-opt -affine-super-vectorize="virtual-vector-size=8 vectorize-reductions" --a
 
 This code can be translated to C++ code that can be included in a Vitis design:
 ```
-aie-opt -affine-super-vectorize="virtual-vector-size=8" --aie-vectorize < ../../aie/test/aievec/pointwise_mult_f32.mlir | aie-translate --aievec-to-cpp
+aie-opt -affine-super-vectorize="virtual-vector-size=8" --aie-vectorize < pointwise_mult_f32.mlir | aie-translate --aievec-to-cpp
 ```
 ```
 void pointwise_mult(float * restrict v1, float * restrict v2, float * restrict v3) {
@@ -90,7 +94,7 @@ void pointwise_mult(float * restrict v1, float * restrict v2, float * restrict v
 
 ## Vectorizing integer types
 
-The AIEngine architecture supports a number of different datatypes, typically supporting different vector sizes.  For 16-bit values we can vectorize with 
+The AIEngine architecture supports a number of different datatypes, typically supporting different vector sizes.  For 16-bit values we can vectorize with
 ```
 aie-opt -affine-super-vectorize="virtual-vector-size=16" --aie-vectorize < pointwise_mult_i16.mlir
 ```
@@ -178,10 +182,11 @@ aie-opt --affine-loop-unroll="unroll-full unroll-full-threshold=3" --canonicaliz
 
 One way to generate the code for Affine loops is using [Polygeist](https://github.com/wsmoses/Polygeist), a clang-based frontend to MLIR.
 
-```
+```bash
 mlir-clang conv2d.c --function=conv2d -S --raise-scf-to-affine
 ```
-```
+
+```c
 void conv2d(int img_in[17][272], int kernel_coeff[3][3], int img_out[16][256]) {
     for(int r = 0; r < 16; r++)
         for(int c = 0; c < 256; c++) {

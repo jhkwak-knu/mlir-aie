@@ -1,0 +1,46 @@
+//===- logical_tile_op_bad.mlir --------------------------------*- MLIR -*-===//
+//
+// Copyright (C) 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+// RUN: not aie-opt --split-input-file %s 2>&1 | FileCheck %s
+
+// CHECK: error{{.*}}'aie.logical_tile' op column index (100) must be less than the number of columns in the device
+module @test_logical_tile_bad_col {
+  aie.device(npu2) {
+    %tile = aie.logical_tile<CoreTile>(100, ?)
+    aie.end
+  }
+}
+
+// -----
+
+// CHECK: error{{.*}}'aie.logical_tile' op row index (100) must be less than the number of rows in the device
+module @test_logical_tile_bad_row {
+  aie.device(npu2) {
+    %tile = aie.logical_tile<CoreTile>(?, 100)
+    aie.end
+  }
+}
+
+// -----
+
+// CHECK: error{{.*}}'aie.logical_tile' op declared logical tile type does not match the tile type at coordinates (0, 0)
+module @test_logical_tile_type_mismatch_fixed {
+  aie.device(npu2) {
+    %tile = aie.logical_tile<CoreTile>(0, 0)
+    aie.end
+  }
+}
+
+// -----
+
+// CHECK: error{{.*}}'aie.logical_tile' op tile type 'MemTile' does not exist on the target device
+module @test_logical_tile_memtile_on_xcvc1902 {
+  aie.device(xcvc1902) {
+    %mem_tile = aie.logical_tile<MemTile>(?, ?)
+    aie.end
+  }
+}

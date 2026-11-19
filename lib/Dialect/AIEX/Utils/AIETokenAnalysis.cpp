@@ -1,10 +1,8 @@
 //===- AIETokenAnalysis.cpp -------------------------------------*- C++ -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2019-2022 Xilinx, Inc.
+// Copyright (C) 2022-2024 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2019 Xilinx Inc.
 //
 //===----------------------------------------------------------------------===//
 
@@ -76,7 +74,7 @@ void xilinx::AIEX::TokenAnalysis::runAnalysis() {
   // token
   for (const auto &map : tokenAcqMap) {
     StringRef tokenName = map.first;
-    for (auto Op : map.second) {
+    for (auto *Op : map.second) {
       [[maybe_unused]] bool isReleased = false;
       if (auto op = dyn_cast<MemcpyOp>(Op))
         isReleased = true;
@@ -110,14 +108,14 @@ void xilinx::AIEX::TokenAnalysis::runAnalysis() {
           return pair.second;
       return std::vector<Operation *>();
     }();
-    for (auto ROp : tokenRels) {
+    for (auto *ROp : tokenRels) {
 
       if (auto op = dyn_cast<UseTokenOp>(ROp))
         releaseValue = op.getTokenValue();
       else if (auto op = dyn_cast<MemcpyOp>(ROp))
         releaseValue = op.getReleaseTokenValue();
 
-      for (auto AOp : tokenAcqs) {
+      for (auto *AOp : tokenAcqs) {
 
         if (auto op = dyn_cast<UseTokenOp>(AOp))
           acquireValue = op.getTokenValue();

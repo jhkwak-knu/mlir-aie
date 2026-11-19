@@ -1,24 +1,25 @@
 //===- test.cpp -------------------------------------------000---*- C++ -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2023 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// Copyright (C) 2023, Advanced Micro Devices, Inc.
 //
 //===----------------------------------------------------------------------===//
 
 #include "cxxopts.hpp"
-#include <bits/stdc++.h>
+
+#include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
-#include <stdfloat>
+#include <string>
+#include <vector>
 
 #include "xrt/xrt_bo.h"
 #include "xrt/xrt_device.h"
@@ -29,10 +30,10 @@
 #ifndef DATATYPES_USING_DEFINED
 #define DATATYPES_USING_DEFINED
 #ifndef DTYPE_IN
-#define DTYPE_IN std::bfloat16_t
+#define DTYPE_IN test_utils::bfloat16_t
 #endif
 #ifndef DTYPE_OUT
-#define DTYPE_OUT std::bfloat16_t
+#define DTYPE_OUT test_utils::bfloat16_t
 #endif
 #ifndef DTYPE_ACC
 #define DTYPE_ACC float
@@ -67,9 +68,10 @@ int main(int argc, const char *argv[]) {
   int n_warmup_iterations = vm["warmup"].as<int>();
   int trace_size = vm["trace_sz"].as<int>();
   int b_col_maj = vm["b_col_maj"].as<int>();
+  int c_col_maj = vm["c_col_maj"].as<int>();
 
   // Fix the seed to ensure reproducibility in CI.
-  srand(1726250518); // srand(time(NULL));
+  std::srand(1726250518);
 
   int M = vm["M"].as<int>();
   int K = vm["K"].as<int>();
@@ -85,11 +87,11 @@ int main(int argc, const char *argv[]) {
   int B_VOLUME = N * K;
   int C_VOLUME = M * N;
 
-  size_t A_SIZE = (A_VOLUME * sizeof(A_DATATYPE));
-  size_t B_SIZE = (B_VOLUME * sizeof(B_DATATYPE));
-  size_t C_SIZE = (C_VOLUME * sizeof(C_DATATYPE));
+  std::size_t A_SIZE = (A_VOLUME * sizeof(A_DATATYPE));
+  std::size_t B_SIZE = (B_VOLUME * sizeof(B_DATATYPE));
+  std::size_t C_SIZE = (C_VOLUME * sizeof(C_DATATYPE));
 
-  std::vector<uint32_t> instr_v =
+  std::vector<std::uint32_t> instr_v =
       test_utils::load_instr_binary(vm["instr"].as<std::string>());
 
   if (verbosity >= 1)
@@ -146,12 +148,13 @@ int main(int argc, const char *argv[]) {
   auto bo_out =
       xrt::bo(device, C_SIZE, XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(5));
 
-  auto bo_tmp1 = xrt::bo(device, 1, XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(6));
-
-  // Workaround so we declare a really small trace buffer when one is not used
-  int tmp_trace_size = (trace_size > 0) ? trace_size : 1;
-  auto bo_trace = xrt::bo(device, tmp_trace_size * 4, XRT_BO_FLAGS_HOST_ONLY,
-                          kernel.group_id(7));
+  // Trace lowering appends the trace buffer as the runtime_sequence operand
+  // right after the data buffers, so it lands at group_id(6) -- no padding
+  // buffer in front of it. It is only part of the ABI when tracing is enabled.
+  xrt::bo bo_trace;
+  if (trace_size > 0)
+    bo_trace = xrt::bo(device, trace_size * 4, XRT_BO_FLAGS_HOST_ONLY,
+                       kernel.group_id(6));
 
   if (verbosity >= 1) {
     std::cout << "Writing data into buffer objects.\n";
@@ -162,7 +165,7 @@ int main(int argc, const char *argv[]) {
   for (int i = 0; i < A_VOLUME; i++) {
     AVec[i] = matmul_common::get_random<A_DATATYPE>();
   }
-  memcpy(bufA, AVec.data(), (AVec.size() * sizeof(A_DATATYPE)));
+  std::memcpy(bufA, AVec.data(), (AVec.size() * sizeof(A_DATATYPE)));
   B_DATATYPE *bufB = bo_b.map<B_DATATYPE *>();
   std::vector<B_DATATYPE> BVec(B_VOLUME);
   for (int i = 0; i < B_VOLUME; i++) {
@@ -174,16 +177,18 @@ int main(int argc, const char *argv[]) {
     //   BVec[i] = 0.0;
     // }
   }
-  memcpy(bufB, BVec.data(), (BVec.size() * sizeof(B_DATATYPE)));
+  std::memcpy(bufB, BVec.data(), (BVec.size() * sizeof(B_DATATYPE)));
 
   // Initialize outputs; bufOut is results matrix plus tracing info
   char *bufOut = bo_out.map<char *>();
   std::vector<C_DATATYPE> CVec(C_VOLUME);
-  memset(bufOut, 0, C_SIZE);
+  std::memset(bufOut, 0, C_SIZE);
 
-  char *bufTrace = bo_trace.map<char *>();
-  if (trace_size > 0)
-    memset(bufTrace, 0, trace_size);
+  char *bufTrace = nullptr;
+  if (trace_size > 0) {
+    bufTrace = bo_trace.map<char *>();
+    std::memset(bufTrace, 0, trace_size);
+  }
 
   if (verbosity >= 2) {
     std::cout << "DTYPE_IN  = " XSTR(DTYPE_IN) "\n";
@@ -198,7 +203,7 @@ int main(int argc, const char *argv[]) {
 
   // Instruction buffer for DMA configuration
   void *bufInstr = bo_instr.map<void *>();
-  memcpy(bufInstr, instr_v.data(), instr_v.size() * sizeof(int));
+  std::memcpy(bufInstr, instr_v.data(), instr_v.size() * sizeof(int));
 
   bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
   bo_a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
@@ -222,8 +227,19 @@ int main(int argc, const char *argv[]) {
     }
     auto start = std::chrono::high_resolution_clock::now();
     unsigned int opcode = 3;
-    auto run = kernel(opcode, bo_instr, instr_v.size(), bo_a, bo_b, bo_out,
-                      bo_tmp1, bo_trace);
+    // Build the argument list explicitly so the trace buffer is only passed
+    // when tracing is enabled, matching the kernel's declared host-buffer ABI
+    // (opcode, instr, ninstr, A, B, C, [trace]).
+    auto run = xrt::run(kernel);
+    run.set_arg(0, opcode);
+    run.set_arg(1, bo_instr);
+    run.set_arg(2, instr_v.size());
+    run.set_arg(3, bo_a);
+    run.set_arg(4, bo_b);
+    run.set_arg(5, bo_out);
+    if (trace_size > 0)
+      run.set_arg(6, bo_trace);
+    run.start();
     ert_cmd_state r = run.wait();
     if (r != ERT_CMD_STATE_COMPLETED) {
       std::cout << "Kernel did not complete. Returned status: " << r << "\n";
@@ -240,7 +256,7 @@ int main(int argc, const char *argv[]) {
     }
 
     if (do_verify) {
-      memcpy(CVec.data(), bufOut, (CVec.size() * sizeof(C_DATATYPE)));
+      std::memcpy(CVec.data(), bufOut, (CVec.size() * sizeof(C_DATATYPE)));
       if (verbosity >= 1) {
         if (do_verify_stochastic) {
           std::cout << "Verifying " << verify_stochastic_n_samples
@@ -255,10 +271,11 @@ int main(int argc, const char *argv[]) {
         errors = matmul_common::verify_stochastic<A_DATATYPE, C_DATATYPE,
                                                   ACC_DATATYPE>(
             M, N, K, AVec, BVec, CVec, verify_stochastic_n_samples, verbosity,
-            abs_tol, rel_tol, b_col_maj);
+            abs_tol, rel_tol, b_col_maj, c_col_maj);
       } else {
         errors = matmul_common::verify<A_DATATYPE, C_DATATYPE, ACC_DATATYPE>(
-            M, N, K, AVec, BVec, CVec, verbosity, abs_tol, rel_tol, b_col_maj);
+            M, N, K, AVec, BVec, CVec, verbosity, abs_tol, rel_tol, b_col_maj,
+            c_col_maj);
       }
       auto vstop = std::chrono::system_clock::now();
       float vtime =

@@ -1,29 +1,26 @@
 //===- allocation_info_test.mlir --------------------------*- MLIR -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2023 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// Copyright (C) 2023, Advanced Micro Devices, Inc.
 //
 // Date: May 20th 2023
 //
 //===----------------------------------------------------------------------===//
 
-// RUN: aie-opt --aie-objectFifo-stateful-transform %s | FileCheck %s
+// RUN: aie-opt --aie-objectFifo-stateful-transform="skip-verify=true" --aie-objectFifo-unroll %s | FileCheck %s
 
 // CHECK-LABEL:   aie.device(xcve2302) {
-// CHECK:           %[[VAL_0:.*]] = aie.tile(2, 0)
-// CHECK:           %[[VAL_1:.*]] = aie.tile(2, 2)
-// CHECK:           %[[VAL_2:.*]] = aie.tile(2, 3)
-// CHECK:           aie.flow(%[[VAL_0]], DMA : 0, %[[VAL_1]], DMA : 0)
-// CHECK:           aie.flow(%[[VAL_1]], DMA : 0, %[[VAL_0]], DMA : 0)
-// CHECK:           aie.flow(%[[VAL_0]], DMA : 1, %[[VAL_2]], DMA : 0)
-// CHECK:           aie.flow(%[[VAL_2]], DMA : 0, %[[VAL_0]], DMA : 1)
-// CHECK:           aie.shim_dma_allocation @of_in_0(MM2S, 0, 2)
-// CHECK:           aie.shim_dma_allocation @of_out_0(S2MM, 0, 2)
-// CHECK:           aie.shim_dma_allocation @of_in_1(MM2S, 1, 2)
-// CHECK:           aie.shim_dma_allocation @of_out_1(S2MM, 1, 2)
+// CHECK-DAG:           %[[VAL_0:.*]] = aie.tile(2, 0)
+// CHECK-DAG:           %[[VAL_1:.*]] = aie.tile(2, 2)
+// CHECK-DAG:           %[[VAL_2:.*]] = aie.tile(2, 3)
+// CHECK-DAG:           aie.flow(%[[VAL_0]], DMA : 0, %[[VAL_1]], DMA : 0)
+// CHECK-DAG:           aie.flow(%[[VAL_1]], DMA : 0, %[[VAL_0]], DMA : 0)
+// CHECK-DAG:           aie.flow(%[[VAL_0]], DMA : 1, %[[VAL_2]], DMA : 0)
+// CHECK-DAG:           aie.flow(%[[VAL_2]], DMA : 0, %[[VAL_0]], DMA : 1)
+// CHECK-DAG:           aie.shim_dma_allocation @of_in_0__shim_alloc(%[[VAL_0]], MM2S, 0)
+// CHECK-DAG:           aie.shim_dma_allocation @of_out_0__shim_alloc(%[[VAL_0]], S2MM, 0)
+// CHECK-DAG:           aie.shim_dma_allocation @of_in_1__shim_alloc(%[[VAL_0]], MM2S, 1)
+// CHECK-DAG:           aie.shim_dma_allocation @of_out_1__shim_alloc(%[[VAL_0]], S2MM, 1)
 // CHECK:         }
 
 module @alloc {

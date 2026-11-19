@@ -1,7 +1,9 @@
-import numpy as np
+# Copyright (C) 2024 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-from aie.helpers.taplib import TensorTiler2D
-from util import construct_test
+import numpy as np
+from aie.helpers.taplib import TensorAccessPattern
+from util import construct_test, grid_steps, accesses
 
 # RUN: %python %s | FileCheck %s
 
@@ -9,8 +11,8 @@ from util import construct_test
 # CHECK-LABEL: square_tiler_tile_grouping
 @construct_test
 def square_tiler_tile_grouping():
-    tiler = TensorTiler2D.group_tiler((32, 32), (8, 8), (2, 2))
-    access_count = tiler.access_count()
+    tiler = grid_steps(TensorAccessPattern.full((32, 32)).tile((8, 8)), (2, 2))
+    access_count = accesses(tiler)[1]
     assert (access_count == 1).all()
 
     tile1_reference_order = np.array(

@@ -1,11 +1,9 @@
 //===- AIELocalizeLocks.cpp ---------------------------------------*- C++
 //-*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2019-2022 Xilinx, Inc.
+// Copyright (C) 2022-2026 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2019 Xilinx Inc.
 //
 //===----------------------------------------------------------------------===//
 
@@ -15,13 +13,19 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Pass/Pass.h"
 
+namespace xilinx::AIE {
+#define GEN_PASS_DEF_AIELOCALIZELOCKS
+#include "aie/Dialect/AIE/Transforms/AIEPasses.h.inc"
+} // namespace xilinx::AIE
+
 #define DEBUG_TYPE "aie-localize-locks"
 
 using namespace mlir;
 using namespace xilinx;
 using namespace xilinx::AIE;
 
-struct AIELocalizeLocksPass : AIELocalizeLocksBase<AIELocalizeLocksPass> {
+struct AIELocalizeLocksPass
+    : xilinx::AIE::impl::AIELocalizeLocksBase<AIELocalizeLocksPass> {
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<arith::ArithDialect>();
   }
@@ -33,7 +37,7 @@ struct AIELocalizeLocksPass : AIELocalizeLocksBase<AIELocalizeLocksPass> {
       // Collect the locks used in this core.
       const auto &targetModel = getTargetModel(coreOp);
 
-      auto thisTile = dyn_cast<TileOp>(coreOp.getTile().getDefiningOp());
+      auto thisTile = cast<TileOp>(coreOp.getTile().getDefiningOp());
       int col = thisTile.colIndex();
       int row = thisTile.rowIndex();
 
@@ -49,8 +53,19 @@ struct AIELocalizeLocksPass : AIELocalizeLocksBase<AIELocalizeLocksPass> {
         int dstRow = tile.rowIndex();
 
         const auto &targetModel = getTargetModel(tile);
-        for (auto user : tile.getResult().getUsers())
+        for (auto *user : tile.getResult().getUsers())
           if (auto lock = dyn_cast<LockOp>(user)) {
+            // At this point, we are iterating over all locks that are
+            // accessible from within the current core coreOp. We only need to
+            // localize the current lock if it is used within the core. Note
+            // that this pass is to be applied after the scf-to-cf lowering, so
+            // it suffices to check if the parent of a UseLockOp is coreOp.
+            if (llvm::none_of(lock.getResult().getUsers(),
+                              [&](Operation *user) {
+                                return user->getParentOp() == coreOp;
+                              }))
+              continue;
+
             auto lockIndexOffset =
                 targetModel.getLockLocalBaseIndex(col, row, dstCol, dstRow);
             if (!lockIndexOffset)
@@ -62,8 +77,8 @@ struct AIELocalizeLocksPass : AIELocalizeLocksBase<AIELocalizeLocksPass> {
             OpBuilder builder =
                 OpBuilder::atBlockBegin(&coreOp.getBody().front());
 
-            Value coreLockIDValue = builder.create<arith::ConstantIndexOp>(
-                builder.getUnknownLoc(), localLockIndex);
+            Value coreLockIDValue = arith::ConstantIndexOp::create(
+                builder, lock.getLoc(), localLockIndex);
             lock.getResult().replaceUsesWithIf(
                 coreLockIDValue, [&](OpOperand &opOperand) {
                   return opOperand.getOwner()->getParentOp() == coreOp;

@@ -1,14 +1,11 @@
 //===- oneshim.mlir --------------------------------------------*- MLIR -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2024 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2024 Advanced Micro Devices, Inc. or its affiliates
 //
 //===----------------------------------------------------------------------===//
 
-// RUN: aie-translate --aie-generate-cdo %s --cdo-debug=true |& FileCheck %s
+// RUN: aie-translate --aie-generate-cdo %s --cdo-debug=true 2>&1 | FileCheck %s
 
 // CHECK: (BlockWrite-DMAWriteCmd): Start Address: 0x000000000001D000  Size: 8
 // CHECK:     Address: 0x000000000001D000  Data@ {{0x[0-9a-z]+}} is: 0x00000004 
@@ -16,7 +13,7 @@
 // CHECK:     Address: 0x000000000001D008  Data@ {{0x[0-9a-z]+}} is: 0x00000000 
 // CHECK:     Address: 0x000000000001D00C  Data@ {{0x[0-9a-z]+}} is: 0x00000000 
 // CHECK:     Address: 0x000000000001D010  Data@ {{0x[0-9a-z]+}} is: 0x80000000 
-// CHECK:     Address: 0x000000000001D014  Data@ {{0x[0-9a-z]+}} is: 0x00000000 
+// CHECK:     Address: 0x000000000001D014  Data@ {{0x[0-9a-z]+}} is: 0x02000000
 // CHECK:     Address: 0x000000000001D018  Data@ {{0x[0-9a-z]+}} is: 0x00000000 
 // CHECK:     Address: 0x000000000001D01C  Data@ {{0x[0-9a-z]+}} is: 0x02000000 
 // check that burst length is set to 128B
@@ -31,12 +28,12 @@ module {
   aie.shim_dma(%t00)  {
       aie.dma_start(S2MM, 0, ^bd0, ^bd1)
     ^bd0:
-      aie.dma_bd(%buffer : memref<16 x f32>, 0, 4)  {bd_id = 0 : i32}
+      aie.dma_bd(%buffer : memref<16 x f32> offset = 0 len = 4)  {bd_id = 0 : i32}
       aie.next_bd ^end
     ^bd1:
       aie.dma_start(S2MM, 1, ^bd2, ^end)
     ^bd2:
-      aie.dma_bd(%buffer : memref<16 x f32>, 0, 4)  {bd_id = 1 : i32, burst_length = 128 : i32}
+      aie.dma_bd(%buffer : memref<16 x f32> offset = 0 len = 4)  {bd_id = 1 : i32, burst_length = 128 : i32}
       aie.next_bd ^end
     ^end:
       aie.end

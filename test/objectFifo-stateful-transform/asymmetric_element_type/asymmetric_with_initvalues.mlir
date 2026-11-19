@@ -1,0 +1,56 @@
+//===- asymmetric_with_initvalues.mlir ---------------------------*- MLIR -*-===//
+//
+// Copyright (C) 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+// RUN: aie-opt --aie-objectFifo-stateful-transform --aie-objectFifo-unroll %s | FileCheck %s
+
+// Asymmetric ObjectFifo with initValues and depth=2.
+// Mobilenet weight loading pattern: 2 large buffers with static weight
+// data on MemTile, consumer receives small chunks on CoreTile.
+
+// Consumer buffers use the small type
+// CHECK-DAG: aie.buffer(%{{.*}}) {sym_name = "wts__cons__buf0"} : memref<10xi32>
+// CHECK-DAG: aie.buffer(%{{.*}}) {sym_name = "wts__cons__buf1"} : memref<10xi32>
+
+// Producer buffers have initial values
+// CHECK-DAG: aie.buffer(%{{.*}}) {sym_name = "wts__buf0"} : memref<40xi32> = dense<1>
+// CHECK-DAG: aie.buffer(%{{.*}}) {sym_name = "wts__buf1"} : memref<40xi32> = dense<2>
+
+// Producer lock: init = 0 (depth - initValues count = 0)
+// Consumer lock: init = 2 (initValues count)
+
+// MM2S: 2 BDs for depth=2, each 40 elements
+// CHECK: aie.memtile_dma
+// CHECK: aie.dma_bd(%{{.*}} : memref<40xi32> offset = {{.*}} len = {{.*}})
+// CHECK: aie.dma_bd(%{{.*}} : memref<40xi32> offset = {{.*}} len = {{.*}})
+
+// S2MM: 2 BDs (consumer depth=2), 10 elements each
+// CHECK: aie.mem
+// CHECK: aie.dma_bd(%{{.*}} : memref<10xi32> offset = {{.*}} len = {{.*}})
+// CHECK: aie.dma_bd(%{{.*}} : memref<10xi32> offset = {{.*}} len = {{.*}})
+
+module {
+  aie.device(npu2) {
+    %mt = aie.tile(0, 1)
+    %ct = aie.tile(0, 2)
+
+    aie.objectfifo @wts(%mt, {%ct}, 2 : i32)
+      : !aie.objectfifo<memref<40xi32>>
+      -> !aie.objectfifo<memref<10xi32>>
+      = [dense<1> : memref<40xi32>, dense<2> : memref<40xi32>]
+
+    %c = aie.core(%ct) {
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      %c8 = arith.constant 8 : index
+      scf.for %i = %c0 to %c8 step %c1 {
+        %elem = aie.objectfifo.acquire @wts(Consume, 1) : memref<10xi32>
+        aie.objectfifo.release @wts(Consume, 1)
+      }
+      aie.end
+    }
+  }
+}

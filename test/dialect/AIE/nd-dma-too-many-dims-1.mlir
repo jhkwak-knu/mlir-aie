@@ -1,10 +1,7 @@
 //===- aie.mlir ------------------------------------------------*- MLIR -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2023 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// Copyright (C) 2023, Advanced Micro Devices, Inc.
 //
 //===----------------------------------------------------------------------===//
 
@@ -21,7 +18,7 @@ module @tutorial_2b {
           %srcDma = aie.dma_start("MM2S", 0, ^bd0, ^end)
           ^bd0:
             //expected-error@+1 {{Cannot give more than 4 dimensions}}
-            aie.dma_bd(%buf31 : memref<128xi32>, 0, 128, [<size = 1, stride = 1>, <size = 1, stride = 1>, <size = 1, stride = 1>, <size = 1, stride = 1>, <size = 1, stride = 1>])
+            aie.dma_bd(%buf31 : memref<128xi32> offset = 0 len = 128 sizes = [1, 1, 1, 1, 1] strides = [1, 1, 1, 1, 1])
             aie.next_bd ^end
           ^end: 
             aie.end

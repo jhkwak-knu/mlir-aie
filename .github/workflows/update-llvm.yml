@@ -1,0 +1,179 @@
+# Copyright (C) 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+name: Update LLVM Version
+
+# As of the ROCm/llvm-project migration, utils/update_llvm_version.py targets
+# the HEAD of ROCm/llvm-project@amd-staging (the branch mlirDistro.yml builds
+# wheels from) instead of cross-checking upstream llvm/torch-mlir and Triton
+# pins, which don't correspond to fork commits. The eudsl-python-extras
+# compatibility match still runs against upstream, since eudsl itself tracks
+# upstream llvm/llvm-project.
+on:
+  workflow_dispatch:
+    inputs:
+      llvm_hash:
+        description: 'Specific LLVM hash to use'
+        required: false
+        type: string
+  schedule:
+    # Run on the 1st and 15th of every month at 6:00 UTC (approx biweekly).
+    # GitHub Actions cron can't express "every 2 weeks" directly, so we use
+    # fixed days of the month rather than a weekday cadence.
+    - cron: '0 6 1,15 * *'
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+jobs:
+  update-llvm:
+    runs-on: ubuntu-26.04
+    # Cap total runtime: mlirDistro can take ~1h, leave headroom for the rest.
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.x'
+
+      - name: Identify target LLVM commit
+        id: identify
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -n "${{ inputs.llvm_hash }}" ]; then
+            python3 utils/update_llvm_version.py --identify-only --llvm-hash "${{ inputs.llvm_hash }}"
+          else
+            python3 utils/update_llvm_version.py --identify-only
+          fi
+
+      # Defensive: identify is contractually required to write wheel_exists
+      # (true|false). An unset value means the script took an unexpected
+      # branch; refuse to proceed silently rather than skip downstream steps.
+      - name: Verify identify outputs
+        run: |
+          if [ -z "${{ steps.identify.outputs.wheel_exists }}" ]; then
+            echo "::error::identify step did not set wheel_exists; refusing to proceed."
+            exit 1
+          fi
+
+      - name: Trigger mlirDistro and wait for wheel
+        if: steps.identify.outputs.target_commit != '' && steps.identify.outputs.wheel_exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TARGET="${{ steps.identify.outputs.target_commit }}"
+          # Per-call nonce so we can deterministically locate the dispatched
+          # run by its display title, even if other workflow_dispatch events
+          # for mlirDistro fire in the same second.
+          NONCE="update-llvm-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$(date +%s)-$RANDOM"
+          echo "No mlir-distro wheel for $TARGET; dispatching mlirDistro (nonce=$NONCE)."
+          DISPATCH_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          # `gh workflow run` defaults to the repo's default branch, so the
+          # dispatched mlirDistro run lands on `main` regardless of where this
+          # update-llvm run was triggered. The `--branch main` filter below
+          # mirrors that assumption.
+          gh workflow run mlirDistro.yml -f LLVM_COMMIT="$TARGET" -f DISPATCH_NONCE="$NONCE"
+
+          # Poll up to 5 minutes; GitHub can take a while to materialize a
+          # dispatched run under load. Filter by displayTitle containing our
+          # nonce so we can never pick up an unrelated dispatch.
+          RUN_ID=""
+          for i in $(seq 1 60); do
+            sleep 5
+            RUN_ID=$(gh run list \
+              --workflow mlirDistro.yml \
+              --event workflow_dispatch \
+              --branch main \
+              --limit 20 \
+              --created ">=$DISPATCH_TS" \
+              --json databaseId,displayTitle \
+              --jq ".[] | select(.displayTitle | contains(\"$NONCE\")) | .databaseId" \
+              | head -n1)
+            if [ -n "$RUN_ID" ]; then break; fi
+          done
+
+          if [ -z "$RUN_ID" ]; then
+            echo "::error::Could not locate dispatched mlirDistro run with nonce $NONCE after 5 minutes."
+            exit 1
+          fi
+
+          echo "Watching mlirDistro run $RUN_ID..."
+          gh run watch "$RUN_ID" --exit-status --interval 60
+
+      - name: Apply update
+        id: update
+        if: steps.identify.outputs.target_commit != ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 utils/update_llvm_version.py --llvm-hash "${{ steps.identify.outputs.target_commit }}"
+
+      - name: Check for changes
+        id: check_changes
+        run: |
+          if git diff --quiet; then
+            echo "changes=false" >> $GITHUB_OUTPUT
+            echo "No changes detected."
+          else
+            echo "changes=true" >> $GITHUB_OUTPUT
+            echo "Changes detected."
+          fi
+
+      - name: Select Assignee
+        if: steps.check_changes.outputs.changes == 'true'
+        id: assignee
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -f utils/dependency-update-rotation.txt ]; then
+            users=($(cat utils/dependency-update-rotation.txt))
+            count=${#users[@]}
+            if [ $count -gt 0 ]; then
+              # Find the last assignee
+              last_assignee=$(gh pr list --state all --search "Update LLVM version in:title" --limit 1 --json assignees --jq '.[0].assignees[0].login')
+              echo "Last assignee: $last_assignee"
+
+              next_index=0
+              if [ -n "$last_assignee" ]; then
+                for i in "${!users[@]}"; do
+                  if [[ "${users[$i]}" == "$last_assignee" ]]; then
+                    next_index=$(( (i + 1) % count ))
+                    break
+                  fi
+                done
+              fi
+
+              assignee=${users[$next_index]}
+              echo "Selected assignee: $assignee"
+              echo "assignee=$assignee" >> $GITHUB_OUTPUT
+            else
+              echo "No users found in rotation file."
+              echo "assignee=" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "Rotation file not found."
+            echo "assignee=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Pull Request
+        if: steps.check_changes.outputs.changes == 'true'
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1  # v8
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "Update LLVM version"
+          title: "Update LLVM version"
+          body: |
+            Updates LLVM version to the latest ROCm/llvm-project@amd-staging commit.
+
+            Reason: ${{ steps.update.outputs.bump_reason }}
+
+            Triggered by: ${{ github.event_name }}
+          branch: update-llvm-version
+          base: main
+          assignees: ${{ steps.assignee.outputs.assignee }}
+          delete-branch: true

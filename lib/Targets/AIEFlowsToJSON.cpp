@@ -1,10 +1,8 @@
 //===- AIEFlowsToJSON.cpp ---------------------------------------*- C++ -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2021-2022 Xilinx, Inc.
+// Copyright (C) 2022-2026 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2021 Xilinx Inc.
 //
 //===----------------------------------------------------------------------===//
 
@@ -31,7 +29,7 @@ using namespace xilinx::AIE;
 namespace xilinx::AIE {
 
 // returns coordinates in the direction indicated by bundle
-TileID getNextCoords(int col, int row, WireBundle bundle) {
+static TileID getNextCoords(int col, int row, WireBundle bundle) {
   switch (bundle) {
   case WireBundle::North:
     return {col, row + 1};
@@ -46,7 +44,7 @@ TileID getNextCoords(int col, int row, WireBundle bundle) {
   }
 }
 
-void translateSwitchboxes(DeviceOp targetOp, raw_ostream &output) {
+static void translateSwitchboxes(DeviceOp targetOp, raw_ostream &output) {
   // count flow sources and destinations
   std::map<TileID, int> sourceCounts;
   std::map<TileID, int> destinationCounts;
@@ -63,11 +61,11 @@ void translateSwitchboxes(DeviceOp targetOp, raw_ostream &output) {
     Block &b = r.front();
     for (Operation &Op : b.getOperations()) {
       if (auto pktSource = dyn_cast<PacketSourceOp>(Op)) {
-        TileOp source = dyn_cast<TileOp>(pktSource.getTile().getDefiningOp());
+        TileOp source = cast<TileOp>(pktSource.getTile().getDefiningOp());
         TileID srcID = {source.colIndex(), source.rowIndex()};
         sourceCounts[srcID]++;
       } else if (auto pktDest = dyn_cast<PacketDestOp>(Op)) {
-        TileOp dest = dyn_cast<TileOp>(pktDest.getTile().getDefiningOp());
+        TileOp dest = cast<TileOp>(pktDest.getTile().getDefiningOp());
         TileID dstID = {dest.colIndex(), dest.rowIndex()};
         destinationCounts[dstID]++;
       }
@@ -153,8 +151,8 @@ void translateSwitchboxes(DeviceOp targetOp, raw_ostream &output) {
   output << "\"total_path_length\": " << totalPathLength << ",\n";
 }
 
-void translateCircuitFlows(DeviceOp targetOp, int &flowCount,
-                           raw_ostream &output) {
+static void translateCircuitFlows(DeviceOp targetOp, int &flowCount,
+                                  raw_ostream &output) {
   // for each flow, trace it through switchboxes and write the route to JSON
   std::set<std::pair<TileOp, Port>> flowSources;
   for (FlowOp flowOp : targetOp.getOps<FlowOp>()) {
@@ -273,8 +271,8 @@ void translateCircuitFlows(DeviceOp targetOp, int &flowCount,
   }
 }
 
-void translatePacketFlows(DeviceOp targetOp, int &flowCount,
-                          raw_ostream &output) {
+static void translatePacketFlows(DeviceOp targetOp, int &flowCount,
+                                 raw_ostream &output) {
   // for each flow, trace it through switchboxes and write the route to JSON
   std::set<std::pair<TileOp, Port>> flowSources;
   for (PacketFlowOp pktFlowOp : targetOp.getOps<PacketFlowOp>()) {
@@ -284,10 +282,10 @@ void translatePacketFlows(DeviceOp targetOp, int &flowCount,
     TileOp source, dest;
     for (Operation &Op : b.getOperations()) {
       if (auto pktSource = dyn_cast<PacketSourceOp>(Op)) {
-        source = dyn_cast<TileOp>(pktSource.getTile().getDefiningOp());
+        source = cast<TileOp>(pktSource.getTile().getDefiningOp());
         sourcePort = pktSource.port();
       } else if (auto pktDest = dyn_cast<PacketDestOp>(Op)) {
-        dest = dyn_cast<TileOp>(pktDest.getTile().getDefiningOp());
+        dest = cast<TileOp>(pktDest.getTile().getDefiningOp());
         destPort = pktDest.port();
       }
     }
@@ -422,13 +420,34 @@ void translatePacketFlows(DeviceOp targetOp, int &flowCount,
   }
 }
 
-mlir::LogicalResult AIEFlowsToJSON(ModuleOp module, raw_ostream &output) {
-  output << "{\n";
-  if (module.getOps<DeviceOp>().empty()) {
-    module.emitOpError("expected AIE.device operation at toplevel");
-  }
+mlir::LogicalResult AIEFlowsToJSON(ModuleOp module, raw_ostream &output,
+                                   llvm::StringRef deviceName) {
+  DeviceOp targetOp = AIE::DeviceOp::getForSymbolInModule(module, deviceName);
+  if (!targetOp)
+    return module.emitOpError("expected AIE.device operation at toplevel");
 
-  DeviceOp targetOp = *(module.getOps<DeviceOp>().begin());
+  std::set<TileID> switchboxes;
+  for (SwitchboxOp switchboxOp : targetOp.getOps<SwitchboxOp>())
+    switchboxes.insert({switchboxOp.colIndex(), switchboxOp.rowIndex()});
+  WalkResult untraceable = targetOp.walk([&](Operation *op) {
+    Value source;
+    if (auto flowOp = dyn_cast<FlowOp>(op))
+      source = flowOp.getSource();
+    else if (auto pktSource = dyn_cast<PacketSourceOp>(op))
+      source = pktSource.getTile();
+    else
+      return WalkResult::advance();
+    if (switchboxes.count(cast<TileOp>(source.getDefiningOp()).getTileID()))
+      return WalkResult::advance();
+    op->emitError("no switchbox at the flow's source to trace it through; "
+                  "keep the routed switchboxes with "
+                  "--aie-find-flows=remove-lifted=false");
+    return WalkResult::interrupt();
+  });
+  if (untraceable.wasInterrupted())
+    return failure();
+
+  output << "{\n";
   int flowCount = 0;
 
   translateSwitchboxes(targetOp, output);

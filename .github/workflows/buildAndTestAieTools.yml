@@ -1,4 +1,11 @@
+# Copyright (C) 2023-2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
 name: Build and Test with AIE tools
+
+permissions:
+  contents: read
+  packages: read
 
 on:
   push:
@@ -36,18 +43,18 @@ jobs:
   build-repo:
     name: Build and Test
 
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
 
     steps:
 
       - name: Free disk space
-        uses: descriptinc/free-disk-space@main
+        uses: descriptinc/free-disk-space@1b4b157593c6801212a2ed488c205e0a810b4592  # main
         with:
           tool-cache: true
           android: true
           dotnet: true
           haskell: true
-          large-packages: true
+          large-packages: false # The package list includes powershell, unavailable on Ubuntu 26.04.
           swap-storage: false
 
       - name: Docker prune
@@ -55,15 +62,17 @@ jobs:
         run: |
           docker system prune -a -f
 
-      - uses: uraimo/run-on-arch-action@v2.5.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: ./.github/actions/run_x86_container
         name: Run commands
         id: runcmd
         with:
-          distro: none
-          base_image: ghcr.io/xilinx/mlir-aie/xilinx:latest
-          githubToken: ${{ github.token }}
-          dockerRunArgs: |
-            --mac-address ${{ secrets.XILINX_MAC }}
+          image: ghcr.io/xilinx/mlir-aie/xilinx:latest
+          github-token: ${{ github.token }}
+          mac-address: ${{ secrets.XILINX_MAC }}
+          env: |
+            HEAD_REF=${{ github.head_ref }}
           run: |
             ls -l /opt/Xilinx/Vitis/2023.2/
 
@@ -75,18 +84,22 @@ jobs:
             git clone https://github.com/Xilinx/mlir-aie.git
             cd /mlir-aie
 
-            git checkout ${{ github.head_ref }}
+            git checkout "$HEAD_REF"
             if [ x"${{ inputs.AIE_COMMIT }}" != x"" ]; then
               git reset --hard ${{ inputs.AIE_COMMIT }}
             fi
 
             git submodule update --init --recursive
 
-            apt install python3.10-venv
+            apt install python3.12-venv
             python -m venv aie-venv
             source aie-venv/bin/activate
-            pip install -r python/requirements.txt
-            HOST_MLIR_PYTHON_PACKAGE_PREFIX=aie pip install -r python/requirements_extras.txt
+            pip install --upgrade pip
+            python utils/mlir_aie_wheels/vendor_eudsl.py \
+                --requirements python/requirements.txt \
+                --install-non-eudsl
+            python -m pip install --require-hashes -r python/requirements_notebook.lock
+            python -m pip install --require-hashes -r python/requirements_dev.lock
 
             VERSION=$(utils/clone-llvm.sh --get-wheel-version)
             pip -q download mlir==$VERSION \
@@ -107,7 +120,6 @@ jobs:
               -DVitis_VERSION_MINOR=2 \
               -DCMAKE_MODULE_PATH=$PWD/../cmake/modulesXilinx \
               -DLLVM_EXTERNAL_LIT=$(which lit) \
-              -DAIE_INCLUDE_INTEGRATION_TESTS=OFF \
               -DAIE_ENABLE_PYTHON_PASSES=OFF \
               -DCMAKE_EXE_LINKER_FLAGS_INIT="-fuse-ld=lld" \
               -DCMAKE_MODULE_LINKER_FLAGS_INIT="-fuse-ld=lld" \

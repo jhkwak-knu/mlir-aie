@@ -1,17 +1,17 @@
 //===- aie.mlir ------------------------------------------------*- MLIR -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2022 Xilinx, Inc.
+// Copyright (C) 2022-2025 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2022 Xilinx Inc.
 //
 //===----------------------------------------------------------------------===//
 
-// RUN: %PYTHON aiecc.py %VitisSysrootFlag% --host-target=%aieHostTargetTriplet% %link_against_hsa% %s %test_lib_flags %extraAieCcFlags% %S/test.cpp -o test.elf
+// RUN: %aiecc --xchesscc --xbridge %VitisSysrootFlag% --host-target=%aieHostTargetTriplet% %link_against_hsa% %s %test_lib_flags %extraAieCcFlags% -o test.elf -- %S/test.cpp
 // RUN: %run_on_vck5000 ./test.elf
 
 module @test22_init_locks {
+aie.device(xcvc1902) {
+
   %tile13 = aie.tile(1, 3)
 
   %buf13_0 = aie.buffer(%tile13) { sym_name = "a" } : memref<256xi32>
@@ -21,8 +21,10 @@ module @test22_init_locks {
   %lock13_5 = aie.lock(%tile13, 5) { sym_name = "lock_b" }
 
   %core13 = aie.core(%tile13) {
-    aie.use_lock(%lock13_3, "Acquire", 1) // acquire for read(e.g. input ping)
-    aie.use_lock(%lock13_5, "Acquire", 0) // acquire for write
+    %c1_ul0 = arith.constant 1 : i32
+    aie.use_lock(%lock13_3, "Acquire", %c1_ul0) // acquire for read(e.g. input ping)
+    %c0_ul1 = arith.constant 0 : i32
+    aie.use_lock(%lock13_5, "Acquire", %c0_ul1) // acquire for write
     %idx1 = arith.constant 3 : index
     %val1 = memref.load %buf13_0[%idx1] : memref<256xi32>
     %2    = arith.addi %val1, %val1 : i32
@@ -31,8 +33,11 @@ module @test22_init_locks {
     %5 = arith.addi %4, %val1 : i32
     %idx2 = arith.constant 5 : index
     memref.store %5, %buf13_1[%idx2] : memref<256xi32>
-    aie.use_lock(%lock13_3, "Release", 0) // release for write
-    aie.use_lock(%lock13_5, "Release", 1) // release for read
+    %c0_ul2 = arith.constant 0 : i32
+    aie.use_lock(%lock13_3, "Release", %c0_ul2) // release for write
+    %c1_ul3 = arith.constant 1 : i32
+    aie.use_lock(%lock13_5, "Release", %c1_ul3) // release for read
     aie.end
   }
+}
 }

@@ -1,10 +1,7 @@
 //===- dma_to_npu_invalid.mlir ---------------------------------*- MLIR -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2024 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2024 Advanced Micro Devices, Inc.
 //
 //===----------------------------------------------------------------------===//
 
@@ -12,10 +9,8 @@
 
 module  {
   aie.device(npu1) {
-    memref.global "public" @toMem : memref<16xi32>
-    aiex.runtime_sequence() {
-      // expected-error@+2 {{failed to legalize operation 'aiex.npu.dma_wait' that was explicitly marked illegal}}
-      // expected-error@+1 {{couldn't find shim_dma_allocation op}}
+    aie.runtime_sequence() {
+      // expected-error@+1 {{couldn't find symbol in parent device}}
       aiex.npu.dma_wait {symbol = @toMem}
     }
   }

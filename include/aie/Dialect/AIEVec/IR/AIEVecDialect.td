@@ -1,10 +1,7 @@
 //===- AIEVecDialect.td - AIE vector op definitions--------*- tablegen -*-====//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2022-2024 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2022-2024 Advanced Micro Devices, Inc. or its affiliates
 //
 //===----------------------------------------------------------------------===//
 // Defines AIE vector dialect.
@@ -21,6 +18,8 @@ def AIEVec_Dialect : Dialect {
   let cppNamespace = "::xilinx::aievec";
 
   let useDefaultAttributePrinterParser = 1;
+  // bfp16 FIFO stream addresses are LLVM pointers.
+  let dependentDialects = ["::mlir::LLVM::LLVMDialect"];
 
   let extraClassDeclaration = [{
     void registerTypes();

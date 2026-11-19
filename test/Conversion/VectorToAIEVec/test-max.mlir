@@ -1,3 +1,6 @@
+// Copyright (C) 2023-2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
 // RUN: aie-opt %s --convert-vector-to-aievec="aie-target=aie2" | FileCheck %s
 
 // CHECK-LABEL:func @vecmax_i32
@@ -48,5 +51,19 @@ func.func @vecmax_f32(%arg0: vector<16xf32>, %arg1: vector<16xf32>) -> vector<16
   %0 = arith.maximumf %arg0, %arg1 : vector<16xf32>
   // CHECK: return %[[RES]] : vector<16xf32>
   return %0 : vector<16xf32>
+}
+
+// CHECK-LABEL:func @vecmax_bf16_v16
+// CHECK-SAME: %[[LHS:.*]]: vector<16xbf16>,
+// CHECK-SAME: %[[RHS:.*]]: vector<16xbf16>)
+func.func @vecmax_bf16_v16(%arg0: vector<16xbf16>, %arg1: vector<16xbf16>) -> vector<16xbf16> {
+  // CHECK-DAG: %[[ZERO:.*]] = arith.constant dense<0.000000e+00> : vector<16xbf16>
+  // CHECK-DAG: %[[LPAD:.*]] = aievec.concat %[[LHS]], %[[ZERO]] : vector<16xbf16>, vector<32xbf16>
+  // CHECK-DAG: %[[RPAD:.*]] = aievec.concat %[[RHS]], %[[ZERO]] : vector<16xbf16>, vector<32xbf16>
+  // CHECK: %[[WIDE:.*]] = aievec.max %[[LPAD]], %[[RPAD]] : vector<32xbf16>
+  // CHECK: %[[RES:.*]] = aievec.ext %[[WIDE]] {index = 0 : i8} : vector<32xbf16>, vector<16xbf16>
+  %0 = arith.maximumf %arg0, %arg1 : vector<16xbf16>
+  // CHECK: return %[[RES]] : vector<16xbf16>
+  return %0 : vector<16xbf16>
 }
 

@@ -1,0 +1,157 @@
+//===- AIEPlaceTiles.cpp ----------------------------------------*- C++ -*-===//
+//
+// Copyright (C) 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+#include "aie/Dialect/AIE/IR/AIEDialect.h"
+#include "aie/Dialect/AIE/Transforms/AIEPasses.h"
+#include "aie/Dialect/AIE/Transforms/AIEPlacer.h"
+
+#include "mlir/IR/Location.h"
+#include "mlir/IR/PatternMatch.h"
+#include "mlir/Transforms/DialectConversion.h"
+
+#include <cmath>
+
+namespace xilinx::AIE {
+#define GEN_PASS_DEF_AIEPLACETILES
+#include "aie/Dialect/AIE/Transforms/AIEPasses.h.inc"
+} // namespace xilinx::AIE
+
+#define DEBUG_TYPE "aie-place-tiles"
+
+using namespace mlir;
+using namespace xilinx;
+using namespace xilinx::AIE;
+
+namespace {
+
+struct ConvertLogicalTileToTile : OpConversionPattern<LogicalTileOp> {
+  ConvertLogicalTileToTile(MLIRContext *context, DeviceOp &d, Placer &p,
+                           PatternBenefit benefit = 1)
+      : OpConversionPattern(context, benefit), device(d), placer(p) {}
+
+  LogicalResult
+  matchAndRewrite(LogicalTileOp logicalTile, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto placement = placer.getPlacement(logicalTile);
+    if (!placement)
+      return logicalTile.emitError("no placement found for logical tile");
+
+    // Handle merging multiple logical tiles to same physical tile
+    TileOp tileOp = TileOp::getOrCreate(rewriter, device, placement->col,
+                                        placement->row, logicalTile.getLoc());
+    rewriter.modifyOpInPlace(tileOp, [&] {
+      tileOp->setLoc(
+          rewriter.getFusedLoc({tileOp.getLoc(), logicalTile.getLoc()}));
+    });
+
+    if (auto controllerId = logicalTile->getAttr("controller_id"))
+      tileOp->setAttr("controller_id", controllerId);
+
+    rewriter.replaceOp(logicalTile, tileOp.getResult());
+    return success();
+  }
+
+private:
+  DeviceOp device;
+  Placer &placer;
+};
+
+struct AIEPlaceTilesPass
+    : xilinx::AIE::impl::AIEPlaceTilesBase<AIEPlaceTilesPass> {
+
+  AIEPlaceTilesPass() = default;
+
+  AIEPlaceTilesPass(const AIEPlaceTilesOptions &options)
+      : AIEPlaceTilesBase(options) {}
+
+  void runOnOperation() override {
+    DeviceOp device = getOperation();
+
+    // Create placer
+    std::shared_ptr<Placer> placer;
+    std::shared_ptr<SAPlacer> saPlacer;
+    switch (clPlacerType) {
+    case PlacerType::SequentialPlacer: {
+      std::optional<int> coresPerCol = std::nullopt;
+      if (clCoresPerCol >= 0)
+        coresPerCol = clCoresPerCol;
+      placer = std::make_shared<SequentialPlacer>(
+          coresPerCol, clMergeLogicalTiles, clSpreadUnanchoredTiles);
+      break;
+    }
+    case PlacerType::SAPlacer: {
+      double effort = clSAEffort.getValue();
+      if (!std::isfinite(effort) || effort <= 0) {
+        device.emitError("sa-effort must be positive and finite, got ")
+            << effort;
+        return signalPassFailure();
+      }
+      SAConfig config;
+      config.effort = effort;
+      placer = saPlacer = std::make_shared<SAPlacer>(clSASeed, config);
+      break;
+    }
+    }
+
+    placer->initialize(device.getTargetModel());
+    if (failed(placer->place(device)))
+      return signalPassFailure();
+    if (saPlacer)
+      saFinalCost += saPlacer->getFinalCost();
+
+    ConversionTarget target(getContext());
+    target.addLegalOp<TileOp>();
+    target.addIllegalOp<LogicalTileOp>();
+    target.addLegalDialect<AIEDialect>();
+
+    RewritePatternSet patterns(&getContext());
+    patterns.add<ConvertLogicalTileToTile>(device.getContext(), device,
+                                           *placer);
+
+    if (failed(applyPartialConversion(device, target, std::move(patterns))))
+      return signalPassFailure();
+
+    // Generate objectfifo.allocate ops right after their respective objectfifo
+    auto &allocs = placer->getAllocates();
+    if (!allocs.empty()) {
+      // Deduplicate: only emit one allocate per fifo
+      llvm::DenseSet<Operation *> emitted;
+      for (auto &[fifoOp, delegateTileID] : allocs) {
+        if (emitted.count(fifoOp))
+          continue;
+        emitted.insert(fifoOp);
+
+        auto ofOp = dyn_cast<ObjectFifoCreateOp>(fifoOp);
+        if (!ofOp)
+          continue;
+
+        // Insert right after the objectfifo op
+        OpBuilder builder(ofOp->getContext());
+        builder.setInsertionPointAfter(ofOp);
+
+        TileOp delegateTile =
+            TileOp::getOrCreate(builder, device, delegateTileID.col,
+                                delegateTileID.row, ofOp.getLoc());
+        ObjectFifoAllocateOp::create(
+            builder, ofOp.getLoc(),
+            SymbolRefAttr::get(builder.getContext(), ofOp.getSymName()),
+            delegateTile.getResult());
+      }
+    }
+  }
+};
+
+} // namespace
+
+std::unique_ptr<OperationPass<DeviceOp>> AIE::createAIEPlaceTilesPass() {
+  return std::make_unique<AIEPlaceTilesPass>();
+}
+
+std::unique_ptr<OperationPass<DeviceOp>>
+AIE::createAIEPlaceTilesPass(const AIEPlaceTilesOptions &options) {
+  return std::make_unique<AIEPlaceTilesPass>(options);
+}

@@ -1,0 +1,216 @@
+# Copyright (C) 2025 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+#
+
+import aie.iron as iron
+import numpy as np
+from aie.helpers.dialects.scf import else_, if_
+from aie.helpers.npdtypes import np_ndarray_type_get_shape
+from aie.iron import (
+    Buffer,
+    CompileTime,
+    In,
+    ObjectFifo,
+    Out,
+    Program,
+    Runtime,
+    Worker,
+    kernels,
+)
+from aie.iron.controlflow import range_
+from aie.utils.verify import assert_pass
+from ml_dtypes import bfloat16
+
+
+# JIT decorator for IRON
+# Decorator to compile an IRON kernel into a binary to run on the NPU.
+# Parameters:
+#     - use_cache (bool): Use cached MLIR module if available. Defaults to True.
+@iron.jit
+def vector_reduce_max(
+    input0: In,
+    output: Out,
+    *,
+    in_tensor_size: CompileTime[int],
+    element_type: CompileTime[type],
+):
+
+    n_cores = 4
+    N = 2048
+    elems_per_core = N // n_cores
+
+    num_iter = in_tensor_size // N
+
+    # --------------------------------------------------------------------------
+    # In-Array Data Movement
+    # --------------------------------------------------------------------------
+
+    in_ty = np.ndarray[(in_tensor_size,), np.dtype[element_type]]
+    mem_ty = np.ndarray[(N,), np.dtype[element_type]]
+
+    # Build the reduction kernel up front so its arg types drive the FIFO/Buffer
+    # types — guarantees the example's data layout matches what the kernel
+    # consumes/produces (the bf16 output is padded to 2 elements internally to
+    # satisfy 4-byte shim-DMA alignment).
+    reduce_max_vector = kernels.reduce_max(tile_size=elems_per_core, dtype=element_type)
+    op_ty, out_ty, _ = reduce_max_vector.arg_types()
+    out_elems = out_ty.__args__[0][0]
+
+    # Input A and Output C
+    of_in = ObjectFifo(mem_ty, name="of_in")
+
+    in_fifos = []
+    out_fifos = []
+
+    if n_cores > 1:
+        of_a_offsets = [
+            int(np.prod(np_ndarray_type_get_shape(mem_ty)) // n_cores) * i
+            for i in range(n_cores)
+        ]
+    else:
+        of_a_offsets = [0]
+
+    # split() distributes one large ObjectFifo into n_cores smaller ones,
+    # each starting at the given offset. See programming_guide/section-2/section-2b/
+    # for more detail on ObjectFifo distribute and join patterns.
+    in_fifos = of_in.cons().split(
+        of_a_offsets,
+        obj_types=[op_ty] * n_cores,
+        names=[f"memA{i}" for i in range(n_cores)],
+    )
+
+    min_val = np.full(out_elems, bfloat16(float("-inf")), dtype=element_type)
+    nextC_buffers = []
+    tmp_buffers = []
+    for i in range(n_cores):
+        out_fifos.append(ObjectFifo(out_ty, name=f"memC{i}"))
+        nextC_buffers.append(
+            Buffer(
+                type=out_ty,
+                initial_value=min_val,
+            )
+        )
+        tmp_buffers.append(
+            Buffer(
+                type=out_ty,
+                initial_value=min_val,
+            )
+        )
+    # --------------------------------------------------------------------------
+    # Task each core will run
+    # --------------------------------------------------------------------------
+
+    # final_core_body: runs on the last core in the cascade. This core does not
+    # read results from a downstream neighbor — it is the terminal node that
+    # writes the final maximum value to the output ObjectFifo.
+    def final_core_body(of_in, of_out, reduce_fn, nextC_buffer, tmp_buffer):
+        elem_out = of_out.acquire(1)
+        for _ in range_(num_iter):
+            elem_in = of_in.acquire(1)
+            reduce_fn(elem_in, tmp_buffer, elems_per_core)
+            with if_(nextC_buffer[0] < tmp_buffer[0]):
+                nextC_buffer[0] = tmp_buffer[0]
+            of_in.release(1)
+        elem_out[0] = nextC_buffer[0]
+        of_out.release(1)
+
+    def core_body(of_in, of_out, in0, reduce_fn, nextC_buffer, tmp_buffer):
+        for _ in range_(num_iter):
+            elem_in = of_in.acquire(1)
+            reduce_fn(elem_in, tmp_buffer, elems_per_core)
+            with if_(nextC_buffer[0] < tmp_buffer[0]) as if_op:
+                nextC_buffer[0] = tmp_buffer[0]
+            of_in.release(1)
+
+        elem_out = of_out.acquire(1)
+        elem_in1 = in0.acquire(1)
+        with if_(elem_in1[0] > nextC_buffer[0]) as if_op:
+            elem_out[0] = elem_in1[0]
+        with else_(if_op):
+            elem_out[0] = nextC_buffer[0]
+        in0.release(1)
+        of_out.release(1)
+
+    workers = []
+    for i in range(n_cores):
+        if i != n_cores - 1:
+            workers.append(
+                Worker(
+                    core_body,
+                    fn_args=[
+                        in_fifos[i].cons(),
+                        out_fifos[i].prod(),
+                        out_fifos[i + 1].cons(),
+                        reduce_max_vector,
+                        nextC_buffers[i],
+                        tmp_buffers[i],
+                    ],
+                    trace=None,
+                )
+            )
+        else:
+            workers.append(
+                Worker(
+                    final_core_body,
+                    fn_args=[
+                        in_fifos[i].cons(),
+                        out_fifos[i].prod(),
+                        reduce_max_vector,
+                        nextC_buffers[i],
+                        tmp_buffers[i],
+                    ],
+                    trace=None,
+                )
+            )
+
+    # --------------------------------------------------------------------------
+    # DRAM-NPU data movement and work dispatch
+    # --------------------------------------------------------------------------
+
+    def sequence(a_in, c_out, in_prod, out_cons):
+        in_prod.fill(a_in)
+        out_cons.drain(c_out, wait=True)
+
+    rt = Runtime(
+        sequence,
+        [in_ty, out_ty, of_in.prod(), out_fifos[0].cons()],
+    )
+
+    # --------------------------------------------------------------------------
+    # Place and generate MLIR program
+    # --------------------------------------------------------------------------
+
+    my_program = Program(iron.get_current_device(), rt, workers=workers)
+    return my_program.resolve_program()
+
+
+def main():
+    # Define tensor shapes and data types
+    in_size = 524288
+    element_type = bfloat16
+
+    in_tensor_size = in_size // element_type(0).nbytes
+
+    # Allocate output with enough elements for 4-byte DMA alignment.
+    _dma_align = 4
+    out_elems = (_dma_align + element_type(0).nbytes - 1) // element_type(0).nbytes
+    input0 = iron.arange(in_tensor_size, dtype=element_type, device="npu")
+    output = iron.zeros(out_elems, dtype=element_type, device="npu")
+
+    # JIT-compile the kernel then launches the kernel with the given arguments. Future calls
+    # to the kernel will use the same compiled kernel and loaded code objects
+    vector_reduce_max(
+        input0, output, in_tensor_size=in_tensor_size, element_type=element_type
+    )
+
+    # Numpy reference: vector-max over the whole input (bf16-safe).
+    ref_max = input0.numpy().max()
+    assert_pass(
+        output.numpy()[0],
+        ref_max,
+        fail_msg=f"reduce-max output {output.numpy()[0]} does not match host max {ref_max}",
+    )
+
+
+if __name__ == "__main__":
+    main()

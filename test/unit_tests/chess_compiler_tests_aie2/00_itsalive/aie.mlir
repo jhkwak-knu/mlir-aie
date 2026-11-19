@@ -1,25 +1,23 @@
 //===- aie.mlir ------------------------------------------------*- MLIR -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2021-2022 Xilinx, Inc.
+// Copyright (C) 2022-2024 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2021 Xilinx Inc.
 //
 //===----------------------------------------------------------------------===//
 
 // REQUIRES: valid_xchess_license, peano
 
-// RUN: %PYTHON aiecc.py --no-unified --xchesscc    --xbridge %s
-// RUN: %PYTHON aiecc.py --unified    --xchesscc    --xbridge %s
-// RUN: %PYTHON aiecc.py --no-unified --no-xchesscc --no-xbridge %s
-// RUN: %PYTHON aiecc.py --unified    --no-xchesscc --no-xbridge %s
+// RUN: %aiecc --no-unified --xchesscc       --xbridge %s
+// RUN: %aiecc --unified    --xchesscc       --xbridge %s
+// RUN: %aiecc --no-unified --xchesscc=false --xbridge=false %s
+// RUN: %aiecc --unified    --xchesscc=false --xbridge=false %s
 
 // xchesscc and open source peano do not interact well
-//  UN: %PYTHON aiecc.py --no-unified --no-xchesscc --xbridge %s
-//  UN: %PYTHON aiecc.py --unified    --no-xchesscc --xbridge %s
-//  UN: %PYTHON aiecc.py --no-unified --xchesscc    --no-xbridge %s
-//  UN: %PYTHON aiecc.py --unified    --xchesscc    --no-xbridge %s
+//  UN: %aiecc --no-unified --xchesscc=false --xbridge %s
+//  UN: %aiecc --unified    --xchesscc=false --xbridge %s
+//  UN: %aiecc --no-unified --xchesscc       --xbridge=false %s
+//  UN: %aiecc --unified    --xchesscc       --xbridge=false %s
 
 module @test00_itsalive {
   aie.device(xcve2802) {

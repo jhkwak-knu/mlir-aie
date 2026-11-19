@@ -1,10 +1,8 @@
 //===- Passes.h - AIE Vector pipeline entry points --------------*- C++ -*-===//
 //
-// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2022 Xilinx, Inc.
+// Copyright (C) 2022-2026 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2022 Xilinx Inc.
 //
 //===----------------------------------------------------------------------===//
 //
@@ -18,20 +16,6 @@
 #include "mlir/Pass/PassOptions.h"
 
 namespace xilinx {
-enum class AIEArch {
-  AIE,    // Original AIE
-  AIE2,   // AIE-ML/V2 arch version of AIE
-  AIE2P,  // AIE2P arch version of AIE
-  UNKNOWN // Unsupported/Unknown backend
-};
-enum class TargetBackend {
-  CPP,    // Convert to aievec targeting C++ backend
-  LLVMIR, // Convert to aievec targeting LLVM IR backend
-  UNKNOWN // Unsupported/Unknown backend
-};
-} // namespace xilinx
-
-namespace xilinx {
 namespace aievec {
 
 // TODO: Create a common base class for all AIEVec pipeline options.
@@ -41,15 +25,16 @@ struct CanonicalizeVectorForAIEVecOptions
     : public mlir::PassPipelineOptions<CanonicalizeVectorForAIEVecOptions> {
   PassOptions::Option<std::string> aieTarget{
       *this, "aie-target",
-      llvm::cl::desc("Select AIE version: \"aie\" or \"aie2\". This will "
-                     "determine the vector size and available operations."),
+      llvm::cl::desc(
+          "Select AIE version: \"aie\", \"aie2\", or \"aie2p\". This will "
+          "determine the vector size and available operations."),
       llvm::cl::init("aie")};
-  PassOptions::Option<std::string> targetBackend{
-      *this, "target-backend",
-      llvm::cl::desc("Select translation backend: \"cpp\" or \"llvmir\". This "
-                     "will determine the aievec operations used to convert "
-                     "from vector dialect."),
-      llvm::cl::init("cpp")};
+  PassOptions::Option<bool> enableBF16Emulation{
+      *this, "bf16-emulation",
+      llvm::cl::desc(
+          "Run f32 vector arithmetic on the bf16 datapath: multiplies and "
+          "transcendentals take inputs rounded to bf16, sums stay f32."),
+      llvm::cl::init(false)};
 };
 
 /// Options for the "lower-vector-to-aievec" pipeline.
@@ -57,15 +42,10 @@ struct LowerVectorToAIEVecOptions
     : public mlir::PassPipelineOptions<LowerVectorToAIEVecOptions> {
   PassOptions::Option<std::string> aieTarget{
       *this, "aie-target",
-      llvm::cl::desc("Select AIE version: \"aie\" or \"aie2\". This will "
-                     "determine the vector size and available operations."),
+      llvm::cl::desc(
+          "Select AIE version: \"aie\", \"aie2\", or \"aie2p\". This will "
+          "determine the vector size and available operations."),
       llvm::cl::init("aie")};
-  PassOptions::Option<std::string> targetBackend{
-      *this, "target-backend",
-      llvm::cl::desc("Select translation backend: \"cpp\" or \"llvmir\". This "
-                     "will determine the aievec operations used to convert "
-                     "from vector dialect."),
-      llvm::cl::init("cpp")};
 };
 
 /// Options for the "optimize-aievec" pipeline.
@@ -73,15 +53,10 @@ struct OptimizeAIEVecOptions
     : public mlir::PassPipelineOptions<OptimizeAIEVecOptions> {
   PassOptions::Option<std::string> aieTarget{
       *this, "aie-target",
-      llvm::cl::desc("Select AIE version: \"aie\" or \"aie2\". This will "
-                     "determine the vector size and available operations."),
+      llvm::cl::desc(
+          "Select AIE version: \"aie\", \"aie2\", or \"aie2p\". This will "
+          "determine the vector size and available operations."),
       llvm::cl::init("aie")};
-  PassOptions::Option<std::string> targetBackend{
-      *this, "target-backend",
-      llvm::cl::desc("Select translation backend: \"cpp\" or \"llvmir\". This "
-                     "will determine the aievec operations used to convert "
-                     "from vector dialect."),
-      llvm::cl::init("cpp")};
   PassOptions::Option<unsigned> shiftParam{
       *this, "shift",
       llvm::cl::desc("Shift parameter for rounding and saturation"),
@@ -109,25 +84,24 @@ struct ConvertVectorToAIEVecOptions
       llvm::cl::init(2)};
   PassOptions::Option<std::string> aieTarget{
       *this, "aie-target",
-      llvm::cl::desc("Select AIE version: \"aie\" or \"aie2\". This will "
-                     "determine the vector size and available operations."),
+      llvm::cl::desc(
+          "Select AIE version: \"aie\", \"aie2\", or \"aie2p\". This will "
+          "determine the vector size and available operations."),
       llvm::cl::init("aie")};
-  PassOptions::Option<std::string> targetBackend{
-      *this, "target-backend",
-      llvm::cl::desc("Select translation backend: \"cpp\" or \"llvmir\". This "
-                     "will determine the aievec operations used to convert "
-                     "from vector dialect."),
-      llvm::cl::init("cpp")};
+  PassOptions::Option<bool> enableBF16Emulation{
+      *this, "bf16-emulation",
+      llvm::cl::desc(
+          "Run f32 vector arithmetic on the bf16 datapath: multiplies and "
+          "transcendentals take inputs rounded to bf16, sums stay f32."),
+      llvm::cl::init(false)};
 
   mlir::LogicalResult parseFromString(mlir::StringRef options) {
     auto res = PassPipelineOptions::parseFromString(options);
     if (!failed(res)) {
       lowerOptions.aieTarget = aieTarget;
-      lowerOptions.targetBackend = targetBackend;
       canonicalizeOptions.aieTarget = aieTarget;
-      canonicalizeOptions.targetBackend = targetBackend;
+      canonicalizeOptions.enableBF16Emulation = enableBF16Emulation;
       optimizeOptions.aieTarget = aieTarget;
-      optimizeOptions.targetBackend = targetBackend;
       optimizeOptions.shiftParam = shiftParam;
     }
     return res;
@@ -185,6 +159,14 @@ std::unique_ptr<::mlir::Pass> createDynamicSizeNoImplicitBroadcastPass();
 // Build a pipeline for CLI access to the pass
 // `dynamic-size-no-implicit-broadcast`
 void buildDynamicSizeNoImplicitBroadcastPass(mlir::OpPassManager &pm);
+
+/// Create a pass that splits vector.load + aievec.ups chains to reduce shuffle
+/// operations for AIE2p targets.
+std::unique_ptr<::mlir::Pass> createSplitVectorLoadUpsChainsPass();
+
+/// Create a pass that runs f32 vector arithmetic on the bf16 datapath:
+/// multiplies and transcendentals take inputs rounded to bf16, sums stay f32.
+std::unique_ptr<::mlir::Pass> createBF16EmulationPass();
 
 } // namespace aievec
 } // namespace xilinx

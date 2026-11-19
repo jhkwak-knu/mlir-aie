@@ -1,14 +1,12 @@
 //===- aie.mlir ------------------------------------------------*- MLIR -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2021-2022 Xilinx, Inc.
+// Copyright (C) 2022-2025 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2021 Xilinx Inc.
 //
 //===----------------------------------------------------------------------===//
 
-// RUN: %PYTHON aiecc.py %VitisSysrootFlag% --host-target=%aieHostTargetTriplet% %link_against_hsa% %s %test_lib_flags %extraAieCcFlags% %S/test.cpp -o test.elf
+// RUN: %aiecc --xchesscc --xbridge %VitisSysrootFlag% --host-target=%aieHostTargetTriplet% %link_against_hsa% %s %test_lib_flags %extraAieCcFlags% -o test.elf -- %S/test.cpp
 // RUN: %run_on_vck5000 ./test.elf
 
 // When this IR is lowered to LLVM, the affine.load operation resulting "%val0"
@@ -23,6 +21,8 @@
 // correctly.
 
 module attributes {llvm.target_triple = "x86_64-unknown-linux-gnu"}  {
+aie.device(xcvc1902) {
+
   %tile32 = aie.tile(1, 3)
 
   %buf_a = aie.buffer(%tile32) {sym_name = "a"} : memref<16xi32>
@@ -37,4 +37,5 @@ module attributes {llvm.target_triple = "x86_64-unknown-linux-gnu"}  {
     }
     aie.end
   }
+}
 }

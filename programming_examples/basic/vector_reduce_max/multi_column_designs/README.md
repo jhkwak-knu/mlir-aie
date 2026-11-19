@@ -1,60 +1,66 @@
 <!---//===- README.md --------------------------*- Markdown -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2025-2026 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Copyright (C) 2025, Advanced Micro Devices, Inc.
-// 
 //===----------------------------------------------------------------------===//-->
 ## Multi-Column Reduction Designs
 
-The designs in this folder are optimized to avoid the use of memory tiles and minimize data movement. Partial reductions are performed within each column using shared memory between neighboring tiles, followed by a final reduction step across the two columns. The number of cores (`n_cores`) can be configured from 1 to 8, and all shim tiles and shim DMAs are utilized. 
+Partial reductions are performed within each row using shared memory between neighboring tiles, followed by a final reduction step across the column. In `col_wise_vector_reduce_max.py`, `--num_cores` (default 8, two cores per column) sets how many cores share the reduction; `row_wise_vector_reduce_max.py` fixes its core count at `N_CORES`, with one shim channel per core.
 
 Both BF16 and INT32 data types are supported, leveraging kernels from `reduce_max.cc`.
 
 ## Source Files Overview
 
 ### Design Source Files
-1. `vector_reduce_max.py`: A Python script that defines the AIE array structural design using MLIR-AIE operations. This generates MLIR that is then compiled using `aiecc.py` to produce design binaries (ie. XCLBIN and inst.bin for the NPU in Ryzen™ AI). 
+1. `col_wise_vector_reduce_max.py`: An `@iron.jit`-decorated IRON design that limits the number of cores per column, generating a design with reduction executed horizontally across the columns.
 
-2. `vector_reduce_max_placed.py`: An alternative version of the design in `vector_reduce_max.py`, that is expressed in a lower-level version of IRON.
+<br><img src="assets/Multi-col.png" alt="Multi-column Design" width="1250"/>
 
-<br><img src="assets/Multi-col.png" alt="Multi-column Design" width="500"/>
+2. `row_wise_vector_reduce_max.py`: An alternative to `col_wise_vector_reduce_max.py` using the maximum number of cores per column, generating a design with reduction executed vertically across the rows.
+
+<br><img src="assets/Multi-col-row-wise.png" alt="Multi-column Design" width="500"/>
 
 ## Ryzen™ AI Usage
 
-### Compilation
-
-To compile the design (default is the cascade design):
+### Standalone JIT verification
 
 ```shell
-make
+python3 col_wise_vector_reduce_max.py
+python3 row_wise_vector_reduce_max.py
 ```
 
-To compile the placed design:
+Pass `--dev npu2` for Strix. Each command compiles, runs, and verifies its output directly in Python.
+
+### Compilation for the native host
+
+The two variants are selected with the `VARIANT` Makefile variable (default: `col_wise`):
 
 ```shell
-env use_placed=1 make
+make                            # builds VARIANT=col_wise
+env VARIANT=row_wise make
 ```
 
 To compile the C++ testbench:
 
 ```shell
-make vector_reduce_max.exe
+make col_wise_vector_reduce_max.exe   # VARIANT=row_wise builds row_wise_vector_reduce_max.exe
 ```
+
 ### C++ Testbench
 
 To run the design:
 
 ```shell
-make run
+make run                        # runs VARIANT=col_wise
+env VARIANT=row_wise make run
 ```
 
 ### Trace
 
-To generate a [trace file](../../../programming_guide/section-4/section-4b/README.md) for the default cascade design:
+To generate a [trace file](../../../../programming_guide/section-4/section-4b/README.md):
 
 ```shell
-make trace
+make trace                      # traces VARIANT=col_wise
+env VARIANT=row_wise make trace
 ```

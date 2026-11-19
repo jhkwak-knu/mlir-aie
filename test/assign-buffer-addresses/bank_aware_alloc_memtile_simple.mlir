@@ -1,14 +1,11 @@
 //===- bank_aware_alloc_memtile_simple.mlir --------------------*- MLIR -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2024 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// Copyright (C) 2024, Advanced Micro Devices, Inc.
 //
 //===----------------------------------------------------------------------===//
 
-// RUN: aie-opt --aie-assign-buffer-addresses="alloc-scheme=bank-aware" %s 2>&1 | FileCheck %s
+// RUN: aie-opt --aie-assign-buffer-addresses %s 2>&1 | FileCheck %s
 // CHECK:       %a = aie.buffer(%{{.*}}_3_1) {address = 0 : i32, mem_bank = 0 : i32, sym_name = "a"} : memref<16384xi32>
 
 module @test {

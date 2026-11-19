@@ -1,8 +1,12 @@
---- 
+---
+# Copyright (C) 2025-2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 # **Memcpy**
 
-The `memcpy.py` design is a highly parallel, parameterized design that uses shim DMAs in every NPU column. It enables both compute and bypass modes to help you analyze performance charactaristics.
+> **Exercise Design:** The runtime sequence in `memcpy.py` is intentionally left unoptimized — drain operations run serially rather than in parallel, which limits measured bandwidth. Your task is to restructure the runtime sequence using `TaskGroup()` to achieve full concurrency across all columns and channels. See Step 4 below for guidance, and [getting_started/00_memcpy/memcpy.py](../../getting_started/00_memcpy/memcpy.py) for the reference solution.
+
+The `memcpy.py` design is a highly parallel, parameterized design that uses shim DMAs in every NPU column. It enables both compute and bypass modes to help you analyze performance characteristics.
 
 ---
 
@@ -19,7 +23,7 @@ In this exercise, you'll use the `memcpy` design to measure memory bandwidth acr
 
 ---
 
-### **Step-by-Step Instructions**
+## Step-by-Step Instructions
 
 1. **Configure Your Run Using `make` Parameters:**
 
@@ -38,8 +42,8 @@ In this exercise, you'll use the `memcpy` design to measure memory bandwidth acr
 
 2. **Explore the Two Modes:**
 
-   * **Bypass Mode (`--bypass True`)**: Uses only shim DMA, bypassing the AIE core. This isolates raw memory movement capability
-   * **Passthrough Mode (`--bypass False`)**: Adds a minimal AIE kernel, mimicking a compute+transfer design. Helps understand potential core overhead
+   * **Bypass Mode (`--bypass True`)**: Uses only shim DMA, bypassing the AIE core. This isolates raw memory movement capability.
+   * **Passthrough Mode (`--bypass False`)**: Adds a minimal AIE kernel, mimicking a compute+transfer design. Helps understand potential core overhead.
 
 3. **Calculate Effective Bandwidth:**
 
@@ -59,55 +63,53 @@ In this exercise, you'll use the `memcpy` design to measure memory bandwidth acr
 
 4. **Ensure Optimal Task Sequencing in the Runtime**
 
-	To achieve full parallelism when draining data from all 	columns and channels, the `memcpy` design can use **task groups** in the IRON 	`Runtime().sequence` to group operations and start them together before waiting for completion.
+	To achieve full parallelism when draining data from all columns and channels, the `memcpy` design can use **task groups** in the IRON `Runtime` sequence body to group operations and start them together before waiting for completion.
 
-	Modify your IRON runtime sequences to optimize performance using **task groups**:
+	Modify your IRON runtime sequence body to optimize performance using **task groups**:
 
-	* **Start workers (if not bypassing)** before enqueueing transfers
-	* **Group drain tasks** using `task_group()` so they all begin execution concurrently
-	* **Use `finish_task_group()`** to explicitly synchronize the completion of the group
+	* **Start workers (if not bypassing)** by passing them to the `Program` (they are launched for you — the body does not start them)
+	* **Group drain tasks** using `TaskGroup()` so they all begin execution concurrently
+	* **Use `tg.finish()`** to explicitly synchronize the completion of the group
 
 	*Key Code Snippet:*
 
 	```python
-	rt = Runtime()
-	with rt.sequence(transfer_type, transfer_type) as (a_in, b_out):
-	    if not bypass:
-	        rt.start(*my_workers)
-	
-	    tg_out = rt.task_group()  # Initialize a group for parallel drain tasks
+	def sequence(a_in, b_out, in_hs, out_hs):
+	    tg_out = TaskGroup()  # Initialize a group for parallel drain tasks
 	
 	    # Fill the input FIFOs (these will start immediately)
-	    for i in range(num_columns):
-	        for j in range(num_channels):
-	            rt.fill(
-	                of_ins[i * num_channels + j].prod(),
-	                a_in,
-	                taps[i * num_channels + j],
-	            )
+	    for idx in range(len(in_hs)):
+	        in_hs[idx].fill(a_in, taps[idx])
 	
 	    # Drain the outputs into host buffer and wait for all to finish
-	    for i in range(num_columns):
-	        for j in range(num_channels):
-	            rt.drain(
-	                of_outs[i * num_channels + j].cons(),
-	                b_out,
-	                taps[i * num_channels + j],
-	                wait=True,
-	                task_group=tg_out,  # Add task to the group
-	            )
+	    for idx in range(len(out_hs)):
+	        out_hs[idx].drain(
+	            b_out,
+	            taps[idx],
+	            wait=True,
+	            group=tg_out,  # Add task to the group
+	        )
 	
-	    rt.finish_task_group(tg_out)  # Wait for all drain tasks together
+	    tg_out.finish()  # Wait for all drain tasks together
+	
+	rt = Runtime(
+	    sequence,
+	    [transfer_type, transfer_type, in_prods, out_conses],
+	)
+	# Workers (if not bypassing) are launched via the Program, not the body:
+	Program(dev, rt, workers=my_workers).resolve_program()
 	```
 
  	*Why This Matters:*
 
 	Without grouping, each `drain(..., wait=True)` call would block serially, and you’d lose concurrency across channels. This would **underutilize the memory system** and give you lower bandwidth measurements.
 	
-	Using a `task_group` ensures:
+	Using a `TaskGroup` ensures:
 	
 	* All drain tasks begin concurrently
 	* Runtime waits for **all drains to complete together**, preserving parallel execution
+
+	HINT: If you're stuck wondering where to use task groups, see [programming_examples/getting_started/00_memcpy/memcpy.py](../../getting_started/00_memcpy/memcpy.py).
 
 5. **Report Your Findings:**
 
@@ -115,15 +117,13 @@ In this exercise, you'll use the `memcpy` design to measure memory bandwidth acr
    * Record latency and bandwidth
    * Identify the configuration that delivers the highest bandwidth
    * Discuss why bypass mode may or may not outperform passthrough
-   * Understand the runtme sequence operations in the generated `memcpy.mlir` file
+   * Understand the runtime sequence operations in the generated `memcpy.mlir` file
 
----
-
-### **Expected Outcome**
+## Expected Outcome
 
 By the end of this exercise, you should have a solid understanding of:
 
 * How to configure a scalable data movement design across a Ryzen AI NPU
 * The impact of architectural parameters on dataflow and bandwidth
-* How IRON APIs map to low-level hardware capabilities like DMA engines and object FIFOs
+* How IRON APIs map to low-level hardware capabilities like DMA engines and ObjectFifos
 * The importance of proper transfer scheduling and synchronization of runtime data movement operations

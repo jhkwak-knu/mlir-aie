@@ -1,60 +1,96 @@
 # dmatask.py -*- Python -*-
 #
-# This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-# See https://llvm.org/LICENSE.txt for license information.
+# Copyright (C) 2024 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #
-# (c) Copyright 2024 Advanced Micro Devices, Inc.
+"""DMATask: a RuntimeTask that generates a shim DMA transfer operation."""
 
-from ... import ir  # type: ignore
-
-from ...dialects._aiex_ops_gen import dma_start_task  # type: ignore
-from ...dialects.aiex import shim_dma_single_bd_task
-from ..dataflow import ObjectFifoHandle
-from .data import RuntimeData
+from ... import ir  # pyright: ignore[reportMissingImports, reportAttributeAccessIssue]
+from ...dialects.aiex import dma_start_task, shim_dma_single_bd_task
+from ...helpers.sourceloc import iron_name, relocate
 from ...helpers.taplib import TensorAccessPattern
+from ..scratchpad_parameter import ScratchpadParameter
+from ._context import active_sequence
+from .data import RuntimeData
+from .dmataskhandle import Task
 from .task import RuntimeTask
-from .taskgroup import RuntimeTaskGroup
+from .taskgroup import TaskGroup
 
 
 class DMATask(RuntimeTask):
     def __init__(
         self,
-        object_fifo: ObjectFifoHandle,
+        alloc: str,
         rt_data: RuntimeData,
         tap: TensorAccessPattern,
-        task_group: RuntimeTaskGroup | None = None,
+        task_group: TaskGroup | None = None,
         wait: bool = False,
+        offset_parameter: str | None = None,
+        packet: tuple[int, int] | None = None,
+        length_parameter: str | None = None,
+        length_unit: int | None = None,
+        repeat_parameter: str | None = None,
+        out_of_order_id: int | None = None,
     ):
-        """A RuntimeTask that will resolve to a DMA Operation.
+        """Construct a RuntimeTask that will resolve to a DMA Operation.
 
         Args:
-            object_fifo (ObjectFifoHandle): The ObjectFifoHandle associated with the operation
+            alloc (str): Name of the shim DMA allocation this transfer drives,
+                i.e. the symbol naming the shim channel. An
+                [`ObjectFifo`][aie.iron.ObjectFifo] with a shim endpoint generates an
+                allocation of its own name; a [`Flow`][aie.iron.Flow] generates one
+                for its ``shim_symbol``.
             rt_data (RuntimeData): The Runtime buffer associated with the operation.
-            tap (TensorAccessPattern): The access pattern associated with the operation.
-            task_group (RuntimeTaskGroup | None, optional): The task group associated with the operation. Defaults to None.
+            tap (TensorAccessPattern): The walk over ``rt_data``; its values may be staged.
+            task_group (TaskGroup | None, optional): The task group associated with the operation. Defaults to None.
             wait (bool, optional): Whether this task should conclude with a call to await or a call to free. Defaults to False.
+            offset_parameter (str | None, optional): Name of a ScratchpadParameter whose
+                value is used as the element offset for this DMA transfer. Defaults to None.
+            length_parameter (str | None, optional): Name of a ScratchpadParameter
+                n; the transfer moves exactly n passes of ``tap`` (per
+                iteration). Defaults to None.
+            length_unit (int | None, optional): Elements per unit of
+                length_parameter, a multiple of 16 bytes. Defaults to the
+                elements one pass of ``tap`` moves.
+            repeat_parameter (str | None, optional): Name of a
+                ScratchpadParameter n; the transfer runs n + 1 times, at most
+                as many as ``tap``'s outer dimensions give (it stops an
+                iteration over them early). Defaults to None.
+            packet (tuple[int, int] | None, optional): Stamp the shim DMA's
+                BD with a packet header `(pkt_type, pkt_id)`. A packet-switched
+                [`ObjectFifo`][aie.iron.ObjectFifo] needs none, since the transfer
+                takes the header its shim allocation was assigned; this is for
+                an explicit [`PacketFlow`][aie.iron.PacketFlow] or to override that
+                header. Defaults to None.
+            out_of_order_id (int | None, optional): Buffer descriptor id the
+                receiving out-of-order channel takes this transfer with. The
+                header carries it, which is how that channel tells apart the
+                fifos sharing it. Defaults to None.
         """
-        self._object_fifo = object_fifo
+        self._alloc = alloc
         self._rt_data = rt_data
         self._tap = tap
         self._wait = wait
+        self._offset_parameter = offset_parameter
+        self._length_parameter = length_parameter
+        self._length_unit = length_unit
+        self._out_of_order_id = out_of_order_id
+        self._repeat_parameter = repeat_parameter
+        self._packet = packet
         self._task = None
         RuntimeTask.__init__(self, task_group)
 
     def will_wait(self) -> bool:
-        """If this tasks shoudl conclude with an await operation."""
+        """Whether this task should conclude with an await operation."""
         return self._wait
 
     @property
-    def fifo(self) -> ObjectFifoHandle:
-        """The ObjectFifoHandle associated with this task."""
-        return self._object_fifo
-
-    @property
     def task(self):
-        """The MLIR op generated by resolve(). This handle is used after resolution for await or free operations as
-        dictated by a RuntimeTaskGroup Finish operation"""
+        """Return the MLIR op generated by resolve().
+
+        This handle is used after resolution for await or free operations as
+        dictated by a TaskGroup Finish operation.
+        """
         if not self._task:
             raise ValueError("Cannot get task before it is created (during resolve())")
         return self._task
@@ -64,10 +100,110 @@ class DMATask(RuntimeTask):
         loc: ir.Location | None = None,
         ip: ir.InsertionPoint | None = None,
     ) -> None:
+        # Reference the shim allocation by symbol name, not by a resolved op:
+        # the DMA only needs the metadata symbol (shim_dma_single_bd_task
+        # reduces an op to its sym_name anyway). That keeps building the task
+        # independent of the op that declares the allocation, so this code does
+        # not have to hold or thread one.
         self._task = shim_dma_single_bd_task(
-            self._object_fifo.op,
+            self._alloc,
             self._rt_data.op,
             tap=self._tap,
+            transfer_len=0 if self._length_parameter is not None else None,
             issue_token=self._wait,
+            offset_parameter=self._offset_parameter,
+            length_parameter=self._length_parameter,
+            length_unit=self._length_unit,
+            packet=self._packet,  # pyright: ignore[reportArgumentType]
+            out_of_order_id=self._out_of_order_id,
         )
-        dma_start_task(self._task)
+        dma_start_task(self._task, repeat_parameter=self._repeat_parameter)
+        # Named after the buffer and the channel it moves through
+        # ("iron:A@of_in"), so the sequence's tasks and BDs read like the source.
+        if self._rt_data.name is not None:
+            name = iron_name(f"{self._rt_data.name}@{self._alloc}")
+            # The task, its BDs, and the start pushing it (its only use yet).
+            ops = [self._task.operation]
+            ops += [use.owner for use in self._task.result.uses]
+            for op in ops:
+                relocate(op, lambda loc: ir.Location.name(name, childLoc=loc))
+
+
+def emit_shim_transfer(
+    alloc: str,
+    rt_data,
+    tap=None,
+    wait: bool = False,
+    packet: tuple[int, int] | None = None,
+    offset_parameter: ScratchpadParameter | str | None = None,
+    group=None,
+    managed: bool = True,
+    length_parameter: ScratchpadParameter | str | None = None,
+    length_unit: int | None = None,
+    repeat_parameter: ScratchpadParameter | str | None = None,
+    out_of_order_id: int | None = None,
+) -> Task:
+    """Emit one shim DMA transfer on the ``alloc`` channel, inside the active sequence.
+
+    The body shared by the runtime's data-movement verbs --
+    ``ObjectFifoHandle.fill``/``drain`` and ``Flow.fill``/``drain`` -- which
+    differ only in how they name the shim channel and in the endpoint
+    bookkeeping they do first.
+
+    ``tap`` is the walk over the runtime buffer; its offset, sizes and strides
+    may be runtime values. When it is None, the whole buffer moves linearly.
+
+    When ``managed`` is True (default), the transfer is enrolled in a TaskGroup
+    (explicit ``group`` or the sequence's implicit one), which awaits/frees it at
+    group close. When False, the caller owns the transfer's lifetime via the
+    returned Task's ``.free()``/``.await_()`` -- used for hand-rolled software
+    pipelines that carry the task across ``scf.for`` iterations.
+
+    ``offset_parameter``, ``length_parameter`` and ``repeat_parameter`` take a
+    ScratchpadParameter (or its name). A ``length_parameter`` n makes the
+    transfer move exactly n passes of ``tap`` (per iteration), and a
+    ``repeat_parameter`` n runs it n + 1 times; see DMATask.
+
+    Returns:
+        Task: A handle to the transfer.
+    """
+    active = active_sequence()
+    rt = active.runtime
+
+    if not isinstance(rt_data, RuntimeData):
+        raise ValueError(f"Expected a RuntimeData source/dest, got {rt_data}")
+    if rt_data not in rt._rt_data:
+        raise ValueError(
+            f"{rt_data} is not a RuntimeData object declared by sequence()"
+        )
+
+    if tap is None:
+        tap = rt_data.default_tap()
+
+    if not managed and group is not None:
+        raise ValueError(
+            "An unmanaged transfer (managed=False) is not part of a TaskGroup; "
+            "do not also pass group=."
+        )
+
+    task = DMATask(
+        alloc,
+        rt_data,
+        tap=tap,
+        task_group=group,
+        wait=wait,
+        offset_parameter=rt.register_parameter(offset_parameter),
+        packet=packet,
+        length_parameter=rt.register_parameter(length_parameter),
+        length_unit=length_unit,
+        repeat_parameter=rt.register_parameter(repeat_parameter),
+        out_of_order_id=out_of_order_id,
+    )
+    if managed:
+        active.emit_transfer(task, group)
+    else:
+        # Emit the BD only; the caller owns await/free via the Task.
+        task.resolve()
+    # Wrap the transfer's !index result: it is both the scf iter_arg payload
+    # and the operand dma_await_task/dma_free_task accept.
+    return Task(task.task.result)

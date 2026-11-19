@@ -1,10 +1,8 @@
 //===- AIECreateBroadcastPacket.cpp -----------------------------*- C++ -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2019-2022 Xilinx, Inc.
+// Copyright (C) 2022-2026 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2019 Xilinx Inc.
 //
 //===----------------------------------------------------------------------===//
 
@@ -19,6 +17,11 @@
 #include "mlir/Transforms/DialectConversion.h"
 
 #include "llvm/ADT/Twine.h"
+
+namespace xilinx::AIEX {
+#define GEN_PASS_DEF_AIEBROADCASTPACKET
+#include "aie/Dialect/AIEX/Transforms/AIEXPasses.h.inc"
+} // namespace xilinx::AIEX
 
 #define DEBUG_TYPE "aie-create-lower-packet"
 
@@ -46,7 +49,8 @@ struct AIEOpRemoval : public OpConversionPattern<MyOp> {
 };
 
 struct AIEBroadcastPacketPass
-    : public AIEBroadcastPacketBase<AIEBroadcastPacketPass> {
+    : public xilinx::AIEX::impl::AIEBroadcastPacketBase<
+          AIEBroadcastPacketPass> {
   void runOnOperation() override {
 
     DeviceOp device = getOperation();
@@ -56,8 +60,7 @@ struct AIEBroadcastPacketPass
       Region &r = broadcastpacket.getPorts();
       Block &b = r.front();
       Port sourcePort = broadcastpacket.port();
-      TileOp srcTile =
-          dyn_cast<TileOp>(broadcastpacket.getTile().getDefiningOp());
+      TileOp srcTile = cast<TileOp>(broadcastpacket.getTile().getDefiningOp());
 
       for (Operation &Op : b.getOperations()) {
         if (BPIDOp bpid = dyn_cast<BPIDOp>(Op)) {
@@ -65,25 +68,24 @@ struct AIEBroadcastPacketPass
           Block &b_bpid = r_bpid.front();
           int flowID = bpid.IDInt();
           builder.setInsertionPointAfter(broadcastpacket);
-          PacketFlowOp pkFlow = builder.create<PacketFlowOp>(
-              builder.getUnknownLoc(), flowID, nullptr, nullptr);
+          PacketFlowOp pkFlow = PacketFlowOp::create(
+              builder, broadcastpacket.getLoc(), flowID, nullptr, nullptr);
           Region &r_pkFlow = pkFlow.getPorts();
           Block *b_pkFlow = builder.createBlock(&r_pkFlow);
           builder.setInsertionPointToStart(b_pkFlow);
-          builder.create<PacketSourceOp>(builder.getUnknownLoc(), srcTile,
-                                         sourcePort.bundle, sourcePort.channel);
+          PacketSourceOp::create(builder, broadcastpacket.getLoc(), srcTile,
+                                 sourcePort.bundle, sourcePort.channel);
           for (Operation &op : b_bpid.getOperations()) {
             if (BPDestOp bpdest = dyn_cast<BPDestOp>(op)) {
-              TileOp destTile =
-                  dyn_cast<TileOp>(bpdest.getTile().getDefiningOp());
+              TileOp destTile = cast<TileOp>(bpdest.getTile().getDefiningOp());
               Port destPort = bpdest.port();
               builder.setInsertionPointToEnd(b_pkFlow);
-              builder.create<PacketDestOp>(builder.getUnknownLoc(), destTile,
-                                           destPort.bundle, destPort.channel);
+              PacketDestOp::create(builder, bpdest.getLoc(), destTile,
+                                   destPort.bundle, destPort.channel);
             }
           }
           builder.setInsertionPointToEnd(b_pkFlow);
-          builder.create<EndOp>(builder.getUnknownLoc());
+          EndOp::create(builder, broadcastpacket.getLoc());
         }
       }
     }

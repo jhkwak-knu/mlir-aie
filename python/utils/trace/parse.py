@@ -1,0 +1,1077 @@
+#!/usr/bin/env python3
+# Copyright (C) 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+import argparse
+import json
+import logging
+import sys
+
+import aie.dialects.aie as aiedialect
+import aie.dialects.aiex as aiexdialect
+import numpy as np
+from aie._mlir_libs._aie import (  # pyright: ignore[reportMissingImports]
+    trace_buffer_fields,  # pyright: ignore[reportAttributeAccessIssue]
+    trace_slice_fields,  # pyright: ignore[reportAttributeAccessIssue]
+)
+from aie.dialects.aie import (  # pyright: ignore[reportMissingImports]
+    RuntimeSequenceOp,  # pyright: ignore[reportAttributeAccessIssue]
+)
+from aie.extras.util import find_ops  # pyright: ignore[reportMissingImports]
+from aie.helpers.util import (  # pyright: ignore[reportMissingImports]
+    fold_constant_operand,
+)
+from aie.ir import (  # pyright: ignore[reportMissingImports]
+    Context,  # pyright: ignore[reportAttributeAccessIssue]
+    Location,  # pyright: ignore[reportAttributeAccessIssue]
+    Module,  # pyright: ignore[reportAttributeAccessIssue]
+)
+from aie.utils.trace.events import (
+    NUM_TRACE_TYPES,
+    PacketType,
+    get_events_for_device,
+)
+from aie.utils.trace.utils import (
+    convert_to_byte_stream,
+    convert_to_commands,
+    decode_event_pc_stream,
+    split_trace_segments,
+    trace_pkts_de_interleave,
+    trim_trace_pkts,
+)
+
+logger = logging.getLogger(__name__)
+
+NUM_EVENTS = 8  # number of events we can view per trace
+
+# Single2/Multiple2 carry an 18-bit cycle delta (utils.py convert_to_commands). Event_Sync is
+# the hardware's marker that the field wrapped once, so decoding it as a no-op undercounts by
+# one full range per occurrence -- 6.9x on a measured capture whose real per-tile interval was
+# 306746 cycles against 44602 decoded.
+EVENT_SYNC_CYCLES = 1 << 18
+
+DEFAULT_KERNEL = "main:sequence"
+
+
+def _device_name(device_op):
+    sym_name = device_op.sym_name
+    return sym_name.value if sym_name is not None else None
+
+
+def _find_sequence(module, kernel):
+    """Return the `aie.runtime_sequence` that `kernel` names, as "device:sequence"."""
+    found = []
+    for seq in find_ops(
+        module.operation,
+        lambda o: isinstance(o.operation.opview, RuntimeSequenceOp),
+    ):
+        device = seq.operation.parent.opview
+        name = f"{_device_name(device)}:{seq.sym_name.value}"
+        if name == kernel:
+            return seq
+        found.append(name)
+    raise ValueError(f"no runtime sequence named '{kernel}'; found {found}")
+
+
+def get_trace_buffer(mlir_module_str, kernel=DEFAULT_KERNEL):
+    """Return which argument of `kernel` receives trace data.
+
+    Reads the `#aie.trace_buffer` attribute that `-aie-insert-trace-flows` sets
+    and `-aie-fuse-trace-buffers` updates. Write that attribute by hand to point
+    tracing at an argument of your choice.
+
+    Returns a dict with ``arg_index``, ``offset``, ``size`` and ``dedicated``,
+    or ``None`` when `kernel` is untraced.
+    """
+    with Context(), Location.unknown():
+        module = Module.parse(mlir_module_str)
+        attr = _find_sequence(module, kernel).trace_buffer
+        if attr is None:
+            return None
+        arg_index, offset, size, dedicated = trace_buffer_fields(attr)
+        return {
+            "arg_index": arg_index,
+            "offset": offset,
+            "size": size,
+            "dedicated": dedicated,
+        }
+
+
+def get_trace_slices(mlir_module_str, kernel=DEFAULT_KERNEL):
+    """Return how `kernel` splits its trace buffer between the designs it runs.
+
+    `-aie-fuse-trace-buffers` records one `#aie.trace_slice` per `aiex.run` call
+    site, so a sequence that runs several designs, or one design several times,
+    keeps their traces in separate byte ranges.
+
+    Returns a list of dicts with ``device``, ``sequence``, ``offset`` and
+    ``size``, in buffer order. Returns ``[]`` when `kernel` runs no other
+    sequence, because its whole buffer is then its own.
+    """
+    with Context(), Location.unknown():
+        module = Module.parse(mlir_module_str)
+        try:
+            sequence = _find_sequence(module, kernel)
+        except ValueError:
+            if kernel != DEFAULT_KERNEL:
+                raise
+            for sequence in find_ops(
+                module.operation,
+                lambda o: isinstance(o.operation.opview, RuntimeSequenceOp),
+            ):
+                if sequence.trace_slices is not None:
+                    raise
+            return []
+        attr = sequence.trace_slices
+        if attr is None:
+            return []
+        entries = []
+        for slice_attr in attr:
+            device, sequence, offset, size = trace_slice_fields(slice_attr)
+            entries.append(
+                {
+                    "device": device,
+                    "sequence": sequence,
+                    "offset": offset,
+                    "size": size,
+                }
+            )
+        return entries
+
+
+def parse_trace_slices(
+    trace_buffer, mlir_module_str, colshift=None, kernel=DEFAULT_KERNEL
+):
+    """Parse a shared trace buffer into one event list per traced sub-design.
+
+    Each slice is decoded against the device that wrote it, which separates two
+    sub-designs that occupy the same tiles.
+
+    Returns a list of ``(slice_info, events)``. A buffer with no recorded layout
+    yields one entry covering all of it.
+    """
+    slices = get_trace_slices(mlir_module_str, kernel)
+    if not slices:
+        return [(None, parse_trace(trace_buffer, mlir_module_str, colshift))]
+
+    words = np.asarray(trace_buffer).view(np.uint32).reshape(-1)
+    results = []
+    for entry in slices:
+        start = entry["offset"] // 4
+        end = start + entry["size"] // 4
+        region = words[start:end]
+        if not region.any():
+            continue
+        results.append(
+            (
+                entry,
+                parse_trace(region, mlir_module_str, colshift, entry["device"]),
+            )
+        )
+    return results
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", help="Input trace file", required=True)
+    parser.add_argument("--mlir", help="mlir source file", required=True)
+    parser.add_argument(
+        "--colshift", help="column shift adjustment to source mlir", required=False
+    )
+    parser.add_argument("--output", help="Output json file", required=True)
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug output (equivalent to AIE_LOG_LEVEL=DEBUG)",
+    )
+    # TODO tracelabels removed since we can have multiple sets of labels for each pkt_type & loc combination
+    # parser.add_argument('--tracelabels',
+    #         nargs='+',
+    #         help='Labels for traces', required=False)
+    return parser.parse_args(sys.argv[1:])
+
+
+# Check for valid trace packets data
+# 1) if only 1 trace packet
+# 2) if first trace packet is all 0's
+def check_for_valid_trace(filename, trace_pkts):
+    logger.debug("len(trace_pkts): %s", len(trace_pkts))
+    logger.debug("trace_pkts[0]: %s", trace_pkts[0] if trace_pkts else "<empty>")
+    if len(trace_pkts) < 2 or trace_pkts[0] == "00000000":
+        logger.error("Empty trace file. Valid trace was not written to %s", filename)
+        logger.error(
+            "See https://github.com/Xilinx/mlir-aie/tree/main/programming_guide/section-4/section-4b#Additional-Debug-Hints for additional trace debug tips."
+        )
+        return False
+    return True
+
+
+def make_event_lists(commands):
+    events = {}
+    ts = 0
+    last = None  # the last command that is not a Repeat
+    for i, command in enumerate(commands):
+        if command["type"] == "Start":
+            ts = command["timer_value"]
+        if command["type"] == "Event_Sync":
+            ts += EVENT_SYNC_CYCLES
+        if "Repeat" in command["type"] and last == "Event_Sync":
+            ts += int(command["repeats"]) * EVENT_SYNC_CYCLES
+        if "Repeat" not in command["type"]:
+            last = command["type"]
+        if "Single" in command["type"]:
+            ts += command["cycles"]
+            if command["event"] in events:
+                events[command["event"]].append(ts)
+            else:
+                events[command["event"]] = [ts]
+    return events
+
+
+# testing a flattening of repeat commands
+def flatten_repeat_command(commands):
+    prev = None
+    flat_commands = list()
+    for c in commands:
+        if c["type"] == "Repeat0" or c["type"] == "Repeat1":
+            if prev is not None:
+                flat_commands.extend([prev] * int(c["repeats"]))
+        else:
+            flat_commands.append(c)
+            prev = c
+    return flat_commands
+
+
+def _convert_to_commands_by_mode(byte_streams, trace_modes, zero=True):
+    event_pc_streams = []
+    event_time_streams = [dict() for _ in range(NUM_TRACE_TYPES)]
+    for trace_type, streams in enumerate(byte_streams):
+        for loc, stream in streams.items():
+            mode = trace_modes[trace_type].get(loc, 0)
+            if mode == 0:
+                event_time_streams[trace_type][loc] = stream
+            elif mode == 1:
+                event_pc_streams.append((trace_type, loc, stream))
+            else:
+                raise NotImplementedError(
+                    f"trace mode {mode} is not supported for type {trace_type} tile {loc}"
+                )
+
+    commands = convert_to_commands(event_time_streams, zero)
+    for trace_type, loc, stream in event_pc_streams:
+        commands[trace_type][loc] = decode_event_pc_stream(stream, zero)
+    return commands
+
+
+# This function assert an end event for all active events if:
+# 1) the cycles from the last event is > 0
+# 2) active event is not in list of new events (multiples)
+#
+# if cycles > 0, deactivate all events
+# if cycles == 0, deactivate all events except this one
+#
+# multiples - list of new active events
+# active_events - list of existing active events
+# timer - current running time
+# cycles - # of cycles from last event
+# pid -
+# trace_type -
+# loc -
+# pid_events -
+def deactivate_events(
+    multiples,
+    active_events,
+    timer,
+    cycles,
+    pid,
+    trace_type,
+    loc,
+    pid_events,
+    trace_events,
+    events_module,
+):
+    for k in active_events.keys():  # an active event
+        if cycles > 0 or (cycles == 0 and k not in multiples):
+            # if not k in multiples: # active event it not in multiples list
+            if active_events[k] > 0:
+                trace_event = {
+                    "name": lookup_event_name_by_type(
+                        trace_type, pid_events[trace_type][loc][k], events_module
+                    )
+                }  # TODO remove
+                trace_event["ts"] = timer
+                trace_event["ph"] = "E"
+                trace_event["pid"] = pid
+                trace_event["tid"] = k
+                trace_event["args"] = {}
+                trace_events.append(trace_event)
+            active_events[k] = 0
+
+
+# Assert a begin signal for the current event unless the event is still active
+def activate_event(
+    event, tt, loc, timer, pid, active_events, pid_events, trace_events, events_module
+):
+    try:
+        if active_events[event] == 0:
+            trace_event = {
+                "name": lookup_event_name_by_type(
+                    tt, pid_events[tt][loc][event], events_module
+                )
+            }
+            trace_event["ts"] = timer
+            trace_event["ph"] = "B"
+            trace_event["pid"] = pid
+            trace_event["tid"] = event
+            trace_event["args"] = {}
+            trace_events.append(trace_event)
+            active_events[event] = 1
+    except KeyError:
+        pass
+
+
+# def convert_commands_to_json(trace_events, commands, pid, pid_events):
+# TODO iterate over commands which is ...
+#
+# commands:  list (idx = trace type, value = byte_stream_dict)
+# byte_stream_dict: dict (key = row,col, value = list of commands)
+def convert_commands_to_json(trace_events, commands, pid_events, events_module):
+    # byte_stream_dict for each trace type.
+    for [tt, byte_stream_dict] in enumerate(commands):  # tt = trace type
+
+        for loc, command in byte_stream_dict.items():  # row,col with list of commands
+            if any(c["type"] == "EventPC" for c in command):
+                command = flatten_repeat_command(command)
+            timer = 0  # TODO Some way to set this or sync this between trace types and row,col
+            # timer on each execution is the time for the last execution
+            # so we by default will increment it by 1 for each event
+            logger.debug("tt: %s, loc: %s, NUM_EVENTS: %s", tt, loc, NUM_EVENTS)
+
+            if loc in pid_events[tt]:
+                pid = pid_events[tt][loc][NUM_EVENTS]
+            else:
+                tiles = [
+                    keys
+                    for tt_tmp in range(len(commands))
+                    for keys in pid_events[tt_tmp]
+                ]
+                raise ValueError(
+                    f"trace data comes from tile {loc}, which the design does not "
+                    f"trace; it traces {tiles}. Consider changing the column "
+                    "shift (colshift) if you think this is an error."
+                )
+
+            active_events = dict()
+            for i in range(8):  # 8 max events at a time
+                active_events[i] = 0
+
+            logger.debug("num commands: %s", len(command))
+            cycles = 0
+            multiple_list = list()
+            event = None
+            capture_index = 0
+            repeated = None  # the command a Repeat repeats
+            for c in command:
+                t = c["type"]
+                if "Repeat" not in t:
+                    repeated = t
+                if t == "EventPC":
+                    for event_slot in range(NUM_EVENTS):
+                        if f"event{event_slot}" in c:
+                            trace_events.append(
+                                {
+                                    "name": lookup_event_name_by_type(
+                                        tt,
+                                        pid_events[tt][loc][event_slot],
+                                        events_module,
+                                    ),
+                                    "ts": capture_index,
+                                    "ph": "i",
+                                    "s": "t",
+                                    "pid": pid,
+                                    "tid": event_slot,
+                                    "args": {"pc": c["pc"]},
+                                }
+                            )
+                    capture_index += 1
+                    continue
+                if "Single" in t:
+                    event = c["event"]
+                    cycles = int(c["cycles"])
+                    timer = timer + 1
+                    multiple_list = list()
+                    multiple_list.append(c["event"])
+                    deactivate_events(
+                        multiple_list,
+                        active_events,
+                        timer,
+                        cycles,
+                        pid,
+                        tt,
+                        loc,
+                        pid_events,
+                        trace_events,
+                        events_module,
+                    )
+                    timer = timer + cycles
+                    activate_event(
+                        event,
+                        tt,
+                        loc,
+                        timer,
+                        pid,
+                        active_events,
+                        pid_events,
+                        trace_events,
+                        events_module,
+                    )
+
+                elif "Multiple" in t:
+                    cycles = int(c["cycles"])
+                    timer = timer + 1
+                    multiple_list = list()
+                    for k in c.keys():
+                        if "event" in k:
+                            multiple_list.append(c[k])
+                    deactivate_events(
+                        multiple_list,
+                        active_events,
+                        timer,
+                        cycles,
+                        pid,
+                        tt,
+                        loc,
+                        pid_events,
+                        trace_events,
+                        events_module,
+                    )
+                    timer = timer + cycles
+
+                    for k in c.keys():
+                        if "event" in k:
+                            activate_event(
+                                c[k],
+                                tt,
+                                loc,
+                                timer,
+                                pid,
+                                active_events,
+                                pid_events,
+                                trace_events,
+                                events_module,
+                            )
+
+                elif "Repeat" in t and repeated == "Event_Sync":
+                    # The hardware folds consecutive wraps into one Repeat of
+                    # the Event_Sync: each repeat is another full field range.
+                    timer = timer + int(c["repeats"]) * EVENT_SYNC_CYCLES
+
+                elif "Repeat" in t:
+                    if (
+                        cycles == 0
+                    ):  # last event has cycles == 0 so we just extend it by the repaet count
+                        timer = timer + int(c["repeats"])
+                    else:
+                        for repeats_cnt in range(int(c["repeats"])):
+                            timer = timer + 1
+                            deactivate_events(
+                                multiple_list,
+                                active_events,
+                                timer,
+                                cycles,
+                                pid,
+                                tt,
+                                loc,
+                                pid_events,
+                                trace_events,
+                                events_module,
+                            )
+                            timer = timer + cycles
+                            # c is the Repeat itself; replay the repeated
+                            # command's events, which Single and Multiple
+                            # both record in multiple_list.
+                            for repeated_event in multiple_list:
+                                activate_event(
+                                    repeated_event,
+                                    tt,
+                                    loc,
+                                    timer,
+                                    pid,
+                                    active_events,
+                                    pid_events,
+                                    trace_events,
+                                    events_module,
+                                )
+
+                elif t == "Event_Sync":
+                    # Advances the clock only; no event starts or ends here.
+                    timer = timer + EVENT_SYNC_CYCLES
+
+
+def process_name_metadata(trace_events, pid, trace_type, loc):
+    trace_event: dict = {"name": "process_name"}
+    trace_event["ph"] = "M"
+    trace_event["pid"] = pid
+    trace_event["args"] = {}
+
+    pt = PacketType(trace_type)
+    name = pt.name.lower()
+    if name == "shimtile":
+        name = "shim"
+
+    trace_event["args"]["name"] = f"{name}_trace for tile{loc}"
+    trace_events.append(trace_event)
+
+
+# def thread_name_metadata(trace_events, pid, tid, pid_events):
+def thread_name_metadata(
+    trace_events, trace_type, loc, pid, tid, pid_events, events_module
+):
+    # def thread_name_metadata(trace_events, trace_type, pid, tid):
+    trace_event: dict = {"name": "thread_name"}
+    trace_event["ph"] = "M"
+    trace_event["pid"] = pid
+    trace_event["tid"] = tid
+    trace_event["args"] = {}
+    # trace_event['args']['name'] = lookupEventNameInStr(str(tid), pid, pid_events)
+    trace_event["args"]["name"] = lookup_event_name_by_type(
+        trace_type, pid_events[trace_type][loc][tid], events_module
+    )
+    trace_events.append(trace_event)
+
+
+# pid_events: list(idx=pkt_type, value=labels_dict)
+# label_dict: dict(key=row,col, value=labels list)
+# labels_list: list(idx=label idx, value=label code)
+#
+# This searches for npu.write32 and categorizes them based on address and row.
+# memtile and core/shim tiles have different addresses, so we distinguish
+# between core and shim tile by row=0
+def parse_mlir_trace_events(mlir_module_str, colshift=None, device_name=None):
+
+    pid_events = list()
+    trace_modes = list()
+    for t in range(NUM_TRACE_TYPES):
+        pid_events.append(dict())
+        trace_modes.append(dict())
+
+    # These op classes / enums come through compiled dialect bindings that
+    # pyright can't see; fetch them dynamically so the static checker is happy.
+    NpuWrite32Op = getattr(aiexdialect, "NpuWrite32Op")
+    DeviceOp = getattr(aiedialect, "DeviceOp")
+    AIEDevice = getattr(aiedialect, "AIEDevice")
+
+    with Context(), Location.unknown():
+        module = Module.parse(mlir_module_str)
+
+        devices = find_ops(
+            module.operation,
+            lambda o: isinstance(
+                o.operation.opview, DeviceOp
+            ),  # pyright: ignore[reportArgumentType]
+        )
+        if not devices:
+            raise ValueError("no aie.device in the given MLIR module")
+
+        # A fused module holds one device per traced design. Two designs often
+        # occupy the same tiles. A whole-module scan then keys both event
+        # assignments to one (row, col). A caller parsing one slice therefore
+        # names the device that wrote it.
+        if device_name is None:
+            device_op = devices[0]
+            scope = module.operation
+        else:
+            matches = [d for d in devices if _device_name(d) == device_name]
+            if not matches:
+                raise ValueError(f"no aie.device named '{device_name}' in module")
+            device_op = matches[0]
+            scope = device_op.operation
+
+        write32s = find_ops(
+            scope,
+            lambda o: isinstance(
+                o.operation.opview, NpuWrite32Op
+            ),  # pyright: ignore[reportArgumentType]
+        )
+        device = AIEDevice(int(device_op.device))
+        target_model = aiedialect.get_target_model(device)
+        events_module = get_events_for_device(str(device))
+
+    # write32 carries address/value as SSA i32 operands (materialized via
+    # arith.constant); row/column remain optional attributes. fold_constant_operand
+    # folds the operand back to its constant integer (None if non-constant).
+    for write32 in write32s:
+        address = None
+        row = None
+        col = None
+        value = None
+        if write32.address:
+            address = fold_constant_operand(write32.address)
+        if write32.row:
+            row = write32.row.value
+        if write32.column:
+            col = write32.column.value
+        if write32.value:
+            value = fold_constant_operand(write32.value)
+
+        if row is None and col is None:
+            if address is None:
+                raise ValueError(
+                    f"Could not decode write32 op '{write32}': address is not a "
+                    "compile-time constant (trace config requires constant "
+                    "operands)"
+                )
+            row = (address >> target_model.get_row_shift()) & 0x1F
+            col = (address >> target_model.get_column_shift()) & 0x1F
+            address = address & 0xFFFFF  # 20 bits address
+
+        logger.debug(
+            "write32: address=%s, row=%s, col=%s, value=%s",
+            hex(address) if address is not None else None,
+            row,
+            col,
+            hex(value) if value is not None else None,
+        )
+        if row is None or col is None or address is None or value is None:
+            raise ValueError(
+                f"Could not decode write32 op '{write32}': address or value is not "
+                "a compile-time constant (trace config requires constant operands)"
+            )
+
+        # Adjust column based on colshift
+        if colshift is not None:
+            col = col + colshift
+        key = str(row) + "," + str(col)
+
+        if address == 0x340D0 and row != 0:
+            trace_modes[PacketType.CORE][key] = value & 0b11
+
+        # core event 0
+        if address == 0x340E0:  # 213216, match ignoring case
+            if row == 0:  # shim
+                if pid_events[2].get(key) is None:
+                    pid_events[2][key] = [0] * 8
+                logger.debug("Trace event 0 configured to be %s", hex(value))
+                pid_events[2][key][0] = value & 0xFF
+                pid_events[2][key][1] = (value >> 8) & 0xFF
+                pid_events[2][key][2] = (value >> 16) & 0xFF
+                pid_events[2][key][3] = (value >> 24) & 0xFF
+            else:  # core
+                if pid_events[0].get(key) is None:
+                    pid_events[0][key] = [0] * 8
+                logger.debug("Trace event 0 configured to be %s", hex(value))
+                pid_events[0][key][0] = value & 0xFF
+                pid_events[0][key][1] = (value >> 8) & 0xFF
+                pid_events[0][key][2] = (value >> 16) & 0xFF
+                pid_events[0][key][3] = (value >> 24) & 0xFF
+        # core event 1
+        elif address == 0x340E4:  # 213220, match ignoring case
+            if row == 0:  # shim
+                if pid_events[2].get(key) is None:
+                    pid_events[2][key] = [0] * 8
+                pid_events[2][key][4] = value & 0xFF
+                pid_events[2][key][5] = (value >> 8) & 0xFF
+                pid_events[2][key][6] = (value >> 16) & 0xFF
+                pid_events[2][key][7] = (value >> 24) & 0xFF
+            else:  # core
+                if pid_events[0].get(key) is None:
+                    pid_events[0][key] = [0] * 8
+                pid_events[0][key][4] = value & 0xFF
+                pid_events[0][key][5] = (value >> 8) & 0xFF
+                pid_events[0][key][6] = (value >> 16) & 0xFF
+                pid_events[0][key][7] = (value >> 24) & 0xFF
+        # mem event 0
+        elif address == 0x140E0:  # 82144
+            if pid_events[1].get(key) is None:
+                pid_events[1][key] = [0] * 8
+            logger.debug("Trace event 0 configured to be %s", hex(value))
+            pid_events[1][key][0] = value & 0xFF
+            pid_events[1][key][1] = (value >> 8) & 0xFF
+            pid_events[1][key][2] = (value >> 16) & 0xFF
+            pid_events[1][key][3] = (value >> 24) & 0xFF
+        # mem event 1
+        elif address == 0x140E4:  # 82148
+            if pid_events[1].get(key) is None:
+                pid_events[1][key] = [0] * 8
+            pid_events[1][key][4] = value & 0xFF
+            pid_events[1][key][5] = (value >> 8) & 0xFF
+            pid_events[1][key][6] = (value >> 16) & 0xFF
+            pid_events[1][key][7] = (value >> 24) & 0xFF
+        # memtile event 0
+        elif address == 0x940E0:  # 606432
+            if pid_events[3].get(key) is None:
+                pid_events[3][key] = [0] * 8
+            logger.debug("Trace event 0 configured to be %s", hex(value))
+            pid_events[3][key][0] = value & 0xFF
+            pid_events[3][key][1] = (value >> 8) & 0xFF
+            pid_events[3][key][2] = (value >> 16) & 0xFF
+            pid_events[3][key][3] = (value >> 24) & 0xFF
+        # memtile event 1
+        elif address == 0x940E4:  # 606436
+            if pid_events[3].get(key) is None:
+                pid_events[3][key] = [0] * 8
+            pid_events[3][key][4] = value & 0xFF
+            pid_events[3][key][5] = (value >> 8) & 0xFF
+            pid_events[3][key][6] = (value >> 16) & 0xFF
+            pid_events[3][key][7] = (value >> 24) & 0xFF
+        # TODO shim event 0, 1 needs to also be defined
+
+    logger.debug("Found labels: %s", pid_events)
+    return pid_events, trace_modes, events_module
+
+
+def lookup_event_name_by_type(trace_type, code, events_module):
+    if trace_type == PacketType.CORE:
+        enum_class = events_module.CoreEvent
+    elif trace_type == PacketType.MEM:
+        enum_class = events_module.MemEvent
+    elif trace_type == PacketType.SHIMTILE:
+        enum_class = events_module.ShimTileEvent
+    elif trace_type == PacketType.MEMTILE:
+        enum_class = events_module.MemTileEvent
+    else:
+        return "Unknown"
+
+    if enum_class is None:
+        return "Unknown"
+
+    try:
+        return enum_class(code).name
+    except ValueError:
+        pass
+    return "Unknown"
+
+
+# def lookup_event_name_by_code(code, traceType):
+#     event = ""
+#     # Core traces
+#     if traceType == 0:
+#         if code == 0x1:
+#             event = "True"
+#         elif code == 24: # 0x18:
+#             event = "StreamStall"
+#         elif code == 26: # 0x1A:
+#             event = "LockStall"
+#         elif code == 32: # 0x20, all events 33-45
+#             event = "CoreProgramFlow"
+#         elif code == 33: # 0x21:
+#             event = "Event0"
+#         elif code == 34: # 0x22:
+#             event = "Event1"
+#         elif code == 37: # 0x25:
+#             event = "VectorInstr"
+#         elif code == 38: # 0x26:
+#             event = "InstrLoad"
+#         elif code == 39: # 0x27:
+#             event = "InstrStore"
+#         elif code == 44: # 0x2C:
+#             event = "LockAcquireInstr"
+#         elif code == 45: # 0x2D:
+#             event = "LockReleaseInstr"
+#         elif code == 75: # 0x4B:
+#             event = "PortRunning0"
+#         elif code == 79: # 0x4F:
+#             event = "PortRunning1"
+#         else:
+#             event = "Unknown"
+#     # Mem traces
+#     elif traceType == 1:
+#         # TODO Need to define these
+#         event = "Unknown"
+#     else
+#         event = "Unknown"
+
+# match code:
+#     case 0x1:
+#         event = "True"
+#     case 0x18:
+#         event = "StreamStall"
+#     case 0x1A:
+#         event = "LockStall"
+#     case 0x22:
+#         event = "Event 1"
+#     case 0x21:
+#         event = "Event 0
+#     case 0x25:
+#         event = "VectorInstr"
+#     case 0x2C:
+#         event = "LockAcquireInstr"
+#     case 0x2D:
+#         event = "LockReleaseInstr"
+#     case 0x4F:
+#         event = "PortRunning1"
+#     case 0x4B:
+#         event = "PortRunning0"
+#     case _:
+#         event = "Unknown"
+# return event
+
+
+# lookupEventNameInStr(event, pid):
+# # TODO Expand to other pid for multiple cores? even/odd
+# if pid == 0 or pid == 2: # Core trace
+#     if event == "0":
+#         return "KernelExecutesVectorInstruction"
+#     elif event == "1":
+#         return "KernelStarts"
+#     elif event == "2":
+#         return "KernelDone"
+#     elif event == "3":
+#         return "PortRunning0"
+#     elif event == "4":
+#         return "PortRunning1"
+#     elif event == "5":
+#         return "LockStall"
+#     elif event == "6":
+#         return "LockAcquireInstr"
+#     elif event == "7":
+#         return "LockReleaseInstr"
+
+
+# This sets up the trace metadata and also assigned the unique pid that's referred
+# eleswhere for each process (combination of tile(row,col) and trace type).
+# NOTE: This assume the pid_events has already be analyzed and populated.
+def setup_trace_metadata(trace_events, pid_events, events_module):
+    pid = 0
+    for t in range(NUM_TRACE_TYPES):
+        # for j in len(pid_events[i]):
+        for loc in pid_events[t]:  # return loc
+            process_name_metadata(trace_events, pid, t, loc)
+            for e in range(8):
+                thread_name_metadata(
+                    trace_events, t, loc, pid, e, pid_events, events_module
+                )
+                pid_events[t][loc].append(pid)  # assign unique pid
+            pid = pid + 1
+
+
+# Attempt to align the starting column of trace in the design (from 'events')
+# with the start first column observed in the trace ('commands'). This is needed
+# because the runtime/firmware can start the design on any valid column
+def _get_column_start_shift(events, commands):
+    # find min column of commands
+    min_commands_col = float("inf")
+    for t in range(NUM_TRACE_TYPES):
+        for loc in commands[t]:
+            col = int(loc.split(",")[1])
+            if col < min_commands_col:
+                min_commands_col = col
+
+    # find min column of events
+    min_events_col = float("inf")
+    for t in range(NUM_TRACE_TYPES):
+        for loc in events[t]:
+            col = int(loc.split(",")[1])
+            if col < min_events_col:
+                min_events_col = col
+
+    return min_events_col - min_commands_col
+
+
+def align_column_start_index(events, commands, colshift=None):
+    if colshift is None:
+        colshift = _get_column_start_shift(events, commands)
+
+    # Shift all event keys by colshift
+    new_events = []
+    for t in range(NUM_TRACE_TYPES):
+        updated = {}
+        for loc, event_data in events[t].items():
+            row, col = map(int, loc.split(","))
+            new_col = col - colshift
+            new_key = f"{row},{new_col}"
+            updated[new_key] = event_data
+        new_events.append(updated)
+    return new_events
+
+
+# ------------------------------------------------------------------------------
+# Library API
+# ------------------------------------------------------------------------------
+
+
+def parse_trace(trace_buffer, mlir_module_str, colshift=None, device_name=None):
+    """Parse AIE trace buffer and return trace events as list in Trace Event Format.
+
+    Args:
+        trace_buffer: numpy array containing trace data (uint32 words)
+        mlir_module_str: string containing MLIR module with trace configuration
+        colshift: optional column shift adjustment (int or None for auto-align)
+        device_name: parse only this ``aie.device``'s trace configuration. Needed
+            when the module holds several traced designs; see ``parse_trace_slices``.
+
+    Returns:
+        list: trace events in Trace Event Format
+    """
+    # Convert numpy array to list of hex strings (format expected by existing functions)
+    trace_pkts = [f"{int(word):08x}" for word in trace_buffer]
+
+    # Parse MLIR to extract event configuration
+    pid_events, trace_modes, events_module = parse_mlir_trace_events(
+        mlir_module_str, colshift, device_name
+    )
+
+    # Split buffer into segments to handle multi-channel trace buffers
+    # (e.g. when distribute-channels splits data across two S2MM channels
+    # at different offsets within the same buffer)
+    segments = split_trace_segments(trace_pkts)
+    if not segments:
+        raise ValueError("Invalid trace data: empty or all zeros")
+
+    # Process each segment independently and merge de-interleaved results.
+    # Each segment goes through trim -> de-interleave, then results are
+    # merged by (type, location) key. For single-channel traces this is
+    # equivalent to the old single-pass pipeline.
+    trace_pkts_sorted = [dict() for _ in range(NUM_TRACE_TYPES)]
+    for segment in segments:
+        if not check_for_valid_trace("<numpy_array>", segment):
+            continue
+        trimmed = trim_trace_pkts(segment)
+        sorted_pkts = trace_pkts_de_interleave(trimmed)
+        for t in range(NUM_TRACE_TYPES):
+            for loc, data in sorted_pkts[t].items():
+                if loc in trace_pkts_sorted[t]:
+                    trace_pkts_sorted[t][loc].extend(data)
+                else:
+                    trace_pkts_sorted[t][loc] = list(data)
+
+    # Convert to byte streams
+    byte_streams = convert_to_byte_stream(trace_pkts_sorted)
+
+    # Auto-align column indices if colshift not provided
+    if colshift is None:
+        column_shift = _get_column_start_shift(pid_events, byte_streams)
+        pid_events = align_column_start_index(pid_events, byte_streams, column_shift)
+        trace_modes = align_column_start_index(trace_modes, byte_streams, column_shift)
+
+    # Convert byte streams to command dictionaries
+    commands = _convert_to_commands_by_mode(byte_streams, trace_modes, False)
+
+    # Initialize trace events list
+    trace_events = []
+
+    # Setup metadata (process names, thread names, assign PIDs)
+    setup_trace_metadata(trace_events, pid_events, events_module)
+
+    # Convert commands to Chrome Trace Event Format
+    convert_commands_to_json(trace_events, commands, pid_events, events_module)
+
+    return trace_events
+
+
+# ------------------------------------------------------------------------------
+# Script execution start - Open trace file and convert to commands
+# ------------------------------------------------------------------------------
+
+
+def main():
+    """Command-line interface entry point."""
+    opts = parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if opts.debug else logging.WARNING,
+        format="%(message)s",
+        stream=sys.stderr,
+    )
+
+    # set colshift based on optional argument
+    colshift = int(opts.colshift) if opts.colshift else None
+
+    try:
+        with open(opts.input, "r") as f:
+            # Create array of trace packets
+            trace_pkts = f.read().split("\n")
+    except Exception:
+        logger.error(
+            "%s could not be opened. Check for valid trace source file.", opts.input
+        )
+        sys.exit(1)
+
+    try:
+        with open(opts.mlir, "r") as mf:
+            mlir_module_str = mf.read()
+        pid_events, trace_modes, events_module = parse_mlir_trace_events(
+            mlir_module_str, colshift
+        )
+    except Exception as e:
+        logger.error(
+            "%s could not be opened. Check for valid MLIR file. %s", opts.mlir, e
+        )
+        sys.exit(1)
+
+    try:
+        of = open(opts.output, "w")
+    except Exception:
+        logger.error(
+            "%s could not be opened. Check for valid output JSON file.", opts.output
+        )
+        sys.exit(1)
+
+    logger.debug("pkt type 0: core tile")
+    logger.debug("pkt type 1: core mem tile")
+    logger.debug("pkt type 2: shim tile")
+    logger.debug("pkt type 3: mem tile")
+    logger.debug("trace_pkts: %s", trace_pkts)
+    logger.debug("pid events: %s", pid_events)
+
+    # Split into segments for multi-channel trace buffer support
+    segments = split_trace_segments(trace_pkts)
+    if not segments:
+        logger.error("No valid trace data found in %s", opts.input)
+        sys.exit(1)
+    logger.debug("found %d trace segment(s)", len(segments))
+
+    # Process each segment and merge de-interleaved results
+    trace_pkts_sorted = [dict() for _ in range(NUM_TRACE_TYPES)]
+    for seg_idx, segment in enumerate(segments):
+        if not check_for_valid_trace(opts.input, segment):
+            continue
+        trimmed = trim_trace_pkts(segment)
+        logger.debug(
+            "segment %d: %d words, trimmed %d",
+            seg_idx,
+            len(segment),
+            len(segment) - len(trimmed),
+        )
+        try:
+            sorted_pkts = trace_pkts_de_interleave(trimmed)
+        except ValueError as e:
+            logger.error("segment %d: %s", seg_idx, e)
+            logger.error("segment %d first words: %s", seg_idx, " ".join(trimmed[:8]))
+            sys.exit(1)
+        for t in range(NUM_TRACE_TYPES):
+            for loc, data in sorted_pkts[t].items():
+                if loc in trace_pkts_sorted[t]:
+                    trace_pkts_sorted[t][loc].extend(data)
+                else:
+                    trace_pkts_sorted[t][loc] = list(data)
+
+    logger.debug("trace_pkts_sorted: %s", trace_pkts_sorted)
+
+    byte_streams = convert_to_byte_stream(trace_pkts_sorted)
+    logger.debug("byte streams: %s", byte_streams)
+
+    if colshift is None:
+        column_shift = _get_column_start_shift(pid_events, byte_streams)
+        pid_events = align_column_start_index(pid_events, byte_streams, column_shift)
+        trace_modes = align_column_start_index(trace_modes, byte_streams, column_shift)
+
+    commands_0 = _convert_to_commands_by_mode(byte_streams, trace_modes, False)
+    logger.debug("commands_0: %s", commands_0)
+
+    trace_events = list()
+
+    setup_trace_metadata(trace_events, pid_events, events_module)
+
+    try:
+        convert_commands_to_json(trace_events, commands_0, pid_events, events_module)
+    except ValueError as e:
+        logger.error("%s", e)
+        sys.exit(1)
+
+    print(json.dumps(trace_events).replace("'", '"').replace(", {", ",\n{"), file=of)
+
+    of.close()
+
+
+if __name__ == "__main__":
+    main()

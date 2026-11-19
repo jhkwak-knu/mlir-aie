@@ -1,0 +1,705 @@
+//===- AIEObjectFifoLowerCores.cpp ------------------------------*- C++ -*-===//
+//
+// Copyright (C) 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+#include "aie/Dialect/AIE/IR/AIEDialect.h"
+#include "aie/Dialect/AIE/Transforms/AIEPasses.h"
+
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/Dominance.h"
+#include "mlir/IR/PatternMatch.h"
+#include "mlir/Interfaces/DataLayoutInterfaces.h"
+#include "mlir/Interfaces/MemorySlotInterfaces.h"
+#include "mlir/Pass/Pass.h"
+#include "mlir/Transforms/Mem2Reg.h"
+#include "mlir/Transforms/WalkPatternRewriteDriver.h"
+
+#include "llvm/ADT/DenseSet.h"
+
+#include <numeric>
+
+using namespace mlir;
+using namespace xilinx;
+using namespace xilinx::AIE;
+
+namespace xilinx::AIE {
+#define GEN_PASS_DEF_AIEOBJECTFIFOLOWERCORES
+#include "aie/Dialect/AIE/Transforms/AIEPasses.h.inc"
+} // namespace xilinx::AIE
+
+namespace {
+
+// Marks the `memref.alloca`s emitted here for bookkeeping only (objects held,
+// current object index). Memrefs thread through control flow more easily than
+// SSA values; mem2reg turns them back into SSA at the end of the pass, and the
+// marker keeps that sweep off allocas this pass did not create. The slots
+// holding the objects themselves carry kObjectFifoObjectSlotAttrName instead
+// and are left in memory.
+constexpr llvm::StringLiteral kBookkeepingSlotAttrName =
+    "aie.objectfifo.bookkeeping_slot";
+
+/// Build an `scf.index_switch` on `idx` with `n` cases (0..n-1) plus a default;
+/// case k (and the default) yields `elem(k)`. The runtime selection folds to a
+/// constant once the enclosing loops are unrolled. Leaves the builder after the
+/// switch and returns its result.
+Value buildRotatingSwitch(OpBuilder &builder, Location loc, Value idx,
+                          Type resultTy, int n,
+                          llvm::function_ref<Value(int)> elem) {
+  SmallVector<int64_t, 4> caseValues;
+  for (int c = 0; c < n; ++c) {
+    caseValues.push_back(c);
+  }
+  auto cases = DenseI64ArrayAttr::get(builder.getContext(), caseValues);
+  auto switchOp = scf::IndexSwitchOp::create(builder, loc, TypeRange{resultTy},
+                                             idx, cases, n);
+  builder.createBlock(&switchOp.getDefaultRegion());
+  builder.setInsertionPointToStart(&switchOp.getDefaultBlock());
+  scf::YieldOp::create(builder, loc, elem(0));
+  for (int c = 0; c < n; ++c) {
+    builder.createBlock(&switchOp.getCaseRegions()[c]);
+    builder.setInsertionPointToStart(&switchOp.getCaseBlock(c));
+    scf::YieldOp::create(builder, loc, elem(c));
+  }
+  builder.setInsertionPointAfter(switchOp);
+  return switchOp.getResult(0);
+}
+
+/// Rotate the objects in `slots` left by `released`, so that the first slot
+/// again holds the next object to acquire.
+void emitRotateObjects(OpBuilder &builder, Location loc,
+                       ArrayRef<memref::AllocaOp> slots, int released) {
+  if (slots.empty() || released % static_cast<int>(slots.size()) == 0) {
+    return;
+  }
+  SmallVector<Value> objects;
+  for (memref::AllocaOp slot : slots) {
+    objects.push_back(
+        memref::LoadOp::create(builder, loc, slot.getResult(), ValueRange{}));
+  }
+  for (size_t k = 0; k < slots.size(); ++k) {
+    memref::AllocaOp slot = slots[k];
+    memref::StoreOp::create(builder, loc,
+                            objects[(k + released) % objects.size()], slot,
+                            ValueRange{});
+  }
+}
+
+/// Advance a rotating object-index counter in its slot:
+/// counter = (counter + released) mod depth.
+void emitAdvanceObjectIndex(OpBuilder &builder, Location loc, Value slot,
+                            int depth, int released) {
+  Value size =
+      arith::ConstantOp::create(builder, loc, builder.getI32IntegerAttr(depth));
+  Value old = memref::LoadOp::create(builder, loc, slot, ValueRange{});
+  Value step = arith::ConstantOp::create(builder, loc,
+                                         builder.getI32IntegerAttr(released));
+  Value sum = arith::AddIOp::create(builder, loc, old, step);
+  Value wrapping =
+      arith::CmpIOp::create(builder, loc, arith::CmpIPredicate::sge, sum, size);
+  // The counter stays in [0, depth), so releasing a single object can only ever
+  // wrap to exactly 0.
+  Value wrapped = released == 1
+                      ? Value(arith::ConstantOp::create(
+                            builder, loc, builder.getI32IntegerAttr(0)))
+                      : Value(arith::SubIOp::create(builder, loc, sum, size));
+  Value next = arith::SelectOp::create(builder, loc, wrapping, wrapped, sum);
+  memref::StoreOp::create(builder, loc, next, slot, ValueRange{});
+}
+
+/// Locks a core endpoint toggles for `action`, one per segment it works: a
+/// filler waits on free objects and hands back full ones, a drainer the
+/// reverse.
+SmallVector<FlatSymbolRefAttr>
+segmentLocksFor(ObjectFifoCoreEndpointOp endpoint, LockAction action) {
+  bool acquiring = action == LockAction::AcquireGreaterEqual;
+  bool wantsProduce = acquiring != endpoint.drains();
+
+  SmallVector<FlatSymbolRefAttr> locks;
+  for (ObjectFifoSegmentOp segment : endpoint.getSelectedSegments()) {
+    if (auto lock = wantsProduce ? segment.getProduceLockAttr()
+                                 : segment.getConsumeLockAttr()) {
+      locks.push_back(lock);
+    }
+  }
+  return locks;
+}
+
+/// Everything a rewrite pattern needs that is not local to its op, resolved
+/// before the driver runs so that no matchAndRewrite scans the IR.
+struct LoweringContext {
+  DeviceOp device;
+  bool usesSemaphoreLocks;
+  DenseMap<Operation *, SmallVector<Value>> poolBuffers{};
+  /// Per-(core, endpoint) runtime bookkeeping: the rotating object index (which
+  /// selects binary locks), the objects in rotation order, starting with the
+  /// next one to acquire, and, where locks count, the number of objects
+  /// currently held. The object of a single-object pool never moves, so it is
+  /// handed over directly instead.
+  DenseMap<std::pair<Operation *, Operation *>, memref::AllocaOp> objectIndex{};
+  DenseMap<std::pair<Operation *, Operation *>, SmallVector<memref::AllocaOp>>
+      objectSlots{};
+  DenseMap<std::pair<Operation *, Operation *>, Value> soleObject{};
+  DenseMap<std::pair<Operation *, Operation *>, memref::AllocaOp> heldCount{};
+  /// The slot a core-pushed endpoint releases next, where the core pushes the
+  /// descriptor of each object it releases.
+  DenseMap<std::pair<Operation *, Operation *>, memref::AllocaOp> sendSlot{};
+  /// Maximum outstanding objects across all pools sharing a tile's MM2S
+  /// queue. S2MM queues are independent and do not participate in this bound.
+  DenseMap<std::pair<Value, int>, int64_t> sendQueueObjects{};
+  llvm::DenseSet<std::pair<Value, int>> unsynchronizedSendQueues{};
+  bool sawError = false;
+
+  ObjectFifoCoreEndpointOp endpointOf(Operation *op, StringRef name) {
+    return SymbolTable::lookupNearestSymbolFrom<ObjectFifoCoreEndpointOp>(
+        device, StringAttr::get(op->getContext(), name));
+  }
+
+  LockOp lockOf(FlatSymbolRefAttr name) {
+    return lookupNamedOp<LockOp>(device, name.getAttr());
+  }
+};
+
+/// Emit the rotating UseLocks for a binary-lock (AIE1) acquire or release. One
+/// lock travels with each object, and the starting index is only known at
+/// runtime, so each of the `count` locks is selected by an scf.index_switch on
+/// the rotation counter -- folded to a concrete lock once the loops unroll.
+void emitBinaryUseLocks(OpBuilder &builder, Location loc,
+                        MutableArrayRef<LockOp> locks, int depth, bool drains,
+                        Value counterSlot, int count, LockAction action) {
+  if (count == 0 || locks.empty()) {
+    return;
+  }
+  // The value carries the direction: 1 for a filler's release or a drainer's
+  // acquire, 0 for the opposite.
+  bool full = (!drains && action == LockAction::Release) ||
+              (drains && action == LockAction::Acquire);
+  Value counter =
+      memref::LoadOp::create(builder, loc, counterSlot, ValueRange{});
+  Value index =
+      arith::IndexCastOp::create(builder, loc, builder.getIndexType(), counter);
+  Type lockTy = locks[0].getType();
+  for (int i = 0; i < count; i++) {
+    Value lock =
+        buildRotatingSwitch(builder, loc, index, lockTy, depth, [&](int c) {
+          return locks[(i + c) % depth].getResult();
+        });
+    UseLockOp::create(builder, loc, lock, action, full ? 1 : 0);
+  }
+}
+
+struct LowerRelease : OpRewritePattern<ObjectFifoReleaseOp> {
+  LoweringContext &ctx;
+  LowerRelease(MLIRContext *context, LoweringContext &ctx)
+      : OpRewritePattern(context), ctx(ctx) {}
+
+  /// Push the descriptor of each object this release frees, for a pool
+  /// whose sending channel the core drives. Nothing else starts those
+  /// descriptors, so an object the core does not push is never sent.
+  void emitSendPushes(PatternRewriter &rewriter, Location loc, CoreOp core,
+                      ObjectFifoCoreEndpointOp endpoint, ObjectFifoPoolOp pool,
+                      int size, bool assumeQueueSpace) const {
+    ObjectFifoCorePushAttr push = endpoint.getCorePushAttr();
+    if (!push || endpoint.drains())
+      return;
+    ArrayRef<int32_t> tags = push.getBdTags();
+    int channel = push.getChannel();
+    int depth = pool.getDepth();
+
+    auto key = std::make_pair(core.getOperation(), endpoint.getOperation());
+    memref::AllocaOp slot = ctx.sendSlot.lookup(key);
+    if (!slot) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(&core.getBody().front());
+      slot = memref::AllocaOp::create(
+          rewriter, loc, MemRefType::get({}, rewriter.getIndexType()));
+      slot->setAttr(kBookkeepingSlotAttrName, rewriter.getUnitAttr());
+      Value zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
+      memref::StoreOp::create(rewriter, loc, zero, slot.getResult(),
+                              ValueRange{});
+      ctx.sendSlot[key] = slot;
+    }
+
+    // A pool's locks bound its outstanding tasks, but all pools on this
+    // channel contribute to the same queue. Poll unless their combined bound
+    // fits in the hardware queue.
+    auto queue = std::make_pair(core.getTile(), channel);
+    bool waitForRoom = !assumeQueueSpace &&
+                       (ctx.unsynchronizedSendQueues.contains(queue) ||
+                        ctx.sendQueueObjects.lookup(queue) >
+                            ctx.device.getTargetModel().getDmaTaskQueueDepth());
+    Value current =
+        memref::LoadOp::create(rewriter, loc, slot.getResult(), ValueRange{});
+    Value depthValue = arith::ConstantIndexOp::create(rewriter, loc, depth);
+    for (int step = 0; step < size; ++step) {
+      Value offset = arith::ConstantIndexOp::create(rewriter, loc, step);
+      Value raw = arith::AddIOp::create(rewriter, loc, current, offset);
+      Value which = arith::RemUIOp::create(rewriter, loc, raw, depthValue);
+      emitPushSwitch(rewriter, loc, which, tags, channel,
+                     pool.getRepeatCount().value_or(1) - 1, waitForRoom);
+    }
+    Value taken = arith::ConstantIndexOp::create(rewriter, loc, size);
+    Value raw = arith::AddIOp::create(rewriter, loc, current, taken);
+    Value next = arith::RemUIOp::create(rewriter, loc, raw, depthValue);
+    memref::StoreOp::create(rewriter, loc, next, slot.getResult(),
+                            ValueRange{});
+  }
+
+  /// Push the descriptor `tags[which]` names, selected at runtime. The switch
+  /// folds to one push once the enclosing loops unroll.
+  void emitPushSwitch(PatternRewriter &rewriter, Location loc, Value which,
+                      ArrayRef<int32_t> tags, int channel, int repeatCount,
+                      bool waitForRoom) const {
+    SmallVector<int64_t> cases;
+    for (size_t c = 0; c < tags.size(); ++c)
+      cases.push_back(c);
+    auto switchOp = scf::IndexSwitchOp::create(
+        rewriter, loc, TypeRange{}, which,
+        DenseI64ArrayAttr::get(rewriter.getContext(), cases), tags.size());
+    auto emit = [&](int32_t tag) {
+      if (waitForRoom)
+        DmaPollForQueueSpaceOp::create(rewriter, loc, DMAChannelDir::MM2S,
+                                       channel);
+      DmaPushQueueOp::create(rewriter, loc, DMAChannelDir::MM2S, channel,
+                             /*bd_id=*/nullptr, rewriter.getI32IntegerAttr(tag),
+                             repeatCount, /*out_of_order=*/false);
+      scf::YieldOp::create(rewriter, loc);
+    };
+    rewriter.createBlock(&switchOp.getDefaultRegion());
+    rewriter.setInsertionPointToStart(&switchOp.getDefaultBlock());
+    emit(tags[0]);
+    for (size_t c = 0; c < tags.size(); ++c) {
+      rewriter.createBlock(&switchOp.getCaseRegions()[c]);
+      rewriter.setInsertionPointToStart(&switchOp.getCaseBlock(c));
+      emit(tags[c]);
+    }
+    rewriter.setInsertionPointAfter(switchOp);
+  }
+
+  LogicalResult matchAndRewrite(ObjectFifoReleaseOp releaseOp,
+                                PatternRewriter &rewriter) const override {
+    auto endpoint = ctx.endpointOf(releaseOp, releaseOp.getObjFifoName());
+    if (!endpoint) {
+      return failure();
+    }
+    ObjectFifoPoolOp pool = endpoint.getPoolOp();
+    CoreOp core = releaseOp->getParentOfType<CoreOp>();
+    auto key = std::make_pair(core.getOperation(), endpoint.getOperation());
+    memref::AllocaOp index = ctx.objectIndex.lookup(key);
+
+    int count = releaseOp.relNumber() * pool.getRepeatCount().value_or(1);
+    rewriter.setInsertionPointAfter(releaseOp);
+    Location loc = releaseOp.getLoc();
+
+    if (!ctx.usesSemaphoreLocks) {
+      // The rotation counter is created by the matching acquire, so a release
+      // without one is releasing objects never acquired on this tile.
+      if (!index) {
+        releaseOp->emitOpError(
+            "objectFifo release has no corresponding acquire on this tile");
+        ctx.sawError = true;
+        return failure();
+      }
+      SmallVector<LockOp> locks = pool.getLockOps();
+      emitBinaryUseLocks(rewriter, loc, locks, pool.getDepth(),
+                         endpoint.drains(), index.getResult(), count,
+                         LockAction::Release);
+    } else {
+      Value amount = arith::ConstantOp::create(
+          rewriter, loc, rewriter.getI32IntegerAttr(count));
+      for (FlatSymbolRefAttr name :
+           segmentLocksFor(endpoint, LockAction::Release)) {
+        UseLockOp::create(rewriter, loc, ctx.lockOf(name), LockAction::Release,
+                          amount);
+      }
+
+      memref::AllocaOp held = ctx.heldCount.lookup(key);
+      assert(held && "a held counter is created for every released endpoint");
+      Value current =
+          memref::LoadOp::create(rewriter, loc, held.getResult(), ValueRange{});
+      Value next = arith::SubIOp::create(rewriter, loc, current, amount);
+      memref::StoreOp::create(rewriter, loc, next, held.getResult(),
+                              ValueRange{});
+    }
+
+    emitSendPushes(rewriter, loc, core, endpoint, pool, releaseOp.getSize(),
+                   releaseOp.getAssumeQueueSpace());
+
+    if (index) {
+      emitAdvanceObjectIndex(rewriter, loc, index.getResult(), pool.getDepth(),
+                             releaseOp.getSize());
+    }
+    auto slots = ctx.objectSlots.find(key);
+    if (slots != ctx.objectSlots.end()) {
+      emitRotateObjects(rewriter, loc, slots->second, releaseOp.getSize());
+    }
+    return success();
+  }
+};
+
+struct LowerAcquire : OpRewritePattern<ObjectFifoAcquireOp> {
+  LoweringContext &ctx;
+  LowerAcquire(MLIRContext *context, LoweringContext &ctx)
+      : OpRewritePattern(context), ctx(ctx) {}
+
+  LogicalResult matchAndRewrite(ObjectFifoAcquireOp acquireOp,
+                                PatternRewriter &rewriter) const override {
+    auto endpoint = ctx.endpointOf(acquireOp, acquireOp.getObjFifoName());
+    if (!endpoint) {
+      return failure();
+    }
+    ObjectFifoPoolOp pool = endpoint.getPoolOp();
+    CoreOp core = acquireOp->getParentOfType<CoreOp>();
+    auto key = std::make_pair(core.getOperation(), endpoint.getOperation());
+
+    int wanted = acquireOp.acqNumber();
+    if (wanted > pool.getDepth()) {
+      acquireOp->emitOpError("acquires ")
+          << wanted << " objects from a pool of " << pool.getDepth();
+      ctx.sawError = true;
+      return failure();
+    }
+    int repeat = pool.getRepeatCount().value_or(1);
+    rewriter.setInsertionPointAfter(acquireOp);
+    Location loc = acquireOp.getLoc();
+
+    if (!ctx.usesSemaphoreLocks) {
+      // Each object has its own rotating binary lock; while the loops are
+      // rolled the offset of the held locks is unknown, so acquire the whole
+      // window [counter, counter + wanted). Redundant re-acquires of
+      // still-held locks are pruned after unrolling.
+      memref::AllocaOp index = ctx.objectIndex.lookup(key);
+      assert(index && "a rotation counter is created for every acquire");
+      SmallVector<LockOp> locks = pool.getLockOps();
+      emitBinaryUseLocks(rewriter, loc, locks, pool.getDepth(),
+                         endpoint.drains(), index.getResult(), wanted * repeat,
+                         LockAction::Acquire);
+      return replaceWithObjects(acquireOp, key, rewriter);
+    }
+
+    // An acquire names every object the core wants to hold, so only the ones
+    // not already held are taken.
+    memref::AllocaOp held = ctx.heldCount.lookup(key);
+    assert(held && "a held counter is created for every acquire");
+    Value current =
+        memref::LoadOp::create(rewriter, loc, held.getResult(), ValueRange{});
+    Value target = arith::ConstantOp::create(
+        rewriter, loc, rewriter.getI32IntegerAttr(wanted));
+    Value zero =
+        arith::ConstantOp::create(rewriter, loc, rewriter.getI32IntegerAttr(0));
+    Value shortfall = arith::SubIOp::create(rewriter, loc, target, current);
+    Value delta = arith::MaxSIOp::create(rewriter, loc, shortfall, zero);
+    if (repeat > 1) {
+      Value repeatVal = arith::ConstantOp::create(
+          rewriter, loc, rewriter.getI32IntegerAttr(repeat));
+      delta = arith::MulIOp::create(rewriter, loc, delta, repeatVal);
+    }
+    for (FlatSymbolRefAttr name :
+         segmentLocksFor(endpoint, LockAction::AcquireGreaterEqual)) {
+      UseLockOp::create(rewriter, loc, ctx.lockOf(name),
+                        LockAction::AcquireGreaterEqual, delta);
+    }
+
+    Value next = arith::AddIOp::create(rewriter, loc, current, delta);
+    memref::StoreOp::create(rewriter, loc, next, held.getResult(),
+                            ValueRange{});
+    return replaceWithObjects(acquireOp, key, rewriter);
+  }
+
+  /// Hand back the objects at the front of the rotation, one per result.
+  LogicalResult replaceWithObjects(ObjectFifoAcquireOp acquireOp,
+                                   std::pair<Operation *, Operation *> key,
+                                   PatternRewriter &rewriter) const {
+    if (Value object = ctx.soleObject.lookup(key)) {
+      for (Value result : acquireOp.getObjects()) {
+        rewriter.replaceAllUsesWith(result, object);
+      }
+      return success();
+    }
+    auto slots = ctx.objectSlots.find(key);
+    if (slots == ctx.objectSlots.end() || slots->second.empty()) {
+      return success();
+    }
+    for (auto [k, result] : llvm::enumerate(acquireOp.getObjects())) {
+      Value object =
+          memref::LoadOp::create(rewriter, acquireOp.getLoc(),
+                                 slots->second[k].getResult(), ValueRange{});
+      rewriter.replaceAllUsesWith(result, object);
+    }
+    return success();
+  }
+};
+
+struct AIEObjectFifoLowerCoresPass
+    : public xilinx::AIE::impl::AIEObjectFifoLowerCoresBase<
+          AIEObjectFifoLowerCoresPass> {
+
+  /// A rank-0 `memref.alloca` initialized to `initial` and tagged `marker`.
+  /// mem2reg later threads a bookkeeping slot through the enclosing loops as an
+  /// iter_arg.
+  memref::AllocaOp makeSlot(OpBuilder &builder, Location loc, Value initial,
+                            StringRef marker = kBookkeepingSlotAttrName) {
+    auto slotTy = MemRefType::get(SmallVector<int64_t>{}, initial.getType());
+    auto slot = memref::AllocaOp::create(builder, loc, slotTy);
+    slot->setAttr(marker, builder.getUnitAttr());
+    memref::StoreOp::create(builder, loc, initial, slot.getResult(),
+                            ValueRange{});
+    return slot;
+  }
+
+  /// One slot per object of the pool, in rotation order from `start`, or the
+  /// object itself if the pool has only one. The slots are not promoted here;
+  /// see kObjectFifoObjectSlotAttrName.
+  void trackObjects(OpBuilder &builder, Location loc,
+                    ObjectFifoCoreEndpointOp endpoint, int64_t start,
+                    std::pair<Operation *, Operation *> key,
+                    LoweringContext &ctx) {
+    ObjectFifoPoolOp pool = endpoint.getPoolOp();
+    SmallVector<Value> buffers = ctx.poolBuffers.lookup(pool.getOperation());
+    // An endpoint holding one side of a join or distribute reaches only its
+    // own run of each object.
+    MemRefType accessType = endpoint.getAccessType();
+    if (accessType != pool.getElemType()) {
+      auto [offset, size] = endpoint.getExtent();
+      for (Value &buffer : buffers) {
+        buffer = memref::SubViewOp::create(
+            builder, loc, accessType, buffer,
+            ArrayRef<OpFoldResult>{builder.getIndexAttr(offset)},
+            {builder.getIndexAttr(size)}, {builder.getIndexAttr(1)});
+      }
+    }
+    if (buffers.size() == 1) {
+      ctx.soleObject[key] = buffers.front();
+      return;
+    }
+    SmallVector<memref::AllocaOp> &slots = ctx.objectSlots[key];
+    for (size_t k = 0; k < buffers.size(); ++k) {
+      slots.push_back(makeSlot(builder, loc,
+                               buffers[(start + k) % buffers.size()],
+                               kObjectFifoObjectSlotAttrName));
+    }
+  }
+
+  void emitCounters(CoreOp coreOp, LoweringContext &ctx, OpBuilder &builder) {
+    builder.setInsertionPointToStart(&coreOp.getBody().front());
+    Operation *core = coreOp.getOperation();
+    Value zero;
+
+    // A pool whose initial contents fill only its first objects is next
+    // written at the first object they leave empty.
+    auto firstObject = [](ObjectFifoCoreEndpointOp endpoint) -> int64_t {
+      ObjectFifoPoolOp pool = endpoint.getPoolOp();
+      auto initValues = pool.getInitValues();
+      if (endpoint.drains() || !initValues || pool.getDepth() <= 0) {
+        return 0;
+      }
+      return static_cast<int64_t>(initValues->size()) % pool.getDepth();
+    };
+
+    auto record = [&](DenseMap<std::pair<Operation *, Operation *>,
+                               memref::AllocaOp> &slots,
+                      StringRef name, bool rotating) {
+      auto endpoint = ctx.endpointOf(coreOp, name);
+      if (!endpoint) {
+        return;
+      }
+      auto key = std::make_pair(core, endpoint.getOperation());
+      if (slots.count(key)) {
+        return;
+      }
+      int64_t start = rotating ? firstObject(endpoint) : 0;
+      Value initial;
+      if (start != 0) {
+        initial = arith::ConstantOp::create(builder, coreOp.getLoc(),
+                                            builder.getI32IntegerAttr(start));
+      } else {
+        if (!zero) {
+          zero = arith::ConstantOp::create(builder, coreOp.getLoc(),
+                                           builder.getI32IntegerAttr(0));
+        }
+        initial = zero;
+      }
+      slots[key] = makeSlot(builder, coreOp.getLoc(), initial);
+    };
+
+    // Objects are only tracked where the core uses one.
+    coreOp.walk([&](ObjectFifoAcquireOp a) {
+      auto endpoint = ctx.endpointOf(coreOp, a.getObjFifoName());
+      if (!endpoint) {
+        return;
+      }
+      ObjectFifoPoolOp pool = endpoint.getPoolOp();
+      auto [buffers, inserted] =
+          ctx.poolBuffers.try_emplace(pool.getOperation());
+      if (inserted) {
+        for (BufferLike buffer : pool.getBufferOps()) {
+          buffers->second.push_back(buffer.getBuffer());
+        }
+        if (static_cast<int64_t>(buffers->second.size()) != pool.getDepth()) {
+          pool.emitOpError(
+              "expects every one of its 'depth' buffers to resolve");
+          ctx.sawError = true;
+        }
+      }
+      if (ctx.sawError || a->use_empty()) {
+        return;
+      }
+      auto key = std::make_pair(core, endpoint.getOperation());
+      if (!ctx.objectSlots.count(key) && !ctx.soleObject.count(key)) {
+        trackObjects(builder, coreOp.getLoc(), endpoint, firstObject(endpoint),
+                     key, ctx);
+      }
+    });
+    if (!ctx.usesSemaphoreLocks) {
+      // Binary locks travel with their objects, so they rotate by index.
+      coreOp.walk([&](ObjectFifoAcquireOp a) {
+        record(ctx.objectIndex, a.getObjFifoName(), /*rotating=*/true);
+      });
+      return;
+    }
+    coreOp.walk([&](ObjectFifoAcquireOp a) {
+      record(ctx.heldCount, a.getObjFifoName(), /*rotating=*/false);
+    });
+    coreOp.walk([&](ObjectFifoReleaseOp r) {
+      record(ctx.heldCount, r.getObjFifoName(), /*rotating=*/false);
+    });
+  }
+
+  /// Tell `--aie-objectFifo-unroll` how far a loop must be unrolled for the
+  /// rotating indices inside it to fold: the least common multiple of the
+  /// depths it touches. Accesses nested in a child loop drive that child, not
+  /// this one, so an ancestor is not over-unrolled.
+  void annotateUnrollHints(DeviceOp device, LoweringContext &ctx,
+                           OpBuilder &builder) {
+    for (auto coreOp : device.getOps<CoreOp>()) {
+      coreOp.walk([&](Operation *loop) {
+        if (!isObjectFifoLoop(loop)) {
+          return;
+        }
+        int64_t period = 1;
+        bool touched = false;
+        auto account = [&](Operation *op, StringRef name) {
+          if (getObjectFifoLoopParent(op) != loop) {
+            return;
+          }
+          auto endpoint = ctx.endpointOf(op, name);
+          if (!endpoint) {
+            return;
+          }
+          touched = true;
+          period = std::lcm(period, (int64_t)endpoint.getPoolOp().getDepth());
+        };
+        loop->walk(
+            [&](ObjectFifoAcquireOp a) { account(a, a.getObjFifoName()); });
+        loop->walk(
+            [&](ObjectFifoReleaseOp r) { account(r, r.getObjFifoName()); });
+        if (touched) {
+          loop->setAttr(kObjectFifoUnrollHintAttrName,
+                        builder.getI64IntegerAttr(period));
+        }
+      });
+    }
+  }
+
+  LogicalResult promoteBookkeepingSlots(DeviceOp device) {
+    SmallVector<PromotableAllocationOpInterface> allocators;
+    device.walk([&](memref::AllocaOp allocaOp) {
+      if (allocaOp->hasAttr(kBookkeepingSlotAttrName)) {
+        allocators.push_back(
+            cast<PromotableAllocationOpInterface>(allocaOp.getOperation()));
+      }
+    });
+    if (allocators.empty()) {
+      return success();
+    }
+
+    DataLayout dataLayout = DataLayout::closest(device);
+    DominanceInfo dominance(device);
+    OpBuilder builder(device.getContext());
+    (void)tryToPromoteMemorySlots(allocators, builder, dataLayout, dominance);
+
+    WalkResult leftover = device.walk([&](memref::AllocaOp allocaOp) {
+      if (!allocaOp->hasAttr(kBookkeepingSlotAttrName)) {
+        return WalkResult::advance();
+      }
+      allocaOp.emitOpError()
+          << "objectFifo bookkeeping slot could not be promoted to SSA "
+             "(mem2reg left it in place); the objectFifo lowering requires "
+             "all bookkeeping counters to become loop-carried SSA values";
+      return WalkResult::interrupt();
+    });
+    return failure(leftover.wasInterrupted());
+  }
+
+  void runOnOperation() override {
+    DeviceOp device = getOperation();
+    OpBuilder builder(device.getContext());
+
+    LoweringContext ctx{device, device.getTargetModel().hasProperty(
+                                    AIETargetModel::UsesSemaphoreLocks)};
+
+    // Only the recorded producer submits tasks for a sending pool.
+    for (auto endpoint : device.getOps<ObjectFifoCoreEndpointOp>()) {
+      ObjectFifoPoolOp pool = endpoint.getPoolOp();
+      if (endpoint.drains())
+        continue;
+      if (auto push = endpoint.getCorePushAttr()) {
+        auto queue = std::make_pair(endpoint.getTile(), int(push.getChannel()));
+        ctx.sendQueueObjects[queue] += pool.getDepth();
+        bool missingLocks = llvm::any_of(
+            endpoint.getSelectedSegments(), [](ObjectFifoSegmentOp segment) {
+              return !segment.getProduceLockAttr() ||
+                     !segment.getConsumeLockAttr();
+            });
+        if (pool.getDisableSynchronization() || missingLocks)
+          ctx.unsynchronizedSendQueues.insert(queue);
+      }
+    }
+
+    annotateUnrollHints(device, ctx, builder);
+    for (auto coreOp : device.getOps<CoreOp>()) {
+      emitCounters(coreOp, ctx, builder);
+    }
+    if (ctx.sawError) {
+      return signalPassFailure();
+    }
+
+    RewritePatternSet patterns(device.getContext());
+    patterns.insert<LowerAcquire, LowerRelease>(device.getContext(), ctx);
+    walkAndApplyPatterns(device, std::move(patterns));
+    if (ctx.sawError) {
+      return signalPassFailure();
+    }
+
+    SmallVector<Operation *> toErase;
+    device.walk([&](Operation *op) {
+      if (isa<ObjectFifoAcquireOp, ObjectFifoReleaseOp>(op)) {
+        toErase.push_back(op);
+      }
+    });
+    for (Operation *op : toErase) {
+      op->dropAllUses();
+      op->erase();
+    }
+
+    for (auto endpoint : llvm::make_early_inc_range(
+             device.getOps<ObjectFifoCoreEndpointOp>())) {
+      endpoint.erase();
+    }
+
+    if (failed(promoteBookkeepingSlots(device))) {
+      return signalPassFailure();
+    }
+  }
+};
+
+} // namespace
+
+std::unique_ptr<OperationPass<DeviceOp>>
+xilinx::AIE::createAIEObjectFifoLowerCoresPass() {
+  return std::make_unique<AIEObjectFifoLowerCoresPass>();
+}

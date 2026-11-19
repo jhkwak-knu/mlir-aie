@@ -1,10 +1,9 @@
 
 ##===- Makefile -----------------------------------------------------------===##
-# 
-# This file licensed under the Apache License v2.0 with LLVM Exceptions.
-# See https://llvm.org/LICENSE.txt for license information.
+#
+# Copyright (C) 2023-2025 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-# 
+#
 ##===----------------------------------------------------------------------===##
 
 srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
@@ -23,8 +22,8 @@ build/aie.mlir: ${srcdir}/aie2.py
 
 build/final.xclbin: build/aie.mlir
 	mkdir -p ${@D}
-	cd ${@D} && aiecc.py --aie-generate-xclbin --no-compile-host --xclbin-name=${@F} \
-				--aie-generate-npu-insts --npu-insts-name=insts.bin $(<:%=../%)
+	cd ${@D} && aiecc --get-xclbin --xclbin-name=${@F} \
+				--get-npu-insts --npu-insts-name=insts.bin $(<:%=../%)
 
 ${targetname}.exe: ${srcdir}/test.cpp
 	rm -rf _build
@@ -34,7 +33,7 @@ ${targetname}.exe: ${srcdir}/test.cpp
 ifeq "${powershell}" "powershell.exe"
 	cp _build/${targetname}.exe $@
 else
-	cp _build/${targetname} $@ 
+	cp _build/${targetname} $@
 endif
 
 run: ${targetname}.exe build/final.xclbin build/insts.bin

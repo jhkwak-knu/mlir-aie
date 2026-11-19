@@ -1,38 +1,46 @@
 //===- AIETargetNPU.cpp -----------------------------------------*- C++ -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2023-2025 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2023-2025 Advanced Micro Devices, Inc.
 //
 //===----------------------------------------------------------------------===//
 
 #include "aie/Targets/AIETargets.h"
 
+#include "aie/Conversion/AIEToConfiguration/AIEToConfiguration.h"
 #include "aie/Dialect/AIE/IR/AIEDialect.h"
+#include "aie/Dialect/AIE/IR/AIETargetModel.h"
+#include "aie/Dialect/AIE/Util/AIERegisterDatabase.h"
+#include "aie/Dialect/AIEX/AIEUtils.h"
 #include "aie/Dialect/AIEX/IR/AIEXDialect.h"
+#include "aie/Runtime/TxnEncoding.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/Interfaces/DataLayoutInterfaces.h"
-#include "mlir/Tools/mlir-translate/MlirTranslateMain.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 
+#include "mlir/Tools/mlir-translate/MlirTranslateMain.h"
+#include "llvm/ADT/DenseMap.h"
+
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Format.h"
+#include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/JSON.h"
+#include "llvm/Support/raw_ostream.h"
 
+#include <memory>
 #include <vector>
 
 using namespace mlir;
 using namespace xilinx;
 using namespace xilinx::AIE;
 using namespace xilinx::AIEX;
-
-#define TXN_OPC_WRITE 0x0
-#define TXN_OPC_BLOCKWRITE 0x1
-#define TXN_OPC_MASKWRITE 0x3
-#define TXN_OPC_TCT 0x80
-#define TXN_OPC_DDR_PATCH 0x81
 
 namespace {
 
@@ -50,247 +58,755 @@ reserveAndGetTail(std::vector<uint32_t> &instructions, uint64_t tailSize) {
                                          tailSize);
 }
 
-void appendSync(std::vector<uint32_t> &instructions, NpuSyncOp op) {
+// Thin wrappers that extract MLIR attributes and delegate to TxnEncoding.h,
+// the single source of truth for the TXN word layout.
 
+LogicalResult appendSync(std::vector<uint32_t> &instructions, NpuSyncOp op) {
+  std::optional<uint32_t> column = AIEX::getConstantIntOperand(op.getColumn());
+  std::optional<uint32_t> row = AIEX::getConstantIntOperand(op.getRow());
+  std::optional<uint32_t> direction =
+      AIEX::getConstantIntOperand(op.getDirection());
+  std::optional<uint32_t> channel =
+      AIEX::getConstantIntOperand(op.getChannel());
+  std::optional<uint32_t> columnNum =
+      AIEX::getConstantIntOperand(op.getColumnNum());
+  std::optional<uint32_t> rowNum = AIEX::getConstantIntOperand(op.getRowNum());
+  if (!column || !row || !direction || !channel || !columnNum || !rowNum)
+    return op.emitOpError("Cannot translate sync with non-constant operands to "
+                          "a static TXN binary");
+  aie_runtime::txn_append_sync(instructions, *column, *row, *direction,
+                               *channel, *columnNum, *rowNum);
+  return success();
+}
+
+LogicalResult appendWrite32(std::vector<uint32_t> &instructions,
+                            NpuWrite32Op op) {
+  if (op.getBuffer())
+    return op.emitOpError("Cannot translate symbolic address");
+  std::optional<uint32_t> address = op.getAbsoluteAddress();
+  std::optional<uint32_t> value = AIEX::getConstantIntOperand(op.getValue());
+  if (!address || !value)
+    return op.emitOpError(
+        "Cannot translate write32 with non-constant address or value "
+        "to a static TXN binary");
+  aie_runtime::txn_append_write32(instructions, *address, *value);
+  return success();
+}
+
+LogicalResult appendMaskWrite32(std::vector<uint32_t> &instructions,
+                                NpuMaskWrite32Op op) {
+  if (op.getBuffer())
+    return op.emitOpError("Cannot translate symbolic address");
+  std::optional<uint32_t> address = op.getAbsoluteAddress();
+  std::optional<uint32_t> value = AIEX::getConstantIntOperand(op.getValue());
+  std::optional<uint32_t> mask = AIEX::getConstantIntOperand(op.getMask());
+  if (!address || !value || !mask)
+    return op.emitOpError("Cannot translate maskwrite32 with non-constant "
+                          "address, value, or mask to a static TXN binary");
+  aie_runtime::txn_append_maskwrite32(instructions, *address, *value, *mask);
+  return success();
+}
+
+LogicalResult appendMaskPoll(std::vector<uint32_t> &instructions,
+                             NpuMaskPollOp op) {
+  if (op.getBuffer())
+    return op.emitOpError("Cannot translate symbolic address");
+  std::optional<uint32_t> address = op.getAbsoluteAddress();
+  std::optional<uint32_t> value = AIEX::getConstantIntOperand(op.getValue());
+  std::optional<uint32_t> mask = AIEX::getConstantIntOperand(op.getMask());
+  if (!address || !value || !mask)
+    return op.emitOpError("Cannot translate maskpoll with non-constant "
+                          "address, value, or mask to a static TXN binary");
+  aie_runtime::txn_append_maskpoll32(instructions, *address, *value, *mask);
+  return success();
+}
+
+void appendLoadPdi(std::vector<uint32_t> &instructions, NpuLoadPdiOp op) {
+  aie_runtime::txn_append_loadpdi(instructions, op.getId(), op.getSize(),
+                                  op.getAddress());
+}
+
+LogicalResult appendAddressPatch(std::vector<uint32_t> &instructions,
+                                 NpuAddressPatchOp op, bool foldDDRAddrOffset) {
+  if (op.getAddrVal())
+    return op.emitOpError("Cannot translate address_patch with a runtime "
+                          "register address (addr_val) to a static TXN binary; "
+                          "the runtime-bd_id pool path targets the C++ TXN "
+                          "target only");
+  std::optional<uint64_t> argPlus =
+      AIEX::getConstantInt64Operand(op.getArgPlus());
+  if (!argPlus)
+    return op.emitOpError("Cannot translate address_patch with non-constant "
+                          "arg_plus to a static TXN binary");
+  std::optional<uint32_t> argIdx = op.getArgIdx();
+  if (!argIdx)
+    return op.emitOpError("address_patch still names its host buffer by SSA "
+                          "value; run -aie-resolve-address-patch-buffers");
+  aie_runtime::txn_append_arg_patch(instructions, op.getAddr(), *argIdx,
+                                    *argPlus, foldDDRAddrOffset);
+  return success();
+}
+
+// Cached resolution of NpuBlockWriteOp's data words.
+// NpuBlockWriteOp::getDataWords() resolves the data memref.global via
+// device.lookupSymbol (a LINEAR symbol scan over the device's symbols) +
+// global.getInitialValue() on EVERY call — perf shows this
+// (SymbolTable::lookupSymbolIn + memref::GlobalOp::getInherentAttr) is ~47% of
+// AIETranslateNpuToBinary on a B=128 runtime sequence (~10^5 block-writes),
+// i.e. O(block-writes x globals). Resolve via a prebuilt per-device SymbolTable
+// (O(1)) and memoize per global symbol (the B-unroll's streams reuse the same
+// data globals), so the returned attribute is byte-identical but the work
+// collapses. Falls back to the canonical method on any non-global memref /
+// lookup miss (identical behavior).
+static DenseIntElementsAttr cachedBlockWriteData(
+    NpuBlockWriteOp op, mlir::SymbolTable &symTab,
+    llvm::DenseMap<mlir::StringAttr, DenseIntElementsAttr> &cache) {
+  auto getGlobal = op.getData().getDefiningOp<mlir::memref::GetGlobalOp>();
+  if (!getGlobal)
+    return op.getDataWords();
+  // A hit already passed the width check: get_global's type is its global's.
+  mlir::StringAttr key = getGlobal.getNameAttr().getRootReference();
+  auto it = cache.find(key);
+  if (it != cache.end())
+    return it->second;
+  // Honor getDataWords()'s 32-bit-element contract exactly: a non-32-bit memref
+  // must take the canonical path (which emits "Only 32-bit data type is
+  // supported" + returns nullptr), not the cached fast path.
+  mlir::DataLayout dataLayout = mlir::DataLayout::closest(op);
+  if (dataLayout.getTypeSizeInBits(
+          mlir::cast<mlir::MemRefType>(op.getData().getType())
+              .getElementType()) != 32)
+    return op.getDataWords();
+  DenseIntElementsAttr data;
+  if (auto global =
+          dyn_cast_if_present<mlir::memref::GlobalOp>(symTab.lookup(key)))
+    if (auto initVal = global.getInitialValue())
+      data = dyn_cast<DenseIntElementsAttr>(*initVal);
+  if (!data)
+    data = op.getDataWords(); // preserve original error/edge behavior exactly
+  cache[key] = data;
+  return data;
+}
+
+LogicalResult appendBlockWrite(
+    std::vector<uint32_t> &instructions, NpuBlockWriteOp op,
+    std::optional<uint32_t> address, mlir::SymbolTable &symTab,
+    llvm::DenseMap<mlir::StringAttr, DenseIntElementsAttr> &dataCache) {
+  if (!address)
+    return op.emitOpError(
+        "Cannot translate blockwrite with unresolved address to a static TXN "
+        "binary");
+  DenseIntElementsAttr data = cachedBlockWriteData(op, symTab, dataCache);
+
+  // Resolve the payload words via the (cached) data attribute, then hand off to
+  // the encoder which owns the word layout.
+  std::vector<uint32_t> payload;
+  payload.reserve(data.size());
+  if (auto words = data.tryGetValues<uint32_t>(); succeeded(words))
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+    payload.assign(words->begin(), words->end());
+  else
+    for (auto d : data)
+      payload.push_back(d.getZExtValue());
+
+  // The col/row word is only populated when BOTH are present (matching the
+  // historical behavior); otherwise it stays 0 (a flat address).
+  auto col = op.getColumn();
+  auto row = op.getRow();
+  uint32_t colVal = 0, rowVal = 0;
+  if (col && row) {
+    colVal = *col;
+    rowVal = *row;
+  }
+  aie_runtime::txn_append_blockwrite(instructions, *address, payload.data(),
+                                     payload.size(), colVal, rowVal);
+  return success();
+}
+
+void appendPreempt(std::vector<uint32_t> &instructions, NpuPreemptOp op) {
+  aie_runtime::txn_append_preempt(instructions, op.getLevel());
+}
+
+void appendCreateScratchpad(std::vector<uint32_t> &instructions,
+                            NpuCreateScratchpadOp op) {
+  // TXN_OPC_CREATE_SCRATCHPAD encoding (4 words = 16 bytes):
+  // Byte 0: Opcode (10)
+  // Byte 1: Usage Type
+  // Bytes 2-3: padding
+  // Bytes 4-7: Size
+  // Bytes 8-15: DDR Address (patched at runtime by XRT)
   auto words = reserveAndGetTail(instructions, 4);
 
-  // XAIE_IO_CUSTOM_OP_TCT
-  words[0] = TXN_OPC_TCT;
-
-  words[1] = words.size() * sizeof(uint32_t); // Operation Size
-
-  words[2] |= static_cast<uint32_t>(op.getDirection()) & 0xff;
-  words[2] |= (op.getRow() & 0xff) << 8;
-  words[2] |= (op.getColumn() & 0xff) << 16;
-
-  words[3] |= (op.getRowNum() & 0xff) << 8;
-  words[3] |= (op.getColumnNum() & 0xff) << 16;
-  words[3] |= (op.getChannel() & 0xff) << 24;
-}
-
-void appendWrite32(std::vector<uint32_t> &instructions, NpuWrite32Op op) {
-
-  auto words = reserveAndGetTail(instructions, 6);
-
-  if (op.getBuffer()) {
-    op.emitOpError("Cannot translate symbolic address");
-    return;
-  }
-
-  // XAIE_IO_WRITE
-  words[0] = TXN_OPC_WRITE;
-  words[2] = op.getAddress();
-  auto col = op.getColumn();
-  auto row = op.getRow();
-  if (col && row) {
-    const AIETargetModel &tm = op->getParentOfType<DeviceOp>().getTargetModel();
-    words[2] = ((*col & 0xff) << tm.getColumnShift()) |
-               ((*row & 0xff) << tm.getRowShift()) | (words[2] & 0xFFFFF);
-  }
-  words[3] = 0;                               // Extra bits for Reg Offset
-  words[4] = op.getValue();                   // Value
-  words[5] = words.size() * sizeof(uint32_t); // Operation Size
-}
-
-void appendMaskWrite32(std::vector<uint32_t> &instructions,
-                       NpuMaskWrite32Op op) {
-
-  auto words = reserveAndGetTail(instructions, 7);
-
-  if (op.getBuffer()) {
-    op.emitOpError("Cannot translate symbolic address");
-    return;
-  }
-
-  // XAIE_IO_MASKWRITE
-  words[0] = TXN_OPC_MASKWRITE;
-  words[2] = op.getAddress();
-  auto col = op.getColumn();
-  auto row = op.getRow();
-  if (col && row) {
-    const AIETargetModel &tm = op->getParentOfType<DeviceOp>().getTargetModel();
-    words[2] = ((*col & 0xff) << tm.getColumnShift()) |
-               ((*row & 0xff) << tm.getRowShift()) | (words[2] & 0xFFFFF);
-  }
+  words[0] = aie_runtime::TXN_OPC_CREATE_SCRATCHPAD;
+  words[0] |= (static_cast<uint32_t>(op.getUsageType()) << 8);
+  words[1] = op.getSize();
+  // DDR address words[2] and words[3] are left as 0;
+  // they will be patched at runtime by XRT/aiebu based on the
+  // .ctrl.scratchpad section.
+  words[2] = 0;
   words[3] = 0;
-  words[4] = op.getValue();                   // Value
-  words[5] = op.getMask();                    // Mask
-  words[6] = words.size() * sizeof(uint32_t); // Operation Size
 }
 
-void appendAddressPatch(std::vector<uint32_t> &instructions,
-                        NpuAddressPatchOp op) {
+LogicalResult appendUpdateRegFromScratchpad(std::vector<uint32_t> &instructions,
+                                            NpuUpdateFromScratchpadOp op,
+                                            const NamedOpTable &names) {
+  std::optional<uint32_t> address = op.getAbsoluteAddress(&names);
+  if (!address)
+    return op.emitOpError("Cannot translate update_from_scratchpad with "
+                          "unresolved address to a static TXN binary");
+  // TXN_OPC_UPDATE_REG encoding (3 words = 12 bytes):
+  // Byte 0: Opcode (12)
+  // Byte 1: StateTableIdx
+  // Byte 2: Func
+  // Byte 3: padding
+  // Bytes 4-7: FuncArg
+  // Bytes 8-11: RegOff (absolute offset from AIE array base to register pair)
+  auto words = reserveAndGetTail(instructions, 3);
 
-  auto words = reserveAndGetTail(instructions, 12);
-
-  // XAIE_IO_CUSTOM_OP_DDR_PATCH
-  words[0] = TXN_OPC_DDR_PATCH;
-  words[1] = words.size() * sizeof(uint32_t); // Operation Size
-
-  words[5] = 0; // Action
-
-  words[6] = op.getAddr();
-
-  words[8] = op.getArgIdx();
-
-  words[10] = op.getArgPlus();
-}
-
-void appendBlockWrite(std::vector<uint32_t> &instructions, NpuBlockWriteOp op) {
-
-  Value memref = op.getData();
-  DataLayout dataLayout = DataLayout::closest(op);
-  int64_t width = dataLayout.getTypeSizeInBits(cast<MemRefType>(memref.getType()).getElementType());
-  if (width != 32) {
-    op.emitWarning("Only 32-bit data type is supported for now");
-    return;
-  }
-
-  memref::GetGlobalOp getGlobal = memref.getDefiningOp<memref::GetGlobalOp>();
-  if (!getGlobal) {
-    op.emitError("Only MemRefs from memref.get_global are supported");
-    return;
-  }
-
-  auto global = dyn_cast_if_present<memref::GlobalOp>(
-      op->getParentOfType<AIE::DeviceOp>().lookupSymbol(getGlobal.getName()));
-  if (!global) {
-    op.emitError("Global symbol not found");
-    return;
-  }
-
-  auto initVal = global.getInitialValue();
-  if (!initVal) {
-    op.emitError("Global symbol has no initial value");
-    return;
-  }
-
-  auto data = dyn_cast<DenseIntElementsAttr>(*initVal);
-  if (!data) {
-    op.emitError("Global symbol initial value is not a dense int array");
-    return;
-  }
-
-  unsigned payload_start = 4;
-  auto words = reserveAndGetTail(instructions, data.size() + payload_start);
-
-  // XAIE_IO_BLOCKWRITE
-  words[0] = TXN_OPC_BLOCKWRITE;
-  words[2] = op.getAddress();
-  auto col = op.getColumn();
-  auto row = op.getRow();
-  if (col && row) {
-    words[1] = (*col & 0xff) | ((*row & 0xff) << 8);
-    const AIETargetModel &tm = op->getParentOfType<DeviceOp>().getTargetModel();
-    words[2] = ((*col & 0xff) << tm.getColumnShift()) |
-               ((*row & 0xff) << tm.getRowShift()) | (words[2] & 0xFFFFF);
-  }
-  words[3] = words.size() * sizeof(uint32_t); // Operation Size
-
-  unsigned i = payload_start;
-  for (auto d : data)
-    words[i++] = d.getZExtValue();
+  words[0] = aie_runtime::TXN_OPC_UPDATE_REG;
+  words[0] |= (static_cast<uint32_t>(op.getStateTableIdx()) << 8);
+  words[0] |= (static_cast<uint32_t>(op.getFunc()) << 16);
+  words[1] = op.getFuncArg();
+  words[2] = *address;
+  return success();
 }
 
 } // namespace
 
-LogicalResult
-xilinx::AIE::AIETranslateNpuToBinary(ModuleOp module,
-                                     std::vector<uint32_t> &instructions,
-                                     StringRef sequenceName) {
+namespace {
 
-  auto words = reserveAndGetTail(instructions, 4);
+// Lazy-loaded regdb for register-name decoration. Loaded once per process,
+// returns nullptr if the JSON files cannot be located (e.g. install dir not
+// set). Decoration is best-effort.
+static const xilinx::AIE::RegisterDatabase *getRegDB() {
+  static std::unique_ptr<xilinx::AIE::RegisterDatabase> db = []() {
+    return xilinx::AIE::RegisterDatabase::loadAIE2();
+  }();
+  return db.get();
+}
 
-  DeviceOp deviceOp = *module.getOps<DeviceOp>().begin();
-  const AIETargetModel &tm = deviceOp.getTargetModel();
+// Decompose an absolute device address into (col, row, offset) using the
+// target model's column/row shifts, then derive the regdb module name from
+// the row's tile type. Looks the (module, offset) up in regdb. Returns the
+// register name on success and writes the module name to *outModule. On any
+// failure returns empty StringRef.
+static llvm::StringRef
+lookupRegisterByAddress(uint64_t address, const AIETargetModel &tm,
+                        const xilinx::AIE::RegisterDatabase *regdb,
+                        std::string &outModule) {
+  outModule.clear();
+  if (!regdb)
+    return {};
+  uint32_t colShift = tm.getColumnShift();
+  uint32_t rowShift = tm.getRowShift();
+  uint8_t col = static_cast<uint8_t>((address >> colShift) & 0xFF);
+  uint8_t row = static_cast<uint8_t>((address >> rowShift) & 0xFF);
+  uint64_t baseMask = (uint64_t{1} << rowShift) - 1;
+  uint32_t offset = static_cast<uint32_t>(address & baseMask);
 
-  // setup txn header
-  uint8_t major = 0;
-  uint8_t minor = 1;
-  uint8_t devGen = 3;                      // NPU (PHX HWK)
-  if (llvm::isa<AIE::NPU2TargetModel>(AIE::getTargetModel(deviceOp)))
-    devGen = 4;                            // NPU2 (STX KRK)
-  uint8_t numRows = tm.rows();
-  uint8_t numCols = tm.columns();
-  uint8_t numMemTileRows = tm.getNumMemTileRows();
-  uint32_t count = 0;
-  words[0] = (numRows << 24) | (devGen << 16) | (minor << 8) | major;
-  words[1] = (numMemTileRows << 8) | numCols;
+  // Determine module from tile type. Module names must match the JSON keys in
+  // aie_registers_aie2.json: "core", "memory", "memory_tile", "shim".
+  StringRef moduleName;
+  if (tm.isShimNOCTile(col, row) || tm.isShimPLTile(col, row)) {
+    moduleName = "shim";
+  } else if (tm.isMemTile(col, row)) {
+    moduleName = "memory_tile";
+  } else {
+    // For aie tiles, regdb has both core and memory modules. The offset alone
+    // disambiguates. Try core first then memory.
+    if (auto *r = regdb->lookupRegisterByOffset(offset, "core")) {
+      outModule = "core";
+      return r->name;
+    }
+    if (auto *r = regdb->lookupRegisterByOffset(offset, "memory")) {
+      outModule = "memory";
+      return r->name;
+    }
+    return {};
+  }
+  if (auto *r = regdb->lookupRegisterByOffset(offset, moduleName)) {
+    outModule = moduleName.str();
+    return r->name;
+  }
+  return {};
+}
 
-  auto sequenceOps = deviceOp.getOps<AIEX::RuntimeSequenceOp>();
-  for (auto seq : sequenceOps) {
-    if (sequenceName.size() && sequenceName != seq.getSymName())
-      continue;
-    Block &entry = seq.getBody().front();
-    for (auto &o : entry) {
-      llvm::TypeSwitch<Operation *>(&o)
-          .Case<NpuSyncOp>([&](auto op) {
-            count++;
-            appendSync(instructions, op);
-          })
-          .Case<NpuWrite32Op>([&](auto op) {
-            count++;
-            appendWrite32(instructions, op);
-          })
-          .Case<NpuBlockWriteOp>([&](auto op) {
-            count++;
-            appendBlockWrite(instructions, op);
-          })
-          .Case<NpuMaskWrite32Op>([&](auto op) {
-            count++;
-            appendMaskWrite32(instructions, op);
-          })
-          .Case<NpuAddressPatchOp>([&](auto op) {
-            count++;
-            appendAddressPatch(instructions, op);
-          });
+static void pushLocEntry(std::vector<TxnLocEntry> *locmap,
+                         uint32_t byteOffsetBefore, uint32_t byteOffsetAfter,
+                         StringRef opcodeName, StringRef sourceOpName,
+                         std::optional<uint64_t> address, mlir::Operation *op,
+                         const AIETargetModel &tm) {
+  if (!locmap)
+    return;
+  TxnLocEntry e;
+  e.byteOffset = byteOffsetBefore;
+  e.byteSize = byteOffsetAfter - byteOffsetBefore;
+  e.opcodeName = opcodeName.str();
+  e.sourceOpName = sourceOpName.str();
+  e.address = address;
+  e.loc = op->getLoc();
+  if (address) {
+    if (auto regName =
+            lookupRegisterByAddress(*address, tm, getRegDB(), e.registerModule);
+        !regName.empty()) {
+      e.registerName = regName.str();
     }
   }
+  locmap->push_back(std::move(e));
+}
 
-  // write size fields of the txn header
-  instructions[2] = count;
-  instructions[3] = instructions.size() * sizeof(uint32_t); // size of the txn
+// Appends the TXN encoding of a runtime sequence's ops, one op at a time.
+struct TxnEncoder {
+  TxnEncoder(DeviceOp device, std::vector<uint32_t> &instructions,
+             std::vector<TxnLocEntry> *locmap, bool foldDDRAddrOffset,
+             NpuConfigCache &configs)
+      : device(device), tm(device.getTargetModel()),
+        symTab(device.getOperation()), names(device.getOperation()),
+        configs(configs), instructions(instructions), locmap(locmap),
+        foldDDRAddrOffset(foldDDRAddrOffset) {}
+
+  void encode(Operation &o);
+  LogicalResult encodeConfig(DeviceOp configured, bool teardown,
+                             NpuConfigCache::Config &config);
+  void appendConfig(Operation *op, FlatSymbolRefAttr deviceRef, bool teardown);
+
+  DeviceOp device;
+  const AIETargetModel &tm;
+  // Built once, with a per-global data cache, so block-write data resolution
+  // is O(1)+memoized instead of a per-op linear symbol scan
+  // (cachedBlockWriteData). ~47% of the translation on a B=128 sequence.
+  mlir::SymbolTable symTab;
+  NamedOpTable names;
+  llvm::DenseMap<mlir::StringAttr, DenseIntElementsAttr> blockWriteDataCache;
+  NpuConfigCache &configs;
+  std::vector<uint32_t> &instructions;
+  std::vector<TxnLocEntry> *locmap;
+  bool foldDDRAddrOffset;
+  uint32_t count = 0;
+  // Accumulates failure from the per-op append helpers (e.g. a non-constant
+  // operand that cannot be encoded into a static TXN binary). The walk
+  // finishes so every offending op is diagnosed, then the translation fails
+  // rather than emit a silently incomplete binary.
+  LogicalResult result = success();
+};
+
+// Generates `configured`'s configuration ops, or with `teardown` its teardown
+// ops, as the expand-load-pdi pass would inline them, in a scratch device of
+// its own, and encodes them as a sequence's own ops are.
+LogicalResult TxnEncoder::encodeConfig(DeviceOp configured, bool teardown,
+                                       NpuConfigCache::Config &config) {
+  MLIRContext *ctx = device.getContext();
+  ctx->getOrLoadDialect<arith::ArithDialect>();
+  ctx->getOrLoadDialect<memref::MemRefDialect>();
+  OpBuilder builder(ctx);
+  OwningOpRef<ModuleOp> scratch = ModuleOp::create(device.getLoc());
+  builder.setInsertionPointToStart(scratch->getBody());
+  auto holder =
+      DeviceOp::create(builder, device.getLoc(), configured.getDevice(),
+                       configured.getSymName(), nullptr);
+  holder.getRegion().emplaceBlock();
+  DeviceOp::ensureTerminator(holder.getBodyRegion(), builder, device.getLoc());
+  builder.setInsertionPointToStart(holder.getBody());
+  auto seq = RuntimeSequenceOp::create(
+      builder, device.getLoc(), builder.getStringAttr("configure"), BoolAttr{},
+      TraceBufferAttr{}, ArrayAttr{}, ArrayAttr{});
+  Block *body = new Block;
+  seq.getBody().push_back(body);
+  builder.setInsertionPointToStart(body);
+  BlockwriteData payloads(holder, teardown ? "teardown_" : "loadpdi_");
+  if (teardown
+          ? failed(generateAndInsertTeardownOps(builder, configured, payloads))
+          : failed(generateAndInsertConfigOps(builder, configured, payloads)))
+    return failure();
+  // The locmap is kept whether or not this translation writes one: another
+  // sharing the cache may.
+  TxnEncoder encoder(holder, config.words, &config.locmap, foldDDRAddrOffset,
+                     configs);
+  for (Operation &op : *body)
+    encoder.encode(op);
+  config.count = encoder.count;
+  return encoder.result;
+}
+
+void TxnEncoder::appendConfig(Operation *op, FlatSymbolRefAttr deviceRef,
+                              bool teardown) {
+  auto configured = dyn_cast_or_null<DeviceOp>(
+      SymbolTable::lookupSymbolIn(device->getParentOp(), deviceRef));
+  const NpuConfigCache::Config *config =
+      configured
+          ? configs.getOrEncode(configured, teardown,
+                                [&](NpuConfigCache::Config &c) {
+                                  return encodeConfig(configured, teardown, c);
+                                })
+          : nullptr;
+  if (!config) {
+    op->emitOpError(teardown ? "cannot generate the teardown of "
+                             : "cannot generate the configuration of ")
+        << deviceRef;
+    result = failure();
+    return;
+  }
+  uint32_t base = static_cast<uint32_t>(instructions.size() * sizeof(uint32_t));
+  llvm::append_range(instructions, config->words);
+  count += config->count;
+  if (locmap)
+    for (TxnLocEntry entry : config->locmap) {
+      entry.byteOffset += base;
+      locmap->push_back(std::move(entry));
+    }
+}
+
+void TxnEncoder::encode(Operation &o) {
+  auto byteOffset = [&]() -> uint32_t {
+    return static_cast<uint32_t>(instructions.size() * sizeof(uint32_t));
+  };
+  llvm::TypeSwitch<Operation *>(&o)
+      .Case<cf::AssertOp>([&](auto op) {
+        // A static sequence only ever carries a constant-true guard
+        // (canonicalization erases it); a constant-false one failed at
+        // compile time, and anything unresolved means a runtime value
+        // reached the binary path.
+        auto c = getConstantIntValue(op.getArg());
+        if (c && *c == 0) {
+          op.emitOpError("is violated at compile time: ") << op.getMsg();
+          result = failure();
+        } else if (!c) {
+          op.emitOpError("runtime check cannot be encoded in a static TXN "
+                         "binary; use the C++ builder (--aie-npu-to-cpp) "
+                         "or specialize the value: ")
+              << op.getMsg();
+          result = failure();
+        }
+      })
+      .Case<NpuSyncOp>([&](auto op) {
+        count++;
+        uint32_t before = byteOffset();
+        if (failed(appendSync(instructions, op)))
+          result = failure();
+        pushLocEntry(locmap, before, byteOffset(), "TCT",
+                     op->getName().getStringRef(), std::nullopt, op, tm);
+      })
+      .Case<NpuWrite32Op>([&](auto op) {
+        count++;
+        uint32_t before = byteOffset();
+        uint64_t addr = op.getAbsoluteAddress().value_or(0);
+        if (failed(appendWrite32(instructions, op)))
+          result = failure();
+        pushLocEntry(locmap, before, byteOffset(), "WRITE32",
+                     op->getName().getStringRef(), addr, op, tm);
+      })
+      .Case<NpuBlockWriteOp>([&](auto op) {
+        count++;
+        uint32_t before = byteOffset();
+        std::optional<uint32_t> addr = op.getAbsoluteAddress(&names);
+        if (failed(appendBlockWrite(instructions, op, addr, symTab,
+                                    blockWriteDataCache)))
+          result = failure();
+        pushLocEntry(locmap, before, byteOffset(), "BLOCKWRITE",
+                     op->getName().getStringRef(), addr.value_or(0), op, tm);
+      })
+      .Case<NpuBlockWriteValuesOp>([&](auto op) {
+        // A runtime-computed blockwrite payload has no static encoding;
+        // this op only reaches the EmitC (C++ TXN) target.
+        op.emitOpError("cannot translate a runtime-valued blockwrite "
+                       "payload to a static TXN binary; this op is "
+                       "supported only by the C++ TXN target "
+                       "(--aie-npu-to-cpp)");
+        result = failure();
+      })
+      .Case<NpuMaskWrite32Op>([&](auto op) {
+        count++;
+        uint32_t before = byteOffset();
+        uint64_t addr = op.getAbsoluteAddress().value_or(0);
+        if (failed(appendMaskWrite32(instructions, op)))
+          result = failure();
+        pushLocEntry(locmap, before, byteOffset(), "MASKWRITE",
+                     op->getName().getStringRef(), addr, op, tm);
+      })
+      .Case<NpuMaskPollOp>([&](auto op) {
+        count++;
+        uint32_t before = byteOffset();
+        uint64_t addr = op.getAbsoluteAddress().value_or(0);
+        if (failed(appendMaskPoll(instructions, op)))
+          result = failure();
+        pushLocEntry(locmap, before, byteOffset(), "MASKPOLL",
+                     op->getName().getStringRef(), addr, op, tm);
+      })
+      .Case<NpuLoadPdiOp>([&](auto op) {
+        count++;
+        uint32_t before = byteOffset();
+        appendLoadPdi(instructions, op);
+        pushLocEntry(locmap, before, byteOffset(), "LOAD_PDI",
+                     op->getName().getStringRef(), std::nullopt, op, tm);
+      })
+      .Case<NpuAddressPatchOp>([&](auto op) {
+        count++;
+        uint32_t before = byteOffset();
+        if (failed(appendAddressPatch(instructions, op, foldDDRAddrOffset)))
+          result = failure();
+        pushLocEntry(locmap, before, byteOffset(), "ADDRESS_PATCH",
+                     op->getName().getStringRef(), op.getAddr(), op, tm);
+      })
+      .Case<NpuPreemptOp>([&](auto op) {
+        count++;
+        uint32_t before = byteOffset();
+        appendPreempt(instructions, op);
+        pushLocEntry(locmap, before, byteOffset(), "PREEMPT",
+                     op->getName().getStringRef(), std::nullopt, op, tm);
+      })
+      .Case<NpuCreateScratchpadOp>([&](auto op) {
+        count++;
+        uint32_t before = byteOffset();
+        appendCreateScratchpad(instructions, op);
+        pushLocEntry(locmap, before, byteOffset(), "CREATE_SCRATCHPAD",
+                     op->getName().getStringRef(), std::nullopt, op, tm);
+      })
+      .Case<NpuUpdateFromScratchpadOp>([&](auto op) {
+        count++;
+        uint32_t before = byteOffset();
+        if (failed(appendUpdateRegFromScratchpad(instructions, op, names)))
+          result = failure();
+        pushLocEntry(locmap, before, byteOffset(), "UPDATE_FROM_SCRATCHPAD",
+                     op->getName().getStringRef(), std::nullopt, op, tm);
+      })
+      .Case<NpuWriteConfigOp>([&](auto op) {
+        appendConfig(op, op.getDeviceRefAttr(), /*teardown=*/false);
+      })
+      .Case<NpuWriteTeardownOp>([&](auto op) {
+        appendConfig(op, op.getDeviceRefAttr(), /*teardown=*/true);
+      })
+      .Default([&](Operation *op) {
+        // Pure values (constants, the operands above) need no encoding;
+        // control packets have their own translation. Anything else would
+        // be dropped from the binary without a trace.
+        if (isMemoryEffectFree(op) || op->hasTrait<OpTrait::IsTerminator>() ||
+            isa<NpuControlPacketOp>(op))
+          return;
+        op->emitOpError("has no static TXN encoding");
+        result = failure();
+      });
+}
+
+} // namespace
+
+const NpuConfigCache::Config *xilinx::AIE::NpuConfigCache::getOrEncode(
+    Operation *device, bool teardown,
+    llvm::function_ref<LogicalResult(Config &)> encode) {
+  std::lock_guard<std::mutex> lock(mutex);
+  auto [it, inserted] = configs[teardown].try_emplace(device);
+  if (inserted) {
+    auto config = std::make_unique<Config>();
+    if (succeeded(encode(*config)))
+      it->second = std::move(config);
+  }
+  return it->second.get();
+}
+
+LogicalResult xilinx::AIE::AIETranslateNpuToBinary(
+    mlir::ModuleOp moduleOp, std::vector<uint32_t> &instructions,
+    StringRef deviceName, StringRef sequenceName,
+    std::vector<TxnLocEntry> *locmap, bool foldDDRAddrOffset,
+    NpuConfigCache *configs) {
+
+  DeviceOp deviceOp =
+      DeviceOp::getForSymbolInModuleOrError(moduleOp, deviceName);
+  if (!deviceOp) {
+    return failure();
+  }
+
+  const AIETargetModel &tm = deviceOp.getTargetModel();
+
+  // Reserve the 4-word header up front; finalized in-place by
+  // txn_prepend_header once all instructions are appended.
+  aie_runtime::txn_init(instructions);
+
+  aie_runtime::TxnDeviceInfo devInfo = aie_runtime::txn_device_info(
+      txnDeviceGen(tm), tm.rows(), tm.columns(), tm.getNumMemTileRows());
+
+  AIE::RuntimeSequenceOp seq =
+      AIE::RuntimeSequenceOp::getForSymbolInDeviceOrError(deviceOp,
+                                                          sequenceName);
+  if (!seq) {
+    return failure();
+  }
+
+  NpuConfigCache ownConfigs;
+  TxnEncoder encoder(deviceOp, instructions, locmap, foldDDRAddrOffset,
+                     configs ? *configs : ownConfigs);
+  for (Block &block : seq.getBody())
+    for (Operation &o : block)
+      encoder.encode(o);
+  if (failed(encoder.result))
+    return failure();
+
+  // Finalize the TXN header (overwrites the 4 reserved words).
+  aie_runtime::txn_prepend_header(instructions, encoder.count, devInfo);
   return success();
 }
 
 LogicalResult xilinx::AIE::AIETranslateControlPacketsToUI32Vec(
-    ModuleOp module, std::vector<uint32_t> &instructions,
-    StringRef sequenceName) {
-  DeviceOp deviceOp = *module.getOps<DeviceOp>().begin();
-  auto sequenceOps = deviceOp.getOps<AIEX::RuntimeSequenceOp>();
-  for (auto seq : sequenceOps) {
-    if (sequenceName.size() && sequenceName != seq.getSymName())
+    ModuleOp module, std::vector<uint32_t> &instructions, StringRef deviceName,
+    StringRef sequenceName, std::vector<TxnLocEntry> *locmap) {
+  DeviceOp deviceOp =
+      AIE::DeviceOp::getForSymbolInModuleOrError(module, deviceName);
+  if (!deviceOp) {
+    return failure();
+  }
+  AIE::RuntimeSequenceOp seq =
+      AIE::RuntimeSequenceOp::getForSymbolInDeviceOrError(deviceOp,
+                                                          sequenceName);
+  if (!seq) {
+    return failure();
+  }
+
+  const AIETargetModel &tm = deviceOp.getTargetModel();
+  Block &entry = seq.getBody().front();
+  for (auto &o : entry) {
+    auto packetOp = dyn_cast<AIEX::NpuControlPacketOp>(o);
+    if (!packetOp)
       continue;
-    Block &entry = seq.getBody().front();
-    for (auto &o : entry) {
-      llvm::TypeSwitch<Operation *>(&o).Case<NpuControlPacketOp>([&](auto op) {
-        uint32_t size = 0;
-        auto data = op.getData();
-        auto length = op.getLength();
-        if (data)
-          size = data->size();
-        auto words = reserveAndGetTail(instructions, 1 + size);
-        if (!data && length)
-          size = *length;
-        auto parity = [](uint32_t n) {
-          uint32_t p = 0;
-          while (n) {
-            p += n & 1;
-            n >>= 1;
-          }
-          return (p % 2) == 0;
-        };
-        uint32_t addr = op.getAddress() & 0xFFFFF;
-        uint32_t beats = size - 1;
-        uint32_t opc = op.getOpcode();
-        uint32_t id = op.getStreamId();
-        uint32_t hdr = id << 24 | opc << 22 | beats << 20 | addr;
-        words[0] = hdr | (0x1 & parity(hdr)) << 31;
-        if (opc == 0x0 || opc == 0x2)
-          for (unsigned i = 0; i < size; i++)
-            words[i + 1] = data.value()[i];
-      });
+
+    // The C API and Python callers can pass ops that were never verified,
+    // and the encoding below relies on the verifier's checks.
+    if (failed(packetOp.verify()))
+      return failure();
+
+    uint32_t before =
+        static_cast<uint32_t>(instructions.size() * sizeof(uint32_t));
+
+    uint32_t size = 0;
+    auto data = packetOp.getData();
+    if (data)
+      size = data->size();
+
+    // Emit: stream_header (1 word) + ctrl_header (1 word) + data (size words).
+    // The stream header contains the routing pkt_id so the stream switch can
+    // route each control packet to the correct tile's TileControl port.
+    // The DMA BD does NOT use enable_packet -- it sends raw data, and the
+    // stream switch parses the embedded packet headers from the data stream.
+    auto words = reserveAndGetTail(instructions, 2 + size);
+
+    std::optional<uint32_t> length = packetOp.getLength();
+    if (!data && length)
+      size = *length;
+
+    auto parity = [](uint32_t n) {
+      uint32_t p = 0;
+      while (n) {
+        p += n & 1;
+        n >>= 1;
+      }
+      return (p % 2) == 0;
+    };
+
+    // stream header with routing pkt_id from target tile's controller_id
+    int col = packetOp.getColumnFromAddr();
+    int row = packetOp.getRowFromAddr();
+    DeviceOp deviceOp2 = packetOp->getParentOfType<AIE::DeviceOp>();
+    OpBuilder builder2 = OpBuilder::atBlockBegin(deviceOp2.getBody());
+    auto destTile = TileOp::getOrCreate(builder2, deviceOp2, col, row);
+    auto info = destTile->getAttrOfType<AIE::PacketInfoAttr>("controller_id");
+    uint32_t hdr = 0;
+    if (info)
+      hdr = (info.getPktType() & 0x7) << 12 | (info.assignedId() & 0xff);
+    words[0] = hdr | (0x1 & parity(hdr)) << 31;
+
+    // `beats` gets two bits, directly above the address, so an oversized
+    // payload corrupts the address instead of truncating. The verifier
+    // rejects empty payloads and long reads; a long write is legal until
+    // --aie-legalize-control-packet splits it, so it is caught here.
+    if (size > AIEX::NpuControlPacketOp::getMaxDataWords())
+      return packetOp.emitOpError()
+             << "payload is " << size
+             << " words; a control packet carries at most "
+             << AIEX::NpuControlPacketOp::getMaxDataWords()
+             << " on the wire. Run --aie-legalize-control-packet before "
+                "translating.";
+
+    uint32_t addr = packetOp.getAddress() & 0xFFFFF;
+    uint32_t beats = size - 1;
+    uint32_t opc = packetOp.getOpcode();
+    uint32_t id = packetOp.getStreamId();
+    hdr = id << 24 | opc << 22 | beats << 20 | addr;
+    words[1] = hdr | (0x1 & parity(hdr)) << 31;
+
+    // configuration data
+    if (data && (opc == 0x0 || opc == 0x2)) {
+      for (unsigned i = 0; i < size; i++)
+        words[i + 2] = (*data)[i];
     }
+
+    uint32_t after =
+        static_cast<uint32_t>(instructions.size() * sizeof(uint32_t));
+    pushLocEntry(locmap, before, after, "CONTROL_PACKET",
+                 packetOp->getName().getStringRef(), packetOp.getAddress(),
+                 packetOp, tm);
   }
   return success();
+}
+
+// Render an mlir::Location as a JSON object, recursing into NameLoc, FusedLoc,
+// and CallSiteLoc so a consumer can reconstruct the file:line:col + named
+// location structure carried by the source op.
+static llvm::json::Value locToJSON(mlir::Location loc) {
+  using namespace llvm;
+  if (auto f = dyn_cast<mlir::FileLineColLoc>(loc))
+    return json::Value(json::Object{
+        {"kind", "file"},
+        {"file", f.getFilename().str()},
+        {"line", static_cast<int64_t>(f.getLine())},
+        {"col", static_cast<int64_t>(f.getColumn())},
+    });
+  if (auto n = dyn_cast<mlir::NameLoc>(loc)) {
+    json::Object o{{"kind", "name"}, {"name", n.getName().str()}};
+    o["child"] = locToJSON(n.getChildLoc());
+    return json::Value(std::move(o));
+  }
+  if (auto fused = dyn_cast<mlir::FusedLoc>(loc)) {
+    json::Array children;
+    for (mlir::Location c : fused.getLocations())
+      children.push_back(locToJSON(c));
+    return json::Value(
+        json::Object{{"kind", "fused"}, {"children", std::move(children)}});
+  }
+  if (auto cs = dyn_cast<mlir::CallSiteLoc>(loc))
+    return json::Value(json::Object{
+        {"kind", "callsite"},
+        {"callee", locToJSON(cs.getCallee())},
+        {"caller", locToJSON(cs.getCaller())},
+    });
+  if (isa<mlir::OpaqueLoc>(loc))
+    return json::Value(json::Object{{"kind", "opaque"}});
+  return json::Value(json::Object{{"kind", "unknown"}});
+}
+
+void xilinx::AIE::emitNpuLocmapJSON(llvm::raw_ostream &output,
+                                    llvm::StringRef deviceName,
+                                    llvm::StringRef binaryName,
+                                    const std::vector<TxnLocEntry> &locmap) {
+  llvm::json::Object root;
+  root["version"] = 1;
+  root["device"] = deviceName.str();
+  root["binary"] = binaryName.str();
+
+  llvm::json::Array opsArr;
+  for (const auto &e : locmap) {
+    llvm::json::Object o;
+    o["byte_offset"] = static_cast<int64_t>(e.byteOffset);
+    o["byte_size"] = static_cast<int64_t>(e.byteSize);
+    o["opcode"] = e.opcodeName;
+    o["source_op"] = e.sourceOpName;
+    if (e.address)
+      o["address"] = llvm::formatv("{0:X}", *e.address).str();
+    if (!e.registerName.empty()) {
+      o["register"] = e.registerName;
+      o["register_module"] = e.registerModule;
+    }
+    if (e.loc)
+      o["loc"] = locToJSON(*e.loc);
+    opsArr.push_back(std::move(o));
+  }
+  root["operations"] = std::move(opsArr);
+
+  output << llvm::formatv("{0:2}\n", llvm::json::Value(std::move(root)));
 }

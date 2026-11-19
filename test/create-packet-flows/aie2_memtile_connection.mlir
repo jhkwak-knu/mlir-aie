@@ -1,14 +1,11 @@
 //===- aie2_memtile_connection.mlir ----------------------------*- MLIR -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2024 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// Copyright (C) 2024, Advanced Micro Devices, Inc.
 //
 //===----------------------------------------------------------------------===//
 
-// RUN: aie-opt --aie-create-pathfinder-flows --aie-find-flows %s -o %t.opt
+// RUN: aie-opt --aie-create-pathfinder-flows --aie-find-flows=remove-lifted=false %s -o %t.opt
 // RUN: FileCheck %s --check-prefix=CHECK1 < %t.opt
 // RUN: aie-translate --aie-flows-to-json %t.opt | FileCheck %s --check-prefix=CHECK2
 
@@ -28,9 +25,9 @@ module {
   %tile_0_0 = aie.tile(0, 0)
   %tile_0_1 = aie.tile(0, 1)
   %tile_0_2 = aie.tile(0, 2)
-  aie.flow(%tile_0_1, DMA : 0, %tile_0_0, DMA : 0) 
-  aie.packet_flow(0) { 
-    aie.packet_source<%tile_0_2, DMA : 0> 
+  aie.flow(%tile_0_1, DMA : 0, %tile_0_0, DMA : 0)
+  aie.packet_flow(0) {
+    aie.packet_source<%tile_0_2, DMA : 0>
     aie.packet_dest<%tile_0_0, DMA : 1>
   }
  }

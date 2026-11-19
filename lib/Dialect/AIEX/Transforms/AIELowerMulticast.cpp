@@ -1,10 +1,8 @@
 //===- AIELowerMulticast.cpp ------------------------------------*- C++ -*-===//
 //
-// This file is licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2020-2022 Xilinx, Inc.
+// Copyright (C) 2022-2026 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// (c) Copyright 2020 Xilinx Inc.
 //
 //===----------------------------------------------------------------------===//
 
@@ -19,6 +17,11 @@
 #include "mlir/Transforms/DialectConversion.h"
 
 #include "llvm/ADT/Twine.h"
+
+namespace xilinx::AIEX {
+#define GEN_PASS_DEF_AIEMULTICAST
+#include "aie/Dialect/AIEX/Transforms/AIEXPasses.h.inc"
+} // namespace xilinx::AIEX
 
 #define DEBUG_TYPE "aie-lower-multicast"
 
@@ -45,7 +48,8 @@ struct AIEOpRemoval : public OpConversionPattern<MyOp> {
   }
 };
 
-struct AIELowerMulticastPass : public AIEMulticastBase<AIELowerMulticastPass> {
+struct AIELowerMulticastPass
+    : public xilinx::AIEX::impl::AIEMulticastBase<AIELowerMulticastPass> {
   void runOnOperation() override {
 
     DeviceOp device = getOperation();
@@ -55,15 +59,14 @@ struct AIELowerMulticastPass : public AIEMulticastBase<AIELowerMulticastPass> {
       Region &r = multicast.getPorts();
       Block &b = r.front();
       Port sourcePort = multicast.port();
-      TileOp srcTile = dyn_cast<TileOp>(multicast.getTile().getDefiningOp());
+      TileOp srcTile = cast<TileOp>(multicast.getTile().getDefiningOp());
       for (Operation &Op : b.getOperations()) {
         if (MultiDestOp multiDest = dyn_cast<MultiDestOp>(Op)) {
-          TileOp destTile =
-              dyn_cast<TileOp>(multiDest.getTile().getDefiningOp());
+          TileOp destTile = cast<TileOp>(multiDest.getTile().getDefiningOp());
           Port destPort = multiDest.port();
-          builder.create<FlowOp>(builder.getUnknownLoc(), srcTile,
-                                 sourcePort.bundle, sourcePort.channel,
-                                 destTile, destPort.bundle, destPort.channel);
+          FlowOp::create(builder, multiDest.getLoc(), srcTile,
+                         sourcePort.bundle, sourcePort.channel, destTile,
+                         destPort.bundle, destPort.channel);
         }
       }
     }

@@ -1,11 +1,14 @@
-cmake==3.27.9
-dataclasses
+# Source for utils/mlir_aie_wheels/requirements.lock (hash-pinned, installed by
+# cibuildwheel before-build). After editing this file, regenerate the .lock with:
+#   utils/regenerate_lockfiles.sh
+cmake>=4.4.4, <5.0
 importlib-metadata
-ninja
-numpy
-pip
-pybind11[global]>=2.10.4
+ninja!=1.13.0
+numpy>=2.4.6,<2.5; python_version == "3.11"
+numpy>=2.5.1; python_version >= "3.12"
+pip>=26.2.1
+pybind11[global]>=3.1.0
 rich
-setuptools>=42
+setuptools>=84.0.0
 wheel
-nanobind>=2.5
+nanobind==2.12.0

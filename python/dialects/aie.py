@@ -1,22 +1,25 @@
-# Copyright (C) 2022, Advanced Micro Devices, Inc.
+# Copyright (C) 2022 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 from dataclasses import dataclass
 import inspect
-from typing import List, Tuple, Dict, Any, Union
+from typing import List, Tuple, Dict, Any, Union, overload
 import contextlib
+import os
+from enum import Enum, IntEnum
 
 import numpy as np
 
 from ._aie_enum_gen import *
 from ._aie_ops_gen import *
-from ._aie_ops_gen import _Dialect
+from ._aie_ops_gen import _Dialect, DMABDOp as _DMABDOp
 from ._ods_common import _cext
+from .transform.structured import MixedValues, _dispatch_mixed_values
 from .func import FuncOp
-from ..helpers.dialects.ext.func import call
-from ..extras.dialects.ext.arith import Scalar, constant
-from ..extras.dialects.ext._shaped_value import ShapedValue
-from ..extras.dialects.ext.memref import (
-    MemRef,
+from ..helpers.dialects.func import call
+from ..extras.dialects.arith import ScalarValue, constant
+from ..extras.dialects._shaped_value import ShapedValue
+from ..extras.dialects.memref import (
+    MemRefValue,
     store as memref_store,
     load as memref_load,
 )
@@ -25,8 +28,8 @@ from array import array
 
 # noinspection PyUnresolvedReferences
 from .._mlir_libs._aie import (
-    ObjectFifoSubviewType,
     ObjectFifoType,
+    dma_bd_fits,
     get_target_model,
     aie_llvm_link,
     generate_bcf,
@@ -35,9 +38,13 @@ from .._mlir_libs._aie import (
     generate_control_packets,
     translate_npu_to_binary,
     register_dialect,
-    translate_aie_vec_to_cpp,
     translate_mlir_to_llvmir,
     transaction_binary_to_mlir,
+    tile_like_is_core_tile,
+    tile_like_is_mem_tile,
+    tile_like_is_shim_noc_tile,
+    tile_like_is_shim_pl_tile,
+    tile_like_is_shim_tile,
 )
 from ..extras import types as T
 from ..extras.meta import region_op
@@ -46,9 +53,10 @@ from ..extras.util import (
     _get_sym_name,
     find_ops,
     find_parent_of_type,
-    get_user_code_loc,
     region_adder,
 )
+from ..helpers.sourceloc import AIE_ROOT, CONTEXTLIB_FILE, user_code_location
+from ..helpers.taplib import PerCall, TensorAccessPattern
 from ..helpers.util import try_convert_np_type_to_mlir_type
 
 from ..ir import (
@@ -57,11 +65,13 @@ from ..ir import (
     BlockList,
     DenseElementsAttr,
     DictAttr,
+    FlatSymbolRefAttr,
     FunctionType,
     InsertionPoint,
     IntegerAttr,
     IntegerType,
     MemRefType,
+    StringAttr,
     TypeAttr,
     UnitAttr,
     Value,
@@ -72,6 +82,29 @@ from ..ir import (
 # Comes from _aie
 register_dialect(get_dialect_registry())
 assert _cext.globals._check_dialect_module_loaded("aie")
+# Lets ir.loc_tracebacks() skip this package; the exclusion is a path prefix.
+_cext.globals.register_traceback_file_exclusion(f"{AIE_ROOT}{os.sep}")
+# And contextlib, which a `with` over one of its @contextmanagers runs through.
+_cext.globals.register_traceback_file_exclusion(CONTEXTLIB_FILE)
+
+# The generated `use_lock` builder takes the lock value as an SSA i32 operand.
+# Wrap it so callers may still pass a plain Python int (materialized as an
+# arith.constant) or omit the value entirely (defaults to 1), while also
+# accepting a Value for runtime-parameterized lock values.
+from ._aie_ops_gen import use_lock as _use_lock
+
+
+def use_lock(
+    lock, action, value=None, *, blocking=None, acq_en=None, loc=None, ip=None
+):
+    if value is None:
+        value = 1
+    if isinstance(value, int):
+        value = constant(value, T.i32())
+    return _use_lock(
+        lock, action, value, blocking=blocking, acq_en=acq_en, loc=loc, ip=ip
+    )
+
 
 # Included in aie instead of aiex to avoid circular imports, as buffer uses this
 from ._aiex_ops_gen import NpuWriteRTPOp
@@ -82,24 +115,182 @@ class npu_write_rtp(NpuWriteRTPOp):
         buff_name = buffer
         if isinstance(buffer, BufferOp):
             buff_name = buffer.sym_name.value
+        # `value` is an SSA i32 operand; materialize a constant from a plain int
+        # while still accepting a Value for runtime-parameterized sequences.
+        if isinstance(value, int):
+            value = constant(value, T.i32())
         super().__init__(buffer=buff_name, index=index, value=value, loc=loc, ip=ip)
 
 
+@overload
+def _as_i32(v: None) -> None: ...
+@overload
+def _as_i32(v: Union[int, np.integer, Value]) -> Value: ...
+@overload
+def _as_i32(v: PerCall) -> PerCall: ...
+def _as_i32(v):
+    """Materialize an arith.constant i32 from a Python/NumPy int, pass a Value
+    (or a sequence-builder scalar such as a DispatchTime PerCall) through
+    unchanged, or return None for None. Shared by the npu scalar op wrappers
+    in aiex.py (imported from this module)."""
+    if v is None:
+        return None
+    if isinstance(v, (int, np.integer)):
+        return constant(int(v), T.i32())
+    return v
+
+
+def _split_i32_scalar(v):
+    """Split a dma_bd offset/len argument into (operand, static_attr): a Python
+    int becomes the static attribute, an SSA Value becomes the runtime operand,
+    and None leaves both unset. Unlike ``_as_i32``, an int stays an attribute
+    rather than being materialized as an arith.constant operand."""
+    if v is None:
+        return None, None
+    if isinstance(v, (int, np.integer)):
+        return None, int(v)
+    return v, None
+
+
+def dma_bd(
+    buffer,
+    sizes: MixedValues | None = None,
+    strides: MixedValues | None = None,
+    offset=None,
+    transfer_len=None,
+    **kwargs,
+):
+    """User-facing aie.dma_bd builder with a single interleaved list per
+    dimension-list, mirroring aiex.npu.dma_memcpy_nd.
+
+    ``sizes`` and ``strides`` each accept one sequence where entries may be
+    Python ints (constant) or SSA Values (runtime).  ``offset`` and
+    ``transfer_len`` accept ints or Values; a plain int lands in the
+    static_offset/static_len attribute while a Value becomes a runtime operand.
+    (``transfer_len`` maps to the op's ``len`` operand; the Python name avoids
+    shadowing the builtin and matches ``shim_dma_bd``.)
+
+    For example:
+
+    ```mlir
+    %len = ...
+    aie.dma_bd(%buf sizes=[16, %n] strides=[16, 1]
+               offset=0 len=%len)
+    ```
+    """
+    dyn_sizes, _packed_sizes, static_sizes = _dispatch_mixed_values(sizes or [])
+    dyn_strides, _packed_strides, static_strides = _dispatch_mixed_values(strides or [])
+
+    offset_operand, static_offset = _split_i32_scalar(offset)
+    len_operand, static_len = _split_i32_scalar(transfer_len)
+
+    # Leave the static arrays unset when there is no ND layout so they elide.
+    return _DMABDOp(
+        buffer,
+        sizes=dyn_sizes,
+        strides=dyn_strides,
+        static_sizes=static_sizes if static_sizes else None,
+        static_strides=static_strides if static_strides else None,
+        offset=offset_operand,
+        len=len_operand,
+        static_offset=static_offset,
+        static_len=static_len,
+        **kwargs,
+    )
+
+
 class external_func(FuncOp):
-    def __init__(self, name: str, inputs, outputs=None, visibility="private"):
-        if outputs is None:
-            outputs = []
-        for i, ty in enumerate(inputs):
-            new_type = try_convert_np_type_to_mlir_type(ty)
-            if new_type != ty:
-                inputs[i] = new_type
-        for i, ty in enumerate(outputs):
-            new_type = try_convert_np_type_to_mlir_type(ty)
-            if new_type != ty:
-                outputs[i] = new_type
+    """A ``func.func`` declaration for an externally-defined AIE core function.
+
+    Args:
+        name: Symbol name of the function.
+        inputs: List of input types (numpy dtypes or MLIR types).
+        outputs: List of output types.  Defaults to [].
+        visibility: MLIR symbol visibility.  Defaults to ``"private"``.
+        link_with: Optional name of the artifact that implements this function
+            -- an object file, an archive, or an LLVM IR file (``.ll``/``.bc``).
+            Sets the ``link_with`` string attribute on the generated
+            ``func.func`` op; the ``aie-assign-core-link-files`` pass reads this
+            attribute and propagates it into the CoreOp's ``link_files``
+            attribute.  How the artifact is consumed is decided by
+            ``link_with_mode``, not by the file suffix.
+        link_with_mode: Optional link policy for ``link_with``.  The only
+            currently-valid value is ``"merge"``: aiecc merges the artifact into
+            the core's LLVM module with ``llvm-link`` before codegen instead of
+            object-linking it.  Requires ``link_with``.  When omitted, the
+            artifact is object-linked, whatever its suffix.
+        stack_size_override: Declared upper bound, in bytes, on the stack that
+            this function's call subtree uses. It replaces the number aiecc's
+            analysis computes, even when it is smaller. See
+            `programming_guide/core_data_memory.md` for when to set it.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        inputs,
+        outputs=None,
+        visibility="private",
+        link_with=None,
+        link_with_mode=None,
+        stack_size_override=None,
+        loc=None,
+        ip=None,
+    ):
+        # Validate before building the op so a rejected declaration never lands
+        # in the IR at the current insertion point.
+        if link_with_mode is not None:
+            if link_with is None:
+                raise ValueError(
+                    f"external_func '{name}': link_with_mode requires link_with "
+                    "to be set."
+                )
+            if link_with_mode != "merge":
+                raise ValueError(
+                    f"external_func '{name}': invalid link_with_mode "
+                    f"'{link_with_mode}'; the only supported value is 'merge'."
+                )
+        if stack_size_override is not None:
+            if not isinstance(stack_size_override, int) or isinstance(
+                stack_size_override, bool
+            ):
+                raise ValueError(
+                    f"external_func '{name}': stack_size_override must be an int, "
+                    f"got {type(stack_size_override).__name__}."
+                )
+            if stack_size_override < 0:
+                raise ValueError(
+                    f"external_func '{name}': stack_size_override must be >= 0, "
+                    f"got {stack_size_override}."
+                )
+            # The attribute is a signless i32. A larger value wraps and turns
+            # the override into an undercount.
+            if stack_size_override > 2**31 - 1:
+                raise ValueError(
+                    f"external_func '{name}': stack_size_override must fit in a "
+                    f"signed 32-bit integer (<= {2**31 - 1}), got "
+                    f"{stack_size_override}."
+                )
+        # Convert into new lists rather than in place: `inputs` belongs to the
+        # caller, and a Kernel holds on to it as the declaration it was built
+        # with (see Kernel.arg_types).
+        mlir_inputs = [try_convert_np_type_to_mlir_type(ty) for ty in inputs]
+        mlir_outputs = [try_convert_np_type_to_mlir_type(ty) for ty in outputs or []]
         super().__init__(
-            name=name, type=FunctionType.get(inputs, outputs), visibility=visibility
+            name=name,
+            type=FunctionType.get(mlir_inputs, mlir_outputs),
+            visibility=visibility,
+            loc=loc,
+            ip=ip,
         )
+        if link_with is not None:
+            self.operation.attributes["link_with"] = StringAttr.get(link_with)
+        if link_with_mode is not None:
+            self.operation.attributes["link_with_mode"] = StringAttr.get(link_with_mode)
+        if stack_size_override is not None:
+            self.operation.attributes["stack_size_override"] = IntegerAttr.get(
+                IntegerType.get_signless(32), stack_size_override
+            )
 
     def __call__(self, *call_args):
         return call(self, call_args)
@@ -115,15 +306,57 @@ def bd_pad_layout(const_pad_before, const_pad_after):
     return Attribute.parse(
         f"#aie.bd_pad_layout<{const_pad_before=}, {const_pad_after=}>"
     )
-    
-    
+
+
 @register_attribute_builder("PacketInfoAttr")
-def bd_dim_layout_array_attr_builder(tups: Tuple[int] | List[int], context=None):
+def packet_info_attr_builder(tups: Tuple[int] | List[int], context=None):
+    """Build ``#aie.packet_info`` from ``(pkt_type, pkt_id)``.
+
+    ``pkt_id`` may be ``None`` for a header allocation has yet to assign.
+    """
     assert (isinstance(tups, list) or isinstance(tups, Tuple)) and len(tups) == 2
+    pkt_type, pkt_id = tups
+    fields = []
+    if pkt_type:
+        fields.append(f"pkt_type = {pkt_type}")
+    if pkt_id is not None:
+        fields.append(f"pkt_id = {pkt_id}")
+    return Attribute.parse(f"#aie.packet_info<{', '.join(fields)}>", context=context)
+
+
+@dataclass
+class BdIteration:
+    """Iteration state of a buffer descriptor for aie.dma_bd.
+
+    Lets one BD cover ``size`` sub-buffers over ``size`` executions instead of an
+    N-deep chain. Values are true/element: the base advances by ``stride``
+    elements each execution and wraps after ``size`` executions; ``current`` is
+    the starting step (default 0). The lowering applies the hardware ``-1`` bias
+    and element->word scaling. NOTE: the identically-named ``iteration_*`` family
+    on the runtime-sequence path uses RAW register values instead -- do not copy
+    numbers between them.
+    """
+
+    size: int
+    stride: int
+    current: int = 0
+
+
+@register_attribute_builder("BDIterationAttr")
+def bd_iteration_attr_builder(
+    value: BdIteration | Tuple[int] | List[int], context=None
+):
+    if isinstance(value, BdIteration):
+        size, stride, current = value.size, value.stride, value.current
+    else:
+        assert (isinstance(value, list) or isinstance(value, tuple)) and len(value) == 3
+        size, stride, current = value
     return Attribute.parse(
-        f'#aie.packet_info<pkt_type = {tups[0]}, pkt_id = {tups[1]}>', context=context
+        f"#aie.bd_iteration<size = {size}, stride = {stride}, current = {current}>",
+        context=context,
     )
-          
+
+
 @register_attribute_builder("BDDimLayoutArrayAttr")
 def bd_dim_layout_array_attr_builder(tups: List[Attribute | Tuple[int]], context=None):
     if isinstance(tups, list) and all(isinstance(t, tuple) for t in tups):
@@ -185,6 +418,24 @@ def _objectFifo_depth_attr(x, context):
     return IntegerAttr.get(IntegerType.get_signless(32, context=context), x)
 
 
+@register_attribute_builder("TraceEventAttr")
+def _trace_event_attr(x, context):
+    """Build TraceEventAttr from string, Enum, or GenericEvent."""
+    if isinstance(x, str):
+        return Attribute.parse(f'#aie.trace_event<"{x}">', context=context)
+    elif isinstance(x, StringAttr):
+        return Attribute.parse(f'#aie.trace_event<"{x.value}">', context=context)
+    from aie.utils.trace.events import GenericEvent
+
+    if isinstance(x, GenericEvent):
+        return Attribute.parse(f'#aie.trace_event<"{x.code.name}">', context=context)
+    elif isinstance(x, Enum):
+        return Attribute.parse(f'#aie.trace_event<"{x.name}">', context=context)
+    else:
+        # Assume it's already an Attribute
+        return x
+
+
 #### MLIR Helpers ####
 
 """
@@ -219,7 +470,7 @@ class ContextManagedBlock:
 
 
 """
-A dictionary of ContextManagedBlocks, a specialization of ir.Block, keyed by arbitrary values, which automatically appends a new block at the end of `root_block_list` whenever a non-existant block is attempted to be accessed.
+A dictionary of ContextManagedBlocks, a specialization of ir.Block, keyed by arbitrary values, which automatically appends a new block at the end of `root_block_list` whenever a non-existent block is attempted to be accessed.
 """
 
 
@@ -255,13 +506,25 @@ Device = DeviceOp
 class Core(CoreOp):
     # Until https://github.com/llvm/llvm-project/pull/73620 gets figured out.
     def __init__(
-        self, tile, link_with=None, dynamic_objfifo_lowering=None, stack_size=None
+        self,
+        tile,
+        link_with=None,
+        dynamic_objfifo_lowering=None,
+        stack_size=None,
+        data_size=None,
     ):
+        if link_with is not None:
+            raise TypeError(
+                "Core() no longer accepts link_with. "
+                "Set link_with= on each external_func() declaration instead; "
+                "the aie-assign-core-link-files pass aggregates them onto the core."
+            )
         super().__init__(
             result=T.index(),
             tile=tile,
             stack_size=stack_size,
-            link_with=link_with,
+            data_size=data_size,
+            link_with=None,
             dynamic_objfifo_lowering=dynamic_objfifo_lowering,
         )
 
@@ -280,6 +543,7 @@ class buffer(BufferOp):
         datatype: MemRefType | type[np.ndarray],
         name: str | None = None,
         address=None,
+        mem_bank=None,
         initial_value: np.ndarray | None = None,
         use_write_rtp: bool = False,
         loc=None,
@@ -299,6 +563,7 @@ class buffer(BufferOp):
             tile=tile,
             sym_name=name,
             address=address,
+            mem_bank=mem_bank,
             initial_value=initial_value,
             loc=loc,
             ip=ip,
@@ -317,8 +582,8 @@ class buffer(BufferOp):
     def owner(self):
         return self.result.owner
 
-    def __getitem__(self, idx: tuple | Scalar) -> "MemRef":
-        loc = get_user_code_loc()
+    def __getitem__(self, idx: tuple | ScalarValue) -> MemRefValue:
+        loc = user_code_location()
 
         if not self.has_rank():
             raise ValueError("only ranked memref slicing/indexing supported")
@@ -327,7 +592,7 @@ class buffer(BufferOp):
             return self
         elif isinstance(idx, tuple) and all(i == slice(None) for i in idx):
             return self
-        elif isinstance(idx, Scalar):
+        elif isinstance(idx, ScalarValue):
             idx = (idx,)
         elif idx is None:
             raise ValueError("Operation not supported for buffer")
@@ -337,13 +602,13 @@ class buffer(BufferOp):
             if isinstance(d, int):
                 idx[i] = constant(d, index=True, loc=loc)
 
-        if all(isinstance(d, Scalar) for d in idx) and len(idx) == len(self.shape):
+        if all(isinstance(d, ScalarValue) for d in idx) and len(idx) == len(self.shape):
             return memref_load(self, idx, loc=loc)
         else:
             raise ValueError("Buffer slicing not supported, only indexing supported")
 
     def __setitem__(self, idx, source):
-        loc = get_user_code_loc()
+        loc = user_code_location()
 
         if not self.has_rank():
             raise ValueError("only ranked memref slicing/indexing supported")
@@ -358,16 +623,16 @@ class buffer(BufferOp):
                     "Buffer slicing not supported, only indexing supported"
                 )
         else:
-            idx = list((idx,) if isinstance(idx, (Scalar, int, Value)) else idx)
+            idx = list((idx,) if isinstance(idx, (ScalarValue, int, Value)) else idx)
             for i, d in enumerate(idx):
                 if isinstance(d, int):
                     idx[i] = constant(d, index=True, loc=loc)
 
-            if all(isinstance(d, (Scalar)) for d in idx) and len(idx) == len(
+            if all(isinstance(d, (ScalarValue)) for d in idx) and len(idx) == len(
                 self.shape
             ):
-                if not isinstance(source, Scalar):
-                    source = Scalar(source, dtype=self.dtype)
+                if not isinstance(source, ScalarValue):
+                    source = ScalarValue(source, dtype=self.dtype)
                 memref_store(source, self, idx, loc=loc)
             else:
                 raise ValueError(
@@ -378,7 +643,7 @@ class buffer(BufferOp):
 # Create an aie external buffer of (shape x datatype).
 # shape examples: [256], [256, 256], [256, 256,]
 # This class hides the ExternalBufferOp and instead pretends to be a MemRef
-class external_buffer(MemRef):
+class external_buffer(MemRefValue):
     def __init__(self):
         raise ValueError("Should never be called")
 
@@ -402,7 +667,155 @@ class external_buffer(MemRef):
 
 # Create an aie objectFifo between specified tiles, with given depth and memref datatype.
 # depth examples: 2, [2,2,7]
+@dataclass(frozen=True)
+class Packet:
+    """A packet-switched stream connection's header, ``#aie.packet_info``.
+
+    ``Packet()`` asks for packet switching and lets allocation pick the 5-bit
+    id; ``Packet(id=3)`` pins it, for designs that route on the id. The same
+    header ends up on the route, the endpoints and the buffer descriptors.
+    """
+
+    id: int | None = None
+    type: int = 0
+
+    def __str__(self) -> str:
+        fields = []
+        if self.type:
+            fields.append(f"pkt_type = {self.type}")
+        if self.id is not None:
+            fields.append(f"pkt_id = {self.id}")
+        return f"#aie.packet_info<{', '.join(fields)}>"
+
+
+@dataclass(frozen=True)
+class Transport:
+    """Which hardware path carries an ObjectFifo's objects.
+
+    Lowers to the ``transport`` attribute on ``aie.objectfifo``. Build one with
+    `auto`, `shared_mem` or `dma`, for example ``Transport.dma()`` or
+    ``Transport.dma(packet=Packet(id=3))``.
+
+    ``out_of_order=True`` requires a ``Packet`` and makes packet headers select
+    receiving buffer descriptors, allowing FIFOs to share an S2MM channel.
+    It changes descriptor selection, not packet arrival order. The receiving
+    BD ID is separate from the packet ID used for routing. With ``auto``, these
+    settings apply only when DMA is selected. FIFOs pinned to one receiving
+    channel must explicitly request ``out_of_order=True``.
+    """
+
+    mode: str
+    packet: Packet | None = None
+    out_of_order: bool = False
+
+    @staticmethod
+    def auto(
+        packet: Packet | None = None, *, out_of_order: bool = False
+    ) -> "Transport":
+        """Leave the path to the lowering.
+
+        It uses shared memory when both ends reach one memory module and
+        nothing else forces DMAs. A packet header only matters if the DMAs end
+        up carrying the fifo.
+        """
+        return Transport("auto", packet, out_of_order)
+
+    @staticmethod
+    def shared_mem() -> "Transport":
+        """Shared memory between the ends; the lowering fails if it cannot."""
+        return Transport("shared_mem")
+
+    @staticmethod
+    def dma(packet: Packet | None = None, *, out_of_order: bool = False) -> "Transport":
+        """The DMAs, packet-switched when given a `Packet`."""
+        return Transport("dma", packet, out_of_order)
+
+    def __str__(self) -> str:
+        fields = [self.mode]
+        if self.packet is not None:
+            fields.append(f"packet = {self.packet}")
+        if self.out_of_order:
+            fields.append("out_of_order = true")
+        return f"#aie.transport<{', '.join(fields)}>"
+
+    def to_attr(self) -> Attribute:
+        return Attribute.parse(str(self))
+
+    @staticmethod
+    def coerce(value) -> "Transport | None":
+        """Accept a Transport, a bare mode name, or None."""
+        if value is None or isinstance(value, Transport):
+            return value
+        if isinstance(value, str):
+            if value not in ("auto", "shared_mem", "dma"):
+                raise ValueError(f"transport is auto, shared_mem or dma, got {value!r}")
+            return Transport(value)
+        raise TypeError(f"expected a Transport or a mode name, got {value!r}")
+
+
+@dataclass(frozen=True)
+class Port:
+    """What drives one end of an ObjectFifo, ``#aie.end_port``.
+
+    ``Port.dma()`` is a DMA channel allocation picks, ``Port.dma(1)`` pins
+    channel 1, and ``Port.stream(0)`` wires the end to the core's stream port
+    0, where the core reads or writes the stream itself and holds no objects.
+    """
+
+    bundle: str
+    channel: int | None = None
+
+    @staticmethod
+    def dma(channel: int | None = None) -> "Port":
+        """A DMA channel, pinned when `channel` is given."""
+        if channel is not None and channel < 0:
+            raise ValueError(f"DMA channel must be >= 0, got {channel}")
+        return Port("DMA", channel)
+
+    @staticmethod
+    def stream(port: int) -> "Port":
+        """The core's stream port `port` (0 or 1)."""
+        if port not in (0, 1):
+            raise ValueError(f"stream port is 0 or 1, got {port!r}")
+        return Port("Core", port)
+
+    def __str__(self) -> str:
+        if self.channel is None:
+            return f"#aie.end_port<{self.bundle}>"
+        return f"#aie.end_port<{self.bundle} : {self.channel}>"
+
+    def to_attr(self) -> Attribute:
+        return Attribute.parse(str(self))
+
+
 class object_fifo(ObjectFifoCreateOp):
+    @staticmethod
+    def stream_dims(dims, what, can_pad=False):
+        """Return `dims` as the `(size, stride)` pairs a DMA walks each transfer by.
+
+        `dims` is the pair list itself or a TensorAccessPattern over what one
+        transfer moves: an object, or a segment of one when a link joins or
+        distributes it. The DMA starts each walk at the transfer's first
+        element, so a pattern must have offset 0.
+
+        Raises:
+            ValueError: If the pattern is staged, has a nonzero offset, or
+                pads where `can_pad` is False.
+        """
+        if not isinstance(dims, TensorAccessPattern):
+            return [] if dims is None else dims
+        if dims.is_symbolic:
+            raise ValueError(f"{what} {dims!r} must have compile-time values")
+        if dims.offset != 0:
+            raise ValueError(
+                f"{what} {dims!r} has offset {dims.offset}, but an objectfifo "
+                "walks each transfer from its first element; apply the offset "
+                "where the buffer is addressed instead"
+            )
+        if dims.padding is not None and not can_pad:
+            raise ValueError(f"only a producer's walk can pad, but {what} is {dims!r}")
+        return list(dims.transformation_dims)
+
     def __init__(
         self,
         name,
@@ -413,19 +826,48 @@ class object_fifo(ObjectFifoCreateOp):
         dimensionsToStream=None,
         dimensionsFromStreamPerConsumer=None,
         initValues=None,
-        via_DMA=None,
+        transport=None,
         plio=None,
         padDimensions=None,
+        padValue=None,
         disable_synchronization=None,
+        iter_count=None,
+        consumer_datatype=None,
+        loc=None,
+        ip=None,
     ):
         self.datatype = try_convert_np_type_to_mlir_type(datatype)
+        self.consumer_datatype = (
+            try_convert_np_type_to_mlir_type(consumer_datatype)
+            if consumer_datatype is not None
+            else None
+        )
         if not isinstance(consumerTiles, List):
             consumerTiles = [consumerTiles]
         if dimensionsFromStreamPerConsumer is None:
-            dimensionsFromStreamPerConsumer = []
+            dimensionsFromStreamPerConsumer = [[] for _ in range(len(consumerTiles))]
         if dimensionsToStream is None:
             dimensionsToStream = []
+        if isinstance(dimensionsToStream, TensorAccessPattern) and (
+            dimensionsToStream.padding is not None
+        ):
+            if padDimensions is not None:
+                raise ValueError(
+                    "dimensionsToStream is a padded TensorAccessPattern; "
+                    "do not also pass padDimensions"
+                )
+            padDimensions = list(dimensionsToStream.padding)
+        dimensionsToStream = self.stream_dims(
+            dimensionsToStream, "dimensionsToStream", can_pad=True
+        )
+        dimensionsFromStreamPerConsumer = [
+            self.stream_dims(dims, "dimensionsFromStreamPerConsumer")
+            for dims in dimensionsFromStreamPerConsumer
+        ]
         of_Ty = TypeAttr.get(ObjectFifoType.get(self.datatype))
+        consumerElemType = None
+        if self.consumer_datatype is not None:
+            consumerElemType = TypeAttr.get(ObjectFifoType.get(self.consumer_datatype))
         if initValues is not None:
             values = []
             for e in initValues:
@@ -442,50 +884,85 @@ class object_fifo(ObjectFifoCreateOp):
             elemType=of_Ty,
             dimensionsToStream=dimensionsToStream,
             dimensionsFromStreamPerConsumer=dimensionsFromStreamPerConsumer,
-            via_DMA=via_DMA,
             plio=plio,
             padDimensions=padDimensions,
+            padValue=padValue,
             disable_synchronization=disable_synchronization,
             initValues=initValues,
+            iter_count=iter_count,
+            transport=(
+                Transport.coerce(transport).to_attr() if transport is not None else None
+            ),
+            loc=loc,
+            ip=ip,
         )
+        if consumerElemType is not None:
+            self.attributes["consumerElemType"] = consumerElemType
 
     def acquire(self, port, num_elem):
-        subview_t = ObjectFifoSubviewType.get(self.datatype)
-        acq = ObjectFifoAcquireOp(subview_t, port, self.sym_name.value, num_elem)
+        # Use consumer_datatype for consumer-side acquire if available
+        dt = self.datatype
+        if self.consumer_datatype is not None and port == ObjectFifoPort.Consume:
+            dt = self.consumer_datatype
+        acq = ObjectFifoAcquireOp([dt] * num_elem, self.sym_name.value, port=port)
+        if num_elem == 1:
+            return acq.objects[0]
+        return list(acq.objects)
 
-        objects = []
-        if acq.size.value == 1:
-            return ObjectFifoSubviewAccessOp(
-                self.datatype, acq.subview, acq.size.value - 1
-            ).result
-        for i in range(acq.size.value):
-            objects.append(
-                ObjectFifoSubviewAccessOp(self.datatype, acq.subview, i).result
-            )
-        return objects
+    def release(self, port, num_elem, *, assume_queue_space: bool = False):
+        """Release objects, optionally asserting room for all generated DMA pushes."""
+        return objectfifo_release(
+            self.sym_name.value,
+            num_elem,
+            port=port,
+            assume_queue_space=assume_queue_space,
+        )
 
-    def release(self, port, num_elem):
-        return objectfifo_release(port, self.sym_name.value, num_elem)
+    def register_external_buffers(self, tile, external_buffers):
+        return objectfifo_register_external_buffers(
+            self.sym_name.value, tile, external_buffers
+        )
 
-    def set_via_shared_mem(self, port):
-        num = 0
-        if port == ObjectFifoPort.Produce:
-            num = 0
-        elif port == ObjectFifoPort.Consume:
-            num = 1
-        int_num = IntegerAttr.get(T.i32(), num)
-        self.attributes["via_shared_mem"] = int_num
+    def allocate(self, tile):
+        return objectfifo_allocate(self.sym_name.value, tile)
 
     def set_repeat_count(self, num):
         int_num = IntegerAttr.get(T.i32(), num)
         self.attributes["repeat_count"] = int_num
+
+    def set_transport(self, transport):
+        self.attributes["transport"] = Transport.coerce(transport).to_attr()
+
+    def set_prod_port(self, port: Port):
+        self.attributes["prod_port"] = port.to_attr()
+
+    def set_cons_ports(self, ports: list[Port | None]):
+        """One entry per consumer; None is a DMA channel allocation picks."""
+        self.attributes["cons_ports"] = _arrayAttr(
+            [(Port.dma() if p is None else p).to_attr() for p in ports], None
+        )
+
+    def set_release_strategy(self, strategy):
+        self.attributes["release_strategy"] = Attribute.parse(
+            f"#aie.release_strategy<{strategy}>"
+        )
 
 
 # Create an aie objectFifo_link between input and output objectFifos.
 class object_fifo_link(ObjectFifoLinkOp):
     """Specialize ObjectFifoLinkOp class constructor to take python variables"""
 
-    def __init__(self, fifoIns, fifoOuts, srcOffsets=[], dstOffsets=[]):
+    def __init__(
+        self,
+        fifoIns,
+        fifoOuts,
+        srcOffsets=[],
+        dstOffsets=[],
+        *,
+        mode: ObjectFifoLinkMode | None = None,
+        loc=None,
+        ip=None,
+    ):
         if not isinstance(fifoIns, List):
             fifoIns = [fifoIns]
         if not isinstance(fifoOuts, List):
@@ -501,10 +978,28 @@ class object_fifo_link(ObjectFifoLinkOp):
             fifoOuts=fifoOutRefs,
             src_offsets=srcOffsets,
             dst_offsets=dstOffsets,
+            mode=mode,
+            loc=loc,
+            ip=ip,
         )
 
 
 # Create a packet flow between source and destination tile ports.
+def _unpack_vias(vias):
+    if not vias:
+        return [], [], [], [], []
+    tiles, ingress_bundles, ingress_channels, egress_bundles, egress_channels = zip(
+        *vias
+    )
+    return (
+        list(tiles),
+        list(ingress_bundles),
+        list(ingress_channels),
+        list(egress_bundles),
+        list(egress_channels),
+    )
+
+
 class packetflow(PacketFlowOp):
     """Specialize PacketFlowOp class constructor to take python integers"""
 
@@ -514,21 +1009,112 @@ class packetflow(PacketFlowOp):
         source,
         source_port,
         source_channel,
-        dest,
-        dest_port,
-        dest_channel,
+        dests: Union[Dict, List[Dict]],
         keep_pkt_header: bool | None = None,
+        priority_route: bool | None = None,
+        vias=None,
+        *,
+        loc=None,
+        ip=None,
     ):
-        super().__init__(ID=pkt_id, keep_pkt_header=keep_pkt_header)
+        via_tiles, in_bundles, in_channels, out_bundles, out_channels = _unpack_vias(
+            vias
+        )
+        super().__init__(
+            ID=pkt_id,
+            keep_pkt_header=keep_pkt_header,
+            priority_route=priority_route,
+            vias=via_tiles,
+            via_ingress_bundles=in_bundles,
+            via_ingress_channels=in_channels,
+            via_egress_bundles=out_bundles,
+            via_egress_channels=out_channels,
+            loc=loc,
+            ip=ip,
+        )
         bb = Block.create_at_start(self.ports)
         with InsertionPoint(bb):
-            src = PacketSourceOp(source, source_port, source_channel)
-            dest = PacketDestOp(dest, dest_port, dest_channel)
-            end = EndOp()
+            PacketSourceOp(source, source_port, source_channel, loc=loc)
+            dests = [dests] if isinstance(dests, dict) else dests
+            for dest in dests:
+                PacketDestOp(dest["dest"], dest["port"], dest["channel"], loc=loc)
+            EndOp(loc=loc)
 
 
 core = region_op(Core, terminator=lambda *_: EndOp())
 device = region_op(Device, terminator=lambda *_: EndOp())
+trace = region_op(
+    lambda tile, sym_name, *, loc=None, ip=None: TraceOp(
+        tile, sym_name, loc=loc, ip=ip
+    ),
+    terminator=lambda *_: EndOp(),
+)
+
+
+def trace_mode(mode, *, loc=None, ip=None):
+    return TraceModeOp(mode=mode, loc=loc, ip=ip)
+
+
+def trace_event(event, *, label=None, loc=None, ip=None):
+    return TraceEventOp(event=event, label=label, loc=loc, ip=ip)
+
+
+def trace_packet(id=None, type=None, *, loc=None, ip=None):
+    return TracePacketOp(id=id, type_=type, loc=loc, ip=ip)
+
+
+def trace_port(slot, port, channel, direction, *, loc=None, ip=None):
+    return TracePortOp(
+        slot=slot, port=port, channel=channel, direction=direction, loc=loc, ip=ip
+    )
+
+
+def trace_start(*, broadcast=None, event=None, loc=None, ip=None):
+    return TraceStartEventOp(broadcast=broadcast, event=event, loc=loc, ip=ip)
+
+
+def trace_stop(*, broadcast=None, event=None, loc=None, ip=None):
+    return TraceStopEventOp(broadcast=broadcast, event=event, loc=loc, ip=ip)
+
+
+def trace_combo_event(slot, eventA, logic, eventB, *, loc=None, ip=None):
+    return TraceComboEventOp(
+        slot=slot, eventA=eventA, logic=logic, eventB=eventB, loc=loc, ip=ip
+    )
+
+
+def trace_edge_event(slot, event, trigger, *, loc=None, ip=None):
+    return TraceEdgeEventOp(slot=slot, event=event, trigger=trigger, loc=loc, ip=ip)
+
+
+def trace_start_config(name, *, loc=None, ip=None):
+    return TraceStartConfigOp(trace_config=name, loc=loc, ip=ip)
+
+
+def trace_host_config(
+    buffer_size,
+    *,
+    reuse_output_buffer=False,
+    routing=TraceShimRouting.Single,
+    egress_shim_col=0,
+    loc=None,
+    ip=None,
+):
+    if isinstance(routing, str):
+        if routing == "single":
+            routing = TraceShimRouting.Single
+        else:
+            raise ValueError(f"Unknown routing strategy: {routing}.")
+    return TraceHostConfigOp(
+        buffer_size=buffer_size,
+        reuse_output_buffer=reuse_output_buffer,
+        routing=routing,
+        egress_shim_col=egress_shim_col,
+        loc=loc,
+        ip=ip,
+    )
+
+
 switchbox = region_op(
     lambda tile, *, loc=None, ip=None: SwitchboxOp(T.index(), tile, loc=loc, ip=ip)
 )
@@ -578,7 +1164,9 @@ def dma(
     num_blocks=1,
     loop=None,
     repeat_count=None,
+    out_of_order=False,
     sym_name=None,
+    pad_value: int = 0,
     loc=None,
     ip=None,
 ):
@@ -591,7 +1179,9 @@ def dma(
         num_bds=num_blocks,
         loop=loop,
         repeat_count=repeat_count,
+        out_of_order=out_of_order,
         sym_name=sym_name,
+        pad_value=pad_value or None,
         loc=loc,
         ip=ip,
     )
@@ -608,16 +1198,35 @@ def another_bd(dma_op):
     raise Exception("couldn't find empty region to add to.")
 
 
+def _dma_channel_attr(channel):
+    """A DMA program's channel: an index, or the `aie.route_endpoint` (op or
+    symbol name) whose channel allocation picks."""
+    if isinstance(channel, (IntegerAttr, FlatSymbolRefAttr)):
+        return channel
+    if isinstance(channel, (int, np.integer)):
+        return IntegerAttr.get(T.i32(), int(channel))
+    if isinstance(channel, str):
+        return FlatSymbolRefAttr.get(channel)
+    if isinstance(channel, RouteEndpointOp):
+        return FlatSymbolRefAttr.get(channel.sym_name.value)
+    raise TypeError(
+        "A DMA channel is an index or an aie.route_endpoint (op or symbol "
+        f"name), not {type(channel).__name__}."
+    )
+
+
 @_cext.register_operation(_Dialect, replace=True)
 class DMAStartOp(DMAStartOp):
     def __init__(
         self,
         channel_dir,
-        channel_index,
+        channel,
         *,
         dest: Successor | Block | None = None,
         chain: Successor | Block | None = None,
         repeat_count: int | None = None,
+        pad_value: int | None = None,
+        out_of_order: bool = False,
         loc=None,
         ip=None,
     ):
@@ -631,10 +1240,12 @@ class DMAStartOp(DMAStartOp):
             chain = InsertionPoint.current.block
         super().__init__(
             channel_dir,
-            channel_index,
+            _dma_channel_attr(channel),
             dest,
             chain,
             repeat_count=repeat_count,
+            pad_value=pad_value,
+            out_of_order=out_of_order,
             loc=loc,
             ip=ip,
         )
@@ -650,17 +1261,28 @@ class DMAStartOp(DMAStartOp):
 
 def dma_start(
     channel_dir,
-    channel_index,
+    channel,
     *,
     dest: Successor | Block | ContextManagedBlock | None = None,
     chain: Successor | Block | ContextManagedBlock | None = None,
+    repeat_count: int = 0,
+    pad_value: int = 0,
+    out_of_order: bool = False,
     loc=None,
     ip=None,
 ):
     chain_block = chain.block if isinstance(chain, ContextManagedBlock) else chain
     dest_block = dest.block if isinstance(dest, ContextManagedBlock) else dest
     op = DMAStartOp(
-        channel_dir, channel_index, dest=dest_block, chain=chain_block, loc=loc, ip=ip
+        channel_dir,
+        channel,
+        dest=dest_block,
+        chain=chain_block,
+        loc=loc,
+        ip=ip,
+        repeat_count=repeat_count,
+        pad_value=pad_value or None,
+        out_of_order=out_of_order,
     )
     return op.dest, op.chain
 
@@ -673,7 +1295,7 @@ class NextBDOp(NextBDOp):
         if dest is None:
             dest = InsertionPoint.current.block
         if loc is None:
-            loc = get_user_code_loc()
+            loc = user_code_location()
         super().__init__(dest, loc=loc, ip=ip)
 
     @property
@@ -725,6 +1347,10 @@ def flow(
     dest=None,
     dest_bundle=None,
     dest_channel=None,
+    vias=None,
+    *,
+    loc=None,
+    ip=None,
 ):
     assert dest is not None
     if source_bundle is None:
@@ -735,8 +1361,21 @@ def flow(
         dest_bundle = WireBundle.DMA
     if dest_channel is None:
         dest_channel = 0
+    via_tiles, in_bundles, in_channels, out_bundles, out_channels = _unpack_vias(vias)
     return FlowOp(
-        source, source_bundle, source_channel, dest, dest_bundle, dest_channel
+        source,
+        source_bundle,
+        source_channel,
+        dest,
+        dest_bundle,
+        dest_channel,
+        vias=via_tiles,
+        via_ingress_bundles=in_bundles,
+        via_ingress_channels=in_channels,
+        via_egress_bundles=out_bundles,
+        via_egress_channels=out_channels,
+        loc=loc,
+        ip=ip,
     )
 
 
@@ -928,9 +1567,91 @@ class TileOp(TileOp):
             [self], sym_name=sym_name, annot=annot, device=device
         )
 
+    # TileLike interface methods
+    def is_core_tile(self):
+        """Returns True if this is a core tile."""
+        return tile_like_is_core_tile(self.operation)
 
-def tile(col, row, *, loc=None, ip=None, allocation_scheme=None):
-    return TileOp(col=col, row=row, loc=loc, ip=ip, allocation_scheme=allocation_scheme)
+    def is_mem_tile(self):
+        """Returns True if this is a mem tile."""
+        return tile_like_is_mem_tile(self.operation)
+
+    def is_shim_noc_tile(self):
+        """Returns True if this is a shim NOC tile."""
+        return tile_like_is_shim_noc_tile(self.operation)
+
+    def is_shim_pl_tile(self):
+        """Returns True if this is a shim PL tile."""
+        return tile_like_is_shim_pl_tile(self.operation)
+
+    def is_shim_tile(self):
+        """Returns True if this is a shim tile (NOC or PL)."""
+        return tile_like_is_shim_tile(self.operation)
+
+
+def tile(
+    col,
+    row,
+    *,
+    loc=None,
+    ip=None,
+    packet_type=0,
+    packet_id=None,
+):
+    tile_op = TileOp(col=col, row=row, loc=loc, ip=ip)
+    if packet_id is not None:
+        tile_op.attributes["controller_id"] = packet_info_attr_builder(
+            (packet_type, packet_id)
+        )
+    return tile_op
+
+
+@_cext.register_operation(_Dialect, replace=True)
+class LogicalTileOp(LogicalTileOp):
+    # TileLike interface methods
+    def is_core_tile(self):
+        """Returns True if this is a core tile."""
+        return tile_like_is_core_tile(self.operation)
+
+    def is_mem_tile(self):
+        """Returns True if this is a mem tile."""
+        return tile_like_is_mem_tile(self.operation)
+
+    def is_shim_noc_tile(self):
+        """Returns True if this is a shim NOC tile."""
+        return tile_like_is_shim_noc_tile(self.operation)
+
+    def is_shim_pl_tile(self):
+        """Returns True if this is a shim PL tile."""
+        return tile_like_is_shim_pl_tile(self.operation)
+
+    def is_shim_tile(self):
+        """Returns True if this is a shim tile (NOC or PL)."""
+        return tile_like_is_shim_tile(self.operation)
+
+
+def logical_tile(
+    tile_type,
+    *,
+    col=None,
+    row=None,
+    loc=None,
+    ip=None,
+    packet_type=0,
+    packet_id=None,
+):
+    tile_op = LogicalTileOp(
+        tile_type=tile_type,
+        col=col,
+        row=row,
+        loc=loc,
+        ip=ip,
+    )
+    if packet_id is not None:
+        tile_op.attributes["controller_id"] = packet_info_attr_builder(
+            (packet_type, packet_id)
+        )
+    return tile_op
 
 
 # BDChainOp
