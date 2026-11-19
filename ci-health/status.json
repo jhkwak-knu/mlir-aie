@@ -1,0 +1,715 @@
+{
+ "schema": 1,
+ "generated_at": "2026-11-19T16:05:32+00:00",
+ "repo": "jhkwak-knu/mlir-aie",
+ "window_days": 14,
+ "critical": [
+  {
+   "file": "buildAndTestRyzenAI.yml",
+   "title": "Linux hardware tests",
+   "every": 24,
+   "legs": true,
+   "why": "lit and IRON tests on npu1 and npu2; the only hardware test of main",
+   "runs": 0,
+   "main": {
+    "passed": 0,
+    "failed": 0,
+    "timed_out": 0,
+    "runner_lost": 0,
+    "no_runner": 0,
+    "cancelled": 0,
+    "rate": null
+   },
+   "latest_main": null,
+   "newest_main": null,
+   "latest_main_jobs": null,
+   "main_runs": [],
+   "pull_requests": {
+    "passed": 0,
+    "failed": 0,
+    "rate": null
+   },
+   "merge_queue": {
+    "passed": 0,
+    "failed": 0,
+    "rate": null
+   },
+   "flaky": {
+    "commits": 0,
+    "flaky": 0,
+    "rate": null
+   },
+   "minutes_median": null,
+   "minutes_p90": null,
+   "queued_median": null
+  },
+  {
+   "file": "buildAndTestRyzenAIWindows.yml",
+   "title": "Windows hardware tests",
+   "every": 24,
+   "legs": true,
+   "why": "the same on a Windows Strix Halo machine",
+   "runs": 0,
+   "main": {
+    "passed": 0,
+    "failed": 0,
+    "timed_out": 0,
+    "runner_lost": 0,
+    "no_runner": 0,
+    "cancelled": 0,
+    "rate": null
+   },
+   "latest_main": null,
+   "newest_main": null,
+   "latest_main_jobs": null,
+   "main_runs": [],
+   "pull_requests": {
+    "passed": 0,
+    "failed": 0,
+    "rate": null
+   },
+   "merge_queue": {
+    "passed": 0,
+    "failed": 0,
+    "rate": null
+   },
+   "flaky": {
+    "commits": 0,
+    "flaky": 0,
+    "rate": null
+   },
+   "minutes_median": null,
+   "minutes_p90": null,
+   "queued_median": null
+  },
+  {
+   "file": "buildAndTestMulti.yml",
+   "title": "Compile across platforms",
+   "every": 24,
+   "legs": false,
+   "why": "compilers, assertions and RTTI on Linux and Windows",
+   "runs": 0,
+   "main": {
+    "passed": 0,
+    "failed": 0,
+    "timed_out": 0,
+    "runner_lost": 0,
+    "no_runner": 0,
+    "cancelled": 0,
+    "rate": null
+   },
+   "latest_main": null,
+   "newest_main": null,
+   "latest_main_jobs": null,
+   "main_runs": [],
+   "pull_requests": {
+    "passed": 0,
+    "failed": 0,
+    "rate": null
+   },
+   "merge_queue": {
+    "passed": 0,
+    "failed": 0,
+    "rate": null
+   },
+   "flaky": {
+    "commits": 0,
+    "flaky": 0,
+    "rate": null
+   },
+   "minutes_median": null,
+   "minutes_p90": null,
+   "queued_median": null
+  },
+  {
+   "file": "buildAndTestPythons.yml",
+   "title": "Python versions",
+   "every": 24,
+   "legs": false,
+   "why": "the tests on each supported Python",
+   "runs": 0,
+   "main": {
+    "passed": 0,
+    "failed": 0,
+    "timed_out": 0,
+    "runner_lost": 0,
+    "no_runner": 0,
+    "cancelled": 0,
+    "rate": null
+   },
+   "latest_main": null,
+   "newest_main": null,
+   "latest_main_jobs": null,
+   "main_runs": [],
+   "pull_requests": {
+    "passed": 0,
+    "failed": 0,
+    "rate": null
+   },
+   "merge_queue": {
+    "passed": 0,
+    "failed": 0,
+    "rate": null
+   },
+   "flaky": {
+    "commits": 0,
+    "flaky": 0,
+    "rate": null
+   },
+   "minutes_median": null,
+   "minutes_p90": null,
+   "queued_median": null
+  },
+  {
+   "file": "lintAndFormat.yml",
+   "title": "Lint and format",
+   "every": 24,
+   "legs": false,
+   "why": "clang-tidy, pyright and the docs checks",
+   "runs": 0,
+   "main": {
+    "passed": 0,
+    "failed": 0,
+    "timed_out": 0,
+    "runner_lost": 0,
+    "no_runner": 0,
+    "cancelled": 0,
+    "rate": null
+   },
+   "latest_main": null,
+   "newest_main": null,
+   "latest_main_jobs": null,
+   "main_runs": [],
+   "pull_requests": {
+    "passed": 0,
+    "failed": 0,
+    "rate": null
+   },
+   "merge_queue": {
+    "passed": 0,
+    "failed": 0,
+    "rate": null
+   },
+   "flaky": {
+    "commits": 0,
+    "flaky": 0,
+    "rate": null
+   },
+   "minutes_median": null,
+   "minutes_p90": null,
+   "queued_median": null
+  }
+ ],
+ "merge_time": {
+  "merged": 0,
+  "hours_median": null,
+  "hours_p90": null,
+  "open": 0,
+  "open_drafts": 0,
+  "open_over_30_days": 0
+ },
+ "workflows": [
+  {
+   "file": "nightlyKernelChecks.yml",
+   "title": "Kernel checks",
+   "every": 24,
+   "legs": true,
+   "why": "the Kernels section's numbers; a leg that found no runner publishes nothing",
+   "runs": [
+    {
+     "id": 44554199357,
+     "url": "https://github.com/jhkwak-knu/mlir-aie/actions/runs/44554199357",
+     "status": "in_progress",
+     "conclusion": null,
+     "created_at": "2026-11-19T15:23:14Z",
+     "run_started_at": "2026-11-19T15:23:14Z",
+     "updated_at": "2026-11-19T15:23:20Z",
+     "head_sha": "9e09d3c2058451902a732f6d384cb2a0fdb3e560",
+     "title": "Nightly Kernel Checks on Ryzen AI",
+     "attempt": 1
+    }
+   ],
+   "jobs": [
+    {
+     "name": "runners / pick",
+     "url": "https://github.com/jhkwak-knu/mlir-aie/actions/runs/44554199357/job/135665718898",
+     "status": "in_progress",
+     "conclusion": null,
+     "created_at": "2026-11-19T15:23:15Z",
+     "started_at": "2026-11-19T15:23:19Z",
+     "runner": "GitHub Actions 1000000046"
+    }
+   ]
+  },
+  {
+   "file": "nightlyComponentChecks.yml",
+   "title": "Placement and performance checks",
+   "every": 24,
+   "legs": true,
+   "why": "the Performance and Placement sections' numbers",
+   "runs": [
+    {
+     "id": 44560567041,
+     "url": "https://github.com/jhkwak-knu/mlir-aie/actions/runs/44560567041",
+     "status": "in_progress",
+     "conclusion": null,
+     "created_at": "2026-11-19T15:57:07Z",
+     "run_started_at": "2026-11-19T15:57:07Z",
+     "updated_at": "2026-11-19T15:57:11Z",
+     "head_sha": "9e09d3c2058451902a732f6d384cb2a0fdb3e560",
+     "title": "Nightly Component Checks",
+     "attempt": 1
+    }
+   ],
+   "jobs": [
+    {
+     "name": "SA placer seed sweep (CPU-only)",
+     "url": "https://github.com/jhkwak-knu/mlir-aie/actions/runs/44560567041/job/135688385571",
+     "status": "in_progress",
+     "conclusion": null,
+     "created_at": "2026-11-19T15:57:08Z",
+     "started_at": "2026-11-19T15:57:11Z",
+     "runner": "GitHub Actions 1000000047"
+    },
+    {
+     "name": "runners / pick",
+     "url": "https://github.com/jhkwak-knu/mlir-aie/actions/runs/44560567041/job/135688385952",
+     "status": "in_progress",
+     "conclusion": null,
+     "created_at": "2026-11-19T15:57:08Z",
+     "started_at": "2026-11-19T15:57:10Z",
+     "runner": "GitHub Actions 1000000048"
+    }
+   ]
+  },
+  {
+   "file": "modelBasedTests.yml",
+   "title": "Model-based tests",
+   "every": 24,
+   "legs": true,
+   "why": "the buffer allocator and the packet router against their models at many times check-aie's scale; the Routing and Placement sections' numbers",
+   "runs": [
+    {
+     "id": 44518323916,
+     "url": "https://github.com/jhkwak-knu/mlir-aie/actions/runs/44518323916",
+     "status": "completed",
+     "conclusion": "failure",
+     "created_at": "2026-11-19T11:50:03Z",
+     "run_started_at": "2026-11-19T11:50:03Z",
+     "updated_at": "2026-11-19T13:37:05Z",
+     "head_sha": "9e09d3c2058451902a732f6d384cb2a0fdb3e560",
+     "title": "Model-based tests",
+     "attempt": 1
+    }
+   ],
+   "jobs": [
+    {
+     "name": "Build, allocator and router lit tests",
+     "url": "https://github.com/jhkwak-knu/mlir-aie/actions/runs/44518323916/job/135540068872",
+     "status": "completed",
+     "conclusion": "success",
+     "created_at": "2026-11-19T11:50:04Z",
+     "started_at": "2026-11-19T11:50:07Z",
+     "runner": "GitHub Actions 1000000010",
+     "outcome": "passed"
+    },
+    {
+     "name": "Router hops-off, npu2",
+     "url": "https://github.com/jhkwak-knu/mlir-aie/actions/runs/44518323916/job/135556136017",
+     "status": "completed",
+     "conclusion": "success",
+     "created_at": "2026-11-19T12:20:36Z",
+     "started_at": "2026-11-19T13:17:34Z",
+     "runner": "GitHub Actions 1000000034",
+     "outcome": "passed"
+    },
+    {
+     "name": "Router properties, npu1",
+     "url": "https://github.com/jhkwak-knu/mlir-aie/actions/runs/44518323916/job/135556136022",
+     "status": "completed",
+     "conclusion": "success",
+     "created_at": "2026-11-19T12:20:36Z",
+     "started_at": "2026-11-19T13:03:31Z",
+     "runner": "GitHub Actions 1000000029",
+     "outcome": "passed"
+    },
+    {
+     "name": "Router hops-on, npu1",
+     "url": "https://github.com/jhkwak-knu/mlir-aie/actions/runs/44518323916/job/135556136037",
+     "status": "completed",
+     "conclusion": "success",
+     "created_at": "2026-11-19T12:20:36Z",
+     "started_at": "2026-11-19T12:23:30Z",
+     "runner": "GitHub Actions 1000000018",
+     "outcome": "passed"
+    },
+    {
+     "name": "Router hops-on, xcvc1902",
+     "url": "https://github.com/jhkwak-knu/mlir-aie/actions/runs/44518323916/job/135556136073",
+     "status": "completed",
+     "conclusion": "failure",
+     "created_at": "2026-11-19T12:20:36Z",
+     "started_at": "2026-11-19T13:22:52Z",
+     "runner": "GitHub Actions 1000000035",
+     "outcome": "failed"
+    },
+    {
+     "name": "Router hops-on, npu2",
+     "url": "https://github.com/jhkwak-knu/mlir-aie/actions/runs/44518323916/job/135556136096",
+     "status": "completed",
+     "conclusion": "success",
+     "created_at": "2026-11-19T12:20:36Z",
+     "started_at": "2026-11-19T13:10:32Z",
+     "runner": "GitHub Actions 1000000030",
+     "outcome": "passed"
+    },
+    {
+     "name": "Router properties, npu2",
+     "url": "https://github.com/jhkwak-knu/mlir-aie/actions/runs/44518323916/job/135556136106",
+     "status": "completed",
+     "conclusion": "success",
+     "created_at": "2026-11-19T12:20:36Z",
+     "started_at": "2026-11-19T13:03:31Z",
+     "runner": "GitHub Actions 1000000028",
+     "outcome": "passed"
+    },
+    {
+     "name": "Router properties, xcvc1902",
+     "url": "https://github.com/jhkwak-knu/mlir-aie/actions/runs/44518323916/job/135556136146",
+     "status": "completed",
+     "conclusion": "success",
+     "created_at": "2026-11-19T12:20:36Z",
+     "started_at": "2026-11-19T13:11:15Z",
+     "runner": "GitHub Actions 1000000031",
+     "outcome": "passed"
+    },
+    {
+     "name": "Router hops-off, npu1",
+     "url": "https://github.com/jhkwak-knu/mlir-aie/actions/runs/44518323916/job/135556136171",
+     "status": "completed",
+     "conclusion": "success",
+     "created_at": "2026-11-19T12:20:36Z",
+     "started_at": "2026-11-19T13:17:29Z",
+     "runner": "GitHub Actions 1000000033",
+     "outcome": "passed"
+    },
+    {
+     "name": "Router hops-off, xcvc1902",
+     "url": "https://github.com/jhkwak-knu/mlir-aie/actions/runs/44518323916/job/135556136238",
+     "status": "completed",
+     "conclusion": "success",
+     "created_at": "2026-11-19T12:20:36Z",
+     "started_at": "2026-11-19T13:24:21Z",
+     "runner": "GitHub Actions 1000000037",
+     "outcome": "passed"
+    },
+    {
+     "name": "Collect results",
+     "url": "https://github.com/jhkwak-knu/mlir-aie/actions/runs/44518323916/job/135598470005",
+     "status": "completed",
+     "conclusion": "failure",
+     "created_at": "2026-11-19T13:36:33Z",
+     "started_at": "2026-11-19T13:36:35Z",
+     "runner": "GitHub Actions 1000000044",
+     "outcome": "failed"
+    },
+    {
+     "name": "publish",
+     "url": "https://github.com/jhkwak-knu/mlir-aie/actions/runs/44518323916/job/135598599805",
+     "status": "completed",
+     "conclusion": "success",
+     "created_at": "2026-11-19T13:36:47Z",
+     "started_at": "2026-11-19T13:36:49Z",
+     "runner": "GitHub Actions 1000000045",
+     "outcome": "passed"
+    }
+   ]
+  },
+  {
+   "file": "buildRyzenWheels.yml",
+   "title": "Ryzen AI wheels",
+   "every": 24,
+   "legs": true,
+   "why": "refreshes the latest-wheels releases users install from",
+   "runs": [
+    {
+     "id": 44523920066,
+     "url": "https://github.com/jhkwak-knu/mlir-aie/actions/runs/44523920066",
+     "status": "queued",
+     "conclusion": null,
+     "created_at": "2026-11-19T12:26:37Z",
+     "run_started_at": "2026-11-19T12:26:37Z",
+     "updated_at": "2026-11-19T12:26:37Z",
+     "head_sha": "9e09d3c2058451902a732f6d384cb2a0fdb3e560",
+     "title": "Publish Ryzen AI wheels",
+     "attempt": 1
+    }
+   ],
+   "jobs": [
+    {
+     "name": "Build Linux wheels / Build and upload mlir_aie wheel (Linux 3.12 RTTI ON)",
+     "url": "https://github.com/jhkwak-knu/mlir-aie/actions/runs/44523920066/job/135559374872",
+     "status": "completed",
+     "conclusion": "failure",
+     "created_at": "2026-11-19T12:26:38Z",
+     "started_at": "2026-11-19T12:52:32Z",
+     "runner": "GitHub Actions 1000000025",
+     "outcome": "failed"
+    },
+    {
+     "name": "Build Linux wheels / Build and upload mlir_aie wheels (Linux) (3.12, OFF)",
+     "url": "https://github.com/jhkwak-knu/mlir-aie/actions/runs/44523920066/job/135559375311",
+     "status": "completed",
+     "conclusion": "failure",
+     "created_at": "2026-11-19T12:26:38Z",
+     "started_at": "2026-11-19T13:24:11Z",
+     "runner": "GitHub Actions 1000000036",
+     "outcome": "failed"
+    },
+    {
+     "name": "Build Linux wheels / Build and upload mlir_aie wheels (Linux) (3.14, ON)",
+     "url": "https://github.com/jhkwak-knu/mlir-aie/actions/runs/44523920066/job/135559375377",
+     "status": "completed",
+     "conclusion": "failure",
+     "created_at": "2026-11-19T12:26:38Z",
+     "started_at": "2026-11-19T13:24:42Z",
+     "runner": "GitHub Actions 1000000038",
+     "outcome": "failed"
+    },
+    {
+     "name": "Build Windows wheels / Build and upload mlir_aie wheel (Windows 3.13 RTTI ON)",
+     "url": "https://github.com/jhkwak-knu/mlir-aie/actions/runs/44523920066/job/135559375414",
+     "status": "completed",
+     "conclusion": "success",
+     "created_at": "2026-11-19T12:26:38Z",
+     "started_at": "2026-11-19T12:29:39Z",
+     "runner": "GitHub Actions 1000000019",
+     "outcome": "passed"
+    },
+    {
+     "name": "Build Linux wheels / Build and upload mlir_aie wheels (Linux) (3.14, OFF)",
+     "url": "https://github.com/jhkwak-knu/mlir-aie/actions/runs/44523920066/job/135559375506",
+     "status": "completed",
+     "conclusion": "failure",
+     "created_at": "2026-11-19T12:26:38Z",
+     "started_at": "2026-11-19T13:26:30Z",
+     "runner": "GitHub Actions 1000000040",
+     "outcome": "failed"
+    },
+    {
+     "name": "Build Windows wheels / Build and upload mlir_aie wheels (Windows) (3.13, OFF)",
+     "url": "https://github.com/jhkwak-knu/mlir-aie/actions/runs/44523920066/job/135559375520",
+     "status": "completed",
+     "conclusion": "success",
+     "created_at": "2026-11-19T12:26:38Z",
+     "started_at": "2026-11-19T12:29:39Z",
+     "runner": "GitHub Actions 1000000020",
+     "outcome": "passed"
+    },
+    {
+     "name": "Build Linux wheels / Build and upload mlir_aie wheels (Linux) (3.11, ON)",
+     "url": "https://github.com/jhkwak-knu/mlir-aie/actions/runs/44523920066/job/135559375525",
+     "status": "completed",
+     "conclusion": "failure",
+     "created_at": "2026-11-19T12:26:38Z",
+     "started_at": "2026-11-19T13:25:14Z",
+     "runner": "GitHub Actions 1000000039",
+     "outcome": "failed"
+    },
+    {
+     "name": "Build Linux wheels / Build and upload mlir_aie wheels (Linux) (3.13, OFF)",
+     "url": "https://github.com/jhkwak-knu/mlir-aie/actions/runs/44523920066/job/135559375654",
+     "status": "completed",
+     "conclusion": "failure",
+     "created_at": "2026-11-19T12:26:38Z",
+     "started_at": "2026-11-19T13:27:27Z",
+     "runner": "GitHub Actions 1000000043",
+     "outcome": "failed"
+    },
+    {
+     "name": "Build Linux wheels / Build and upload mlir_aie wheels (Linux) (3.13, ON)",
+     "url": "https://github.com/jhkwak-knu/mlir-aie/actions/runs/44523920066/job/135559375659",
+     "status": "completed",
+     "conclusion": "failure",
+     "created_at": "2026-11-19T12:26:38Z",
+     "started_at": "2026-11-19T13:26:52Z",
+     "runner": "GitHub Actions 1000000042",
+     "outcome": "failed"
+    },
+    {
+     "name": "Build Linux wheels / Build and upload mlir_aie wheels (Linux) (3.11, OFF)",
+     "url": "https://github.com/jhkwak-knu/mlir-aie/actions/runs/44523920066/job/135559375704",
+     "status": "completed",
+     "conclusion": "failure",
+     "created_at": "2026-11-19T12:26:38Z",
+     "started_at": "2026-11-19T13:26:30Z",
+     "runner": "GitHub Actions 1000000041",
+     "outcome": "failed"
+    },
+    {
+     "name": "Build Windows wheels / Build and upload mlir_aie wheels (Windows) (3.12, ON)",
+     "url": "https://github.com/jhkwak-knu/mlir-aie/actions/runs/44523920066/job/135559375991",
+     "status": "completed",
+     "conclusion": "success",
+     "created_at": "2026-11-19T12:26:38Z",
+     "started_at": "2026-11-19T12:30:16Z",
+     "runner": "GitHub Actions 1000000021",
+     "outcome": "passed"
+    },
+    {
+     "name": "Build Windows wheels / Build and upload mlir_aie wheels (Windows) (3.11, ON)",
+     "url": "https://github.com/jhkwak-knu/mlir-aie/actions/runs/44523920066/job/135559376007",
+     "status": "completed",
+     "conclusion": "success",
+     "created_at": "2026-11-19T12:26:38Z",
+     "started_at": "2026-11-19T12:51:01Z",
+     "runner": "GitHub Actions 1000000023",
+     "outcome": "passed"
+    },
+    {
+     "name": "Build Windows wheels / Build and upload mlir_aie wheels (Windows) (3.14, OFF)",
+     "url": "https://github.com/jhkwak-knu/mlir-aie/actions/runs/44523920066/job/135559376087",
+     "status": "completed",
+     "conclusion": "success",
+     "created_at": "2026-11-19T12:26:38Z",
+     "started_at": "2026-11-19T12:51:00Z",
+     "runner": "GitHub Actions 1000000024",
+     "outcome": "passed"
+    },
+    {
+     "name": "Build Windows wheels / Build and upload mlir_aie wheels (Windows) (3.11, OFF)",
+     "url": "https://github.com/jhkwak-knu/mlir-aie/actions/runs/44523920066/job/135559376143",
+     "status": "completed",
+     "conclusion": "success",
+     "created_at": "2026-11-19T12:26:38Z",
+     "started_at": "2026-11-19T12:31:15Z",
+     "runner": "GitHub Actions 1000000022",
+     "outcome": "passed"
+    },
+    {
+     "name": "Build Windows wheels / Build and upload mlir_aie wheels (Windows) (3.12, OFF)",
+     "url": "https://github.com/jhkwak-knu/mlir-aie/actions/runs/44523920066/job/135559376210",
+     "status": "completed",
+     "conclusion": "success",
+     "created_at": "2026-11-19T12:26:38Z",
+     "started_at": "2026-11-19T12:54:07Z",
+     "runner": "GitHub Actions 1000000026",
+     "outcome": "passed"
+    },
+    {
+     "name": "Build Windows wheels / Build and upload mlir_aie wheels (Windows) (3.14, ON)",
+     "url": "https://github.com/jhkwak-knu/mlir-aie/actions/runs/44523920066/job/135559376438",
+     "status": "completed",
+     "conclusion": "success",
+     "created_at": "2026-11-19T12:26:38Z",
+     "started_at": "2026-11-19T12:58:28Z",
+     "runner": "GitHub Actions 1000000027",
+     "outcome": "passed"
+    },
+    {
+     "name": "Build Linux wheels / Smoke-Test Wheel on Ryzen AI",
+     "url": "https://github.com/jhkwak-knu/mlir-aie/actions/runs/44523920066/job/135574241700",
+     "status": "completed",
+     "conclusion": "skipped",
+     "created_at": "2026-11-19T12:54:05Z",
+     "started_at": "2026-11-19T12:54:05Z",
+     "runner": null,
+     "outcome": "passed"
+    },
+    {
+     "name": "Build Windows wheels / Smoke-Test Wheel on Ryzen AI (Windows)",
+     "url": "https://github.com/jhkwak-knu/mlir-aie/actions/runs/44523920066/job/135579401935",
+     "status": "queued",
+     "conclusion": null,
+     "created_at": "2026-11-19T13:03:29Z",
+     "started_at": "2026-11-19T13:03:29Z",
+     "runner": ""
+    }
+   ]
+  },
+  {
+   "file": "mlirDistro.yml",
+   "title": "MLIR distro from LLVM head",
+   "every": 4,
+   "why": "early warning that upstream LLVM broke the build",
+   "runs": [
+    {
+     "id": 44522626854,
+     "url": "https://github.com/jhkwak-knu/mlir-aie/actions/runs/44522626854",
+     "status": "completed",
+     "conclusion": "success",
+     "created_at": "2026-11-19T12:18:15Z",
+     "run_started_at": "2026-11-19T12:18:15Z",
+     "updated_at": "2026-11-19T15:33:53Z",
+     "head_sha": "9e09d3c2058451902a732f6d384cb2a0fdb3e560",
+     "title": "MLIR Distro",
+     "attempt": 1
+    }
+   ],
+   "jobs": null
+  },
+  {
+   "file": "pruneReleaseAssets.yml",
+   "title": "Prune release assets",
+   "every": 24,
+   "why": "keeps dev-wheels under 1,000 assets; when it stops, PR wheel uploads fail",
+   "runs": [
+    {
+     "id": 44529770145,
+     "url": "https://github.com/jhkwak-knu/mlir-aie/actions/runs/44529770145",
+     "status": "completed",
+     "conclusion": "failure",
+     "created_at": "2026-11-19T13:03:58Z",
+     "run_started_at": "2026-11-19T13:03:58Z",
+     "updated_at": "2026-11-19T13:17:32Z",
+     "head_sha": "9e09d3c2058451902a732f6d384cb2a0fdb3e560",
+     "title": "Prune release assets",
+     "attempt": 1
+    }
+   ],
+   "jobs": null
+  },
+  {
+   "file": "buildAndTestRyzenAISw.yml",
+   "title": "Ryzen AI Software build",
+   "every": 24,
+   "why": "the Docker build against Ryzen AI Software",
+   "runs": [],
+   "jobs": null
+  },
+  {
+   "file": "nightlyCodeHealth.yml",
+   "title": "Code health",
+   "every": 24,
+   "legs": true,
+   "why": "coverage, check-aie under ASan, UBSan and TSan, CodeQL C++ and clang-tidy over every file: the Code health section's numbers",
+   "runs": [],
+   "jobs": null
+  },
+  {
+   "file": "update-llvm.yml",
+   "title": "LLVM bump",
+   "every": 384,
+   "why": "opens the LLVM bump pull request on the 1st and 15th",
+   "runs": [],
+   "jobs": null
+  },
+  {
+   "file": "update-peano.yml",
+   "title": "Peano bump",
+   "every": 168,
+   "why": "opens the Peano bump pull request each Monday",
+   "runs": [],
+   "jobs": null
+  },
+  {
+   "file": "scorecard.yml",
+   "title": "OpenSSF Scorecard",
+   "every": 168,
+   "why": "the supply-chain scan, to the Security tab",
+   "runs": [],
+   "jobs": null
+  }
+ ],
+ "runners": []
+}
