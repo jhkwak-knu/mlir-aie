@@ -22,6 +22,14 @@
 using namespace mlir;
 using namespace onnx_to_aie;
 
+// Generated pass base; placed after the includes and `using namespace mlir`
+// because it refers to func::FuncOp and onnx::ONNXDialect.
+#include "onnx/Conversion/Passes.h"
+namespace onnx {
+#define GEN_PASS_DEF_CONVERTONNXTOAIE
+#include "onnx/Conversion/Passes.h.inc"
+} // namespace onnx
+
 namespace {
 
 //===----------------------------------------------------------------------===//
@@ -133,7 +141,7 @@ void populateONNXRewritePatterns(RewritePatternSet &patterns,
 }
 
 struct ConvertONNXToAIE
-    : public ConvertONNXToAIEBase<ConvertONNXToAIE> {
+    : public onnx::impl::ConvertONNXToAIEBase<ConvertONNXToAIE> {
 
   void getDependentDialects(mlir::DialectRegistry &registry) const override {
     registry.insert<mlir::arith::ArithDialect>();
