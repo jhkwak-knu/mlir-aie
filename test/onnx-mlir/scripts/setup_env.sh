@@ -11,7 +11,8 @@ if [[ "${1:-}" == "--measure" ]]; then
 fi
 
 # Set parameters
-MLIR_AIE_ROOT="$HOME/ryzen_ai/mlir-aie-dev/mlir-aie"
+# Repo root derived from this script location (test/onnx-mlir/scripts/)
+MLIR_AIE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 IRONENV_ACTIVATE="$MLIR_AIE_ROOT/ironenv/bin/activate"
 ENV_SETUP_SH="$MLIR_AIE_ROOT/utils/env_setup.sh"
 MLIR_AIE_INSTALL="$MLIR_AIE_ROOT/install"

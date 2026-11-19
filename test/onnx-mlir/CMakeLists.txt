@@ -9,7 +9,7 @@
 # -DXRT_LIB_DIR: Path to XRT libs (default: /opt/xilinx/xrt/lib)
 # -DTARGET_NAME: Target name to be built
 
-cmake_minimum_required(VERSION 3.1)
+cmake_minimum_required(VERSION 3.10)
 
 project(onnx_mlir_host CXX)
 
@@ -40,7 +40,7 @@ add_executable(${currentTarget}
   ${CMAKE_CURRENT_SOURCE_DIR}/src/host.cpp
 )
 
-target_compile_definitions(${currentTarget} PUBLIC DISABLE_ABI_CHECK=1)
+target_compile_definitions(${currentTarget} PUBLIC DISABLE_ABI_CHECK=1 TEST_UTILS_USE_XRT)
 
 target_include_directories(${currentTarget} PUBLIC
   ${XRT_INC_DIR}

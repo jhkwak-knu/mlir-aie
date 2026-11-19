@@ -5,7 +5,8 @@ AIETOOLS_DIR       ?= $(shell realpath $(dir $(shell which xchesscc))/../)
 AIE2_INCLUDE_DIR   ?= $(AIETOOLS_DIR)/data/aie2p/lib
 AIE_ARCH           ?= aie2p
 CHESSCC_FLAGS      ?= --aiearch $(AIE_ARCH) -f -p me -P $(AIE2_INCLUDE_DIR) -I $(AIETOOLS_DIR)/include
-AIECC_FLAGS        ?= --aie-generate-xclbin --no-compile-host --aie-generate-npu-insts --npu-insts-name=insts.bin -j 24
+# Chess core compiles peak at ~6-7GB each; keep -j low on the laptop.
+AIECC_FLAGS        ?= --xchesscc --get-xclbin --get-npu-insts --npu-insts-name=insts.bin -j 2
 
 # =========================
 # Paths (new tree layout)
@@ -64,9 +65,9 @@ TILE_DIMS = $(shell python3 -c "import json; j=json.load(open('$(TC_JSON)')); L=
 $(BUILD_DIR)/kernel.o: $(KERNEL_SRCS) $(TC_JSON) | $(BUILD_DIR)
 	xchesscc $(CHESSCC_FLAGS) $(TILE_DIMS) -c $< -o $@
 
-# 3) Generate xclbin/insts.bin with aiecc.py
+# 3) Generate xclbin/insts.bin with aiecc
 $(BUILD_DIR)/final.xclbin: $(BUILD_DIR)/aie.mlir $(BUILD_DIR)/kernel.o
-	cd $(BUILD_DIR) && aiecc.py $(AIECC_FLAGS) --xclbin-name=$(@F) aie.mlir
+	cd $(BUILD_DIR) && aiecc $(AIECC_FLAGS) --xclbin-name=$(@F) aie.mlir
 
 # 4) Build host (assumes CMakeLists.txt lives at repo root)
 host: $(BUILD_DIR)/$(TARGET)
