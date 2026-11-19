@@ -17,8 +17,8 @@ IRONENV_ACTIVATE="$MLIR_AIE_ROOT/ironenv/bin/activate"
 ENV_SETUP_SH="$MLIR_AIE_ROOT/utils/env_setup.sh"
 MLIR_AIE_INSTALL="$MLIR_AIE_ROOT/install"
 
-AMD_XDNA_TIMEOUT_PATH="/sys/module/amdxdna/parameters/timeout_in_sec"
-AMD_XDNA_TIMEOUT_SEC=60
+AMD_XDNA_TIMEOUT_PATH="/sys/module/amdxdna/parameters/tdr_timeout_ms"
+AMD_XDNA_TIMEOUT_MS=60000
 
 RAPL_ENERGY_PATH="/sys/class/powercap/intel-rapl:0/energy_uj"
 
@@ -37,18 +37,19 @@ fi
 source "$ENV_SETUP_SH" "$MLIR_AIE_INSTALL"
 echo
 
-# Set amdxdna timeout (seconds)
+# Check amdxdna TDR timeout. tdr_timeout_ms is read-only (0400) at runtime;
+# set it at module load: /etc/modprobe.d/amdxdna.conf
+#   options amdxdna tdr_timeout_ms=60000
 if [[ ! -f "$AMD_XDNA_TIMEOUT_PATH" ]]; then
   echo "[error] timeout parameter file not found: $AMD_XDNA_TIMEOUT_PATH" >&2
   return 1 2>/dev/null || exit 1
 fi
-echo "[info] amdxdna timeout (before): $(cat "$AMD_XDNA_TIMEOUT_PATH") sec"
-
-if ! echo "$AMD_XDNA_TIMEOUT_SEC" | sudo tee "$AMD_XDNA_TIMEOUT_PATH" >/dev/null; then
-  echo "[error] failed to write $AMD_XDNA_TIMEOUT_SEC to $AMD_XDNA_TIMEOUT_PATH (need sudo/root?)" >&2
+_cur_timeout="$(sudo cat "$AMD_XDNA_TIMEOUT_PATH")"
+if [[ "$_cur_timeout" != "$AMD_XDNA_TIMEOUT_MS" ]]; then
+  echo "[error] amdxdna tdr_timeout_ms=$_cur_timeout, expected $AMD_XDNA_TIMEOUT_MS (set it in /etc/modprobe.d/amdxdna.conf and reload the module)" >&2
   return 1 2>/dev/null || exit 1
 fi
-echo "[info] amdxdna timeout (after):  $(cat "$AMD_XDNA_TIMEOUT_PATH") sec"
+echo "[info] amdxdna tdr_timeout_ms: $_cur_timeout"
 echo
 
 # Grant read access to RAPL energy counters (resets on reboot)
