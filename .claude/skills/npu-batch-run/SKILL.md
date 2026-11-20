@@ -20,7 +20,7 @@ description: Use before running NPU hardware tests or measurement batches (run_t
 3. **Progress monitoring** -- During long batch runs:
    - Periodically check `tail -5 <result_csv>` for recent statuses
    - Watch for consecutive RUN_FAIL (may indicate driver/NPU hang)
-   - If >3 consecutive failures, stop and restart NPU driver or reboot
+   - If >3 consecutive failures, stop the batch, check for a hang (item 4), and tell the user
    - Compare `log.txt` modification time vs current time to detect hangs
    - If `onnx_matmul` process is in `D` (disk sleep) state for >5 min, it is hung
 
@@ -32,7 +32,7 @@ description: Use before running NPU hardware tests or measurement batches (run_t
    - **Only reliable recovery is reboot**
    - After reboot, resume with `run_tc_all.sh -s <next_case>` (preserves existing CSV)
    - Prevention: ensure `tdr_timeout_ms=60000` before batch start (`setup_env.sh` verifies it)
-   - Note: timeout_in_sec=60 does NOT prevent all hangs -- some D states bypass driver timeout (observed with amdxdna 2.20)
+   - Note: the driver timeout does NOT prevent all hangs -- some D states bypass it (observed with amdxdna 2.20)
 
 5. **Autonomous batch execution** -- When running batches via Claude Code:
    - **Before start**: verify RAPL readable, NPU timeout set, no stale artifacts
