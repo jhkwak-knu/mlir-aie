@@ -69,5 +69,6 @@ test/onnx-mlir/paper/search_bench/output/
 /docs/dialects.png
 
 # Local Claude Code tooling/settings
-/.claude/
+/.claude/*
+!/.claude/skills/
 sandbox-hsa-env/
